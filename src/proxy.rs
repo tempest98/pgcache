@@ -8,6 +8,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::{LocalSet, spawn_local},
 };
+use tracing::{debug, instrument};
 
 type Worker<'scope> = (
     thread::ScopedJoinHandle<'scope, Result<(), Error>>,
@@ -43,13 +44,14 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     }
 }
 
+#[instrument]
 pub fn handle_connection(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
 ) -> Result<(), Error> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 
-    println!("handle connection start {:?}", thread::current().name());
+    debug!("handle connection start");
     rt.block_on(async {
         let local = LocalSet::new();
         local
@@ -58,14 +60,14 @@ pub fn handle_connection(
                     spawn_local(async move {
                         let mut buf = [0u8; 1024];
 
-                        println!("spawn task {:?}", thread::current().name());
+                        debug!("spawn task");
 
                         let _ = socket.set_nodelay(true);
                         while let Ok(count) = socket.read(&mut buf).await {
                             if count == 0 {
                                 break;
                             }
-                            println!("read {count} [{:?}]", &buf[0..count]);
+                            debug!("read {count} [{:?}]", &buf[0..count]);
                         }
                     });
                 }
@@ -76,6 +78,7 @@ pub fn handle_connection(
     })
 }
 
+#[instrument]
 pub fn handle_listen(settings: &Settings) -> Result<(), Error> {
     thread::scope(|scope| {
         let mut workers: Vec<_> = (0..settings.num_workers)
@@ -84,14 +87,14 @@ pub fn handle_listen(settings: &Settings) -> Result<(), Error> {
 
         let rt = Builder::new_current_thread().enable_all().build()?;
 
-        println!("accept loop {:?}", thread::current().name());
+        debug!("accept loop");
         rt.block_on(async {
             let listener = TcpListener::bind(&settings.listen.socket).await?;
-            println!("Listening to {}", &settings.listen.socket);
+            debug!("Listening to {}", &settings.listen.socket);
 
             let mut cur_worker = 0;
             while let Ok((socket, _)) = listener.accept().await {
-                println!("socket accepted");
+                debug!("socket accepted");
 
                 let _ = workers[cur_worker].1.send(socket);
 

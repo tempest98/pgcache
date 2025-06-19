@@ -1,15 +1,22 @@
-mod settings;
 mod proxy;
+mod settings;
+mod tracing_utils;
 
-use std::{io::Error, thread};
+use std::{error::Error, thread};
 
-use settings::Settings;
 use proxy::handle_listen;
+use settings::Settings;
+use tracing::Level;
+use tracing_utils::SimpeFormatter;
 
-
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn Error>> {
     let settings = Settings::new()?;
-    println!("{settings:?}");
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .event_format(SimpeFormatter)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
     thread::scope(|scope| {
         let _ = thread::Builder::new()
