@@ -5,18 +5,23 @@ use std::{
     thread,
 };
 
-use crate::settings::Settings;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    join,
-    net::{
-        TcpListener, TcpStream, lookup_host,
-        tcp::{ReadHalf, WriteHalf},
+use crate::{
+    pg::protocol::{
+        PgBackendMessage, PgBackendMessageCodec, PgConnectionState, PgFrontendMessage,
+        PgFrontendMessageCodec,
     },
+    settings::Settings,
+};
+
+use futures::StreamExt;
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpListener, TcpStream, lookup_host},
     runtime::Builder,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::{LocalSet, spawn_local},
 };
+use tokio_util::{bytes::Buf, codec::FramedRead};
 use tracing::{debug, error, instrument};
 
 type Worker<'scope> = (
@@ -31,7 +36,7 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
 ) -> Result<Worker<'scope>, Error> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
-        .name(format!("cnxt {}", worker_id))
+        .name(format!("cnxt {worker_id}"))
         .spawn_scoped(scope, || connection_run(settings, rx))?;
 
     Ok((join, tx))
@@ -115,6 +120,14 @@ pub fn connection_run(
     })
 }
 
+#[derive(Debug)]
+enum ProxyMode {
+    ClientRead,
+    OriginWrite(PgFrontendMessage),
+    OriginRead,
+    ClientWrite(PgBackendMessage),
+}
+
 #[instrument]
 async fn handle_connection(
     client_socket: &mut TcpStream,
@@ -135,68 +148,70 @@ async fn handle_connection(
     let _ = client_socket.set_nodelay(true);
     let _ = origin_stream.set_nodelay(true);
 
+    let mut proxy_mode = ProxyMode::ClientRead;
+
     let (client_read, client_write) = client_socket.split();
+    let mut client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
+    let mut client_stream_write = client_write;
+
     let (origin_read, origin_write) = origin_stream.split();
-
-    let results = join!(
-        pump(client_read, origin_write),
-        pump(origin_read, client_write)
-    );
-
-    Ok(())
-}
-
-async fn pump<'r, 'w>(
-    mut stream_from: ReadHalf<'r>,
-    mut stream_to: WriteHalf<'w>,
-) -> Result<(), Error> {
-    enum Mode {
-        Read,
-        Write,
-    }
-
-    let mut mode = Mode::Read;
-    let mut buf = [0u8; 32768];
-    let mut count_buf = 0;
-    let mut count_written = 0;
+    let mut origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
+    let mut origin_stream_write = origin_write;
 
     loop {
-        match mode {
-            Mode::Read => {
-                let Ok(count) = stream_from.read(&mut buf).await else {
-                    return Err(io::Error::other("read error"));
-                };
-                if count > 0 {
-                    mode = Mode::Write;
-                    debug!(
-                        "read {count} [{}]",
-                        String::from_utf8_lossy(&buf[0..count].escape_ascii().collect::<Vec<u8>>())
-                    );
-                    count_buf = count;
+        dbg!(&proxy_mode);
+        match proxy_mode {
+            ProxyMode::ClientRead => {
+                if let Some(res) = client_framed_read.next().await {
+                    match res {
+                        Ok(msg) => {
+                            dbg!(&msg);
+                            proxy_mode = ProxyMode::OriginWrite(msg);
+                        }
+                        Err(err) => {
+                            error!("client read [{}]", err);
+                        }
+                    }
                 } else {
                     break;
                 }
             }
-            Mode::Write => {
-                let Ok(count) = stream_to.write(&buf[count_written..count_buf]).await else {
-                    return Err(io::Error::other("write error"));
-                };
-                if count > 0 {
-                    debug!(
-                        "write {count} [{}]",
-                        String::from_utf8_lossy(
-                            &buf[count_written..(count_written + count)]
-                                .escape_ascii()
-                                .collect::<Vec<u8>>()
-                        )
-                    );
-                    count_written += count;
-                    if count_written == count_buf {
-                        count_written = 0;
-                        mode = Mode::Read;
+            ProxyMode::OriginWrite(ref mut msg) => {
+                let mut b = msg.get_buf();
+                origin_stream_write.write_buf(&mut b).await?;
+                if !b.has_remaining() {
+                    proxy_mode = ProxyMode::OriginRead;
+                }
+            }
+            ProxyMode::OriginRead => {
+                if let Some(res) = origin_framed_read.next().await {
+                    match res {
+                        Ok(msg) => {
+                            dbg!(&msg);
+                            match &msg {
+                                PgBackendMessage::SslRequestResponse(response) => {
+                                    //server will return "N" (no ssl support) or "S" (supported)
+                                    //we will pretend the response is always N for now
+                                    client_framed_read.decoder_mut().state =
+                                        PgConnectionState::AwaitingStartup;
+                                }
+                                _ => {}
+                            }
+                            proxy_mode = ProxyMode::ClientWrite(msg);
+                        }
+                        Err(err) => {
+                            error!("origin read [{}]", err);
+                        }
                     }
                 } else {
                     break;
+                }
+            }
+            ProxyMode::ClientWrite(ref mut msg) => {
+                let mut b = msg.get_buf();
+                client_stream_write.write_buf(&mut b).await?;
+                if !b.has_remaining() {
+                    proxy_mode = ProxyMode::ClientRead;
                 }
             }
         }

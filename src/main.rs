@@ -1,3 +1,4 @@
+mod pg;
 mod proxy;
 mod settings;
 mod tracing_utils;
