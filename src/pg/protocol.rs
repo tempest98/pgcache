@@ -174,7 +174,7 @@ impl Decoder for PgFrontendMessageCodec {
 pub enum PgBackendMessage {
     // startup
     SslRequestResponse(BytesMut),
-    Authentication,
+    Authentication(BytesMut),
     ParameterStatus,
     BackendKeyData,
 
@@ -212,6 +212,7 @@ impl PgBackendMessage {
     pub fn get_buf(&mut self) -> &mut BytesMut {
         match self {
             Self::SslRequestResponse(buf) => buf,
+            Self::Authentication(buf) => buf,
             _ => todo!(),
         }
     }
@@ -219,7 +220,7 @@ impl PgBackendMessage {
 
 #[derive(Debug, Default)]
 pub struct PgBackendMessageCodec {
-    state: PgConnectionState,
+    pub state: PgConnectionState,
 }
 
 impl Decoder for PgBackendMessageCodec {
@@ -240,7 +241,26 @@ impl Decoder for PgBackendMessageCodec {
                 )))
             }
 
-            // PgConnectionState::AwaitingStartup => self.extract_startup(buf),
+            PgConnectionState::AwaitingStartup => {
+                const MIN_MESSAGE_LEN: usize = 5;
+
+                if buf.remaining() < MIN_MESSAGE_LEN {
+                    return Ok(None);
+                }
+
+                if buf[0] != b'R' {
+                    return Err(ProtocolError::InvalidStartupFrame);
+                }
+
+                let msg_len = (&buf[1..5]).get_i32() as usize + 1;
+                if buf.remaining() < msg_len {
+                    return Ok(None);
+                }
+
+                Ok(Some(PgBackendMessage::Authentication(
+                    buf.split_to(msg_len),
+                )))
+            }
             _ => {
                 todo!()
             }

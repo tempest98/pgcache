@@ -194,6 +194,8 @@ async fn handle_connection(
                                     //we will pretend the response is always N for now
                                     client_framed_read.decoder_mut().state =
                                         PgConnectionState::AwaitingStartup;
+                                    origin_framed_read.decoder_mut().state =
+                                        PgConnectionState::AwaitingStartup;
                                 }
                                 _ => {}
                             }
