@@ -46,11 +46,19 @@ pub(crate) enum PgConnectionState {
     AwaitingSync,
 }
 
+pub trait PgMessageType {}
+
 #[derive(Debug)]
-pub enum PgFrontendMessage {
-    Startup(BytesMut),
+pub struct PgMessage<T: PgMessageType> {
+    pub message_type: T,
+    pub data: BytesMut,
+}
+
+#[derive(Debug)]
+pub enum PgFrontendMessageType {
+    Startup,
     CancelRequest,
-    SslRequest(BytesMut),
+    SslRequest,
     PasswordMessageFamily,
 
     Query,
@@ -70,15 +78,9 @@ pub enum PgFrontendMessage {
     CopyDone,
 }
 
-impl PgFrontendMessage {
-    pub fn get_buf(&mut self) -> &mut BytesMut {
-        match self {
-            Self::Startup(buf) => buf,
-            Self::SslRequest(buf) => buf,
-            _ => todo!(),
-        }
-    }
-}
+impl PgMessageType for PgFrontendMessageType {}
+
+pub type PgFrontendMessage = PgMessage<PgFrontendMessageType>;
 
 #[derive(Debug, Default)]
 pub struct PgFrontendMessageCodec {
@@ -105,9 +107,10 @@ impl PgFrontendMessageCodec {
         }
 
         self.state = PgConnectionState::AwaitingStartup;
-        Ok(Some(PgFrontendMessage::SslRequest(
-            buf.split_to(SSL_REQUEST_MESSAGE_LEN),
-        )))
+        Ok(Some(PgFrontendMessage {
+            message_type: PgFrontendMessageType::SslRequest,
+            data: buf.split_to(SSL_REQUEST_MESSAGE_LEN),
+        }))
     }
 
     fn extract_startup(
@@ -147,7 +150,10 @@ impl PgFrontendMessageCodec {
         }
 
         self.state = PgConnectionState::AuthenticationInProgress;
-        Ok(Some(PgFrontendMessage::Startup(buf.split_to(msg_len))))
+        Ok(Some(PgFrontendMessage {
+            message_type: PgFrontendMessageType::Startup,
+            data: buf.split_to(msg_len),
+        }))
     }
 }
 
@@ -177,55 +183,46 @@ impl Decoder for PgFrontendMessageCodec {
 }
 
 #[derive(Debug)]
-pub enum PgBackendMessage {
+pub enum PgBackendMessageType {
     // startup
-    SslRequestResponse(BytesMut),
-    Authentication(BytesMut),
-    ParameterStatus(BytesMut),
-    BackendKeyData(BytesMut),
+    SslRequestResponse,
+    Authentication,
+    ParameterStatus,
+    BackendKeyData,
 
     // extended query
-    ParseComplete(BytesMut),
-    CloseComplete(BytesMut),
-    BindComplete(BytesMut),
-    PortalSuspended(BytesMut),
+    ParseComplete,
+    CloseComplete,
+    BindComplete,
+    PortalSuspended,
 
     // command response
-    CommandComplete(BytesMut),
-    EmptyQueryResponse(BytesMut),
-    ReadyForQuery(BytesMut),
-    ErrorResponse(BytesMut),
-    NoticeResponse(BytesMut),
-    SslResponse(BytesMut),
-    NotificationResponse(BytesMut),
+    CommandComplete,
+    EmptyQueryResponse,
+    ReadyForQuery,
+    ErrorResponse,
+    NoticeResponse,
+    SslResponse,
+    NotificationResponse,
 
     // data
-    ParameterDescription(BytesMut),
-    RowDescription(BytesMut),
-    DataRow(BytesMut),
-    NoData(BytesMut),
+    ParameterDescription,
+    RowDescription,
+    DataRow,
+    NoData,
 
     // copy
-    CopyData(BytesMut),
-    CopyFail(BytesMut),
-    CopyDone(BytesMut),
-    CopyInResponse(BytesMut),
-    CopyOutResponse(BytesMut),
-    CopyBothResponse(BytesMut),
+    CopyData,
+    CopyFail,
+    CopyDone,
+    CopyInResponse,
+    CopyOutResponse,
+    CopyBothResponse,
 }
 
-impl PgBackendMessage {
-    pub fn get_buf(&mut self) -> &mut BytesMut {
-        match self {
-            Self::SslRequestResponse(buf) => buf,
-            Self::Authentication(buf) => buf,
-            Self::ParameterStatus(buf) => buf,
-            Self::BackendKeyData(buf) => buf,
-            Self::ReadyForQuery(buf) => buf,
-            _ => todo!(),
-        }
-    }
-}
+impl PgMessageType for PgBackendMessageType {}
+
+pub(crate) type PgBackendMessage = PgMessage<PgBackendMessageType>;
 
 #[derive(Debug, Default)]
 pub struct PgBackendMessageCodec {
@@ -233,7 +230,7 @@ pub struct PgBackendMessageCodec {
 }
 
 impl Decoder for PgBackendMessageCodec {
-    type Item = PgBackendMessage;
+    type Item = PgMessage<PgBackendMessageType>;
     type Error = ProtocolError;
 
     fn decode(&mut self, buf: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -246,9 +243,10 @@ impl Decoder for PgBackendMessageCodec {
                 }
 
                 self.state = PgConnectionState::AwaitingStartup;
-                Ok(Some(PgBackendMessage::SslRequestResponse(
-                    buf.split_to(MESSAGE_LEN),
-                )))
+                Ok(Some(PgBackendMessage {
+                    message_type: PgBackendMessageType::SslRequestResponse,
+                    data: buf.split_to(MESSAGE_LEN),
+                }))
             }
 
             PgConnectionState::AwaitingStartup => {
@@ -268,9 +266,10 @@ impl Decoder for PgBackendMessageCodec {
                 }
 
                 self.state = PgConnectionState::AuthenticationInProgress;
-                Ok(Some(PgBackendMessage::Authentication(
-                    buf.split_to(msg_len),
-                )))
+                Ok(Some(PgBackendMessage {
+                    message_type: PgBackendMessageType::Authentication,
+                    data: buf.split_to(msg_len),
+                }))
             }
             _ => {
                 if !buf.has_remaining() {
@@ -289,9 +288,10 @@ impl Decoder for PgBackendMessageCodec {
                             return Ok(None);
                         }
 
-                        Ok(Some(PgBackendMessage::ParameterStatus(
-                            buf.split_to(msg_len),
-                        )))
+                        Ok(Some(PgBackendMessage {
+                            message_type: PgBackendMessageType::ParameterStatus,
+                            data: buf.split_to(msg_len),
+                        }))
                     }
                     b'K' => {
                         let msg_len = 13;
@@ -299,9 +299,10 @@ impl Decoder for PgBackendMessageCodec {
                             return Ok(None);
                         }
 
-                        Ok(Some(PgBackendMessage::BackendKeyData(
-                            buf.split_to(msg_len),
-                        )))
+                        Ok(Some(PgBackendMessage {
+                            message_type: PgBackendMessageType::BackendKeyData,
+                            data: buf.split_to(msg_len),
+                        }))
                     }
                     b'Z' => {
                         let msg_len = 6;
@@ -309,7 +310,10 @@ impl Decoder for PgBackendMessageCodec {
                             return Ok(None);
                         }
 
-                        Ok(Some(PgBackendMessage::ReadyForQuery(buf.split_to(msg_len))))
+                        Ok(Some(PgBackendMessage {
+                            message_type: PgBackendMessageType::ReadyForQuery,
+                            data: buf.split_to(msg_len),
+                        }))
                     }
                     _ => todo!(),
                 }

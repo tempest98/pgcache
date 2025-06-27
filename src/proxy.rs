@@ -193,16 +193,14 @@ async fn handle_connection(
                 }
             }
             ProxyMode::OriginWrite(ref mut msg) => {
-                let mut b = msg.get_buf();
-                origin_stream_write.write_buf(&mut b).await?;
-                if !b.has_remaining() {
+                origin_stream_write.write_buf(&mut msg.data).await?;
+                if !msg.data.has_remaining() {
                     proxy_mode = ProxyMode::Read;
                 }
             }
             ProxyMode::ClientWrite(ref mut msg) => {
-                let mut b = msg.get_buf();
-                client_stream_write.write_buf(&mut b).await?;
-                if !b.has_remaining() {
+                client_stream_write.write_buf(&mut msg.data).await?;
+                if !msg.data.has_remaining() {
                     proxy_mode = ProxyMode::Read;
                 }
             }
