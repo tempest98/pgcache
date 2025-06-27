@@ -87,7 +87,7 @@ pub struct PgFrontendMessageCodec {
 
 impl PgFrontendMessageCodec {
     fn extract_ssl_request(
-        &self,
+        &mut self,
         buf: &mut BytesMut,
     ) -> Result<Option<PgFrontendMessage>, ProtocolError> {
         const SSL_REQUEST_MESSAGE_LEN: usize = 8;
@@ -104,13 +104,14 @@ impl PgFrontendMessageCodec {
             return Err(ProtocolError::InvalidSslRequest(code_major, code_minor));
         }
 
+        self.state = PgConnectionState::AwaitingStartup;
         Ok(Some(PgFrontendMessage::SslRequest(
             buf.split_to(SSL_REQUEST_MESSAGE_LEN),
         )))
     }
 
     fn extract_startup(
-        &self,
+        &mut self,
         buf: &mut BytesMut,
     ) -> Result<Option<PgFrontendMessage>, ProtocolError> {
         const MINIMUM_STARTUP_MESSAGE_LEN: usize = 8;
@@ -145,6 +146,7 @@ impl PgFrontendMessageCodec {
             return Err(ProtocolError::InvalidStartupFrame);
         }
 
+        self.state = PgConnectionState::AuthenticationInProgress;
         Ok(Some(PgFrontendMessage::Startup(buf.split_to(msg_len))))
     }
 }
@@ -164,7 +166,11 @@ impl Decoder for PgFrontendMessageCodec {
             PgConnectionState::AwaitingStartup => self.extract_startup(buf),
 
             _ => {
-                todo!()
+                if buf.remaining() < 8 {
+                    return Ok(None);
+                } else {
+                    todo!();
+                }
             }
         }
     }
@@ -175,37 +181,37 @@ pub enum PgBackendMessage {
     // startup
     SslRequestResponse(BytesMut),
     Authentication(BytesMut),
-    ParameterStatus,
-    BackendKeyData,
+    ParameterStatus(BytesMut),
+    BackendKeyData(BytesMut),
 
     // extended query
-    ParseComplete,
-    CloseComplete,
-    BindComplete,
-    PortalSuspended,
+    ParseComplete(BytesMut),
+    CloseComplete(BytesMut),
+    BindComplete(BytesMut),
+    PortalSuspended(BytesMut),
 
     // command response
-    CommandComplete,
-    EmptyQueryResponse,
-    ReadyForQuery,
-    ErrorResponse,
-    NoticeResponse,
-    SslResponse,
-    NotificationResponse,
+    CommandComplete(BytesMut),
+    EmptyQueryResponse(BytesMut),
+    ReadyForQuery(BytesMut),
+    ErrorResponse(BytesMut),
+    NoticeResponse(BytesMut),
+    SslResponse(BytesMut),
+    NotificationResponse(BytesMut),
 
     // data
-    ParameterDescription,
-    RowDescription,
-    DataRow,
-    NoData,
+    ParameterDescription(BytesMut),
+    RowDescription(BytesMut),
+    DataRow(BytesMut),
+    NoData(BytesMut),
 
     // copy
-    CopyData,
-    CopyFail,
-    CopyDone,
-    CopyInResponse,
-    CopyOutResponse,
-    CopyBothResponse,
+    CopyData(BytesMut),
+    CopyFail(BytesMut),
+    CopyDone(BytesMut),
+    CopyInResponse(BytesMut),
+    CopyOutResponse(BytesMut),
+    CopyBothResponse(BytesMut),
 }
 
 impl PgBackendMessage {
@@ -213,6 +219,9 @@ impl PgBackendMessage {
         match self {
             Self::SslRequestResponse(buf) => buf,
             Self::Authentication(buf) => buf,
+            Self::ParameterStatus(buf) => buf,
+            Self::BackendKeyData(buf) => buf,
+            Self::ReadyForQuery(buf) => buf,
             _ => todo!(),
         }
     }
@@ -236,6 +245,7 @@ impl Decoder for PgBackendMessageCodec {
                     return Ok(None);
                 }
 
+                self.state = PgConnectionState::AwaitingStartup;
                 Ok(Some(PgBackendMessage::SslRequestResponse(
                     buf.split_to(MESSAGE_LEN),
                 )))
@@ -257,12 +267,52 @@ impl Decoder for PgBackendMessageCodec {
                     return Ok(None);
                 }
 
+                self.state = PgConnectionState::AuthenticationInProgress;
                 Ok(Some(PgBackendMessage::Authentication(
                     buf.split_to(msg_len),
                 )))
             }
             _ => {
-                todo!()
+                if !buf.has_remaining() {
+                    return Ok(None);
+                }
+                dbg!(&buf);
+                match buf[0] {
+                    b'S' => {
+                        const MIN_MESSAGE_LEN: usize = 5;
+                        if buf.remaining() < MIN_MESSAGE_LEN {
+                            return Ok(None);
+                        }
+
+                        let msg_len = (&buf[1..5]).get_i32() as usize + 1;
+                        if buf.remaining() < msg_len {
+                            return Ok(None);
+                        }
+
+                        Ok(Some(PgBackendMessage::ParameterStatus(
+                            buf.split_to(msg_len),
+                        )))
+                    }
+                    b'K' => {
+                        let msg_len = 13;
+                        if buf.remaining() < msg_len {
+                            return Ok(None);
+                        }
+
+                        Ok(Some(PgBackendMessage::BackendKeyData(
+                            buf.split_to(msg_len),
+                        )))
+                    }
+                    b'Z' => {
+                        let msg_len = 6;
+                        if buf.remaining() < msg_len {
+                            return Ok(None);
+                        }
+
+                        Ok(Some(PgBackendMessage::ReadyForQuery(buf.split_to(msg_len))))
+                    }
+                    _ => todo!(),
+                }
             }
         }
     }

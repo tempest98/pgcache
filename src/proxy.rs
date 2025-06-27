@@ -13,7 +13,6 @@ use crate::{
     settings::Settings,
 };
 
-use futures::StreamExt;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
@@ -21,6 +20,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::{LocalSet, spawn_local},
 };
+use tokio_stream::StreamExt;
 use tokio_util::{bytes::Buf, codec::FramedRead};
 use tracing::{debug, error, instrument};
 
@@ -122,10 +122,15 @@ pub fn connection_run(
 
 #[derive(Debug)]
 enum ProxyMode {
-    ClientRead,
+    Read,
     OriginWrite(PgFrontendMessage),
-    OriginRead,
     ClientWrite(PgBackendMessage),
+}
+
+#[derive(Debug)]
+enum StreamSource {
+    ClientRead(PgFrontendMessage),
+    OriginRead(PgBackendMessage),
 }
 
 #[instrument]
@@ -148,7 +153,7 @@ async fn handle_connection(
     let _ = client_socket.set_nodelay(true);
     let _ = origin_stream.set_nodelay(true);
 
-    let mut proxy_mode = ProxyMode::ClientRead;
+    let mut proxy_mode = ProxyMode::Read;
 
     let (client_read, client_write) = client_socket.split();
     let mut client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
@@ -158,18 +163,29 @@ async fn handle_connection(
     let mut origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
     let mut origin_stream_write = origin_write;
 
+    let client_mapped =
+        client_framed_read.map(|item| item.map(|msg| StreamSource::ClientRead(msg)));
+    let origin_mapped =
+        origin_framed_read.map(|item| item.map(|msg| StreamSource::OriginRead(msg)));
+
+    let mut framed_read = client_mapped.merge(origin_mapped);
+
     loop {
         dbg!(&proxy_mode);
         match proxy_mode {
-            ProxyMode::ClientRead => {
-                if let Some(res) = client_framed_read.next().await {
+            ProxyMode::Read => {
+                if let Some(res) = framed_read.next().await {
                     match res {
-                        Ok(msg) => {
+                        Ok(StreamSource::ClientRead(msg)) => {
                             dbg!(&msg);
                             proxy_mode = ProxyMode::OriginWrite(msg);
                         }
+                        Ok(StreamSource::OriginRead(msg)) => {
+                            dbg!(&msg);
+                            proxy_mode = ProxyMode::ClientWrite(msg);
+                        }
                         Err(err) => {
-                            error!("client read [{}]", err);
+                            error!("read error [{}]", err);
                         }
                     }
                 } else {
@@ -180,40 +196,14 @@ async fn handle_connection(
                 let mut b = msg.get_buf();
                 origin_stream_write.write_buf(&mut b).await?;
                 if !b.has_remaining() {
-                    proxy_mode = ProxyMode::OriginRead;
-                }
-            }
-            ProxyMode::OriginRead => {
-                if let Some(res) = origin_framed_read.next().await {
-                    match res {
-                        Ok(msg) => {
-                            dbg!(&msg);
-                            match &msg {
-                                PgBackendMessage::SslRequestResponse(response) => {
-                                    //server will return "N" (no ssl support) or "S" (supported)
-                                    //we will pretend the response is always N for now
-                                    client_framed_read.decoder_mut().state =
-                                        PgConnectionState::AwaitingStartup;
-                                    origin_framed_read.decoder_mut().state =
-                                        PgConnectionState::AwaitingStartup;
-                                }
-                                _ => {}
-                            }
-                            proxy_mode = ProxyMode::ClientWrite(msg);
-                        }
-                        Err(err) => {
-                            error!("origin read [{}]", err);
-                        }
-                    }
-                } else {
-                    break;
+                    proxy_mode = ProxyMode::Read;
                 }
             }
             ProxyMode::ClientWrite(ref mut msg) => {
                 let mut b = msg.get_buf();
                 client_stream_write.write_buf(&mut b).await?;
                 if !b.has_remaining() {
-                    proxy_mode = ProxyMode::ClientRead;
+                    proxy_mode = ProxyMode::Read;
                 }
             }
         }
