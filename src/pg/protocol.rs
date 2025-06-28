@@ -3,7 +3,7 @@ use std::{error::Error, fmt, io};
 
 use phf::phf_map;
 use tokio_util::{
-    bytes::{self, Buf, BytesMut},
+    bytes::{Buf, BytesMut},
     codec::Decoder,
 };
 
@@ -96,6 +96,7 @@ const FRONTEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgFrontendMessageType> = phf_map! 
     b'E' => PgFrontendMessageType::Execute,
     b'H' => PgFrontendMessageType::Flush,
     b'F' => PgFrontendMessageType::FunctionCall,
+    b'p' => PgFrontendMessageType::PasswordMessageFamily,
     b'P' => PgFrontendMessageType::Parse,
     b'Q' => PgFrontendMessageType::Query,
     b'S' => PgFrontendMessageType::Sync,
@@ -150,7 +151,7 @@ impl Decoder for PgFrontendMessageCodec {
                             return Err(ProtocolError::InvalidStartupFrame);
                         }
 
-                        self.state = PgConnectionState::Authentication;
+                        self.state = PgConnectionState::Query;
                         Ok(Some(PgFrontendMessage {
                             message_type: PgFrontendMessageType::Startup,
                             data: buf.split_to(msg_len),
@@ -184,6 +185,7 @@ impl Decoder for PgFrontendMessageCodec {
                         data: buf.split_to(msg_len),
                     }))
                 } else {
+                    dbg!(buf);
                     todo!()
                 }
             }
@@ -265,11 +267,40 @@ pub struct PgBackendMessageCodec {
     pub state: PgConnectionState,
 }
 
+impl PgBackendMessageCodec {
+    fn handle_authentication_message(
+        &mut self,
+        buf: &mut BytesMut,
+    ) -> Result<Option<PgMessage<PgBackendMessageType>>, ProtocolError> {
+        const MIN_AUTHENTICATION_LEN: usize = 9;
+        const AUTHENTICATION_OK: i32 = 0;
+        if buf.remaining() < MIN_AUTHENTICATION_LEN {
+            return Ok(None);
+        }
+
+        let msg_len = (&buf[1..5]).get_i32() as usize + 1;
+        if buf.remaining() < msg_len {
+            return Ok(None);
+        }
+
+        self.state = if (&buf[5..9]).get_i32() == AUTHENTICATION_OK {
+            PgConnectionState::Query
+        } else {
+            PgConnectionState::Authentication
+        };
+
+        Ok(Some(PgBackendMessage {
+            message_type: PgBackendMessageType::Authentication,
+            data: buf.split_to(msg_len),
+        }))
+    }
+}
+
 impl Decoder for PgBackendMessageCodec {
     type Item = PgMessage<PgBackendMessageType>;
     type Error = ProtocolError;
 
-    fn decode(&mut self, buf: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if !buf.has_remaining() {
             return Ok(None);
         }
@@ -287,33 +318,11 @@ impl Decoder for PgBackendMessageCodec {
                         message_type: PgBackendMessageType::SslRequestResponse,
                         data: buf.split_to(1),
                     })),
-                    b'R' => {
-                        const MIN_AUTHENTICATION_LEN: usize = 9;
-                        const AUTHENTICATION_OK: i32 = 0;
-                        if buf.remaining() < MIN_AUTHENTICATION_LEN {
-                            return Ok(None);
-                        }
-
-                        let msg_len = (&buf[1..5]).get_i32() as usize + 1;
-                        if buf.remaining() < msg_len {
-                            return Ok(None);
-                        }
-
-                        self.state = if (&buf[5..9]).get_i32() == AUTHENTICATION_OK {
-                            PgConnectionState::Query
-                        } else {
-                            PgConnectionState::Authentication
-                        };
-
-                        Ok(Some(PgBackendMessage {
-                            message_type: PgBackendMessageType::Authentication,
-                            data: buf.split_to(msg_len),
-                        }))
-                    }
+                    b'R' => self.handle_authentication_message(buf),
                     _ => Err(ProtocolError::InvalidStartupFrame),
                 }
             }
-            PgConnectionState::Authentication => todo!(),
+            PgConnectionState::Authentication => self.handle_authentication_message(buf),
             _ => {
                 if let Some(msg_type) = BACKEND_MESSAGE_TYPE_MAP.get(&buf[0]) {
                     const MIN_MESSAGE_LEN: usize = 5;
@@ -337,12 +346,3 @@ impl Decoder for PgBackendMessageCodec {
         }
     }
 }
-
-// struct MessageDescriptor<T: PgMessageType> {
-//     msg_type: T,
-//     min_msg_len: usize,
-//     msg_len_loc: Option<Range<usize>>,
-// }
-
-// type FrontendMessageDescriptor = MessageDescriptor<PgFrontendMessageType>;
-// type BackendMessageDescriptor = MessageDescriptor<PgBackendMessageType>;
