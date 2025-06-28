@@ -1,11 +1,11 @@
 // adapted from https://github.com/sunng87/pgwire
-use std::{error::Error, fmt, io};
+use std::{error::Error, fmt, io, ops::Range};
 
+use phf::phf_map;
 use tokio_util::{
     bytes::{self, Buf, BytesMut},
     codec::Decoder,
 };
-use tracing::trace;
 
 #[derive(Debug, Clone)]
 pub enum ProtocolError {
@@ -54,7 +54,7 @@ pub struct PgMessage<T: PgMessageType> {
     pub data: BytesMut,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum PgFrontendMessageType {
     Startup,
     CancelRequest,
@@ -62,6 +62,8 @@ pub enum PgFrontendMessageType {
     PasswordMessageFamily,
 
     Query,
+
+    FunctionCall,
 
     Parse,
     Close,
@@ -81,6 +83,23 @@ pub enum PgFrontendMessageType {
 impl PgMessageType for PgFrontendMessageType {}
 
 pub type PgFrontendMessage = PgMessage<PgFrontendMessageType>;
+
+const FRONTEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgFrontendMessageType> = phf_map! {
+    b'B' => PgFrontendMessageType::Bind,
+    b'C' => PgFrontendMessageType::Close,
+    b'd' => PgFrontendMessageType::CopyData,
+    b'c' => PgFrontendMessageType::CopyDone,
+    b'f' => PgFrontendMessageType::CopyFail,
+    b'D' => PgFrontendMessageType::Describe,
+    b'E' => PgFrontendMessageType::Execute,
+    b'H' => PgFrontendMessageType::Flush,
+    b'F' => PgFrontendMessageType::FunctionCall,
+    b'P' => PgFrontendMessageType::Parse,
+    b'Q' => PgFrontendMessageType::Query,
+    b'S' => PgFrontendMessageType::Sync,
+    b'X' => PgFrontendMessageType::Terminate,
+
+};
 
 #[derive(Debug, Default)]
 pub struct PgFrontendMessageCodec {
@@ -172,23 +191,42 @@ impl Decoder for PgFrontendMessageCodec {
             PgConnectionState::AwaitingStartup => self.extract_startup(buf),
 
             _ => {
-                if buf.remaining() < 8 {
+                if !buf.has_remaining() {
                     return Ok(None);
+                }
+                dbg!(&buf);
+
+                if let Some(msg_type) = FRONTEND_MESSAGE_TYPE_MAP.get(&buf[0]) {
+                    const MIN_MESSAGE_LEN: usize = 5;
+                    if buf.remaining() < MIN_MESSAGE_LEN {
+                        return Ok(None);
+                    }
+
+                    let msg_len = (&buf[1..5]).get_i32() as usize + 1;
+                    if buf.remaining() < msg_len {
+                        return Ok(None);
+                    }
+
+                    Ok(Some(PgFrontendMessage {
+                        message_type: *msg_type,
+                        data: buf.split_to(msg_len),
+                    }))
                 } else {
-                    todo!();
+                    todo!()
                 }
             }
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum PgBackendMessageType {
     // startup
     SslRequestResponse,
     Authentication,
     ParameterStatus,
     BackendKeyData,
+    NegotiateProtocolVersion,
 
     // extended query
     ParseComplete,
@@ -202,8 +240,8 @@ pub enum PgBackendMessageType {
     ReadyForQuery,
     ErrorResponse,
     NoticeResponse,
-    SslResponse,
     NotificationResponse,
+    FunctionCallResponse,
 
     // data
     ParameterDescription,
@@ -213,7 +251,6 @@ pub enum PgBackendMessageType {
 
     // copy
     CopyData,
-    CopyFail,
     CopyDone,
     CopyInResponse,
     CopyOutResponse,
@@ -223,6 +260,33 @@ pub enum PgBackendMessageType {
 impl PgMessageType for PgBackendMessageType {}
 
 pub(crate) type PgBackendMessage = PgMessage<PgBackendMessageType>;
+
+const BACKEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgBackendMessageType> = phf_map! {
+    b'R' => PgBackendMessageType::Authentication,
+    b'K' => PgBackendMessageType::BackendKeyData,
+    b'2' => PgBackendMessageType::BindComplete,
+    b'3' => PgBackendMessageType::CloseComplete,
+    b'C' => PgBackendMessageType::CommandComplete,
+    b'd' => PgBackendMessageType::CopyData,
+    b'c' => PgBackendMessageType::CopyDone,
+    b'G' => PgBackendMessageType::CopyInResponse,
+    b'H' => PgBackendMessageType::CopyOutResponse,
+    b'W' => PgBackendMessageType::CopyBothResponse,
+    b'D' => PgBackendMessageType::DataRow,
+    b'I' => PgBackendMessageType::EmptyQueryResponse,
+    b'E' => PgBackendMessageType::ErrorResponse,
+    b'V' => PgBackendMessageType::FunctionCallResponse,
+    b'v' => PgBackendMessageType::NegotiateProtocolVersion,
+    b'n' => PgBackendMessageType::NoData,
+    b'N' => PgBackendMessageType::NoticeResponse,
+    b'A' => PgBackendMessageType::NotificationResponse,
+    b't' => PgBackendMessageType::ParameterDescription,
+    b'S' => PgBackendMessageType::ParameterStatus,
+    b'1' => PgBackendMessageType::ParseComplete,
+    b's' => PgBackendMessageType::PortalSuspended,
+    b'Z' => PgBackendMessageType::ReadyForQuery,
+    b'T' => PgBackendMessageType::RowDescription,
+};
 
 #[derive(Debug, Default)]
 pub struct PgBackendMessageCodec {
@@ -276,48 +340,35 @@ impl Decoder for PgBackendMessageCodec {
                     return Ok(None);
                 }
                 dbg!(&buf);
-                match buf[0] {
-                    b'S' => {
-                        const MIN_MESSAGE_LEN: usize = 5;
-                        if buf.remaining() < MIN_MESSAGE_LEN {
-                            return Ok(None);
-                        }
 
-                        let msg_len = (&buf[1..5]).get_i32() as usize + 1;
-                        if buf.remaining() < msg_len {
-                            return Ok(None);
-                        }
-
-                        Ok(Some(PgBackendMessage {
-                            message_type: PgBackendMessageType::ParameterStatus,
-                            data: buf.split_to(msg_len),
-                        }))
+                if let Some(msg_type) = BACKEND_MESSAGE_TYPE_MAP.get(&buf[0]) {
+                    const MIN_MESSAGE_LEN: usize = 5;
+                    if buf.remaining() < MIN_MESSAGE_LEN {
+                        return Ok(None);
                     }
-                    b'K' => {
-                        let msg_len = 13;
-                        if buf.remaining() < msg_len {
-                            return Ok(None);
-                        }
 
-                        Ok(Some(PgBackendMessage {
-                            message_type: PgBackendMessageType::BackendKeyData,
-                            data: buf.split_to(msg_len),
-                        }))
+                    let msg_len = (&buf[1..5]).get_i32() as usize + 1;
+                    if buf.remaining() < msg_len {
+                        return Ok(None);
                     }
-                    b'Z' => {
-                        let msg_len = 6;
-                        if buf.remaining() < msg_len {
-                            return Ok(None);
-                        }
 
-                        Ok(Some(PgBackendMessage {
-                            message_type: PgBackendMessageType::ReadyForQuery,
-                            data: buf.split_to(msg_len),
-                        }))
-                    }
-                    _ => todo!(),
+                    Ok(Some(PgBackendMessage {
+                        message_type: *msg_type,
+                        data: buf.split_to(msg_len),
+                    }))
+                } else {
+                    todo!()
                 }
             }
         }
     }
 }
+
+// struct MessageDescriptor<T: PgMessageType> {
+//     msg_type: T,
+//     min_msg_len: usize,
+//     msg_len_loc: Option<Range<usize>>,
+// }
+
+// type FrontendMessageDescriptor = MessageDescriptor<PgFrontendMessageType>;
+// type BackendMessageDescriptor = MessageDescriptor<PgBackendMessageType>;
