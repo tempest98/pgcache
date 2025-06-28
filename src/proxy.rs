@@ -7,8 +7,7 @@ use std::{
 
 use crate::{
     pg::protocol::{
-        PgBackendMessage, PgBackendMessageCodec, PgConnectionState, PgFrontendMessage,
-        PgFrontendMessageCodec,
+        PgBackendMessage, PgBackendMessageCodec, PgFrontendMessage, PgFrontendMessageCodec,
     },
     settings::Settings,
 };
@@ -156,22 +155,20 @@ async fn handle_connection(
     let mut proxy_mode = ProxyMode::Read;
 
     let (client_read, client_write) = client_socket.split();
-    let mut client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
+    let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
     let mut client_stream_write = client_write;
 
     let (origin_read, origin_write) = origin_stream.split();
-    let mut origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
+    let origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
     let mut origin_stream_write = origin_write;
 
-    let client_mapped =
-        client_framed_read.map(|item| item.map(|msg| StreamSource::ClientRead(msg)));
-    let origin_mapped =
-        origin_framed_read.map(|item| item.map(|msg| StreamSource::OriginRead(msg)));
+    let client_mapped = client_framed_read.map(|item| item.map(StreamSource::ClientRead));
+    let origin_mapped = origin_framed_read.map(|item| item.map(StreamSource::OriginRead));
 
     let mut framed_read = client_mapped.merge(origin_mapped);
 
     loop {
-        dbg!(&proxy_mode);
+        // dbg!(&proxy_mode);
         match proxy_mode {
             ProxyMode::Read => {
                 if let Some(res) = framed_read.next().await {
