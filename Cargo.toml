@@ -26,6 +26,7 @@ nu-ansi-term = "0.50.1"
 futures = "0.3.31"
 tokio-stream = "0.1.17"
 phf = { version = "0.12.1", features = ["macros"] }
+error_set = { version = "0.8.5", features = ["tracing"] }
 
 # async-trait = "0.1.88"
 # md5 = "0.7"

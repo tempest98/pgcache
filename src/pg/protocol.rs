@@ -1,36 +1,28 @@
 // adapted from https://github.com/sunng87/pgwire
-use std::{error::Error, fmt, io};
+use std::io;
 
+use error_set::error_set;
 use phf::phf_map;
 use tokio_util::{
     bytes::{Buf, BytesMut},
     codec::Decoder,
 };
+use tracing::{instrument, trace};
 
-#[derive(Debug, Clone)]
-pub enum ProtocolError {
-    InvalidProtocolVersion(i16, i16),
-    InvalidStartupFrame,
-    IoError,
-}
-
-impl fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "protocol error")
-    }
-}
-impl Error for ProtocolError {}
-
-impl From<ProtocolError> for io::Error {
-    fn from(error: ProtocolError) -> Self {
-        io::Error::other(error)
-    }
-}
-
-impl From<io::Error> for ProtocolError {
-    fn from(_: io::Error) -> Self {
-        Self::IoError
-    }
+error_set! {
+    ProtocolError = {
+        #[display("Invalid protocal version: {major}.{minor}")]
+        InvalidProtocolVersion {
+            major: i16,
+            minor: i16,
+        },
+        InvalidStartupFrame,
+        #[display("Unrecognized message type: {tag}")]
+        UnrecognizedMessageType {
+            tag: String,
+        },
+        IoError(io::Error),
+    };
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -113,6 +105,7 @@ impl Decoder for PgFrontendMessageCodec {
     type Item = PgFrontendMessage;
     type Error = ProtocolError;
 
+    #[instrument]
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if !buf.has_remaining() {
             return Ok(None);
@@ -165,7 +158,10 @@ impl Decoder for PgFrontendMessageCodec {
                         message_type: PgFrontendMessageType::SslRequest,
                         data: buf.split_to(msg_len),
                     })),
-                    _ => Err(ProtocolError::InvalidProtocolVersion(code[0], code[1])),
+                    _ => Err(ProtocolError::InvalidProtocolVersion {
+                        major: code[0],
+                        minor: code[1],
+                    }),
                 }
             }
             _ => {
@@ -185,8 +181,10 @@ impl Decoder for PgFrontendMessageCodec {
                         data: buf.split_to(msg_len),
                     }))
                 } else {
-                    dbg!(buf);
-                    todo!()
+                    trace!("{:?}", buf);
+                    Err(ProtocolError::UnrecognizedMessageType {
+                        tag: buf[0].escape_ascii().to_string(),
+                    })
                 }
             }
         }
@@ -300,6 +298,7 @@ impl Decoder for PgBackendMessageCodec {
     type Item = PgMessage<PgBackendMessageType>;
     type Error = ProtocolError;
 
+    #[instrument]
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if !buf.has_remaining() {
             return Ok(None);
@@ -340,7 +339,10 @@ impl Decoder for PgBackendMessageCodec {
                         data: buf.split_to(msg_len),
                     }))
                 } else {
-                    todo!()
+                    trace!("{:?}", buf);
+                    Err(ProtocolError::UnrecognizedMessageType {
+                        tag: buf[0].escape_ascii().to_string(),
+                    })
                 }
             }
         }

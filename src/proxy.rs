@@ -8,10 +8,12 @@ use std::{
 use crate::{
     pg::protocol::{
         PgBackendMessage, PgBackendMessageCodec, PgFrontendMessage, PgFrontendMessageCodec,
+        ProtocolError,
     },
     settings::Settings,
 };
 
+use error_set::error_set;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
@@ -22,6 +24,19 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::{bytes::Buf, codec::FramedRead};
 use tracing::{debug, error, instrument};
+
+error_set! {
+    ConnectionError = ConnectError || ReadError;
+
+    ReadError = {
+        ProtocolError(ProtocolError),
+        IoError(io::Error),
+    };
+
+    ConnectError = {
+        NoConnection,
+    };
+}
 
 type Worker<'scope> = (
     thread::ScopedJoinHandle<'scope, Result<(), Error>>,
@@ -136,7 +151,7 @@ enum StreamSource {
 async fn handle_connection(
     client_socket: &mut TcpStream,
     addrs: Vec<SocketAddr>,
-) -> Result<(), Error> {
+) -> Result<(), ConnectionError> {
     let mut maybe_stream: Option<TcpStream> = None;
     for addr in &addrs {
         maybe_stream = TcpStream::connect(addr).await.ok();
@@ -146,7 +161,7 @@ async fn handle_connection(
     }
 
     let Some(mut origin_stream) = maybe_stream else {
-        return Err(io::Error::other("no origin connection"));
+        return Err(ConnectionError::NoConnection);
     };
 
     let _ = client_socket.set_nodelay(true);
@@ -182,7 +197,8 @@ async fn handle_connection(
                             proxy_mode = ProxyMode::ClientWrite(msg);
                         }
                         Err(err) => {
-                            error!("read error [{}]", err);
+                            debug!("read error [{}]", err);
+                            return Err(ConnectionError::ProtocolError(err));
                         }
                     }
                 } else {
