@@ -13,7 +13,7 @@ use crate::{
     settings::Settings,
 };
 
-use error_set::error_set;
+use error_set::{ErrContext, error_set};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
@@ -73,7 +73,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
 }
 
 #[instrument]
-pub fn handle_listen(settings: &Settings) -> Result<(), Error> {
+pub fn handle_listen(settings: &Settings) -> Result<(), ConnectionError> {
     thread::scope(|scope| {
         let mut workers: Vec<_> = (0..settings.num_workers)
             .map(|i| worker_create(settings, i, scope))
@@ -83,7 +83,9 @@ pub fn handle_listen(settings: &Settings) -> Result<(), Error> {
 
         debug!("accept loop");
         rt.block_on(async {
-            let listener = TcpListener::bind(&settings.listen.socket).await?;
+            let listener = TcpListener::bind(&settings.listen.socket)
+                .await
+                .with_error_context(|e| format!("bind error [{}] {e}", &settings.listen.socket))?;
             debug!("Listening to {}", &settings.listen.socket);
 
             let mut cur_worker = 0;

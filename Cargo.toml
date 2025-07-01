@@ -3,6 +3,14 @@ name = "pgcache"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "pgcache"
+path = "src/main.rs"
+
+[lib]
+name = "pgcache_lib"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-util = "0.7.15"
@@ -27,6 +35,7 @@ futures = "0.3.31"
 tokio-stream = "0.1.17"
 phf = { version = "0.12.1", features = ["macros"] }
 error_set = { version = "0.8.5", features = ["tracing"] }
+lexopt = "0.3.1"
 
 # async-trait = "0.1.88"
 # md5 = "0.7"

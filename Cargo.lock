@@ -812,6 +812,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
+name = "lexopt"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fa0e2a1fcbe2f6be6c42e342259976206b383122fc152e872795338b5a3f3a7"
+
+[[package]]
 name = "libc"
 version = "0.2.173"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1047,6 +1053,7 @@ version = "0.1.0"
 dependencies = [
  "error_set",
  "futures",
+ "lexopt",
  "nu-ansi-term 0.50.1",
  "pg_query",
  "pgwire",

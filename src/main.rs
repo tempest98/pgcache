@@ -1,17 +1,16 @@
-mod pg;
-mod proxy;
-mod settings;
-mod tracing_utils;
-
 use std::{error::Error, thread};
 
-use proxy::handle_listen;
-use settings::Settings;
-use tracing::Level;
-use tracing_utils::SimpeFormatter;
+use pgcache_lib::proxy::{ConnectionError, handle_listen};
+use pgcache_lib::settings::Settings;
+use pgcache_lib::tracing_utils::SimpeFormatter;
+
+use lexopt::prelude::*;
+use tokio::io;
+use tracing::{Level, error};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let settings = Settings::new()?;
+    // let settings = Settings::new()?;
+    let settings = Settings::from_args()?;
 
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
@@ -19,11 +18,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    thread::scope(|scope| {
-        let _ = thread::Builder::new()
+    let res = thread::scope(|scope| {
+        let handle = thread::Builder::new()
             .name("listen".to_owned())
-            .spawn_scoped(scope, || handle_listen(&settings));
+            .spawn_scoped(scope, || handle_listen(&settings))?;
+
+        match handle.join() {
+            Ok(res) => res,
+            Err(_panic) => {
+                error!("listen thread panicked");
+                Err(ConnectionError::IoError(io::Error::other(
+                    "listen thread panicked",
+                )))
+            }
+        }
     });
 
-    Ok(())
+    res.map_err(|e| Box::new(e) as Box<dyn Error>)
 }
