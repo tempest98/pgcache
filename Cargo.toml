@@ -37,6 +37,10 @@ phf = { version = "0.12.1", features = ["macros"] }
 error_set = { version = "0.8.5", features = ["tracing"] }
 lexopt = "0.3.1"
 
+
+[dev-dependencies]
+pgtemp = "0.6.0"
+
 # async-trait = "0.1.88"
 # md5 = "0.7"
 # futures = "0.3.31"

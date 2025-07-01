@@ -4,7 +4,6 @@ use pgcache_lib::proxy::{ConnectionError, handle_listen};
 use pgcache_lib::settings::Settings;
 use pgcache_lib::tracing_utils::SimpeFormatter;
 
-use lexopt::prelude::*;
 use tokio::io;
 use tracing::{Level, error};
 

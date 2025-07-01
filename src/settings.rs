@@ -118,8 +118,7 @@ impl Settings {
                 database: "cache".to_owned(),
             },
             listen: ListenSettings {
-                // socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6432)),
-                socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1)),
+                socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6432)),
             },
             num_workers: 2,
         };
