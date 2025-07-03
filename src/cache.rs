@@ -1,6 +1,62 @@
-use crate::query::parse::*;
+use std::{io, thread};
 
+use crate::{query::parse::*, settings::Settings};
+
+use error_set::error_set;
 use pg_query::ParseResult;
+use tokio::{
+    runtime::Builder,
+    sync::{mpsc::Receiver, oneshot},
+};
+use tracing::{debug, error, instrument};
+
+error_set! {
+    ConnectionError = ConnectError || ReadError;
+
+    ReadError = {
+        IoError(io::Error),
+    };
+
+    ConnectError = {
+        NoConnection,
+    };
+}
+
+#[derive(Debug)]
+pub enum CacheMessage {
+    Query(ParseResult),
+}
+
+#[derive(Debug)]
+pub enum CacheReply {
+    CacheMiss(ParseResult),
+}
+
+#[instrument]
+pub fn cache_run(
+    settings: &Settings,
+    mut cache_rx: Receiver<(CacheMessage, oneshot::Sender<CacheReply>)>,
+) -> Result<(), ConnectionError> {
+    thread::scope(|_scope| {
+        let rt = Builder::new_current_thread().enable_all().build()?;
+
+        debug!("cache loop");
+        rt.block_on(async {
+            while let Some((msg, reply_tx)) = cache_rx.recv().await {
+                match msg {
+                    CacheMessage::Query(ast) => {
+                        // todo check for cache hit and store data in cache on miss
+                        // just run the query and return the results for now
+                        if reply_tx.send(CacheReply::CacheMiss(ast)).is_err() {
+                            error!("no receiver");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    })
+}
 
 pub fn is_cacheable(ast: &ParseResult) -> bool {
     ast.statement_types().contains(&"SelectStmt")

@@ -1,10 +1,12 @@
 use std::{error::Error, thread};
 
-use pgcache_lib::proxy::{ConnectionError, handle_listen};
+use pgcache_lib::cache::cache_run;
+use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use pgcache_lib::tracing_utils::SimpeFormatter;
 
 use tokio::io;
+use tokio::sync::mpsc;
 use tracing::{Level, error};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -18,11 +20,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let res = thread::scope(|scope| {
-        let handle = thread::Builder::new()
-            .name("listen".to_owned())
-            .spawn_scoped(scope, || handle_listen(&settings))?;
+        const DEFAULT_CHANNEL_SIZE: usize = 100;
+        let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-        match handle.join() {
+        let listen_handle = thread::Builder::new()
+            .name("listen".to_owned())
+            .spawn_scoped(scope, || proxy_run(&settings, tx))?;
+
+        let cache_handle = thread::Builder::new()
+            .name("cache".to_owned())
+            .spawn_scoped(scope, || cache_run(&settings, rx))?;
+
+        match listen_handle.join() {
             Ok(res) => res,
             Err(_panic) => {
                 error!("listen thread panicked");

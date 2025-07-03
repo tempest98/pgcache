@@ -2,16 +2,18 @@ use std::{
     io::{self, Error},
     mem,
     net::SocketAddr,
+    pin::Pin,
     thread,
 };
 
 use crate::{
-    cache::is_cacheable,
+    cache::{CacheMessage, CacheReply, is_cacheable},
     pg::protocol::{
         PgBackendMessage, PgBackendMessageCodec, PgFrontendMessage, PgFrontendMessageCodec,
         PgFrontendMessageType, ProtocolError,
     },
     settings::Settings,
+    stream_utils::ReceiverStream,
 };
 
 use error_set::{ErrContext, error_set};
@@ -20,27 +22,35 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
     runtime::Builder,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::{
+        mpsc::{Sender, UnboundedReceiver, UnboundedSender, unbounded_channel},
+        oneshot,
+    },
     task::{LocalSet, spawn_local},
 };
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt, StreamMap};
 use tokio_util::{
-    bytes::{Buf, BytesMut},
+    bytes::{Buf, BufMut, BytesMut},
     codec::FramedRead,
 };
 use tracing::{debug, error, instrument};
 
 error_set! {
-    ConnectionError = ConnectError || ReadError;
+    ConnectionError = ConnectError || ReadError || WriteError;
 
     ReadError = {
         ProtocolError(ProtocolError),
         IoError(io::Error),
     };
 
+    WriteError = {
+        MpscError,
+    };
+
     ConnectError = {
         NoConnection,
     };
+
     ParseError = {
         InvalidUtf8,
         Parse(pg_query::Error)
@@ -53,14 +63,15 @@ type Worker<'scope> = (
 );
 
 fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
-    settings: &'settings Settings,
     worker_id: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
 ) -> Result<Worker<'scope>, Error> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
-        .spawn_scoped(scope, || connection_run(settings, rx))?;
+        .spawn_scoped(scope, || connection_run(settings, rx, cache_tx))?;
 
     Ok((join, tx))
 }
@@ -68,11 +79,12 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
 fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     workers: &mut [Worker<'scope>],
     worker_index: usize,
-    settings: &'settings Settings,
     scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
 ) -> Result<bool, Error> {
     if workers[worker_index].0.is_finished() {
-        let new_worker = worker_create(settings, worker_index, scope)?;
+        let new_worker = worker_create(worker_index, scope, settings, cache_tx)?;
         let old_worker = mem::replace(&mut workers[worker_index], new_worker);
         let _ = old_worker.0.join();
         Ok(true)
@@ -82,10 +94,13 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
 }
 
 #[instrument]
-pub fn handle_listen(settings: &Settings) -> Result<(), ConnectionError> {
+pub fn proxy_run(
+    settings: &Settings,
+    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
+) -> Result<(), ConnectionError> {
     thread::scope(|scope| {
         let mut workers: Vec<_> = (0..settings.num_workers)
-            .map(|i| worker_create(settings, i, scope))
+            .map(|i| worker_create(i, scope, settings, cache_tx.clone()))
             .collect::<Result<Vec<_>, _>>()?;
 
         let rt = Builder::new_current_thread().enable_all().build()?;
@@ -103,7 +118,13 @@ pub fn handle_listen(settings: &Settings) -> Result<(), ConnectionError> {
 
                 let _ = workers[cur_worker].1.send(socket);
 
-                let _ = worker_ensure_alive(&mut workers, cur_worker, settings, scope)?;
+                let _ = worker_ensure_alive(
+                    &mut workers,
+                    cur_worker,
+                    scope,
+                    settings,
+                    cache_tx.clone(),
+                )?;
                 cur_worker = (cur_worker + 1) % settings.num_workers;
             }
 
@@ -116,6 +137,7 @@ pub fn handle_listen(settings: &Settings) -> Result<(), ConnectionError> {
 pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
+    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
 ) -> Result<(), Error> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 
@@ -130,9 +152,10 @@ pub fn connection_run(
             .run_until(async {
                 while let Some(mut socket) = rx.recv().await {
                     let addrs = addrs.clone();
+                    let cache_tx = cache_tx.clone();
                     spawn_local(async move {
                         debug!("task spawn");
-                        let _ = handle_connection(&mut socket, addrs)
+                        let _ = handle_connection(&mut socket, addrs, cache_tx)
                             .await
                             .inspect_err(|e| error!("{}", e));
                         debug!("task done");
@@ -150,18 +173,22 @@ enum ProxyMode {
     Read,
     OriginWrite(PgFrontendMessage),
     ClientWrite(PgBackendMessage),
+    CacheWrite(CacheMessage),
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 enum StreamSource {
     ClientRead(PgFrontendMessage),
     OriginRead(PgBackendMessage),
+    CacheRead(CacheReply),
 }
 
 #[instrument]
 async fn handle_connection(
     client_socket: &mut TcpStream,
     addrs: Vec<SocketAddr>,
+    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
 ) -> Result<(), ConnectionError> {
     let mut maybe_stream: Option<TcpStream> = None;
     for addr in &addrs {
@@ -191,13 +218,24 @@ async fn handle_connection(
     let client_mapped = client_framed_read.map(|item| item.map(StreamSource::ClientRead));
     let origin_mapped = origin_framed_read.map(|item| item.map(StreamSource::OriginRead));
 
-    let mut framed_read = client_mapped.merge(origin_mapped);
+    // let mut framed_read = client_mapped.merge(origin_mapped);
+
+    let mut streams_read: StreamMap<
+        &'static str,
+        Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>,
+    > = StreamMap::new();
+
+    let client_mapped_pin = Box::pin(client_mapped); // as Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>;
+    let origin_mapped_pin = Box::pin(origin_mapped); // as Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>;
+
+    streams_read.insert("client", client_mapped_pin);
+    streams_read.insert("origin", origin_mapped_pin);
 
     loop {
         // dbg!(&proxy_mode);
         match proxy_mode {
             ProxyMode::Read => {
-                if let Some(res) = framed_read.next().await {
+                if let Some((_, res)) = streams_read.next().await {
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
                             dbg!(&msg);
@@ -208,7 +246,9 @@ async fn handle_connection(
                             {
                                 proxy_mode = match handle_query(data).await {
                                     Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
-                                    Ok(Action::CacheCheck(_)) => ProxyMode::OriginWrite(msg), //ignore, just forward for now
+                                    Ok(Action::CacheCheck(ast)) => {
+                                        ProxyMode::CacheWrite(CacheMessage::Query(ast))
+                                    }
                                     Err(e) => {
                                         error!("handle_query {}", e);
                                         ProxyMode::OriginWrite(msg)
@@ -219,9 +259,24 @@ async fn handle_connection(
                             }
                         }
                         Ok(StreamSource::OriginRead(msg)) => {
-                            dbg!(&msg);
                             proxy_mode = ProxyMode::ClientWrite(msg);
                         }
+                        Ok(StreamSource::CacheRead(reply)) => match reply {
+                            CacheReply::CacheMiss(ast) => {
+                                let query = ast.deparse().unwrap();
+                                let msg_len = query.len() + 4 + 1;
+                                let mut data = BytesMut::with_capacity(msg_len + 1);
+                                data.put_u8(b'Q');
+                                data.put_u32(msg_len as u32);
+                                data.extend_from_slice(query.as_bytes());
+                                data.put_u8(0);
+                                let msg = PgFrontendMessage {
+                                    message_type: PgFrontendMessageType::Query,
+                                    data,
+                                };
+                                proxy_mode = ProxyMode::OriginWrite(msg)
+                            }
+                        },
                         Err(err) => {
                             debug!("read error [{}]", err);
                             return Err(ConnectionError::ProtocolError(err));
@@ -243,11 +298,25 @@ async fn handle_connection(
                     proxy_mode = ProxyMode::Read;
                 }
             }
+            ProxyMode::CacheWrite(msg) => {
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let stream_rx = Box::pin(
+                    ReceiverStream::new(resp_rx).map(|item| Ok(StreamSource::CacheRead(item))),
+                );
+                streams_read.insert("cache_reply", stream_rx);
+
+                cache_tx.send((msg, resp_tx)).await.map_err(|e| {
+                    error!("{}", e);
+                    WriteError::MpscError
+                })?;
+                proxy_mode = ProxyMode::Read;
+            }
         }
     }
 
     Ok(())
 }
+
 enum Action {
     Forward,
     CacheCheck(ParseResult),
