@@ -5,7 +5,7 @@ use std::{
 };
 
 use pgtemp::PgTempDBBuilder;
-use tokio_postgres::{Config, NoTls};
+use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
 
 #[tokio::test]
 async fn test_proxy() -> Result<(), Error> {
@@ -29,7 +29,7 @@ async fn test_proxy() -> Result<(), Error> {
         .arg("--origin_database")
         .arg(db.db_name())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // .stderr(Stdio::null())
         .spawn()
         .expect("run pgcache");
 
@@ -78,7 +78,7 @@ async fn test_proxy() -> Result<(), Error> {
         })?;
 
     let res = client
-        .query("select id, data from test where data = $1", &[&"foo"])
+        .simple_query("select id, data from test where data = 'foo'")
         .await
         .map_err(|e| {
             pgcache.kill().expect("pgcache killed");
@@ -86,10 +86,12 @@ async fn test_proxy() -> Result<(), Error> {
             Error::other(e)
         })?;
 
-    assert_eq!(res.len(), 1);
-    let row = &res[0];
-    assert_eq!(row.get::<&str, i32>("id"), 1);
-    assert_eq!(row.get::<&str, &str>("data"), "foo");
+    assert_eq!(res.len(), 3);
+    let SimpleQueryMessage::Row(row) = &res[1] else {
+        panic!("exepcted SimpleQueryMessage::Row");
+    };
+    assert_eq!(row.get::<&str>("id"), Some("1"));
+    assert_eq!(row.get::<&str>("data"), Some("foo"));
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");
