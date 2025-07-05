@@ -77,6 +77,10 @@ impl Settings {
         let mut origin_port: Option<u16> = None;
         let mut origin_user: Option<String> = None;
         let mut origin_database: Option<String> = None;
+        let mut cache_host: Option<String> = None;
+        let mut cache_port: Option<u16> = None;
+        let mut cache_user: Option<String> = None;
+        let mut cache_database: Option<String> = None;
 
         let mut parser = lexopt::Parser::from_env();
         while let Some(arg) = parser.next()? {
@@ -85,12 +89,12 @@ impl Settings {
                 Long("origin_port") => origin_port = Some(parser.value()?.parse()?),
                 Long("origin_user") => origin_user = Some(parser.value()?.parse()?),
                 Long("origin_database") => origin_database = Some(parser.value()?.parse()?),
+                Long("cache_host") => cache_host = Some(parser.value()?.string()?),
+                Long("cache_port") => cache_port = Some(parser.value()?.parse()?),
+                Long("cache_user") => cache_user = Some(parser.value()?.parse()?),
+                Long("cache_database") => cache_database = Some(parser.value()?.parse()?),
                 Long("help") => {
-                    println!(
-                        "Usage: {} --origin_host HOST --origin_port PORT --origin_user USER --origin_database DB",
-                        parser.bin_name().unwrap_or_default()
-                    );
-                    std::process::exit(1);
+                    Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
                 }
                 _ => return Err(ConfigError::ArgumentError(Box::new(arg.unexpected()))),
             }
@@ -112,10 +116,15 @@ impl Settings {
                 })?,
             },
             cache: PgSettings {
-                host: "localhost".to_owned(),
-                port: 7654,
-                user: "postgres".to_owned(),
-                database: "cache".to_owned(),
+                host: cache_host
+                    .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_host" })?,
+                port: cache_port
+                    .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_port" })?,
+                user: cache_user
+                    .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_user" })?,
+                database: cache_database.ok_or_else(|| ConfigError::ArgumentMissing {
+                    name: "cache_database",
+                })?,
             },
             listen: ListenSettings {
                 socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6432)),
@@ -124,5 +133,13 @@ impl Settings {
         };
 
         Ok(settings)
+    }
+
+    fn print_usage_and_exit(name: &str) -> ! {
+        println!(
+            "Usage: {name} --origin_host HOST --origin_port PORT --origin_user USER --origin_database DB \n \
+            --cache_host HOST --cache_port PORT --cache_user USER --cache_database DB"
+        );
+        std::process::exit(1);
     }
 }

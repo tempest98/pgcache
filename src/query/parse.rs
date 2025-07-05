@@ -167,8 +167,6 @@ pub fn query_select_has_sublink(ast: &ParseResult) -> bool {
 pub fn _query_select_columns(ast: &ParseResult) -> HashSet<String> {
     let select_stmt = query_select_statement(ast);
 
-    dbg!(&select_stmt.target_list);
-
     let mut columns = HashSet::new();
     for target in &select_stmt.target_list {
         if let Some(node) = &target.node {
@@ -638,7 +636,6 @@ mod tests {
         );
 
         assert!(result.is_err());
-        dbg!(&result);
         match result.unwrap_err() {
             WhereParseError::UnsupportedOperator { operator } => {
                 assert_eq!(operator, ">");

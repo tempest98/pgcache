@@ -3,75 +3,18 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 use pg_query::ParseResult;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow, types::Type};
 use tokio_util::bytes::{Buf, BytesMut};
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::settings::Settings;
 
 use super::*;
 
-#[derive(Debug, Clone)]
-pub struct TableMetadata {
-    pub relation_oid: u32,
-    pub name: String,
-    pub schema: String,
-    pub primary_key_columns: Vec<String>,
-    pub columns: HashMap<String, ColumnMetadata>,
-    // pub last_updated: std::time::SystemTime,
-    // pub estimated_row_count: Option<i64>,
-}
-
-impl BiHashItem for TableMetadata {
-    type K1<'a> = u32;
-    type K2<'a> = &'a str;
-
-    fn key1(&self) -> Self::K1<'_> {
-        self.relation_oid
-    }
-
-    fn key2(&self) -> Self::K2<'_> {
-        self.name.as_str()
-    }
-
-    bi_upcast!();
-}
-
-#[derive(Debug, Clone)]
-pub struct ColumnMetadata {
-    pub name: String,
-    pub position: i16,
-    pub type_oid: u32,
-    pub data_type: Type,
-    pub type_name: String,
-    pub is_primary_key: bool,
-    // pub is_nullable: bool,
-    // pub max_length: Option<i32>,
-    // pub default_value: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CachedQuery {
-    pub fingerprint: u64,
-    pub table_name: String,
-    pub relation_oid: u32,
-    pub filter_expr: Option<WhereExpr>,
-}
-
-impl IdHashItem for CachedQuery {
-    type Key<'a> = u64;
-
-    fn key(&self) -> Self::Key<'_> {
-        self.fingerprint
-    }
-
-    id_upcast!();
-}
-
+#[derive(Debug)]
 pub struct QueryRequest {
     pub data: BytesMut,
     pub ast: ParseResult,
@@ -85,13 +28,13 @@ pub struct QueryCache {
 
     worker_tx: UnboundedSender<QueryRequest>,
 
-    tables: BiHashMap<TableMetadata>,
-    pub cached_queries: IdHashMap<CachedQuery>,
+    cache: Cache,
 }
 
 impl QueryCache {
     pub async fn new(
         settings: &Settings,
+        cache: Cache,
         worker_tx: UnboundedSender<QueryRequest>,
     ) -> Result<Self, CacheError> {
         let (cache_client, cache_connection) = Config::new()
@@ -113,14 +56,14 @@ impl QueryCache {
         //task to process connection to cache pg db
         tokio::spawn(async move {
             if let Err(e) = cache_connection.await {
-                eprintln!("connection error: {e}");
+                error!("connection error: {e}");
             }
         });
 
         //task to process connection to origin pg db
         tokio::spawn(async move {
             if let Err(e) = origin_connection.await {
-                eprintln!("connection error: {e}");
+                error!("connection error: {e}");
             }
         });
 
@@ -128,14 +71,14 @@ impl QueryCache {
             db_cache: cache_client,
             db_origin: origin_client,
             worker_tx,
-            tables: BiHashMap::new(),
-            cached_queries: IdHashMap::new(),
+            cache,
         })
     }
 
+    #[instrument]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
         let fingerprint = query_fingerprint(&msg.ast).map_err(|_| ParseError::Other)?;
-        let cache_hit = self.cached_queries.contains_key(&fingerprint);
+        let cache_hit = self.cache.queries.read().await.contains_key(&fingerprint);
 
         if cache_hit {
             self.worker_tx.send(msg).map_err(|e| {
@@ -208,6 +151,7 @@ impl QueryCache {
     }
 
     /// Registers a query in the cache for future lookups.
+    #[instrument]
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
@@ -215,15 +159,25 @@ impl QueryCache {
     ) -> Result<u32, CacheError> {
         let table_name = &ast.select_tables()[0];
 
-        if !self.tables.contains_key2(table_name.as_str()) {
+        if !self
+            .cache
+            .tables
+            .read()
+            .await
+            .contains_key2(table_name.as_str())
+        {
             let table = self.cache_table_create(table_name).await?;
-            self.tables.insert_overwrite(table);
+            self.cache.tables.write().await.insert_overwrite(table);
         }
 
-        let table = self
+        let relation_oid = self
+            .cache
             .tables
+            .read()
+            .await
             .get2(table_name.as_str())
-            .ok_or(CacheError::UnknownTable)?;
+            .ok_or(CacheError::UnknownTable)?
+            .relation_oid;
 
         // Parse WHERE conditions and store full expression AST
         let filter_expr = query_where_clause_parse(ast).unwrap_or_default();
@@ -232,26 +186,35 @@ impl QueryCache {
         let cached_query = CachedQuery {
             fingerprint,
             table_name: table_name.to_owned(),
-            relation_oid: table.relation_oid,
+            relation_oid,
             filter_expr,
         };
 
         // Store cached query metadata
-        self.cached_queries.insert_overwrite(cached_query);
+        self.cache
+            .queries
+            .write()
+            .await
+            .insert_overwrite(cached_query);
 
-        Ok(table.relation_oid)
+        Ok(relation_oid)
     }
 
     /// Stores query results in the cache for faster retrieval.
+    #[instrument]
     pub async fn query_cache_results(
         &self,
         table_oid: u32,
         rows: &[&SimpleQueryRow],
     ) -> Result<(), CacheError> {
-        let table = self
-            .tables
+        //todo, reorganize for efficiency, use prepared statement
+        let table_guard = self.cache.tables.read().await;
+        let table = table_guard
             .get1(&table_oid)
             .ok_or(CacheError::UnknownTable)?;
+
+        let pkey_columns = &table.primary_key_columns;
+        let table_name = table.name.as_str();
 
         let columns: Vec<&str> = Vec::from_iter(rows[0].columns().iter().map(|c| c.name()));
         for &row in rows {
@@ -286,24 +249,21 @@ impl QueryCache {
                 values.push(format!("${}", i + 1));
             }
 
-            let pkey_columns = table.primary_key_columns.clone();
-
             let update_columns = columns
                 .iter()
                 .filter(|&&c| !pkey_columns.contains(&c.to_owned()))
                 .map(|&c| format!("{c} = EXCLUDED.{c}"))
                 .collect::<Vec<_>>();
 
-            let mut insert_table = format!(
-                "insert into {}({}) values (",
-                table.name.as_str(),
-                columns.join(",")
-            );
+            let mut insert_table =
+                format!("insert into {}({}) values (", table_name, columns.join(","));
             insert_table.push_str(&values.join(","));
             insert_table.push_str(") on conflict (");
             insert_table.push_str(&pkey_columns.join(","));
             insert_table.push_str(") do update set ");
             insert_table.push_str(&update_columns.join(", "));
+
+            debug!("insert table [{insert_table}]");
 
             self.db_cache.execute_raw(&insert_table, params).await?;
         }
@@ -311,12 +271,14 @@ impl QueryCache {
         Ok(())
     }
 
+    #[instrument]
     async fn cache_table_create(&self, table_name: &str) -> Result<TableMetadata, CacheError> {
         let table = self.query_table_metadata(table_name).await?;
         self.cache_table_create_from_metadata(&table).await?;
         Ok(table)
     }
 
+    #[instrument]
     async fn query_table_metadata(&self, table_name: &str) -> Result<TableMetadata, CacheError> {
         let create_table_sql = r"
             SELECT
@@ -384,6 +346,7 @@ impl QueryCache {
         Ok(table)
     }
 
+    #[instrument]
     async fn cache_table_create_from_metadata(
         &self,
         table_metadata: &TableMetadata,
@@ -413,6 +376,245 @@ impl QueryCache {
 
         Ok(())
     }
+
+    /// Register table metadata from CDC processing.
+    #[instrument]
+    pub async fn cache_table_register(
+        &self,
+        table_metadata: TableMetadata,
+    ) -> Result<(), CacheError> {
+        let relation_oid = table_metadata.relation_oid;
+
+        // Check if table already exists
+        let table_exists = self.cache.tables.read().await.contains_key1(&relation_oid);
+
+        if table_exists {
+            // TODO: Handle schema changes when table already exists
+            // Compare existing TableMetadata with new metadata from CDC
+            // Handle cases like:
+            // - Column additions/removals
+            // - Type changes
+            // - Primary key changes
+            // For now, we just skip re-registration
+            info!(
+                "Table {} (OID: {}) already exists, skipping registration",
+                table_metadata.name, relation_oid
+            );
+            return Ok(());
+        }
+
+        // Table doesn't exist, create cache table from CDC metadata
+        self.cache_table_create_from_metadata(&table_metadata)
+            .await?;
+
+        // Store CDC metadata in both indexes
+        self.cache
+            .tables
+            .write()
+            .await
+            .insert_overwrite(table_metadata);
+
+        Ok(())
+    }
+
+    /// Apply UPSERT to cache database.
+    #[instrument]
+    async fn cache_upsert_apply(
+        &self,
+        table_metadata: &TableMetadata,
+        row_data: &[Option<String>],
+    ) -> Result<(), CacheError> {
+        // For now, use a simplified approach without parameters to avoid ToSql complexity
+
+        // Build column names and values for INSERT
+        let mut column_names = Vec::new();
+        let mut values = Vec::new();
+
+        for column_meta in table_metadata.columns.values() {
+            dbg!(&column_meta);
+            let position = column_meta.position as usize - 1;
+            if position < row_data.len() {
+                let value = row_data[position]
+                    .as_deref()
+                    .map_or("NULL".to_string(), |v| format!("'{v}'"));
+
+                column_names.push(column_meta.name.as_str());
+                values.push(value);
+            }
+        }
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
+            table_metadata.name,
+            column_names.to_vec().join(", "),
+            values.to_vec().join(", "),
+            table_metadata.primary_key_columns.join(", "),
+            column_names
+                .iter()
+                .filter(|&col| !table_metadata
+                    .primary_key_columns
+                    .contains(&col.to_string()))
+                .map(|col| format!("{col} = EXCLUDED.{col}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // Execute the INSERT
+        // TODO: Replace with proper parameterized query once ToSql issues are resolved
+        let simple_sql = sql.replace("$", "");
+        println!("Executing cache INSERT: {simple_sql}");
+
+        // Placeholder - in a real implementation we'd execute the parameterized query
+        self.db_cache.execute(&sql, &[]).await?;
+
+        Ok(())
+    }
+
+    /// Handle INSERT operation with query-aware filtering.
+    /// Applies the insert to cache entries that match the filter conditions.
+    #[instrument]
+    pub async fn handle_insert(
+        &self,
+        relation_oid: u32,
+        row_data: Vec<Option<String>>,
+    ) -> Result<(), CacheError> {
+        // Get cached queries that reference this table
+        let queries_guard = self.cache.queries.read().await;
+        let cached_queries = queries_guard
+            .iter()
+            .filter(|query| query.relation_oid == relation_oid);
+
+        // Get table metadata for column information
+        let table_guard = self.cache.tables.read().await;
+        let table_metadata = match table_guard.get1(&relation_oid) {
+            Some(metadata) => metadata,
+            None => {
+                error!("No table metadata found for relation_oid: {}", relation_oid);
+                return Ok(());
+            }
+        };
+
+        // Check each cached query to see if this INSERT affects it
+        for query in cached_queries {
+            if cache_query_row_matches(query, &row_data, table_metadata) {
+                // This INSERT affects the cached query, apply it to the cache
+                if let Err(e) = self.cache_upsert_apply(table_metadata, &row_data).await {
+                    error!(
+                        "Failed to apply INSERT to cache for query {}: {:?}",
+                        query.fingerprint, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle UPDATE operation with query-aware filtering.
+    /// Analyzes old and new values to determine cache operations needed.
+    #[instrument]
+    pub async fn handle_update(
+        &self,
+        relation_oid: u32,
+        key_data: Vec<Option<String>>,
+        new_row_data: Vec<Option<String>>,
+    ) -> Result<(), CacheError> {
+        // Get table metadata for column information
+        let table_guard = self.cache.tables.read().await;
+        let table_metadata = match table_guard.get1(&relation_oid) {
+            Some(metadata) => metadata,
+            None => {
+                error!("No table metadata found for relation_oid: {relation_oid}");
+                return Ok(());
+            }
+        };
+
+        // Check each cached query to see if this UPDATE affects it
+        let queries_guard = self.cache.queries.read().await;
+        let matched = queries_guard
+            .iter()
+            .filter(|query| query.relation_oid == relation_oid)
+            .any(|query| cache_query_row_matches(query, &new_row_data, table_metadata));
+
+        if matched {
+            if let Err(e) = self.cache_upsert_apply(table_metadata, &new_row_data).await {
+                error!("Failed to apply UPSERT to cache for query during UPDATE: {e:?}");
+            }
+        } else {
+            self.cache_delete_apply(table_metadata, &new_row_data)
+                .await?;
+        }
+
+        if !key_data.is_empty() {
+            self.cache_delete_apply(table_metadata, &key_data).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Handle DELETE operation by removing the row from cache.
+    #[instrument]
+    pub async fn handle_delete(
+        &self,
+        relation_oid: u32,
+        row_data: Vec<Option<String>>,
+    ) -> Result<(), CacheError> {
+        // Get table metadata for column information
+        let table_guard = self.cache.tables.read().await;
+        let table_metadata = match table_guard.get1(&relation_oid) {
+            Some(metadata) => metadata,
+            None => {
+                error!("No table metadata found for relation_oid: {}", relation_oid);
+                return Ok(());
+            }
+        };
+
+        // Apply DELETE to cache - if row doesn't exist, DELETE will be a no-op
+        if let Err(e) = self.cache_delete_apply(table_metadata, &row_data).await {
+            error!("Failed to apply DELETE to cache: {:?}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Apply DELETE to cache database by removing matching rows.
+    #[instrument]
+    async fn cache_delete_apply(
+        &self,
+        table_metadata: &TableMetadata,
+        row_data: &[Option<String>],
+    ) -> Result<(), CacheError> {
+        // Build WHERE clause using primary key columns
+        let mut where_conditions = Vec::new();
+
+        for pk_column in &table_metadata.primary_key_columns {
+            if let Some(column_meta) = table_metadata.columns.get(pk_column) {
+                let position = column_meta.position as usize - 1;
+                if position < row_data.len() {
+                    let value = row_data[position].as_deref().unwrap_or("NULL");
+                    where_conditions.push(format!("{pk_column} = '{value}'"));
+                }
+            }
+        }
+
+        if where_conditions.is_empty() {
+            error!("Cannot build DELETE WHERE clause: no primary key values found");
+            return Ok(());
+        }
+
+        let sql = format!(
+            "DELETE FROM {} WHERE {}",
+            table_metadata.name,
+            where_conditions.join(" AND ")
+        );
+
+        println!("Executing cache DELETE: {sql}");
+
+        // Execute the DELETE
+        self.db_cache.execute(&sql, &[]).await?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -433,7 +635,7 @@ impl CacheWorker {
         //task to process connection to cache pg db
         tokio::spawn(async move {
             if let Err(e) = cache_connection.await {
-                eprintln!("connection error: {e}");
+                error!("connection error: {e}");
             }
         });
 

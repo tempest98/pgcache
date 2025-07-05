@@ -239,7 +239,7 @@ async fn handle_connection(
                 if let Some((_, res)) = streams_read.next().await {
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
-                            dbg!(&msg);
+                            // dbg!(&msg);
                             if matches!(msg.message_type, PgFrontendMessageType::Query) {
                                 proxy_mode = match handle_query(&msg.data).await {
                                     Ok(Action::Forward) => ProxyMode::OriginWrite(msg),

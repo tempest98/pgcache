@@ -1,11 +1,12 @@
 use std::{
     io::{Error, Read},
-    process::Command,
-    process::Stdio,
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 use pgcache_lib::tracing_utils::SimpeFormatter;
 use pgtemp::PgTempDBBuilder;
+use tokio::time::sleep;
 use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
 use tracing::Level;
 
@@ -44,6 +45,7 @@ async fn test_proxy() -> Result<(), Error> {
     //wait to read some data to make sure pgcache process is initialized before proceeding
     let mut buf = [0u8; 256];
     let _ = pgcache.stdout.take().unwrap().read(&mut buf);
+    sleep(Duration::from_secs(1)).await; //hacky sleep for now, need something better
 
     let (client, connection) = Config::new()
         .host("localhost")
@@ -65,7 +67,7 @@ async fn test_proxy() -> Result<(), Error> {
     });
 
     client
-        .query("create table test (id integer, data text)", &[])
+        .query("create table test (id integer primary key, data text)", &[])
         .await
         .map_err(|e| {
             pgcache.kill().expect("pgcache killed");
