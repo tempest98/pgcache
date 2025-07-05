@@ -6,14 +6,16 @@ use std::{
 };
 
 use crate::{
+    cache::is_cacheable,
     pg::protocol::{
         PgBackendMessage, PgBackendMessageCodec, PgFrontendMessage, PgFrontendMessageCodec,
-        ProtocolError,
+        PgFrontendMessageType, ProtocolError,
     },
     settings::Settings,
 };
 
 use error_set::{ErrContext, error_set};
+use pg_query::ParseResult;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
@@ -22,7 +24,10 @@ use tokio::{
     task::{LocalSet, spawn_local},
 };
 use tokio_stream::StreamExt;
-use tokio_util::{bytes::Buf, codec::FramedRead};
+use tokio_util::{
+    bytes::{Buf, BytesMut},
+    codec::FramedRead,
+};
 use tracing::{debug, error, instrument};
 
 error_set! {
@@ -35,6 +40,10 @@ error_set! {
 
     ConnectError = {
         NoConnection,
+    };
+    ParseError = {
+        InvalidUtf8,
+        Parse(pg_query::Error)
     };
 }
 
@@ -192,7 +201,22 @@ async fn handle_connection(
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
                             dbg!(&msg);
-                            proxy_mode = ProxyMode::OriginWrite(msg);
+                            if let PgFrontendMessage {
+                                message_type: PgFrontendMessageType::Query,
+                                data,
+                            } = &msg
+                            {
+                                proxy_mode = match handle_query(data).await {
+                                    Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
+                                    Ok(Action::CacheCheck(_)) => ProxyMode::OriginWrite(msg), //ignore, just forward for now
+                                    Err(e) => {
+                                        error!("handle_query {}", e);
+                                        ProxyMode::OriginWrite(msg)
+                                    }
+                                };
+                            } else {
+                                proxy_mode = ProxyMode::OriginWrite(msg);
+                            }
                         }
                         Ok(StreamSource::OriginRead(msg)) => {
                             dbg!(&msg);
@@ -223,4 +247,20 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+enum Action {
+    Forward,
+    CacheCheck(ParseResult),
+}
+
+async fn handle_query(data: &BytesMut) -> Result<Action, ParseError> {
+    let msg_len = (&data[1..5]).get_u32() as usize;
+    let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
+
+    let ast = pg_query::parse(query)?;
+    if is_cacheable(&ast) {
+        Ok(Action::CacheCheck(ast))
+    } else {
+        Ok(Action::Forward)
+    }
 }
