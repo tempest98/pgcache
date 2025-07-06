@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // adapted from https://github.com/sunng87/pgwire
 use std::io;
 
@@ -227,11 +228,39 @@ pub enum PgBackendMessageType {
     CopyInResponse,
     CopyOutResponse,
     CopyBothResponse,
+
+    //ugly?
+    Multi, //used for sending a buf that has multiple messages encoded into it
 }
 
 impl PgMessageType for PgBackendMessageType {}
 
 pub(crate) type PgBackendMessage = PgMessage<PgBackendMessageType>;
+
+pub const AUTHENTICATION_TAG: u8 = b'R'; // => PgBackendMessageType::Authentication,
+pub const BACKEND_KEY_DATA_TAG: u8 = b'K'; // => PgBackendMessageType::BackendKeyData,
+pub const BIND_COMPLETE_TAG: u8 = b'2'; // => PgBackendMessageType::BindComplete,
+pub const CLOSE_COMPLETE_TAG: u8 = b'3'; // => PgBackendMessageType::CloseComplete,
+pub const COMMAND_COMPLETE_TAG: u8 = b'C'; // => PgBackendMessageType::CommandComplete,
+pub const COPY_DATA_TAG: u8 = b'd'; // => PgBackendMessageType::CopyData,
+pub const COPY_DONE_TAG: u8 = b'c'; // => PgBackendMessageType::CopyDone,
+pub const COPY_IN_RESPONSE_TAG: u8 = b'G'; // => PgBackendMessageType::CopyInResponse,
+pub const COPY_OUT_RESPONSE_TAG: u8 = b'H'; // => PgBackendMessageType::CopyOutResponse,
+pub const COPY_BOHT_RESPONSE_TAG: u8 = b'W'; // => PgBackendMessageType::CopyBothResponse,
+pub const DATA_ROW_TAG: u8 = b'D'; // => PgBackendMessageType::DataRow,
+pub const EMPTY_QUERY_RESPONSE_TAG: u8 = b'I'; // => PgBackendMessageType::EmptyQueryResponse,
+pub const ERROR_RESPONSE_TAG: u8 = b'E'; // => PgBackendMessageType::ErrorResponse,
+pub const FUNCTION_CALL_RESPONSE_TAG: u8 = b'V'; // => PgBackendMessageType::FunctionCallResponse,
+pub const NEGOTIATE_PROTOCOL_VERSION_TAG: u8 = b'v'; // => PgBackendMessageType::NegotiateProtocolVersion,
+pub const NO_DATA_TAG: u8 = b'n'; // => PgBackendMessageType::NoData,
+pub const NOTICE_RESPONSE_TAG: u8 = b'N'; // => PgBackendMessageType::NoticeResponse,
+pub const NOTIFICATION_RESONPSE_TAG: u8 = b'A'; // => PgBackendMessageType::NotificationResponse,
+pub const PARAMETER_DESCRIPTION_TAG: u8 = b't'; // => PgBackendMessageType::ParameterDescription,
+pub const PARAMETER_STATUS_TAG: u8 = b'S'; // => PgBackendMessageType::ParameterStatus,
+pub const PARSE_COMPLETE_TAG: u8 = b'1'; // => PgBackendMessageType::ParseComplete,
+pub const PORTAL_SUSPENDED_TAG: u8 = b's'; // => PgBackendMessageType::PortalSuspended,
+pub const READY_FOR_QUERY_TAG: u8 = b'Z'; // => PgBackendMessageType::ReadyForQuery,
+pub const ROW_DESCRIPTION_TAG: u8 = b'T'; // => PgBackendMessageType::RowDescription,
 
 const BACKEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgBackendMessageType> = phf_map! {
     b'R' => PgBackendMessageType::Authentication,

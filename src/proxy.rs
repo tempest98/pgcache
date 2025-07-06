@@ -9,8 +9,8 @@ use std::{
 use crate::{
     cache::{CacheMessage, CacheReply, is_cacheable},
     pg::protocol::{
-        PgBackendMessage, PgBackendMessageCodec, PgFrontendMessage, PgFrontendMessageCodec,
-        PgFrontendMessageType, ProtocolError,
+        PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType, PgFrontendMessage,
+        PgFrontendMessageCodec, PgFrontendMessageType, ProtocolError,
     },
     settings::Settings,
     stream_utils::ReceiverStream,
@@ -239,15 +239,11 @@ async fn handle_connection(
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
                             dbg!(&msg);
-                            if let PgFrontendMessage {
-                                message_type: PgFrontendMessageType::Query,
-                                data,
-                            } = &msg
-                            {
-                                proxy_mode = match handle_query(data).await {
+                            if matches!(msg.message_type, PgFrontendMessageType::Query) {
+                                proxy_mode = match handle_query(&msg.data).await {
                                     Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
                                     Ok(Action::CacheCheck(ast)) => {
-                                        ProxyMode::CacheWrite(CacheMessage::Query(ast))
+                                        ProxyMode::CacheWrite(CacheMessage::Query(msg.data, ast))
                                     }
                                     Err(e) => {
                                         error!("handle_query {}", e);
@@ -262,19 +258,11 @@ async fn handle_connection(
                             proxy_mode = ProxyMode::ClientWrite(msg);
                         }
                         Ok(StreamSource::CacheRead(reply)) => match reply {
-                            CacheReply::CacheMiss(ast) => {
-                                let query = ast.deparse().unwrap();
-                                let msg_len = query.len() + 4 + 1;
-                                let mut data = BytesMut::with_capacity(msg_len + 1);
-                                data.put_u8(b'Q');
-                                data.put_u32(msg_len as u32);
-                                data.extend_from_slice(query.as_bytes());
-                                data.put_u8(0);
-                                let msg = PgFrontendMessage {
-                                    message_type: PgFrontendMessageType::Query,
-                                    data,
-                                };
-                                proxy_mode = ProxyMode::OriginWrite(msg)
+                            CacheReply::Data(buf) => {
+                                proxy_mode = ProxyMode::ClientWrite(PgBackendMessage {
+                                    message_type: PgBackendMessageType::Multi,
+                                    data: buf,
+                                })
                             }
                         },
                         Err(err) => {
@@ -293,6 +281,7 @@ async fn handle_connection(
                 }
             }
             ProxyMode::ClientWrite(ref mut msg) => {
+                dbg!(&msg);
                 client_stream_write.write_buf(&mut msg.data).await?;
                 if !msg.data.has_remaining() {
                     proxy_mode = ProxyMode::Read;
