@@ -1,6 +1,17 @@
 use std::{io, sync::Arc, thread};
 
+use error_set::error_set;
+use pg_query::ParseResult;
+use tokio::{
+    runtime::Builder,
+    sync::{mpsc::Receiver, oneshot},
+};
+use tokio_postgres::{Error, SimpleColumn, SimpleQueryRow};
+use tokio_util::bytes::{BufMut, BytesMut};
+use tracing::{debug, error, instrument};
+
 use crate::{
+    cache::query_cache::QueryCache,
     pg::protocol::backend::{
         COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG,
     },
@@ -8,36 +19,31 @@ use crate::{
     settings::Settings,
 };
 
-use error_set::error_set;
-use pg_query::ParseResult;
-use tokio::{
-    runtime::Builder,
-    sync::{mpsc::Receiver, oneshot},
-};
-use tokio_postgres::{
-    Client, Config, Error, NoTls, SimpleColumn, SimpleQueryMessage, SimpleQueryRow,
-};
-use tokio_util::bytes::{Buf, BufMut, BytesMut};
-use tracing::{debug, error, instrument};
+mod query_cache;
 
 error_set! {
-    CacheError = ConnectError || ReadError || ParseError;
+    CacheError = ReadError || DbError || ParseError || TableError;
 
     ReadError = {
         IoError(io::Error),
         InvalidMessage,
     };
 
-    ConnectError = {
+    DbError = {
         NoConnection,
         PgError(Error)
     };
 
     ParseError = {
         InvalidUtf8,
-        Parse(pg_query::Error)
+        Parse(pg_query::Error),
+        Other(),
     };
 
+    TableError = {
+        UnknownTable,
+        UnknownColumn,
+    };
 }
 
 #[derive(Debug)]
@@ -48,109 +54,7 @@ pub enum CacheMessage {
 #[derive(Debug)]
 pub enum CacheReply {
     Data(BytesMut),
-}
-
-struct QueryCache {
-    db_cache: Client,
-    db_origin: Client,
-}
-
-impl QueryCache {
-    async fn new(settings: &Settings) -> Result<Self, CacheError> {
-        let (cache_client, cache_connection) = Config::new()
-            .host(&settings.cache.host)
-            .port(settings.cache.port)
-            .user(&settings.cache.user)
-            .dbname(&settings.cache.database)
-            .connect(NoTls)
-            .await?;
-
-        let (origin_client, origin_connection) = Config::new()
-            .host(&settings.origin.host)
-            .port(settings.origin.port)
-            .user(&settings.origin.user)
-            .dbname(&settings.origin.database)
-            .connect(NoTls)
-            .await?;
-
-        //task to process connection to cache pg db
-        tokio::spawn(async move {
-            if let Err(e) = cache_connection.await {
-                eprintln!("connection error: {e}");
-            }
-        });
-
-        //task to process connection to origin pg db
-        tokio::spawn(async move {
-            if let Err(e) = origin_connection.await {
-                eprintln!("connection error: {e}");
-            }
-        });
-
-        Ok(Self {
-            db_cache: cache_client,
-            db_origin: origin_client,
-        })
-    }
-
-    async fn handle_query(
-        &self,
-        data: BytesMut,
-        ast: &ParseResult,
-    ) -> Result<BytesMut, CacheError> {
-        // todo check for cache hit and store data in cache on miss
-        // just run the query and return the results for now
-
-        let cache_hit = false;
-        // let cache_hit = self
-        //     .query_cache_check(&ast)
-        //     .await
-        //     .is_ok_and(|is_cached| is_cached);
-
-        let query_target = if cache_hit {
-            &self.db_cache
-        } else {
-            &self.db_origin
-        };
-
-        let msg_len = (&data[1..5]).get_u32() as usize;
-        let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
-        // let stmt = query_target.prepare(query).await.unwrap();
-        let res = query_target.simple_query(query).await?;
-        // let res = query_target.query(query, &[]).await;
-        // dbg!(&res);
-
-        let mut buf = BytesMut::new();
-        let SimpleQueryMessage::RowDescription(desc) = &res[0] else {
-            return Err(CacheError::InvalidMessage);
-        };
-        row_description_encode(desc, &mut buf);
-        for msg in &res[1..] {
-            match msg {
-                SimpleQueryMessage::Row(row) => {
-                    simple_query_row_encode(row, &mut buf);
-                }
-                SimpleQueryMessage::CommandComplete(cnt) => {
-                    command_complete_encode(*cnt, &mut buf);
-                }
-                SimpleQueryMessage::RowDescription(_) => return Err(CacheError::InvalidMessage),
-                _ => return Err(CacheError::InvalidMessage),
-            }
-        }
-        ready_for_query_encode(&mut buf);
-
-        // if !cache_hit {
-        //     // Create cache table and store results
-        //     self.query_register(self.origin.clone(), &ast).await?;
-
-        //     if let Ok(rows) = &res {
-        //         self.query_cache_results(&ast.select_tables()[0], rows)
-        //             .await?;
-        //     }
-        // }
-
-        Ok(buf)
-    }
+    Error(BytesMut),
 }
 
 fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
@@ -215,19 +119,23 @@ pub fn cache_run(
 
         debug!("cache loop");
         rt.block_on(async {
-            let cache = QueryCache::new(settings).await?;
+            let mut cache = QueryCache::new(settings).await?;
 
             while let Some((msg, reply_tx)) = cache_rx.recv().await {
                 match msg {
-                    CacheMessage::Query(data, ast) => {
-                        let buf = cache.handle_query(data, &ast).await?;
-                        // todo check for cache hit and store data in cache on miss
-                        // just run the query and return the results for now
-
-                        if reply_tx.send(CacheReply::Data(buf)).is_err() {
-                            error!("no receiver");
+                    CacheMessage::Query(data, ast) => match cache.handle_query(&data, &ast).await {
+                        Ok(buf) => {
+                            if reply_tx.send(CacheReply::Data(buf)).is_err() {
+                                error!("no receiver");
+                            }
                         }
-                    }
+                        Err(e) => {
+                            error!("hadle_query failed {e}");
+                            if reply_tx.send(CacheReply::Error(data)).is_err() {
+                                error!("no receiver");
+                            }
+                        }
+                    },
                 }
             }
             Ok(())

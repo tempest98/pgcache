@@ -31,7 +31,7 @@ use tokio::{
 };
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tokio_util::{
-    bytes::{Buf, BufMut, BytesMut},
+    bytes::{Buf, BytesMut},
     codec::FramedRead,
 };
 use tracing::{debug, error, instrument};
@@ -185,6 +185,8 @@ enum StreamSource {
     CacheRead(CacheReply),
 }
 
+type StreamSourceResult = Result<StreamSource, ProtocolError>;
+
 #[instrument]
 async fn handle_connection(
     client_socket: &mut TcpStream,
@@ -221,10 +223,8 @@ async fn handle_connection(
 
     // let mut framed_read = client_mapped.merge(origin_mapped);
 
-    let mut streams_read: StreamMap<
-        &'static str,
-        Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>,
-    > = StreamMap::new();
+    let mut streams_read: StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult>>>> =
+        StreamMap::new();
 
     let client_mapped_pin = Box::pin(client_mapped); // as Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>;
     let origin_mapped_pin = Box::pin(origin_mapped); // as Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>;
@@ -265,6 +265,14 @@ async fn handle_connection(
                                     data: buf,
                                 })
                             }
+                            CacheReply::Error(buf) => {
+                                debug!("cache error, forwarding to origin");
+                                //send query to origin instead
+                                proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
+                                    message_type: PgFrontendMessageType::Query,
+                                    data: buf,
+                                })
+                            }
                         },
                         Err(err) => {
                             debug!("read error [{}]", err);
@@ -282,7 +290,7 @@ async fn handle_connection(
                 }
             }
             ProxyMode::ClientWrite(ref mut msg) => {
-                dbg!(&msg);
+                // dbg!(&msg);
                 client_stream_write.write_buf(&mut msg.data).await?;
                 if !msg.data.has_remaining() {
                     proxy_mode = ProxyMode::Read;

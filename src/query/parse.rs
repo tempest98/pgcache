@@ -12,7 +12,7 @@ use pg_query::protobuf::{
 use pg_query::{NodeRef, ParseResult};
 
 error_set! {
-    ParseError = WhereParseError;
+    ParseError = WhereParseError || SqlError;
 
     WhereParseError = {
         #[display("Unsupported WHERE clause pattern")]
@@ -30,6 +30,10 @@ error_set! {
         #[display("Missing expression")]
         MissingExpression,
         Other { error: String }
+    };
+
+    SqlError = {
+        DeparseError(pg_query::Error)
     };
 }
 
@@ -138,11 +142,11 @@ pub enum WhereExpr {
     },
 }
 
-pub fn query_fingerprint(ast: &ParseResult) -> u64 {
-    let query_sql = ast.deparse().unwrap();
+pub fn query_fingerprint(ast: &ParseResult) -> Result<u64, SqlError> {
+    let query_sql = ast.deparse()?;
     let mut hasher = DefaultHasher::new();
     query_sql.hash(&mut hasher);
-    hasher.finish()
+    Ok(hasher.finish())
 }
 
 pub fn query_select_has_sublink(ast: &ParseResult) -> bool {
@@ -402,10 +406,12 @@ mod tests {
     fn fingerprint_literals_differ() {
         let f1 = query_fingerprint(
             &pg_query::parse("select id, str from test where str = 'hello'").unwrap(),
-        );
+        )
+        .unwrap();
         let f2 = query_fingerprint(
             &pg_query::parse("select id, str from test where str = 'bye'").unwrap(),
-        );
+        )
+        .unwrap();
 
         assert_ne!(f1, f2);
     }

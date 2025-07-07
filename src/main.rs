@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .name("listen".to_owned())
             .spawn_scoped(scope, || proxy_run(&settings, tx))?;
 
-        let cache_handle = thread::Builder::new()
+        let _cache_handle = thread::Builder::new()
             .name("cache".to_owned())
             .spawn_scoped(scope, || cache_run(&settings, rx))?;
 

@@ -4,11 +4,19 @@ use std::{
     process::Stdio,
 };
 
+use pgcache_lib::tracing_utils::SimpeFormatter;
 use pgtemp::PgTempDBBuilder;
 use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
+use tracing::Level;
 
 #[tokio::test]
 async fn test_proxy() -> Result<(), Error> {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .event_format(SimpeFormatter)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
     let db = PgTempDBBuilder::new()
         .with_dbname("origin_test")
         .start_async()
