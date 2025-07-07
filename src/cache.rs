@@ -16,7 +16,6 @@ use tokio::{
 };
 use tokio_postgres::{
     Client, Config, Error, NoTls, SimpleColumn, SimpleQueryMessage, SimpleQueryRow,
-    config::ReplicationMode,
 };
 use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tracing::{debug, error, instrument};
@@ -54,7 +53,6 @@ pub enum CacheReply {
 struct QueryCache {
     db_cache: Client,
     db_origin: Client,
-    db_origin_cdc: Client,
 }
 
 impl QueryCache {
@@ -75,15 +73,6 @@ impl QueryCache {
             .connect(NoTls)
             .await?;
 
-        let (origin_cdc_client, origin_cdc_connection) = Config::new()
-            .host(&settings.origin.host)
-            .port(settings.origin.port)
-            .user(&settings.origin.user)
-            .dbname(&settings.origin.database)
-            .replication_mode(ReplicationMode::Logical)
-            .connect(NoTls)
-            .await?;
-
         //task to process connection to cache pg db
         tokio::spawn(async move {
             if let Err(e) = cache_connection.await {
@@ -98,17 +87,9 @@ impl QueryCache {
             }
         });
 
-        //task to process connection to origin cdc connection
-        tokio::spawn(async move {
-            if let Err(e) = origin_cdc_connection.await {
-                eprintln!("connection error: {e}");
-            }
-        });
-
         Ok(Self {
             db_cache: cache_client,
             db_origin: origin_client,
-            db_origin_cdc: origin_cdc_client,
         })
     }
 
