@@ -1,7 +1,9 @@
 use std::{io, sync::Arc, thread};
 
 use crate::{
-    pg::protocol::{COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG},
+    pg::protocol::backend::{
+        COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG,
+    },
     query::parse::*,
     settings::Settings,
 };

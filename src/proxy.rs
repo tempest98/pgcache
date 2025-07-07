@@ -9,8 +9,9 @@ use std::{
 use crate::{
     cache::{CacheMessage, CacheReply, is_cacheable},
     pg::protocol::{
-        PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType, PgFrontendMessage,
-        PgFrontendMessageCodec, PgFrontendMessageType, ProtocolError,
+        ProtocolError,
+        backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
+        frontend::{PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType},
     },
     settings::Settings,
     stream_utils::ReceiverStream,
