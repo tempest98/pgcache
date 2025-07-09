@@ -124,9 +124,6 @@ impl QueryCache {
         data: &BytesMut,
         ast: &ParseResult,
     ) -> Result<BytesMut, CacheError> {
-        // todo check for cache hit and store data in cache on miss
-        // just run the query and return the results for now
-
         let fingerprint = query_fingerprint(ast).map_err(|_| ParseError::Other)?;
         let cache_hit = self.cached_queries.contains_key(&fingerprint);
 
