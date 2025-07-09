@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 use pg_query::ParseResult;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow, types::Type};
 use tokio_util::bytes::{Buf, BytesMut};
@@ -70,16 +72,28 @@ impl IdHashItem for CachedQuery {
     id_upcast!();
 }
 
+pub struct QueryRequest {
+    pub data: BytesMut,
+    pub ast: ParseResult,
+    pub reply_tx: oneshot::Sender<CacheReply>,
+}
+
 #[derive(Debug)]
 pub struct QueryCache {
     db_cache: Client,
     db_origin: Client,
+
+    worker_tx: UnboundedSender<QueryRequest>,
+
     tables: BiHashMap<TableMetadata>,
-    cached_queries: IdHashMap<CachedQuery>,
+    pub cached_queries: IdHashMap<CachedQuery>,
 }
 
 impl QueryCache {
-    pub async fn new(settings: &Settings) -> Result<Self, CacheError> {
+    pub async fn new(
+        settings: &Settings,
+        worker_tx: UnboundedSender<QueryRequest>,
+    ) -> Result<Self, CacheError> {
         let (cache_client, cache_connection) = Config::new()
             .host(&settings.cache.host)
             .port(settings.cache.port)
@@ -113,30 +127,51 @@ impl QueryCache {
         Ok(Self {
             db_cache: cache_client,
             db_origin: origin_client,
+            worker_tx,
             tables: BiHashMap::new(),
             cached_queries: IdHashMap::new(),
         })
     }
 
+    pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
+        let fingerprint = query_fingerprint(&msg.ast).map_err(|_| ParseError::Other)?;
+        let cache_hit = self.cached_queries.contains_key(&fingerprint);
+
+        if cache_hit {
+            self.worker_tx.send(msg).map_err(|e| {
+                error!("worker send {e}");
+                CacheError::WorkerSend
+            })
+        } else {
+            match self
+                .handle_cache_miss(fingerprint, &msg.data, &msg.ast)
+                .await
+            {
+                Ok(buf) => msg
+                    .reply_tx
+                    .send(CacheReply::Data(buf))
+                    .map_err(|_| CacheError::Reply),
+                Err(e) => {
+                    error!("handle_cached_query failed {e}");
+                    msg.reply_tx
+                        .send(CacheReply::Error(msg.data))
+                        .map_err(|_| CacheError::Reply)
+                }
+            }
+        }
+    }
+
     #[instrument]
-    pub async fn handle_query(
+    pub async fn handle_cache_miss(
         &mut self,
+        fingerprint: u64,
         data: &BytesMut,
         ast: &ParseResult,
     ) -> Result<BytesMut, CacheError> {
-        let fingerprint = query_fingerprint(ast).map_err(|_| ParseError::Other)?;
-        let cache_hit = self.cached_queries.contains_key(&fingerprint);
-
-        let query_target = if cache_hit {
-            &self.db_cache
-        } else {
-            &self.db_origin
-        };
-
         let msg_len = (&data[1..5]).get_u32() as usize;
         let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
         // let stmt = query_target.prepare(query).await.unwrap();
-        let res = query_target.simple_query(query).await?;
+        let res = self.db_origin.simple_query(query).await?;
         // let res = query_target.query(query, &[]).await;
         // dbg!(&res);
 
@@ -163,14 +198,12 @@ impl QueryCache {
         command_complete_encode(*cnt, &mut buf);
         ready_for_query_encode(&mut buf);
 
-        if !cache_hit {
-            // Create cache table and store results
-            // todo query_register and query_cache_results need to be treated atomically
-            let table_oid = self.query_register(fingerprint, ast).await?;
-            self.query_cache_results(table_oid, &rows).await?;
-        }
+        // Create cache table and store results
+        // todo query_register and query_cache_results need to be treated atomically
+        let table_oid = self.query_register(fingerprint, ast).await?;
+        self.query_cache_results(table_oid, &rows).await?;
 
-        debug!("cache hit {cache_hit}");
+        debug!("cache miss");
         Ok(buf)
     }
 
@@ -223,7 +256,6 @@ impl QueryCache {
         let columns: Vec<&str> = Vec::from_iter(rows[0].columns().iter().map(|c| c.name()));
         for &row in rows {
             let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
-            dbg!(row.columns());
             for idx in 0..row.columns().len() {
                 let value = row.get(idx);
                 let col = table
@@ -380,5 +412,74 @@ impl QueryCache {
         self.db_cache.execute(&sql, &[]).await?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheWorker {
+    db_cache: Rc<Client>,
+}
+
+impl CacheWorker {
+    pub async fn new(settings: &Settings) -> Result<Self, CacheError> {
+        let (cache_client, cache_connection) = Config::new()
+            .host(&settings.cache.host)
+            .port(settings.cache.port)
+            .user(&settings.cache.user)
+            .dbname(&settings.cache.database)
+            .connect(NoTls)
+            .await?;
+
+        //task to process connection to cache pg db
+        tokio::spawn(async move {
+            if let Err(e) = cache_connection.await {
+                eprintln!("connection error: {e}");
+            }
+        });
+
+        Ok(Self {
+            db_cache: Rc::new(cache_client),
+        })
+    }
+
+    #[instrument]
+    pub async fn handle_cached_query(
+        &self,
+        data: &BytesMut,
+        ast: &ParseResult,
+    ) -> Result<BytesMut, CacheError> {
+        let msg_len = (&data[1..5]).get_u32() as usize;
+        let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
+        // let stmt = query_target.prepare(query).await.unwrap();
+        let res = self.db_cache.simple_query(query).await?;
+        // let res = query_target.query(query, &[]).await;
+        // dbg!(&res);
+
+        let mut buf = BytesMut::new();
+        let SimpleQueryMessage::RowDescription(desc) = &res[0] else {
+            return Err(CacheError::InvalidMessage);
+        };
+
+        row_description_encode(desc, &mut buf);
+
+        let mut rows = Vec::new();
+        for msg in &res[1..(res.len() - 1)] {
+            match msg {
+                SimpleQueryMessage::Row(row) => {
+                    simple_query_row_encode(row, &mut buf);
+                    rows.push(row);
+                }
+                _ => return Err(CacheError::InvalidMessage),
+            }
+        }
+
+        let SimpleQueryMessage::CommandComplete(cnt) = &res[res.len() - 1] else {
+            return Err(CacheError::InvalidMessage);
+        };
+        command_complete_encode(*cnt, &mut buf);
+        ready_for_query_encode(&mut buf);
+
+        debug!("cache hit");
+        Ok(buf)
     }
 }

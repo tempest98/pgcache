@@ -4,14 +4,18 @@ use error_set::error_set;
 use pg_query::ParseResult;
 use tokio::{
     runtime::Builder,
-    sync::{mpsc::Receiver, oneshot},
+    sync::{
+        mpsc::{self, Receiver, UnboundedReceiver},
+        oneshot,
+    },
+    task::{LocalSet, spawn_local},
 };
 use tokio_postgres::{Error, SimpleColumn, SimpleQueryRow};
 use tokio_util::bytes::{BufMut, BytesMut};
 use tracing::{debug, error, instrument};
 
 use crate::{
-    cache::query_cache::QueryCache,
+    cache::query_cache::{CacheWorker, QueryCache, QueryRequest},
     pg::protocol::backend::{
         COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG,
     },
@@ -22,7 +26,7 @@ use crate::{
 mod query_cache;
 
 error_set! {
-    CacheError = ReadError || DbError || ParseError || TableError;
+    CacheError = ReadError || DbError || ParseError || TableError || SendError;
 
     ReadError = {
         IoError(io::Error),
@@ -38,6 +42,11 @@ error_set! {
         InvalidUtf8,
         Parse(pg_query::Error),
         Other(),
+    };
+
+    SendError = {
+        WorkerSend,
+        Reply,
     };
 
     TableError = {
@@ -114,32 +123,82 @@ pub fn cache_run(
     settings: &Settings,
     mut cache_rx: Receiver<(CacheMessage, oneshot::Sender<CacheReply>)>,
 ) -> Result<(), CacheError> {
-    thread::scope(|_scope| {
+    thread::scope(|scope| {
         let rt = Builder::new_current_thread().enable_all().build()?;
+
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        // let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+
+        let _worker_handle = thread::Builder::new()
+            .name("cache worker".to_owned())
+            .spawn_scoped(scope, || worker_run(settings, worker_rx))?;
+
+        // let writer_handle = thread::Builder::new()
+        //     .name("cache writer".to_owned())
+        //     .spawn_scoped(scope, || writer_run(&settings, writer_rx))?;
 
         debug!("cache loop");
         rt.block_on(async {
-            let mut cache = QueryCache::new(settings).await?;
-
+            let mut cache = QueryCache::new(settings, worker_tx).await?;
             while let Some((msg, reply_tx)) = cache_rx.recv().await {
                 match msg {
-                    CacheMessage::Query(data, ast) => match cache.handle_query(&data, &ast).await {
-                        Ok(buf) => {
-                            if reply_tx.send(CacheReply::Data(buf)).is_err() {
-                                error!("no receiver");
+                    CacheMessage::Query(data, ast) => {
+                        let msg = QueryRequest {
+                            data,
+                            ast,
+                            reply_tx,
+                        };
+                        match cache.query_dispatch(msg).await {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!("query_dispatch error {e}");
                             }
                         }
-                        Err(e) => {
-                            error!("hadle_query failed {e}");
-                            if reply_tx.send(CacheReply::Error(data)).is_err() {
-                                error!("no receiver");
-                            }
-                        }
-                    },
+                    }
                 }
             }
+
             Ok(())
         })
+    })
+}
+
+fn worker_run(
+    settings: &Settings,
+    mut worker_rx: UnboundedReceiver<QueryRequest>,
+) -> Result<(), CacheError> {
+    let rt = Builder::new_current_thread().enable_all().build()?;
+
+    debug!("worker loop");
+    rt.block_on(async {
+        let worker = CacheWorker::new(settings).await?;
+
+        LocalSet::new()
+            .run_until(async move {
+                while let Some(msg) = worker_rx.recv().await {
+                    let worker = worker.clone();
+                    spawn_local(async move {
+                        debug!("cache worker task spawn");
+                        match worker.handle_cached_query(&msg.data, &msg.ast).await {
+                            Ok(buf) => {
+                                if msg.reply_tx.send(CacheReply::Data(buf)).is_err() {
+                                    error!("no receiver");
+                                }
+                            }
+                            Err(e) => {
+                                error!("handle_cached_query failed {e}");
+                                if msg.reply_tx.send(CacheReply::Error(msg.data)).is_err() {
+                                    error!("no receiver");
+                                }
+                            }
+                        }
+                        debug!("cache worker task done");
+                    });
+                }
+
+                Ok(())
+            })
+            .await
     })
 }
 
