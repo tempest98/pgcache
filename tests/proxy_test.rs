@@ -1,32 +1,24 @@
 use std::{
-    io::{Error, Read},
+    io::Error,
     process::{Command, Stdio},
-    time::Duration,
 };
 
-use pgcache_lib::tracing_utils::SimpeFormatter;
 use pgtemp::PgTempDBBuilder;
-use tokio::time::sleep;
 use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
-use tracing::Level;
+
+mod util;
 
 #[tokio::test]
 async fn test_proxy() -> Result<(), Error> {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
-        .event_format(SimpeFormatter)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
-
     let db = PgTempDBBuilder::new()
         .with_dbname("origin_test")
         .start_async()
         .await;
 
-    dbg!(db.connection_uri());
-    dbg!(db.db_port());
-    dbg!(db.data_dir());
-    dbg!(env!("CARGO_BIN_EXE_pgcache"));
+    let db_cache = PgTempDBBuilder::new()
+        .with_dbname("cache_test")
+        .start_async()
+        .await;
 
     let mut pgcache = Command::new(env!("CARGO_BIN_EXE_pgcache"))
         .arg("--origin_host")
@@ -37,15 +29,21 @@ async fn test_proxy() -> Result<(), Error> {
         .arg(db.db_user())
         .arg("--origin_database")
         .arg(db.db_name())
+        .arg("--cache_host")
+        .arg("127.0.0.1")
+        .arg("--cache_port")
+        .arg(db_cache.db_port().to_string())
+        .arg("--cache_user")
+        .arg(db_cache.db_user())
+        .arg("--cache_database")
+        .arg(db_cache.db_name())
         .stdout(Stdio::piped())
-        // .stderr(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("run pgcache");
 
-    //wait to read some data to make sure pgcache process is initialized before proceeding
-    let mut buf = [0u8; 256];
-    let _ = pgcache.stdout.take().unwrap().read(&mut buf);
-    sleep(Duration::from_secs(1)).await; //hacky sleep for now, need something better
+    //wait to listening message from proxy before proceeding
+    util::proxy_wait_for_ready(&mut pgcache);
 
     let (client, connection) = Config::new()
         .host("localhost")
