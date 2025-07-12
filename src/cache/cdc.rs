@@ -27,6 +27,8 @@ use super::*;
 /// Processes replication messages and synchronizes changes with the cache database.
 pub struct CdcProcessor {
     cdc_client: Client,
+    publication_name: String,
+    slot_name: String,
     cdc_tx: UnboundedSender<CdcMessage>,
     cache: Cache,
     last_received_lsn: u64,
@@ -65,6 +67,8 @@ impl CdcProcessor {
 
         Ok(Self {
             cdc_client: origin_cdc_client,
+            publication_name: settings.cdc.publication_name.clone(),
+            slot_name: settings.cdc.slot_name.clone(),
             cdc_tx,
             cache,
             last_received_lsn: 0,
@@ -79,9 +83,13 @@ impl CdcProcessor {
     /// Uses tokio::select! for concurrent message processing and periodic keep-alives.
     pub async fn run(&mut self) -> Result<(), Error> {
         // Start replication stream
-        let query = "START_REPLICATION SLOT slot_test LOGICAL 0/0 (proto_version '4', publication_names 'pub_test')";
+        let slot = self.slot_name.as_str();
+        let publ = self.publication_name.as_str();
+        let query = format!(
+            "START_REPLICATION SLOT {slot} LOGICAL 0/0 (proto_version '4', publication_names '{publ}')"
+        );
 
-        let copy_stream = self.cdc_client.copy_both_simple::<Bytes>(query).await?;
+        let copy_stream = self.cdc_client.copy_both_simple::<Bytes>(&query).await?;
 
         let stream = LogicalReplicationStream::new(copy_stream);
         pin!(stream);

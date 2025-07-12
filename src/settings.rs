@@ -25,7 +25,6 @@ impl From<lexopt::Error> for ConfigError {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(unused)]
 pub struct PgSettings {
     pub host: String,
     pub port: u16,
@@ -34,16 +33,21 @@ pub struct PgSettings {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(unused)]
+pub struct CdcSettings {
+    pub publication_name: String,
+    pub slot_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ListenSettings {
     pub socket: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(unused)]
 pub struct Settings {
     pub origin: PgSettings,
     pub cache: PgSettings,
+    pub cdc: CdcSettings,
     pub listen: ListenSettings,
     pub num_workers: usize,
 }
@@ -62,6 +66,10 @@ impl Settings {
                 port: 7654,
                 user: "postgres".to_owned(),
                 database: "cache".to_owned(),
+            },
+            cdc: CdcSettings {
+                publication_name: "pub_test".to_owned(),
+                slot_name: "slot_test".to_owned(),
             },
             listen: ListenSettings {
                 socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6432)),
@@ -125,6 +133,10 @@ impl Settings {
                 database: cache_database.ok_or_else(|| ConfigError::ArgumentMissing {
                     name: "cache_database",
                 })?,
+            },
+            cdc: CdcSettings {
+                publication_name: "pub_test".to_owned(),
+                slot_name: "slot_test".to_owned(),
             },
             listen: ListenSettings {
                 socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6432)),
