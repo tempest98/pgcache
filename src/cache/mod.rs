@@ -13,27 +13,26 @@ use tokio::{
     },
     task::{LocalSet, spawn_local},
 };
-use tokio_postgres::{Error, SimpleColumn, SimpleQueryRow, types::Type};
+use tokio_postgres::{Error, types::Type};
 use tokio_stream::{
     StreamExt,
     wrappers::{ReceiverStream, UnboundedReceiverStream},
 };
-use tokio_util::bytes::{BufMut, BytesMut};
+use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, instrument};
 
 use crate::cache::cdc::CdcProcessor;
-use crate::query::evaluate::where_expr_evaluate;
+use crate::cache::worker::CacheWorker;
 use crate::{
-    cache::query_cache::{CacheWorker, QueryCache, QueryRequest},
-    pg::protocol::backend::{
-        COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG,
-    },
+    cache::query_cache::{QueryCache, QueryRequest},
     query::parse::*,
     settings::Settings,
 };
 
 mod cdc;
+pub(crate) mod query;
 mod query_cache;
+mod worker;
 
 error_set! {
     CacheError = ReadError || DbError || ParseError || TableError || SendError;
@@ -171,58 +170,6 @@ impl IdHashItem for CachedQuery {
 pub struct Cache {
     pub tables: Arc<RwLock<BiHashMap<TableMetadata>>>,
     pub queries: Arc<RwLock<IdHashMap<CachedQuery>>>,
-}
-
-fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
-    let cnt = desc.len() as i16;
-    let string_len = desc.iter().fold(0, |acc, col| acc + col.name().len() + 1);
-
-    buf.put_u8(ROW_DESCRIPTION_TAG);
-    buf.put_i32(6 + (18 * cnt as i32) + string_len as i32);
-    buf.put_i16(cnt);
-    for col in desc.iter() {
-        buf.put_slice(col.name().as_bytes());
-        buf.put_u8(0);
-        buf.put_i32(0);
-        buf.put_i16(0);
-        buf.put_i32(0);
-        buf.put_i16(-1);
-        buf.put_i32(-1);
-        buf.put_i16(0);
-    }
-}
-
-fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
-    let cnt = row.len() as i16;
-    let mut value_len = 0;
-    for i in 0..cnt {
-        let value = row.get(i as usize).unwrap_or_default();
-        value_len += value.len();
-    }
-
-    buf.put_u8(DATA_ROW_TAG);
-    buf.put_i32(6 + (4 * cnt as i32) + value_len as i32);
-    buf.put_i16(cnt);
-    for i in 0..cnt {
-        let data = row.get(i as usize).unwrap_or_default().as_bytes();
-        buf.put_i32(data.len() as i32);
-        buf.put_slice(data);
-    }
-}
-
-fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
-    let msg = format!("SELECT {cnt}");
-
-    buf.put_u8(COMMAND_COMPLETE_TAG);
-    buf.put_i32((4 + msg.len() + 1) as i32);
-    buf.put_slice(msg.as_bytes());
-    buf.put_u8(0);
-}
-
-fn ready_for_query_encode(buf: &mut BytesMut) {
-    buf.put_u8(READY_FOR_QUERY_TAG);
-    buf.put_i32(5);
-    buf.put_u8(b'I');
 }
 
 #[instrument]
@@ -366,71 +313,4 @@ fn cdc_run(
 
         Err(CacheError::CdcFailure)
     })
-}
-
-pub fn is_cacheable(ast: &ParseResult) -> bool {
-    ast.statement_types().contains(&"SelectStmt")
-        && ast.select_tables().len() == 1
-        && !query_select_has_sublink(ast)
-        && has_cacheable_where_clause(ast)
-}
-
-/// Check if the WHERE clause can be efficiently cached.
-/// Currently supports: simple equality, AND of equalities, OR of equalities.
-fn has_cacheable_where_clause(ast: &ParseResult) -> bool {
-    match query_where_clause_parse(ast) {
-        Ok(Some(expr)) => is_cacheable_expr(&expr),
-        Ok(None) => true, // No WHERE clause is always cacheable
-        Err(_) => false,  // Can't parse WHERE clause, not cacheable
-    }
-}
-
-/// Determine if a WHERE expression can be efficiently cached.
-/// Step 2: Support simple equality, AND of equalities, OR of equalities.
-fn is_cacheable_expr(expr: &WhereExpr) -> bool {
-    match expr {
-        WhereExpr::Binary(binary_expr) => {
-            match binary_expr.op {
-                WhereOp::Equal => {
-                    // Simple equality: column = value
-                    is_simple_equality(binary_expr)
-                }
-                WhereOp::And => {
-                    // AND: both sides must be cacheable
-                    is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
-                }
-                WhereOp::Or => {
-                    // OR: both sides must be cacheable
-                    is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
-                }
-                _ => false, // Other operators not supported yet
-            }
-        }
-        _ => false, // Other expression types not supported yet
-    }
-}
-
-/// Check if a binary expression is a simple equality (column = value).
-fn is_simple_equality(binary_expr: &BinaryExpr) -> bool {
-    matches!(
-        (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()),
-        (WhereExpr::Column(_), WhereExpr::Value(_)) | (WhereExpr::Value(_), WhereExpr::Column(_))
-    )
-}
-
-/// Check if a row matches the filter conditions of a cached query.
-fn cache_query_row_matches(
-    query: &CachedQuery,
-    row_data: &[Option<String>],
-    table_metadata: &TableMetadata,
-) -> bool {
-    // Guard clause: if no filter expression, all rows match
-    // dbg!(&query.filter_expr);
-    // dbg!(&row_data);
-    // dbg!(&table_metadata);
-
-    match &query.filter_expr {
-        Some(expr) => where_expr_evaluate(expr, row_data, table_metadata),
-        None => true, // No filter means all rows match
-    }
 }

@@ -88,6 +88,14 @@ fn where_value_match_string(filter_value: &WhereValue, row_value_str: &str) -> b
     }
 }
 
+/// Check if a binary expression is a simple equality (column = value).
+pub fn is_simple_equality(binary_expr: &BinaryExpr) -> bool {
+    matches!(
+        (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()),
+        (WhereExpr::Column(_), WhereExpr::Value(_)) | (WhereExpr::Value(_), WhereExpr::Column(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

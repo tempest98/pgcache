@@ -6,6 +6,7 @@ use error_set::error_set;
 use tokio_util::bytes::BytesMut;
 
 pub(crate) mod backend;
+pub(crate) mod encode;
 pub(crate) mod frontend;
 
 error_set! {

@@ -138,7 +138,7 @@ impl CdcProcessor {
     }
 
     /// Marks the current LSN as fully applied after successful processing.
-    async fn mark_lsn_applied(&mut self) {
+    fn mark_lsn_applied(&mut self) {
         let received = self.last_received_lsn;
         self.last_applied_lsn = received;
     }
@@ -242,7 +242,7 @@ impl CdcProcessor {
                     }
                 };
                 if result.is_ok() {
-                    self.mark_lsn_applied().await;
+                    self.mark_lsn_applied();
                 }
                 result
             }

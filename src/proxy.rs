@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    cache::{CacheMessage, CacheReply, is_cacheable},
+    cache::{CacheMessage, CacheReply, query::is_cacheable},
     pg::protocol::{
         ProtocolError,
         backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
