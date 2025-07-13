@@ -207,53 +207,60 @@ pub fn cache_run(
 
         debug!("cache loop");
         rt.block_on(async {
-            let mut qcache = QueryCache::new(settings, cache.clone(), worker_tx).await?;
+            let qcache = QueryCache::new(settings, cache.clone(), worker_tx).await?;
 
-            while let Some(src) = stream.next().await {
-                match src {
-                    StreamSource::Proxy((msg, reply_tx)) => match msg {
-                        CacheMessage::Query(data, ast) => {
-                            let msg = QueryRequest {
-                                data,
-                                ast,
-                                reply_tx,
-                            };
-                            match qcache.query_dispatch(msg).await {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!("query_dispatch error {e}");
-                                }
+            LocalSet::new()
+                .run_until(async move {
+                    while let Some(src) = stream.next().await {
+                        let mut qcache = qcache.clone();
+                        spawn_local(async move {
+                            match src {
+                                StreamSource::Proxy((msg, reply_tx)) => match msg {
+                                    CacheMessage::Query(data, ast) => {
+                                        let msg = QueryRequest {
+                                            data,
+                                            ast,
+                                            reply_tx,
+                                        };
+                                        match qcache.query_dispatch(msg).await {
+                                            Ok(_) => (),
+                                            Err(e) => {
+                                                error!("query_dispatch error {e}");
+                                            }
+                                        }
+                                    }
+                                },
+                                StreamSource::Cdc(msg) => match msg {
+                                    CdcMessage::Register(table_metadata) => {
+                                        let _ = qcache.cache_table_register(table_metadata).await;
+                                    }
+                                    CdcMessage::Insert(relation_oid, row_data) => {
+                                        let _ = qcache.handle_insert(relation_oid, row_data).await;
+                                    }
+                                    CdcMessage::Update(update) => {
+                                        let _ = qcache
+                                            .handle_update(
+                                                update.relation_oid,
+                                                update.key_data,
+                                                update.row_data,
+                                            )
+                                            .await;
+                                    }
+                                    CdcMessage::Delete(relation_oid, row_data) => {
+                                        let _ = qcache.handle_delete(relation_oid, row_data).await;
+                                    }
+                                },
                             }
-                        }
-                    },
-                    StreamSource::Cdc(msg) => match msg {
-                        CdcMessage::Register(table_metadata) => {
-                            let _ = qcache.cache_table_register(table_metadata).await;
-                        }
-                        CdcMessage::Insert(relation_oid, row_data) => {
-                            let _ = qcache.handle_insert(relation_oid, row_data).await;
-                        }
-                        CdcMessage::Update(update) => {
-                            let _ = qcache
-                                .handle_update(
-                                    update.relation_oid,
-                                    update.key_data,
-                                    update.row_data,
-                                )
-                                .await;
-                        }
-                        CdcMessage::Delete(relation_oid, row_data) => {
-                            let _ = qcache.handle_delete(relation_oid, row_data).await;
-                        }
-                    },
-                }
+                        });
 
-                if cdc_handle.is_finished() {
-                    return Err(CacheError::CdcFailure);
-                }
-            }
+                        if cdc_handle.is_finished() {
+                            return Err(CacheError::CdcFailure);
+                        }
+                    }
 
-            Ok(())
+                    Ok(())
+                })
+                .await
         })
     })
 }

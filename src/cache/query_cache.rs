@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use pg_query::ParseResult;
 use tokio::sync::mpsc::UnboundedSender;
@@ -20,10 +21,10 @@ pub struct QueryRequest {
     pub reply_tx: oneshot::Sender<CacheReply>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryCache {
-    db_cache: Client,
-    db_origin: Client,
+    db_cache: Rc<Client>,
+    db_origin: Rc<Client>,
 
     worker_tx: UnboundedSender<QueryRequest>,
 
@@ -67,8 +68,8 @@ impl QueryCache {
         });
 
         Ok(Self {
-            db_cache: cache_client,
-            db_origin: origin_client,
+            db_cache: Rc::new(cache_client),
+            db_origin: Rc::new(origin_client),
             worker_tx,
             cache,
         })

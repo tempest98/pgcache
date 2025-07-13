@@ -94,7 +94,7 @@ impl CdcProcessor {
         let stream = LogicalReplicationStream::new(copy_stream);
         pin!(stream);
 
-        debug!("Starting CDC replication stream with 5-second keep-alive intervals");
+        debug!("Starting CDC replication stream with keep-alive intervals");
 
         loop {
             tokio::select! {
@@ -257,7 +257,7 @@ impl CdcProcessor {
     }
 
     /// Gets keep-alive statistics for debugging purposes.
-    pub async fn get_keep_alive_stats(&self) -> (Option<Instant>, u64) {
+    fn get_keep_alive_stats(&self) -> (Option<Instant>, u64) {
         let last_sent = self.last_keep_alive_sent;
         let count = self.keep_alive_sent_count;
         (last_sent, count)

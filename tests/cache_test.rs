@@ -161,7 +161,7 @@ async fn test_cache() -> Result<(), Error> {
             Error::other(e)
         })?;
 
-    sleep(Duration::from_millis(500)).await; //is there a better way to do this?
+    sleep(Duration::from_millis(250)).await; //is there a better way to do this?
 
     let res = client
         .simple_query("select id, data from test where data = 'foo'")
