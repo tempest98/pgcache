@@ -78,7 +78,7 @@ impl QueryCache {
     #[instrument]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
         let fingerprint = query_fingerprint(&msg.ast).map_err(|_| ParseError::Other)?;
-        let cache_hit = self.cache.queries.read().await.contains_key(&fingerprint);
+        let cache_hit = self.cache.queries.contains_key(&fingerprint);
 
         if cache_hit {
             self.worker_tx.send(msg).map_err(|e| {
@@ -159,22 +159,14 @@ impl QueryCache {
     ) -> Result<u32, CacheError> {
         let table_name = &ast.select_tables()[0];
 
-        if !self
-            .cache
-            .tables
-            .read()
-            .await
-            .contains_key2(table_name.as_str())
-        {
+        if !self.cache.tables.contains_key2(table_name.as_str()) {
             let table = self.cache_table_create(table_name).await?;
-            self.cache.tables.write().await.insert_overwrite(table);
+            self.cache.tables.insert_overwrite(table);
         }
 
         let relation_oid = self
             .cache
             .tables
-            .read()
-            .await
             .get2(table_name.as_str())
             .ok_or(CacheError::UnknownTable)?
             .relation_oid;
@@ -191,13 +183,17 @@ impl QueryCache {
         };
 
         // Store cached query metadata
-        self.cache
-            .queries
-            .write()
-            .await
-            .insert_overwrite(cached_query);
+        self.cache.queries.insert_overwrite(cached_query);
 
         Ok(relation_oid)
+    }
+
+    /// Check if there are any cached queries for a specific table by relation OID.
+    pub async fn cached_queries_exist(&self, relation_oid: u32) -> bool {
+        self.cache
+            .queries
+            .iter()
+            .any(|query| query.relation_oid == relation_oid)
     }
 
     /// Stores query results in the cache for faster retrieval.
@@ -208,8 +204,9 @@ impl QueryCache {
         rows: &[&SimpleQueryRow],
     ) -> Result<(), CacheError> {
         //todo, reorganize for efficiency, use prepared statement
-        let table_guard = self.cache.tables.read().await;
-        let table = table_guard
+        let table = self
+            .cache
+            .tables
             .get1(&table_oid)
             .ok_or(CacheError::UnknownTable)?;
 
@@ -380,13 +377,13 @@ impl QueryCache {
     /// Register table metadata from CDC processing.
     #[instrument]
     pub async fn cache_table_register(
-        &self,
+        &mut self,
         table_metadata: TableMetadata,
     ) -> Result<(), CacheError> {
         let relation_oid = table_metadata.relation_oid;
 
         // Check if table already exists
-        let table_exists = self.cache.tables.read().await.contains_key1(&relation_oid);
+        let table_exists = self.cache.tables.contains_key1(&relation_oid);
 
         if table_exists {
             // TODO: Handle schema changes when table already exists
@@ -408,11 +405,7 @@ impl QueryCache {
             .await?;
 
         // Store CDC metadata in both indexes
-        self.cache
-            .tables
-            .write()
-            .await
-            .insert_overwrite(table_metadata);
+        self.cache.tables.insert_overwrite(table_metadata);
 
         Ok(())
     }
@@ -479,14 +472,14 @@ impl QueryCache {
         row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
         // Get cached queries that reference this table
-        let queries_guard = self.cache.queries.read().await;
-        let cached_queries = queries_guard
+        let cached_queries = self
+            .cache
+            .queries
             .iter()
             .filter(|query| query.relation_oid == relation_oid);
 
         // Get table metadata for column information
-        let table_guard = self.cache.tables.read().await;
-        let table_metadata = match table_guard.get1(&relation_oid) {
+        let table_metadata = match self.cache.tables.get1(&relation_oid) {
             Some(metadata) => metadata,
             None => {
                 error!("No table metadata found for relation_oid: {}", relation_oid);
@@ -520,8 +513,7 @@ impl QueryCache {
         new_row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
         // Get table metadata for column information
-        let table_guard = self.cache.tables.read().await;
-        let table_metadata = match table_guard.get1(&relation_oid) {
+        let table_metadata = match self.cache.tables.get1(&relation_oid) {
             Some(metadata) => metadata,
             None => {
                 error!("No table metadata found for relation_oid: {relation_oid}");
@@ -530,8 +522,9 @@ impl QueryCache {
         };
 
         // Check each cached query to see if this UPDATE affects it
-        let queries_guard = self.cache.queries.read().await;
-        let matched = queries_guard
+        let matched = self
+            .cache
+            .queries
             .iter()
             .filter(|query| query.relation_oid == relation_oid)
             .any(|query| cache_query_row_matches(query, &new_row_data, table_metadata));
@@ -560,8 +553,7 @@ impl QueryCache {
         row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
         // Get table metadata for column information
-        let table_guard = self.cache.tables.read().await;
-        let table_metadata = match table_guard.get1(&relation_oid) {
+        let table_metadata = match self.cache.tables.get1(&relation_oid) {
             Some(metadata) => metadata,
             None => {
                 error!("No table metadata found for relation_oid: {}", relation_oid);

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use postgres_replication::{
@@ -29,8 +29,10 @@ pub struct CdcProcessor {
     cdc_client: Client,
     publication_name: String,
     slot_name: String,
+
     cdc_tx: UnboundedSender<CdcMessage>,
-    cache: Cache,
+    active_relations: HashSet<u32>,
+
     last_received_lsn: u64,
     last_applied_lsn: u64,
     keep_alive_timer: Interval,
@@ -42,7 +44,6 @@ impl CdcProcessor {
     /// Creates a new CdcProcessor with the provided CDC client and cache.
     pub async fn new(
         settings: &Settings,
-        cache: Cache,
         cdc_tx: UnboundedSender<CdcMessage>,
     ) -> Result<Self, CacheError> {
         let (origin_cdc_client, origin_cdc_connection) = Config::new()
@@ -70,7 +71,7 @@ impl CdcProcessor {
             publication_name: settings.cdc.publication_name.clone(),
             slot_name: settings.cdc.slot_name.clone(),
             cdc_tx,
-            cache,
+            active_relations: HashSet::new(),
             last_received_lsn: 0,
             last_applied_lsn: 0,
             keep_alive_timer: timer,
@@ -265,27 +266,27 @@ impl CdcProcessor {
 
     /// Processes transaction begin messages.
     async fn process_begin(&self, body: &BeginBody) -> Result<(), Error> {
-        dbg!(body);
+        // dbg!(body);
         // TODO: Begin transaction in cache database when cache synchronization is added
         Ok(())
     }
 
     /// Processes transaction commit messages.
     async fn process_commit(&self, body: &CommitBody) -> Result<(), Error> {
-        dbg!(body);
+        // dbg!(body);
         // TODO: Commit transaction in cache database when cache synchronization is added
         Ok(())
     }
 
     /// Processes origin messages.
     async fn process_origin(&self, body: &OriginBody) -> Result<(), Error> {
-        dbg!(body);
+        // dbg!(body);
         Ok(())
     }
 
     /// Processes relation (table schema) messages.
     async fn process_relation(&self, body: &RelationBody) -> Result<(), Error> {
-        dbg!(body);
+        // dbg!(body);
 
         // Parse RelationBody into TableMetadata
         let table_metadata = self.parse_relation_to_table_metadata(body);
@@ -302,24 +303,24 @@ impl CdcProcessor {
 
     /// Processes type definition messages.
     async fn process_type(&self, body: &TypeBody) -> Result<(), Error> {
-        dbg!(body);
+        // dbg!(body);
         Ok(())
     }
 
     /// Processes insert messages with query-aware filtering.
-    async fn process_insert(&self, body: &InsertBody) -> Result<(), Error> {
-        dbg!(body);
+    async fn process_insert(&mut self, body: &InsertBody) -> Result<(), Error> {
+        // dbg!(body);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
-        if !self.cached_queries_exist(relation_oid).await {
+        if !self.is_relation_active(relation_oid).await {
             return Ok(()); // No cached queries for this table
         }
 
         // Parse row data from InsertBody
         let row_data = self.parse_insert_row_data(body)?;
 
-        dbg!(&row_data);
+        // dbg!(&row_data);
 
         // Let cache handle the insert with query-aware filtering
         if let Err(e) = self.cdc_tx.send(CdcMessage::Insert(relation_oid, row_data)) {
@@ -331,19 +332,19 @@ impl CdcProcessor {
     }
 
     /// Processes update messages with query-aware filtering.
-    async fn process_update(&self, body: &UpdateBody) -> Result<(), Error> {
-        dbg!(body);
+    async fn process_update(&mut self, body: &UpdateBody) -> Result<(), Error> {
+        // dbg!(body);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
-        if !self.cached_queries_exist(relation_oid).await {
+        if !self.is_relation_active(relation_oid).await {
             return Ok(()); // No cached queries for this table
         }
 
         // Parse old and new row data from UpdateBody
         let (key_data, new_row_data) = self.parse_update_row_data(body)?;
 
-        dbg!(&key_data, &new_row_data);
+        // dbg!(&key_data, &new_row_data);
 
         // Let cache handle the update with query-aware filtering
         if let Err(e) = self.cdc_tx.send(CdcMessage::Update(CdcMessageUpdate {
@@ -359,19 +360,19 @@ impl CdcProcessor {
     }
 
     /// Processes delete messages with query-aware filtering.
-    async fn process_delete(&self, body: &DeleteBody) -> Result<(), Error> {
-        dbg!(body);
+    async fn process_delete(&mut self, body: &DeleteBody) -> Result<(), Error> {
+        // dbg!(body);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
-        if !self.cached_queries_exist(relation_oid).await {
+        if !self.is_relation_active(relation_oid).await {
             return Ok(()); // No cached queries for this table
         }
 
         // Parse row data from DeleteBody
         let row_data = self.parse_delete_row_data(body)?;
 
-        dbg!(&row_data);
+        // dbg!(&row_data);
 
         // Let cache handle the delete with query-aware filtering
         if let Err(e) = self.cdc_tx.send(CdcMessage::Delete(relation_oid, row_data)) {
@@ -384,7 +385,7 @@ impl CdcProcessor {
 
     /// Processes truncate messages.
     async fn process_truncate(&self, body: &TruncateBody) -> Result<(), Error> {
-        dbg!(body);
+        // dbg!(body);
         // TODO: Apply truncate to cache database when cache synchronization is added
         Ok(())
     }
@@ -528,12 +529,33 @@ impl CdcProcessor {
     }
 
     /// Check if there are any cached queries for a specific table by relation OID.
-    pub async fn cached_queries_exist(&self, relation_oid: u32) -> bool {
-        self.cache
-            .queries
-            .read()
-            .await
-            .iter()
-            .any(|query| query.relation_oid == relation_oid)
+    pub async fn is_relation_active(&mut self, relation_oid: u32) -> bool {
+        if self.active_relations.contains(&relation_oid) {
+            return true;
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        if let Err(e) = self
+            .cdc_tx
+            .send(CdcMessage::RelationCheck(relation_oid, resp_tx))
+        {
+            //todo, halt use of cache and fallback to proxy only mode
+            error!("Failed to handle DELETE for relation {relation_oid}: {e:?}");
+            return true;
+        }
+
+        match resp_rx.await {
+            Ok(has_queries) => {
+                if has_queries {
+                    self.active_relations.insert(relation_oid);
+                }
+                has_queries
+            }
+            Err(_) => {
+                error!("the sender dropped");
+                false
+            }
+        }
     }
 }

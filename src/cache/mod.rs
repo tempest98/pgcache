@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::{io, sync::Arc, thread};
+use std::{io, thread};
 
 use error_set::error_set;
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 use pg_query::ParseResult;
-use tokio::sync::RwLock;
 use tokio::{
     runtime::Builder,
     sync::{
@@ -87,6 +86,7 @@ enum CdcMessage {
     Insert(u32, Vec<Option<String>>),
     Update(CdcMessageUpdate),
     Delete(u32, Vec<Option<String>>),
+    RelationCheck(u32, oneshot::Sender<bool>),
 }
 
 enum StreamSource {
@@ -168,8 +168,8 @@ impl IdHashItem for CachedQuery {
 
 #[derive(Debug, Clone)]
 pub struct Cache {
-    pub tables: Arc<RwLock<BiHashMap<TableMetadata>>>,
-    pub queries: Arc<RwLock<IdHashMap<CachedQuery>>>,
+    pub tables: BiHashMap<TableMetadata>,
+    pub queries: IdHashMap<CachedQuery>,
 }
 
 #[instrument]
@@ -180,8 +180,8 @@ pub fn cache_run(
     thread::scope(|scope| {
         let rt = Builder::new_current_thread().enable_all().build()?;
         let cache = Cache {
-            tables: Arc::new(RwLock::new(BiHashMap::new())),
-            queries: Arc::new(RwLock::new(IdHashMap::new())),
+            tables: BiHashMap::new(),
+            queries: IdHashMap::new(),
         };
 
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
@@ -195,10 +195,9 @@ pub fn cache_run(
         //     .spawn_scoped(scope, || writer_run(&settings, writer_rx))?;
 
         let (cdc_tx, cdc_rx) = mpsc::unbounded_channel();
-        let cache_clone = cache.clone();
         let cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
-            .spawn_scoped(scope, move || cdc_run(settings, cache_clone, cdc_tx))?;
+            .spawn_scoped(scope, move || cdc_run(settings, cdc_tx))?;
 
         let cache_rx_mapped = ReceiverStream::new(cache_rx).map(StreamSource::Proxy);
         let cdc_rx_mapped = UnboundedReceiverStream::new(cdc_rx).map(StreamSource::Cdc);
@@ -248,6 +247,11 @@ pub fn cache_run(
                                     }
                                     CdcMessage::Delete(relation_oid, row_data) => {
                                         let _ = qcache.handle_delete(relation_oid, row_data).await;
+                                    }
+                                    CdcMessage::RelationCheck(relation_oid, reply_tx) => {
+                                        let exists =
+                                            qcache.cached_queries_exist(relation_oid).await;
+                                        let _ = reply_tx.send(exists);
                                     }
                                 },
                             }
@@ -304,16 +308,12 @@ fn worker_run(
     })
 }
 
-fn cdc_run(
-    settings: &Settings,
-    cache: Cache,
-    cdc_tx: UnboundedSender<CdcMessage>,
-) -> Result<(), CacheError> {
+fn cdc_run(settings: &Settings, cdc_tx: UnboundedSender<CdcMessage>) -> Result<(), CacheError> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 
     debug!("cdc loop");
     rt.block_on(async {
-        let mut cdc = CdcProcessor::new(settings, cache, cdc_tx).await?;
+        let mut cdc = CdcProcessor::new(settings, cdc_tx).await?;
         if let Err(e) = cdc.run().await {
             error!("cdc.run() failed {e}");
         }
