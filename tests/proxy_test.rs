@@ -12,6 +12,7 @@ mod util;
 async fn test_proxy() -> Result<(), Error> {
     let db = PgTempDBBuilder::new()
         .with_dbname("origin_test")
+        .with_config_param("wal_level", "logical")
         .start_async()
         .await;
 
@@ -20,6 +21,35 @@ async fn test_proxy() -> Result<(), Error> {
         .start_async()
         .await;
     dbg!(db.data_dir());
+
+    //set up logical replication on origin
+    let (origin, origin_connection) = Config::new()
+        .host("localhost")
+        .port(db.db_port())
+        .user(db.db_user())
+        .dbname(db.db_name())
+        .connect(NoTls)
+        .await
+        .map_err(Error::other)?;
+
+    tokio::spawn(async move {
+        if let Err(e) = origin_connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+
+    origin
+        .execute("CREATE PUBLICATION pub_test FOR ALL TABLES", &[])
+        .await
+        .map_err(Error::other)?;
+
+    origin
+        .query(
+            "SELECT * FROM pg_create_logical_replication_slot('slot_test', 'pgoutput')",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
 
     let mut pgcache = Command::new(env!("CARGO_BIN_EXE_pgcache"))
         .arg("--origin_host")
