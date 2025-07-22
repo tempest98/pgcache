@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use pg_query::ParseResult;
@@ -220,7 +219,7 @@ impl QueryCache {
                 let value = row.get(idx);
                 let col = table
                     .columns
-                    .get(row.columns()[idx].name())
+                    .get1(row.columns()[idx].name())
                     .ok_or(CacheError::UnknownColumn)?;
                 match col.data_type {
                     Type::BOOL => {
@@ -305,7 +304,7 @@ impl QueryCache {
             .await?;
 
         let mut primary_key_columns: Vec<String> = Vec::new();
-        let mut columns: HashMap<String, ColumnMetadata> = HashMap::with_capacity(rows.len());
+        let mut columns: BiHashMap<ColumnMetadata> = BiHashMap::with_capacity(rows.len());
         let mut relation_oid: Option<u32> = None;
 
         for row in &rows {
@@ -329,7 +328,7 @@ impl QueryCache {
             if column.is_primary_key {
                 primary_key_columns.push(column.name.clone());
             }
-            columns.insert(column.name.clone(), column);
+            columns.insert_overwrite(column);
         }
 
         let table = TableMetadata {
@@ -349,7 +348,7 @@ impl QueryCache {
         table_metadata: &TableMetadata,
     ) -> Result<(), CacheError> {
         let mut columns = Vec::new();
-        for column in table_metadata.columns.values() {
+        for column in &table_metadata.columns {
             let column_sql = format!(
                 "    {} {} {}",
                 column.name,
@@ -423,7 +422,7 @@ impl QueryCache {
         let mut column_names = Vec::new();
         let mut values = Vec::new();
 
-        for column_meta in table_metadata.columns.values() {
+        for column_meta in &table_metadata.columns {
             dbg!(&column_meta);
             let position = column_meta.position as usize - 1;
             if position < row_data.len() {
@@ -580,7 +579,7 @@ impl QueryCache {
         let mut where_conditions = Vec::new();
 
         for pk_column in &table_metadata.primary_key_columns {
-            if let Some(column_meta) = table_metadata.columns.get(pk_column) {
+            if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
                 if position < row_data.len() {
                     let value = row_data[position].as_deref().unwrap_or("NULL");

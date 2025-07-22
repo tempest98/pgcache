@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::{io, thread};
 
 use error_set::error_set;
@@ -100,7 +99,7 @@ pub struct TableMetadata {
     pub name: String,
     pub schema: String,
     pub primary_key_columns: Vec<String>,
-    pub columns: HashMap<String, ColumnMetadata>,
+    pub columns: BiHashMap<ColumnMetadata>,
     // pub last_updated: std::time::SystemTime,
     // pub estimated_row_count: Option<i64>,
 }
@@ -134,15 +133,15 @@ pub struct ColumnMetadata {
 }
 
 impl BiHashItem for ColumnMetadata {
-    type K1<'a> = i16;
-    type K2<'a> = &'a str;
+    type K1<'a> = &'a str;
+    type K2<'a> = i16;
 
     fn key1(&self) -> Self::K1<'_> {
-        self.position
+        self.name.as_str()
     }
 
     fn key2(&self) -> Self::K2<'_> {
-        self.name.as_str()
+        self.position
     }
 
     bi_upcast!();

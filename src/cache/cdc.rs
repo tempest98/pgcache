@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use postgres_replication::{
@@ -397,7 +397,7 @@ impl CdcProcessor {
         let schema_name = relation_body.namespace().unwrap_or("public").to_string();
 
         // Build column metadata from relation body
-        let mut columns = HashMap::new();
+        let mut columns = BiHashMap::new();
         let mut primary_key_columns = Vec::new();
 
         for (idx, column) in relation_body.columns().iter().enumerate() {
@@ -422,10 +422,7 @@ impl CdcProcessor {
                 primary_key_columns.push(column.name().unwrap_or("unknown_column").to_string());
             }
 
-            columns.insert(
-                column.name().unwrap_or("unknown_column").to_string(),
-                column_metadata,
-            );
+            columns.insert_overwrite(column_metadata);
         }
 
         TableMetadata {

@@ -52,7 +52,7 @@ fn expr_equal_evaluate(
     // Find column position and get row value
     let row_value = table_metadata
         .columns
-        .get(&column_ref.column)
+        .get1(column_ref.column.as_str())
         .and_then(|col| {
             let pos = col.position as usize - 1;
             row_data.get(pos)
@@ -100,7 +100,7 @@ pub fn is_simple_equality(binary_expr: &BinaryExpr) -> bool {
 mod tests {
     use super::*;
     use crate::cache::ColumnMetadata;
-    use std::collections::HashMap;
+    use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 
     // Tests for where_value_match_string function
@@ -158,43 +158,34 @@ mod tests {
 
     // Helper function to create test table metadata
     fn create_test_table_metadata() -> TableMetadata {
-        let mut columns = HashMap::new();
+        let mut columns = BiHashMap::new();
 
-        columns.insert(
-            "id".to_string(),
-            ColumnMetadata {
-                name: "id".to_string(),
-                position: 1,
-                type_oid: 23, // INT4
-                data_type: Type::INT4,
-                type_name: "integer".to_string(),
-                is_primary_key: true,
-            },
-        );
+        columns.insert_overwrite(ColumnMetadata {
+            name: "id".to_string(),
+            position: 1,
+            type_oid: 23, // INT4
+            data_type: Type::INT4,
+            type_name: "integer".to_string(),
+            is_primary_key: true,
+        });
 
-        columns.insert(
-            "name".to_string(),
-            ColumnMetadata {
-                name: "name".to_string(),
-                position: 2,
-                type_oid: 25, // TEXT
-                data_type: Type::TEXT,
-                type_name: "text".to_string(),
-                is_primary_key: false,
-            },
-        );
+        columns.insert_overwrite(ColumnMetadata {
+            name: "name".to_string(),
+            position: 2,
+            type_oid: 25, // TEXT
+            data_type: Type::TEXT,
+            type_name: "text".to_string(),
+            is_primary_key: false,
+        });
 
-        columns.insert(
-            "active".to_string(),
-            ColumnMetadata {
-                name: "active".to_string(),
-                position: 3,
-                type_oid: 16, // BOOL
-                data_type: Type::BOOL,
-                type_name: "boolean".to_string(),
-                is_primary_key: false,
-            },
-        );
+        columns.insert_overwrite(ColumnMetadata {
+            name: "active".to_string(),
+            position: 3,
+            type_oid: 16, // BOOL
+            data_type: Type::BOOL,
+            type_name: "boolean".to_string(),
+            is_primary_key: false,
+        });
 
         TableMetadata {
             name: "test_table".to_string(),
