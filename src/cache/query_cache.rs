@@ -3,12 +3,11 @@ use std::rc::Rc;
 use pg_query::ParseResult;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow, types::Type};
-use tokio_util::bytes::{Buf, BytesMut};
-use tracing::{debug, info, instrument};
+use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
+use tokio_util::bytes::BytesMut;
+use tracing::{info, instrument, trace};
 
-use crate::cache::query::cache_query_row_matches;
-use crate::pg::protocol::encode::*;
+use crate::cache::query::{cache_query_row_matches, query_select_replace};
 use crate::settings::Settings;
 
 use super::*;
@@ -77,76 +76,45 @@ impl QueryCache {
     #[instrument]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
         let fingerprint = query_fingerprint(&msg.ast).map_err(|_| ParseError::Other)?;
-        let cache_hit = self.cache.queries.contains_key(&fingerprint);
+        let cached_query = self.cache.queries.get(&fingerprint);
 
-        if cache_hit {
+        if cached_query.is_some_and(|q| q.state == CachedQueryState::Ready) {
             self.worker_tx.send(msg).map_err(|e| {
                 error!("worker send {e}");
                 CacheError::WorkerSend
             })
         } else {
-            match self
-                .handle_cache_miss(fingerprint, &msg.data, &msg.ast)
-                .await
-            {
-                Ok(buf) => msg
-                    .reply_tx
-                    .send(CacheReply::Data(buf))
-                    .map_err(|_| CacheError::Reply),
-                Err(e) => {
-                    error!("handle_cached_query failed {e}");
-                    msg.reply_tx
-                        .send(CacheReply::Error(msg.data))
-                        .map_err(|_| CacheError::Reply)
-                }
-            }
+            //forward query and load cache
+            msg.reply_tx
+                .send(CacheReply::Forward(msg.data))
+                .map_err(|_| CacheError::Reply)?;
+
+            if cached_query.is_none() {
+                let table_oid = self.query_register(fingerprint, &msg.ast).await?;
+                let rows = self.query_cache_fetch(&msg.ast).await?;
+                self.query_cache_results(table_oid, &rows).await?;
+                self.cache
+                    .queries
+                    .entry(fingerprint)
+                    .and_modify(|mut query| query.state = CachedQueryState::Ready);
+                trace!("cached query ready");
+            };
+
+            Ok(())
         }
     }
 
     #[instrument]
-    pub async fn handle_cache_miss(
+    pub async fn query_cache_fetch(
         &mut self,
-        fingerprint: u64,
-        data: &BytesMut,
         ast: &ParseResult,
-    ) -> Result<BytesMut, CacheError> {
-        let msg_len = (&data[1..5]).get_u32() as usize;
-        let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
-        // let stmt = query_target.prepare(query).await.unwrap();
-        let res = self.db_origin.simple_query(query).await?;
-        // let res = query_target.query(query, &[]).await;
-        // dbg!(&res);
-
-        let mut buf = BytesMut::new();
-        let SimpleQueryMessage::RowDescription(desc) = &res[0] else {
-            return Err(CacheError::InvalidMessage);
-        };
-        row_description_encode(desc, &mut buf);
-
-        let mut rows = Vec::new();
-        for msg in &res[1..(res.len() - 1)] {
-            match msg {
-                SimpleQueryMessage::Row(row) => {
-                    simple_query_row_encode(row, &mut buf);
-                    rows.push(row);
-                }
-                _ => return Err(CacheError::InvalidMessage),
-            }
-        }
-
-        let SimpleQueryMessage::CommandComplete(cnt) = &res[res.len() - 1] else {
-            return Err(CacheError::InvalidMessage);
-        };
-        command_complete_encode(*cnt, &mut buf);
-        ready_for_query_encode(&mut buf);
-
-        // Create cache table and store results
-        // todo query_register and query_cache_results need to be treated atomically
-        let table_oid = self.query_register(fingerprint, ast).await?;
-        self.query_cache_results(table_oid, &rows).await?;
-
-        debug!("cache miss");
-        Ok(buf)
+    ) -> Result<Vec<SimpleQueryMessage>, CacheError> {
+        let new_ast = query_select_replace(ast);
+        let query = new_ast.deparse()?;
+        self.db_origin
+            .simple_query(&query)
+            .await
+            .map_err(CacheError::PgError)
     }
 
     /// Registers a query in the cache for future lookups.
@@ -175,6 +143,7 @@ impl QueryCache {
 
         // Create CachedQuery entry
         let cached_query = CachedQuery {
+            state: CachedQueryState::Loading,
             fingerprint,
             table_name: table_name.to_owned(),
             relation_oid,
@@ -183,6 +152,7 @@ impl QueryCache {
 
         // Store cached query metadata
         self.cache.queries.insert_overwrite(cached_query);
+        trace!("cached query loading");
 
         Ok(relation_oid)
     }
@@ -200,9 +170,13 @@ impl QueryCache {
     pub async fn query_cache_results(
         &self,
         table_oid: u32,
-        rows: &[&SimpleQueryRow],
+        response: &[SimpleQueryMessage],
     ) -> Result<(), CacheError> {
-        //todo, reorganize for efficiency, use prepared statement
+        if response.len() < 3 {
+            //no results to store
+            return Ok(());
+        }
+
         let table = self
             .cache
             .tables
@@ -212,8 +186,19 @@ impl QueryCache {
         let pkey_columns = &table.primary_key_columns;
         let table_name = table.name.as_str();
 
+        let rows = response
+            .iter()
+            .filter_map(|msg| {
+                if let SimpleQueryMessage::Row(row) = msg {
+                    Some(row)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
         let columns: Vec<&str> = Vec::from_iter(rows[0].columns().iter().map(|c| c.name()));
-        for &row in rows {
+        for &row in &rows {
             let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
             for idx in 0..row.columns().len() {
                 let value = row.get(idx);
@@ -258,8 +243,6 @@ impl QueryCache {
             insert_table.push_str(&pkey_columns.join(","));
             insert_table.push_str(") do update set ");
             insert_table.push_str(&update_columns.join(", "));
-
-            debug!("insert table [{insert_table}]");
 
             self.db_cache.execute_raw(&insert_table, params).await?;
         }

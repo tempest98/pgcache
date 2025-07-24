@@ -148,8 +148,15 @@ impl BiHashItem for ColumnMetadata {
     bi_upcast!();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedQueryState {
+    Ready,
+    Loading,
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedQuery {
+    pub state: CachedQueryState,
     pub fingerprint: u64,
     pub table_name: String,
     pub relation_oid: u32,
