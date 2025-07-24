@@ -265,8 +265,8 @@ async fn handle_connection(
                                     data: buf,
                                 })
                             }
-                            CacheReply::Error(buf) => {
-                                debug!("cache error, forwarding to origin");
+                            CacheReply::Error(buf) | CacheReply::Forward(buf) => {
+                                debug!("forwarding to origin");
                                 //send query to origin instead
                                 proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
                                     message_type: PgFrontendMessageType::Query,

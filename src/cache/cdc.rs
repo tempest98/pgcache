@@ -265,21 +265,21 @@ impl CdcProcessor {
     }
 
     /// Processes transaction begin messages.
-    async fn process_begin(&self, body: &BeginBody) -> Result<(), Error> {
+    async fn process_begin(&self, _body: &BeginBody) -> Result<(), Error> {
         // dbg!(body);
         // TODO: Begin transaction in cache database when cache synchronization is added
         Ok(())
     }
 
     /// Processes transaction commit messages.
-    async fn process_commit(&self, body: &CommitBody) -> Result<(), Error> {
+    async fn process_commit(&self, _body: &CommitBody) -> Result<(), Error> {
         // dbg!(body);
         // TODO: Commit transaction in cache database when cache synchronization is added
         Ok(())
     }
 
     /// Processes origin messages.
-    async fn process_origin(&self, body: &OriginBody) -> Result<(), Error> {
+    async fn process_origin(&self, _body: &OriginBody) -> Result<(), Error> {
         // dbg!(body);
         Ok(())
     }
@@ -302,7 +302,7 @@ impl CdcProcessor {
     }
 
     /// Processes type definition messages.
-    async fn process_type(&self, body: &TypeBody) -> Result<(), Error> {
+    async fn process_type(&self, _body: &TypeBody) -> Result<(), Error> {
         // dbg!(body);
         Ok(())
     }
@@ -384,7 +384,7 @@ impl CdcProcessor {
     }
 
     /// Processes truncate messages.
-    async fn process_truncate(&self, body: &TruncateBody) -> Result<(), Error> {
+    async fn process_truncate(&self, _body: &TruncateBody) -> Result<(), Error> {
         // dbg!(body);
         // TODO: Apply truncate to cache database when cache synchronization is added
         Ok(())

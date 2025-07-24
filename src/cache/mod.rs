@@ -71,6 +71,7 @@ pub enum CacheMessage {
 #[derive(Debug)]
 pub enum CacheReply {
     Data(BytesMut),
+    Forward(BytesMut),
     Error(BytesMut),
 }
 
