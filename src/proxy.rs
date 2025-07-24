@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{self, Error},
     mem,
     net::SocketAddr,
@@ -34,7 +36,7 @@ use tokio_util::{
     bytes::{Buf, BytesMut},
     codec::FramedRead,
 };
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, trace};
 
 error_set! {
     ConnectionError = ConnectError || ReadError || WriteError;
@@ -232,6 +234,8 @@ async fn handle_connection(
     streams_read.insert("client", client_mapped_pin);
     streams_read.insert("origin", origin_mapped_pin);
 
+    let mut fingerprint_cache: HashMap<u64, bool> = HashMap::new();
+
     loop {
         // dbg!(&proxy_mode);
         match proxy_mode {
@@ -241,16 +245,17 @@ async fn handle_connection(
                         Ok(StreamSource::ClientRead(msg)) => {
                             // dbg!(&msg);
                             if matches!(msg.message_type, PgFrontendMessageType::Query) {
-                                proxy_mode = match handle_query(&msg.data).await {
-                                    Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
-                                    Ok(Action::CacheCheck(ast)) => {
-                                        ProxyMode::CacheWrite(CacheMessage::Query(msg.data, ast))
-                                    }
-                                    Err(e) => {
-                                        error!("handle_query {}", e);
-                                        ProxyMode::OriginWrite(msg)
-                                    }
-                                };
+                                proxy_mode =
+                                    match handle_query(&msg.data, &mut fingerprint_cache).await {
+                                        Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
+                                        Ok(Action::CacheCheck(ast)) => ProxyMode::CacheWrite(
+                                            CacheMessage::Query(msg.data, ast),
+                                        ),
+                                        Err(e) => {
+                                            error!("handle_query {}", e);
+                                            ProxyMode::OriginWrite(msg)
+                                        }
+                                    };
                             } else {
                                 proxy_mode = ProxyMode::OriginWrite(msg);
                             }
@@ -320,14 +325,36 @@ enum Action {
     CacheCheck(ParseResult),
 }
 
-async fn handle_query(data: &BytesMut) -> Result<Action, ParseError> {
+async fn handle_query(
+    data: &BytesMut,
+    fp_cache: &mut HashMap<u64, bool>,
+) -> Result<Action, ParseError> {
     let msg_len = (&data[1..5]).get_u32() as usize;
     let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
 
-    let ast = pg_query::parse(query)?;
-    if is_cacheable(&ast) {
-        Ok(Action::CacheCheck(ast))
-    } else {
-        Ok(Action::Forward)
+    let mut hasher = DefaultHasher::new();
+    query.hash(&mut hasher);
+    let fingerprint = hasher.finish();
+
+    match fp_cache.get(&fingerprint) {
+        Some(true) => {
+            trace!("cache hit: cacheable true");
+            let ast = pg_query::parse(query)?;
+            Ok(Action::CacheCheck(ast))
+        }
+        Some(false) => {
+            trace!("cache hit: cacheable false");
+            Ok(Action::Forward)
+        }
+        None => {
+            let ast = pg_query::parse(query)?;
+            if is_cacheable(&ast) {
+                fp_cache.insert(fingerprint, true);
+                Ok(Action::CacheCheck(ast))
+            } else {
+                fp_cache.insert(fingerprint, false);
+                Ok(Action::Forward)
+            }
+        }
     }
 }
