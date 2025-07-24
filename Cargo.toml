@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "pgcache_lib"
 path = "src/lib.rs"
 
+[profile.profiling]
+inherits = "release"
+debug = true
+
 [dependencies]
 tokio = { version = "1.46.0", features = ["full"] }
 tokio-util = "0.7.15"
@@ -41,10 +45,3 @@ iddqd = "0.3.8"
 
 [dev-dependencies]
 pgtemp = "0.6.0"
-
-# async-trait = "0.1.88"
-# md5 = "0.7"
-# futures = "0.3.31"
-# byteorder = "1.5.0"
-# bytes = "1.10.1"
-# thiserror = "2.0.12"
