@@ -60,6 +60,7 @@ error_set! {
     TableError = {
         UnknownTable,
         UnknownColumn,
+        NoPrimaryKey,
     };
 }
 

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use pg_query::ParseResult;
@@ -26,7 +27,7 @@ pub struct QueryCache {
 
     worker_tx: UnboundedSender<QueryRequest>,
 
-    cache: Cache,
+    cache: Rc<RefCell<Cache>>,
 }
 
 impl QueryCache {
@@ -69,16 +70,21 @@ impl QueryCache {
             db_cache: Rc::new(cache_client),
             db_origin: Rc::new(origin_client),
             worker_tx,
-            cache,
+            cache: Rc::new(RefCell::new(cache)),
         })
     }
 
     #[instrument]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
         let fingerprint = query_fingerprint(&msg.ast).map_err(|_| ParseError::Other)?;
-        let cached_query = self.cache.queries.get(&fingerprint);
+        let cached_query_state = self
+            .cache
+            .borrow()
+            .queries
+            .get(&fingerprint)
+            .map(|q| q.state);
 
-        if cached_query.is_some_and(|q| q.state == CachedQueryState::Ready) {
+        if cached_query_state.is_some_and(|state| state == CachedQueryState::Ready) {
             self.worker_tx.send(msg).map_err(|e| {
                 error!("worker send {e}");
                 CacheError::WorkerSend
@@ -89,15 +95,15 @@ impl QueryCache {
                 .send(CacheReply::Forward(msg.data))
                 .map_err(|_| CacheError::Reply)?;
 
-            if cached_query.is_none() {
+            if cached_query_state.is_none() {
                 let table_oid = self.query_register(fingerprint, &msg.ast).await?;
                 let rows = self.query_cache_fetch(&msg.ast).await?;
                 self.query_cache_results(table_oid, &rows).await?;
                 self.cache
+                    .borrow_mut()
                     .queries
                     .entry(fingerprint)
                     .and_modify(|mut query| query.state = CachedQueryState::Ready);
-                trace!("cached query ready");
             };
 
             Ok(())
@@ -126,13 +132,19 @@ impl QueryCache {
     ) -> Result<u32, CacheError> {
         let table_name = &ast.select_tables()[0];
 
-        if !self.cache.tables.contains_key2(table_name.as_str()) {
+        if !self
+            .cache
+            .borrow()
+            .tables
+            .contains_key2(table_name.as_str())
+        {
             let table = self.cache_table_create(table_name).await?;
-            self.cache.tables.insert_overwrite(table);
+            self.cache.borrow_mut().tables.insert_overwrite(table);
         }
 
         let relation_oid = self
             .cache
+            .borrow()
             .tables
             .get2(table_name.as_str())
             .ok_or(CacheError::UnknownTable)?
@@ -151,7 +163,10 @@ impl QueryCache {
         };
 
         // Store cached query metadata
-        self.cache.queries.insert_overwrite(cached_query);
+        self.cache
+            .borrow_mut()
+            .queries
+            .insert_overwrite(cached_query);
         trace!("cached query loading");
 
         Ok(relation_oid)
@@ -160,6 +175,7 @@ impl QueryCache {
     /// Check if there are any cached queries for a specific table by relation OID.
     pub async fn cached_queries_exist(&self, relation_oid: u32) -> bool {
         self.cache
+            .borrow()
             .queries
             .iter()
             .any(|query| query.relation_oid == relation_oid)
@@ -176,75 +192,82 @@ impl QueryCache {
             //no results to store
             return Ok(());
         }
+        let sql_list = {
+            let cache = self.cache.borrow();
+            let table = cache
+                .tables
+                .get1(&table_oid)
+                .ok_or(CacheError::UnknownTable)?;
 
-        let table = self
-            .cache
-            .tables
-            .get1(&table_oid)
-            .ok_or(CacheError::UnknownTable)?;
+            let pkey_columns = &table.primary_key_columns;
+            let table_name = table.name.as_str();
 
-        let pkey_columns = &table.primary_key_columns;
-        let table_name = table.name.as_str();
-
-        let rows = response
-            .iter()
-            .filter_map(|msg| {
-                if let SimpleQueryMessage::Row(row) = msg {
-                    Some(row)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let columns: Vec<&str> = Vec::from_iter(rows[0].columns().iter().map(|c| c.name()));
-        for &row in &rows {
-            let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
-            for idx in 0..row.columns().len() {
-                let value = row.get(idx);
-                let col = table
-                    .columns
-                    .get1(row.columns()[idx].name())
-                    .ok_or(CacheError::UnknownColumn)?;
-                match col.data_type {
-                    Type::BOOL => {
-                        params.push(Box::new(value.and_then(|v| v.parse::<bool>().ok())));
-                    }
-                    Type::INT4 => {
-                        params.push(Box::new(value.and_then(|v| v.parse::<i32>().ok())));
-                    }
-                    Type::OID => {
-                        params.push(Box::new(value.and_then(|v| v.parse::<u32>().ok())));
-                    }
-                    Type::VARCHAR | Type::TEXT => {
-                        params.push(Box::new(value));
-                    }
-                    _ => {
-                        params.push(Box::new(value));
-                    }
-                };
-            }
-
-            let mut values: Vec<String> = Vec::new();
-            for i in 0..params.len() {
-                values.push(format!("${}", i + 1));
-            }
-
-            let update_columns = columns
+            let rows = response
                 .iter()
-                .filter(|&&c| !pkey_columns.contains(&c.to_owned()))
-                .map(|&c| format!("{c} = EXCLUDED.{c}"))
+                .filter_map(|msg| {
+                    if let SimpleQueryMessage::Row(row) = msg {
+                        Some(row)
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>();
 
-            let mut insert_table =
-                format!("insert into {}({}) values (", table_name, columns.join(","));
-            insert_table.push_str(&values.join(","));
-            insert_table.push_str(") on conflict (");
-            insert_table.push_str(&pkey_columns.join(","));
-            insert_table.push_str(") do update set ");
-            insert_table.push_str(&update_columns.join(", "));
+            let mut sql_list = Vec::new();
+            let columns: Vec<&str> = Vec::from_iter(rows[0].columns().iter().map(|c| c.name()));
+            for &row in &rows {
+                let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+                for idx in 0..row.columns().len() {
+                    let value = row.get(idx);
+                    let col = table
+                        .columns
+                        .get1(row.columns()[idx].name())
+                        .ok_or(CacheError::UnknownColumn)?;
+                    match col.data_type {
+                        Type::BOOL => {
+                            params.push(Box::new(value.and_then(|v| v.parse::<bool>().ok())));
+                        }
+                        Type::INT4 => {
+                            params.push(Box::new(value.and_then(|v| v.parse::<i32>().ok())));
+                        }
+                        Type::OID => {
+                            params.push(Box::new(value.and_then(|v| v.parse::<u32>().ok())));
+                        }
+                        Type::VARCHAR | Type::TEXT => {
+                            params.push(Box::new(value));
+                        }
+                        _ => {
+                            params.push(Box::new(value));
+                        }
+                    };
+                }
 
-            self.db_cache.execute_raw(&insert_table, params).await?;
+                let mut values: Vec<String> = Vec::new();
+                for i in 0..params.len() {
+                    values.push(format!("${}", i + 1));
+                }
+
+                let update_columns = columns
+                    .iter()
+                    .filter(|&&c| !pkey_columns.contains(&c.to_owned()))
+                    .map(|&c| format!("{c} = EXCLUDED.{c}"))
+                    .collect::<Vec<_>>();
+
+                let mut insert_table =
+                    format!("insert into {}({}) values (", table_name, columns.join(","));
+                insert_table.push_str(&values.join(","));
+                insert_table.push_str(") on conflict (");
+                insert_table.push_str(&pkey_columns.join(","));
+                insert_table.push_str(") do update set ");
+                insert_table.push_str(&update_columns.join(", "));
+
+                sql_list.push((insert_table, params));
+            }
+            sql_list
+        };
+
+        for (sql, params) in sql_list {
+            self.db_cache.execute_raw(sql.as_str(), params).await?;
         }
 
         Ok(())
@@ -365,7 +388,7 @@ impl QueryCache {
         let relation_oid = table_metadata.relation_oid;
 
         // Check if table already exists
-        let table_exists = self.cache.tables.contains_key1(&relation_oid);
+        let table_exists = self.cache.borrow().tables.contains_key1(&relation_oid);
 
         if table_exists {
             // TODO: Handle schema changes when table already exists
@@ -387,18 +410,20 @@ impl QueryCache {
             .await?;
 
         // Store CDC metadata in both indexes
-        self.cache.tables.insert_overwrite(table_metadata);
+        self.cache
+            .borrow_mut()
+            .tables
+            .insert_overwrite(table_metadata);
 
         Ok(())
     }
 
-    /// Apply UPSERT to cache database.
     #[instrument]
-    async fn cache_upsert_apply(
+    fn cache_upsert_sql(
         &self,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
-    ) -> Result<(), CacheError> {
+    ) -> Result<String, CacheError> {
         // For now, use a simplified approach without parameters to avoid ToSql complexity
 
         // Build column names and values for INSERT
@@ -406,7 +431,6 @@ impl QueryCache {
         let mut values = Vec::new();
 
         for column_meta in &table_metadata.columns {
-            dbg!(&column_meta);
             let position = column_meta.position as usize - 1;
             if position < row_data.len() {
                 let value = row_data[position]
@@ -434,15 +458,7 @@ impl QueryCache {
                 .join(", ")
         );
 
-        // Execute the INSERT
-        // TODO: Replace with proper parameterized query once ToSql issues are resolved
-        let simple_sql = sql.replace("$", "");
-        println!("Executing cache INSERT: {simple_sql}");
-
-        // Placeholder - in a real implementation we'd execute the parameterized query
-        self.db_cache.execute(&sql, &[]).await?;
-
-        Ok(())
+        Ok(sql)
     }
 
     /// Handle INSERT operation with query-aware filtering.
@@ -454,32 +470,35 @@ impl QueryCache {
         row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
         // Get cached queries that reference this table
-        let cached_queries = self
-            .cache
-            .queries
-            .iter()
-            .filter(|query| query.relation_oid == relation_oid);
+        let sql_list = {
+            let cache = self.cache.borrow();
+            let cached_queries = cache
+                .queries
+                .iter()
+                .filter(|query| query.relation_oid == relation_oid);
 
-        // Get table metadata for column information
-        let table_metadata = match self.cache.tables.get1(&relation_oid) {
-            Some(metadata) => metadata,
-            None => {
-                error!("No table metadata found for relation_oid: {}", relation_oid);
-                return Ok(());
-            }
-        };
+            // Get table metadata for column information
+            let table_metadata = match cache.tables.get1(&relation_oid) {
+                Some(metadata) => metadata,
+                None => {
+                    error!("No table metadata found for relation_oid: {}", relation_oid);
+                    return Ok(());
+                }
+            };
 
-        // Check each cached query to see if this INSERT affects it
-        for query in cached_queries {
-            if cache_query_row_matches(query, &row_data, table_metadata) {
-                // This INSERT affects the cached query, apply it to the cache
-                if let Err(e) = self.cache_upsert_apply(table_metadata, &row_data).await {
-                    error!(
-                        "Failed to apply INSERT to cache for query {}: {:?}",
-                        query.fingerprint, e
-                    );
+            // Check each cached query to see if this INSERT affects it
+            let mut sql_list = Vec::new();
+            for query in cached_queries {
+                if cache_query_row_matches(query, &row_data, table_metadata) {
+                    sql_list.push(self.cache_upsert_sql(table_metadata, &row_data)?);
                 }
             }
+
+            sql_list
+        };
+
+        for sql in sql_list {
+            self.db_cache.execute(sql.as_str(), &[]).await?;
         }
 
         Ok(())
@@ -495,33 +514,40 @@ impl QueryCache {
         new_row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
         // Get table metadata for column information
-        let table_metadata = match self.cache.tables.get1(&relation_oid) {
-            Some(metadata) => metadata,
-            None => {
-                error!("No table metadata found for relation_oid: {relation_oid}");
-                return Ok(());
-            }
+        let (sql, maybe_key_sql) = {
+            let cache = self.cache.borrow();
+            let table_metadata = match cache.tables.get1(&relation_oid) {
+                Some(metadata) => metadata,
+                None => {
+                    error!("No table metadata found for relation_oid: {relation_oid}");
+                    return Ok(());
+                }
+            };
+
+            // Check each cached query to see if this UPDATE affects it
+            let matched = cache
+                .queries
+                .iter()
+                .filter(|query| query.relation_oid == relation_oid)
+                .any(|query| cache_query_row_matches(query, &new_row_data, table_metadata));
+
+            let sql = if matched {
+                self.cache_upsert_sql(table_metadata, &new_row_data)?
+            } else {
+                self.cache_delete_sql(table_metadata, &new_row_data)?
+            };
+
+            let maybe_key_sql = if !key_data.is_empty() {
+                Some(self.cache_delete_sql(table_metadata, &key_data)?)
+            } else {
+                None
+            };
+            (sql, maybe_key_sql)
         };
 
-        // Check each cached query to see if this UPDATE affects it
-        let matched = self
-            .cache
-            .queries
-            .iter()
-            .filter(|query| query.relation_oid == relation_oid)
-            .any(|query| cache_query_row_matches(query, &new_row_data, table_metadata));
-
-        if matched {
-            if let Err(e) = self.cache_upsert_apply(table_metadata, &new_row_data).await {
-                error!("Failed to apply UPSERT to cache for query during UPDATE: {e:?}");
-            }
-        } else {
-            self.cache_delete_apply(table_metadata, &new_row_data)
-                .await?;
-        }
-
-        if !key_data.is_empty() {
-            self.cache_delete_apply(table_metadata, &key_data).await?;
+        self.db_cache.execute(sql.as_str(), &[]).await?;
+        if let Some(key_sql) = maybe_key_sql {
+            self.db_cache.execute(key_sql.as_str(), &[]).await?;
         }
 
         Ok(())
@@ -535,29 +561,31 @@ impl QueryCache {
         row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
         // Get table metadata for column information
-        let table_metadata = match self.cache.tables.get1(&relation_oid) {
-            Some(metadata) => metadata,
-            None => {
-                error!("No table metadata found for relation_oid: {}", relation_oid);
-                return Ok(());
-            }
+        let delete_sql = {
+            let cache = self.cache.borrow();
+            let table_metadata = match cache.tables.get1(&relation_oid) {
+                Some(metadata) => metadata,
+                None => {
+                    error!("No table metadata found for relation_oid: {}", relation_oid);
+                    return Ok(());
+                }
+            };
+
+            self.cache_delete_sql(table_metadata, &row_data)?
         };
 
-        // Apply DELETE to cache - if row doesn't exist, DELETE will be a no-op
-        if let Err(e) = self.cache_delete_apply(table_metadata, &row_data).await {
-            error!("Failed to apply DELETE to cache: {:?}", e);
-        }
+        self.db_cache.execute(delete_sql.as_str(), &[]).await?;
 
         Ok(())
     }
 
     /// Apply DELETE to cache database by removing matching rows.
     #[instrument]
-    async fn cache_delete_apply(
+    fn cache_delete_sql(
         &self,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
-    ) -> Result<(), CacheError> {
+    ) -> Result<String, CacheError> {
         // Build WHERE clause using primary key columns
         let mut where_conditions = Vec::new();
 
@@ -573,7 +601,7 @@ impl QueryCache {
 
         if where_conditions.is_empty() {
             error!("Cannot build DELETE WHERE clause: no primary key values found");
-            return Ok(());
+            return Err(CacheError::NoPrimaryKey);
         }
 
         let sql = format!(
@@ -582,11 +610,6 @@ impl QueryCache {
             where_conditions.join(" AND ")
         );
 
-        println!("Executing cache DELETE: {sql}");
-
-        // Execute the DELETE
-        self.db_cache.execute(&sql, &[]).await?;
-
-        Ok(())
+        Ok(sql)
     }
 }
