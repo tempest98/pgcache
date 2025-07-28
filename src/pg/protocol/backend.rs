@@ -3,7 +3,6 @@ use tokio_util::{
     bytes::{Buf, BytesMut},
     codec::Decoder,
 };
-use tracing::{instrument, trace};
 
 use super::*;
 
@@ -142,7 +141,6 @@ impl Decoder for PgBackendMessageCodec {
     type Item = PgMessage<PgBackendMessageType>;
     type Error = ProtocolError;
 
-    #[instrument]
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if !buf.has_remaining() {
             return Ok(None);
@@ -183,7 +181,6 @@ impl Decoder for PgBackendMessageCodec {
                         data: buf.split_to(msg_len),
                     }))
                 } else {
-                    trace!("{:?}", buf);
                     Err(ProtocolError::UnrecognizedMessageType {
                         tag: buf[0].escape_ascii().to_string(),
                     })
