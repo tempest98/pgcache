@@ -9,14 +9,13 @@ use std::{
 };
 
 use crate::{
-    cache::{CacheMessage, CacheReply, query::is_cacheable},
+    cache::{CacheMessage, CacheReply, ProxyMessage, query::is_cacheable},
     pg::protocol::{
         ProtocolError,
         backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
         frontend::{PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType},
     },
     settings::Settings,
-    stream_utils::ReceiverStream,
 };
 
 use error_set::{ErrContext, error_set};
@@ -25,13 +24,10 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
     runtime::Builder,
-    sync::{
-        mpsc::{Sender, UnboundedReceiver, UnboundedSender, unbounded_channel},
-        oneshot,
-    },
+    sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel},
     task::{LocalSet, spawn_local},
 };
-use tokio_stream::{Stream, StreamExt, StreamMap};
+use tokio_stream::{Stream, StreamExt, StreamMap, wrappers::ReceiverStream};
 use tokio_util::{
     bytes::{Buf, BytesMut},
     codec::FramedRead,
@@ -65,11 +61,13 @@ type Worker<'scope> = (
     UnboundedSender<TcpStream>,
 );
 
+type SenderCacheType = Sender<ProxyMessage>;
+
 fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     worker_id: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
+    cache_tx: SenderCacheType,
 ) -> Result<Worker<'scope>, Error> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
@@ -84,7 +82,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     worker_index: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
+    cache_tx: SenderCacheType,
 ) -> Result<bool, Error> {
     if workers[worker_index].0.is_finished() {
         let new_worker = worker_create(worker_index, scope, settings, cache_tx)?;
@@ -97,10 +95,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
 }
 
 #[instrument]
-pub fn proxy_run(
-    settings: &Settings,
-    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
-) -> Result<(), ConnectionError> {
+pub fn proxy_run(settings: &Settings, cache_tx: SenderCacheType) -> Result<(), ConnectionError> {
     thread::scope(|scope| {
         let mut workers: Vec<_> = (0..settings.num_workers)
             .map(|i| worker_create(i, scope, settings, cache_tx.clone()))
@@ -140,7 +135,7 @@ pub fn proxy_run(
 pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
-    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
+    cache_tx: SenderCacheType,
 ) -> Result<(), Error> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 
@@ -193,7 +188,7 @@ type StreamSourceResult = Result<StreamSource, ProtocolError>;
 async fn handle_connection(
     client_socket: &mut TcpStream,
     addrs: Vec<SocketAddr>,
-    cache_tx: Sender<(CacheMessage, oneshot::Sender<CacheReply>)>,
+    cache_tx: SenderCacheType,
 ) -> Result<(), ConnectionError> {
     let mut maybe_stream: Option<TcpStream> = None;
     for addr in &addrs {
@@ -212,13 +207,11 @@ async fn handle_connection(
 
     let mut proxy_mode = ProxyMode::Read;
 
-    let (client_read, client_write) = client_socket.split();
+    let (client_read, mut client_write) = client_socket.split();
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
-    let mut client_stream_write = client_write;
 
-    let (origin_read, origin_write) = origin_stream.split();
+    let (origin_read, mut origin_write) = origin_stream.split();
     let origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
-    let mut origin_stream_write = origin_write;
 
     let client_mapped = client_framed_read.map(|item| item.map(StreamSource::ClientRead));
     let origin_mapped = origin_framed_read.map(|item| item.map(StreamSource::OriginRead));
@@ -289,20 +282,20 @@ async fn handle_connection(
                 }
             }
             ProxyMode::OriginWrite(ref mut msg) => {
-                origin_stream_write.write_buf(&mut msg.data).await?;
+                origin_write.write_buf(&mut msg.data).await?;
                 if !msg.data.has_remaining() {
                     proxy_mode = ProxyMode::Read;
                 }
             }
             ProxyMode::ClientWrite(ref mut msg) => {
                 // dbg!(&msg);
-                client_stream_write.write_buf(&mut msg.data).await?;
+                client_write.write_buf(&mut msg.data).await?;
                 if !msg.data.has_remaining() {
                     proxy_mode = ProxyMode::Read;
                 }
             }
             ProxyMode::CacheWrite(msg) => {
-                let (resp_tx, resp_rx) = oneshot::channel();
+                let (resp_tx, resp_rx) = channel(10);
                 let stream_rx = Box::pin(
                     ReceiverStream::new(resp_rx).map(|item| Ok(StreamSource::CacheRead(item))),
                 );

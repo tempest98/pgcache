@@ -6,7 +6,7 @@ use pg_query::ParseResult;
 use tokio::{
     runtime::Builder,
     sync::{
-        mpsc::{self, Receiver, UnboundedReceiver, UnboundedSender},
+        mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
     task::{LocalSet, spawn_local},
@@ -90,8 +90,10 @@ enum CdcMessage {
     RelationCheck(u32, oneshot::Sender<bool>),
 }
 
+pub type ProxyMessage = (CacheMessage, Sender<CacheReply>);
+
 enum StreamSource {
-    Proxy((CacheMessage, oneshot::Sender<CacheReply>)),
+    Proxy(ProxyMessage),
     Cdc(CdcMessage),
 }
 
@@ -181,10 +183,7 @@ pub struct Cache {
 }
 
 #[instrument]
-pub fn cache_run(
-    settings: &Settings,
-    cache_rx: Receiver<(CacheMessage, oneshot::Sender<CacheReply>)>,
-) -> Result<(), CacheError> {
+pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Result<(), CacheError> {
     thread::scope(|scope| {
         let rt = Builder::new_current_thread().enable_all().build()?;
         let cache = Cache {
@@ -295,13 +294,18 @@ fn worker_run(
                         debug!("cache worker task spawn");
                         match worker.handle_cached_query(&msg.data, &msg.ast).await {
                             Ok(buf) => {
-                                if msg.reply_tx.send(CacheReply::Data(buf)).is_err() {
+                                if msg.reply_tx.send(CacheReply::Data(buf)).await.is_err() {
                                     error!("no receiver");
                                 }
                             }
                             Err(e) => {
                                 error!("handle_cached_query failed {e}");
-                                if msg.reply_tx.send(CacheReply::Error(msg.data)).is_err() {
+                                if msg
+                                    .reply_tx
+                                    .send(CacheReply::Error(msg.data))
+                                    .await
+                                    .is_err()
+                                {
                                     error!("no receiver");
                                 }
                             }

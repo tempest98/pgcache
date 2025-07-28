@@ -17,7 +17,7 @@ use super::*;
 pub struct QueryRequest {
     pub data: BytesMut,
     pub ast: ParseResult,
-    pub reply_tx: oneshot::Sender<CacheReply>,
+    pub reply_tx: Sender<CacheReply>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +93,7 @@ impl QueryCache {
             //forward query and load cache
             msg.reply_tx
                 .send(CacheReply::Forward(msg.data))
+                .await
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
@@ -104,6 +105,7 @@ impl QueryCache {
                     .queries
                     .entry(fingerprint)
                     .and_modify(|mut query| query.state = CachedQueryState::Ready);
+                trace!("cached query ready");
             };
 
             Ok(())
