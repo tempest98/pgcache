@@ -74,7 +74,7 @@ impl QueryCache {
         })
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
         let fingerprint = query_fingerprint(&msg.ast).map_err(|_| ParseError::Other)?;
         let cached_query_state = self
@@ -112,7 +112,7 @@ impl QueryCache {
         }
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn query_cache_fetch(
         &mut self,
         ast: &ParseResult,
@@ -126,7 +126,7 @@ impl QueryCache {
     }
 
     /// Registers a query in the cache for future lookups.
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
@@ -184,7 +184,7 @@ impl QueryCache {
     }
 
     /// Stores query results in the cache for faster retrieval.
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn query_cache_results(
         &self,
         table_oid: u32,
@@ -275,14 +275,14 @@ impl QueryCache {
         Ok(())
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     async fn cache_table_create(&self, table_name: &str) -> Result<TableMetadata, CacheError> {
         let table = self.query_table_metadata(table_name).await?;
         self.cache_table_create_from_metadata(&table).await?;
         Ok(table)
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     async fn query_table_metadata(&self, table_name: &str) -> Result<TableMetadata, CacheError> {
         let create_table_sql = r"
             SELECT
@@ -350,7 +350,7 @@ impl QueryCache {
         Ok(table)
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     async fn cache_table_create_from_metadata(
         &self,
         table_metadata: &TableMetadata,
@@ -382,7 +382,7 @@ impl QueryCache {
     }
 
     /// Register table metadata from CDC processing.
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn cache_table_register(
         &mut self,
         table_metadata: TableMetadata,
@@ -420,7 +420,6 @@ impl QueryCache {
         Ok(())
     }
 
-    #[instrument]
     fn cache_upsert_sql(
         &self,
         table_metadata: &TableMetadata,
@@ -465,7 +464,7 @@ impl QueryCache {
 
     /// Handle INSERT operation with query-aware filtering.
     /// Applies the insert to cache entries that match the filter conditions.
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn handle_insert(
         &self,
         relation_oid: u32,
@@ -508,7 +507,8 @@ impl QueryCache {
 
     /// Handle UPDATE operation with query-aware filtering.
     /// Analyzes old and new values to determine cache operations needed.
-    #[instrument]
+    #[instrument(skip_all)]
+
     pub async fn handle_update(
         &self,
         relation_oid: u32,
@@ -556,7 +556,7 @@ impl QueryCache {
     }
 
     /// Handle DELETE operation by removing the row from cache.
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn handle_delete(
         &self,
         relation_oid: u32,
@@ -582,7 +582,7 @@ impl QueryCache {
     }
 
     /// Apply DELETE to cache database by removing matching rows.
-    #[instrument]
+    #[instrument(skip_all)]
     fn cache_delete_sql(
         &self,
         table_metadata: &TableMetadata,

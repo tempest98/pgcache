@@ -188,7 +188,7 @@ pub struct Cache {
     pub queries: IdHashMap<CachedQuery>,
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Result<(), CacheError> {
     thread::scope(|scope| {
         let rt = Builder::new_current_thread().enable_all().build()?;
