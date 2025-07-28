@@ -3,7 +3,6 @@ use std::rc::Rc;
 
 use pg_query::ParseResult;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
@@ -218,35 +217,13 @@ impl QueryCache {
             let mut sql_list = Vec::new();
             let columns: Vec<&str> = Vec::from_iter(rows[0].columns().iter().map(|c| c.name()));
             for &row in &rows {
-                let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
-                for idx in 0..row.columns().len() {
-                    let value = row.get(idx);
-                    let col = table
-                        .columns
-                        .get1(row.columns()[idx].name())
-                        .ok_or(CacheError::UnknownColumn)?;
-                    match col.data_type {
-                        Type::BOOL => {
-                            params.push(Box::new(value.and_then(|v| v.parse::<bool>().ok())));
-                        }
-                        Type::INT4 => {
-                            params.push(Box::new(value.and_then(|v| v.parse::<i32>().ok())));
-                        }
-                        Type::OID => {
-                            params.push(Box::new(value.and_then(|v| v.parse::<u32>().ok())));
-                        }
-                        Type::VARCHAR | Type::TEXT => {
-                            params.push(Box::new(value));
-                        }
-                        _ => {
-                            params.push(Box::new(value));
-                        }
-                    };
-                }
-
                 let mut values: Vec<String> = Vec::new();
-                for i in 0..params.len() {
-                    values.push(format!("${}", i + 1));
+                for idx in 0..row.columns().len() {
+                    values.push(
+                        row.get(idx)
+                            .map(|v| format!("'{v}'"))
+                            .unwrap_or("NULL".to_owned()),
+                    );
                 }
 
                 let update_columns = columns
@@ -263,14 +240,14 @@ impl QueryCache {
                 insert_table.push_str(") do update set ");
                 insert_table.push_str(&update_columns.join(", "));
 
-                sql_list.push((insert_table, params));
+                sql_list.push(insert_table);
             }
             sql_list
         };
 
-        for (sql, params) in sql_list {
-            self.db_cache.execute_raw(sql.as_str(), params).await?;
-        }
+        self.db_cache
+            .simple_query(sql_list.join(";").as_str())
+            .await?;
 
         Ok(())
     }
