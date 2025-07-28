@@ -69,9 +69,15 @@ pub enum CacheMessage {
     Query(BytesMut, ParseResult),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataStreamState {
+    Incomplete,
+    Complete,
+}
+
 #[derive(Debug)]
 pub enum CacheReply {
-    Data(BytesMut),
+    Data(BytesMut, DataStreamState),
     Forward(BytesMut),
     Error(BytesMut),
 }
@@ -292,12 +298,8 @@ fn worker_run(
                     let worker = worker.clone();
                     spawn_local(async move {
                         debug!("cache worker task spawn");
-                        match worker.handle_cached_query(&msg.data, &msg.ast).await {
-                            Ok(buf) => {
-                                if msg.reply_tx.send(CacheReply::Data(buf)).await.is_err() {
-                                    error!("no receiver");
-                                }
-                            }
+                        match worker.handle_cached_query(&msg).await {
+                            Ok(_) => (),
                             Err(e) => {
                                 error!("handle_cached_query failed {e}");
                                 if msg

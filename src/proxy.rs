@@ -257,7 +257,7 @@ async fn handle_connection(
                             proxy_mode = ProxyMode::ClientWrite(msg);
                         }
                         Ok(StreamSource::CacheRead(reply)) => match reply {
-                            CacheReply::Data(buf) => {
+                            CacheReply::Data(buf, _is_complete) => {
                                 proxy_mode = ProxyMode::ClientWrite(PgBackendMessage {
                                     message_type: PgBackendMessageType::Multi,
                                     data: buf,
