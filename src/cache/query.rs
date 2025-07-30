@@ -4,7 +4,7 @@ use pg_query::protobuf::{
 };
 
 use crate::query::{
-    evaluate::{is_simple_equality, where_expr_evaluate},
+    evaluate::{is_simple_comparison, where_expr_evaluate},
     parse::{WhereExpr, WhereOp, query_select_has_sublink, query_where_clause_parse},
 };
 
@@ -33,9 +33,14 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
     match expr {
         WhereExpr::Binary(binary_expr) => {
             match binary_expr.op {
-                WhereOp::Equal => {
-                    // Simple equality: column = value
-                    is_simple_equality(binary_expr)
+                WhereOp::Equal
+                | WhereOp::NotEqual
+                | WhereOp::LessThan
+                | WhereOp::LessThanOrEqual
+                | WhereOp::GreaterThan
+                | WhereOp::GreaterThanOrEqual => {
+                    // Simple comparison: column op value
+                    is_simple_comparison(binary_expr)
                 }
                 WhereOp::And => {
                     // AND: both sides must be cacheable

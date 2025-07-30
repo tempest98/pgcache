@@ -12,7 +12,14 @@ pub fn where_expr_evaluate(
     match expr {
         WhereExpr::Binary(binary_expr) => {
             match binary_expr.op {
-                WhereOp::Equal => expr_equal_evaluate(binary_expr, row_data, table_metadata),
+                WhereOp::Equal
+                | WhereOp::NotEqual
+                | WhereOp::LessThan
+                | WhereOp::LessThanOrEqual
+                | WhereOp::GreaterThan
+                | WhereOp::GreaterThanOrEqual => {
+                    expr_comparison_evaluate(binary_expr, row_data, table_metadata)
+                }
                 WhereOp::And => {
                     // Both sides must be true
                     where_expr_evaluate(&binary_expr.lexpr, row_data, table_metadata)
@@ -36,13 +43,13 @@ pub fn where_expr_evaluate(
     }
 }
 
-/// Evaluate a simple equality expression (column = value) against row data.
-fn expr_equal_evaluate(
+/// Evaluate a comparison expression (column op value) against row data.
+fn expr_comparison_evaluate(
     binary_expr: &BinaryExpr,
     row_data: &[Option<String>],
     table_metadata: &TableMetadata,
 ) -> bool {
-    // Extract column and value from the equality expression
+    // Extract column and value from the comparison expression
     let (column_ref, value) = match (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()) {
         (WhereExpr::Column(col), WhereExpr::Value(val)) => (col, val),
         (WhereExpr::Value(val), WhereExpr::Column(col)) => (col, val),
@@ -60,12 +67,13 @@ fn expr_equal_evaluate(
 
     match row_value {
         Some(Some(row_value_str)) => {
-            // Row has non-NULL value, compare with filter value
-            where_value_match_string(value, row_value_str)
+            // Row has non-NULL value, perform comparison
+            where_value_compare_string(value, row_value_str, binary_expr.op)
         }
         Some(None) => {
-            // Row has NULL value, check if filter is also NULL
-            matches!(value, WhereValue::Null)
+            // Row has NULL value - for equality check if filter is also NULL,
+            // for other comparisons NULL always returns false (SQL semantics)
+            matches!(binary_expr.op, WhereOp::Equal) && matches!(value, WhereValue::Null)
         }
         None => {
             // Column not found in table metadata
@@ -74,22 +82,72 @@ fn expr_equal_evaluate(
     }
 }
 
-/// Check if a string value from row data matches a WhereValue filter condition.
-fn where_value_match_string(filter_value: &WhereValue, row_value_str: &str) -> bool {
+/// Compare a string value from row data with a WhereValue using the specified operator.
+fn where_value_compare_string(filter_value: &WhereValue, row_value_str: &str, op: WhereOp) -> bool {
+    use std::cmp::Ordering;
+
     match filter_value {
-        WhereValue::String(filter_str) => row_value_str == filter_str,
-        WhereValue::Integer(filter_int) => row_value_str.parse::<i64>() == Ok(*filter_int),
-        WhereValue::Float(filter_float) => row_value_str
-            .parse::<f64>()
-            .is_ok_and(|v| (v - filter_float).abs() < f64::EPSILON),
-        WhereValue::Boolean(filter_bool) => row_value_str.parse::<bool>() == Ok(*filter_bool),
+        WhereValue::String(filter_str) => {
+            let cmp = row_value_str.cmp(filter_str);
+            match op {
+                WhereOp::Equal => cmp == Ordering::Equal,
+                WhereOp::NotEqual => cmp != Ordering::Equal,
+                WhereOp::LessThan => cmp == Ordering::Less,
+                WhereOp::LessThanOrEqual => cmp != Ordering::Greater,
+                WhereOp::GreaterThan => cmp == Ordering::Greater,
+                WhereOp::GreaterThanOrEqual => cmp != Ordering::Less,
+                _ => false,
+            }
+        }
+        WhereValue::Integer(filter_int) => {
+            if let Ok(row_int) = row_value_str.parse::<i64>() {
+                let cmp = row_int.cmp(filter_int);
+                match op {
+                    WhereOp::Equal => cmp == Ordering::Equal,
+                    WhereOp::NotEqual => cmp != Ordering::Equal,
+                    WhereOp::LessThan => cmp == Ordering::Less,
+                    WhereOp::LessThanOrEqual => cmp != Ordering::Greater,
+                    WhereOp::GreaterThan => cmp == Ordering::Greater,
+                    WhereOp::GreaterThanOrEqual => cmp != Ordering::Less,
+                    _ => false,
+                }
+            } else {
+                false // Can't parse as integer
+            }
+        }
+        WhereValue::Float(filter_float) => {
+            if let Ok(row_float) = row_value_str.parse::<f64>() {
+                match op {
+                    WhereOp::Equal => (row_float - filter_float).abs() < f64::EPSILON,
+                    WhereOp::NotEqual => (row_float - filter_float).abs() >= f64::EPSILON,
+                    WhereOp::LessThan => row_float < *filter_float,
+                    WhereOp::LessThanOrEqual => row_float <= *filter_float,
+                    WhereOp::GreaterThan => row_float > *filter_float,
+                    WhereOp::GreaterThanOrEqual => row_float >= *filter_float,
+                    _ => false,
+                }
+            } else {
+                false // Can't parse as float
+            }
+        }
+        WhereValue::Boolean(filter_bool) => {
+            if let Ok(row_bool) = row_value_str.parse::<bool>() {
+                match op {
+                    WhereOp::Equal => row_bool == *filter_bool,
+                    WhereOp::NotEqual => row_bool != *filter_bool,
+                    _ => false, // Boolean comparisons other than equality don't make sense
+                }
+            } else {
+                false // Can't parse as boolean
+            }
+        }
         WhereValue::Null => false, // Row has non-NULL value, filter expects NULL
         WhereValue::Parameter(_) => false, // Parameters not supported in cache matching
     }
 }
 
-/// Check if a binary expression is a simple equality (column = value).
-pub fn is_simple_equality(binary_expr: &BinaryExpr) -> bool {
+/// Check if a binary expression is a simple comparison (column op value).
+pub fn is_simple_comparison(binary_expr: &BinaryExpr) -> bool {
     matches!(
         (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()),
         (WhereExpr::Column(_), WhereExpr::Value(_)) | (WhereExpr::Value(_), WhereExpr::Column(_))
@@ -103,57 +161,158 @@ mod tests {
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 
-    // Tests for where_value_match_string function
+    // Tests for where_value_compare_string function
     #[test]
-    fn where_value_match_string_string_match() {
+    fn where_value_compare_string_string_match() {
         let filter_value = WhereValue::String("hello".to_string());
-        assert!(where_value_match_string(&filter_value, "hello"));
-        assert!(!where_value_match_string(&filter_value, "world"));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "hello",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "world",
+            WhereOp::Equal
+        ));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "world",
+            WhereOp::NotEqual
+        ));
     }
 
     #[test]
-    fn where_value_match_string_integer_match() {
+    fn where_value_compare_string_integer_match() {
         let filter_value = WhereValue::Integer(123);
-        assert!(where_value_match_string(&filter_value, "123"));
-        assert!(!where_value_match_string(&filter_value, "124"));
-        assert!(!where_value_match_string(&filter_value, "abc"));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "123",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "124",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "abc",
+            WhereOp::Equal
+        ));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "100",
+            WhereOp::LessThan
+        ));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "150",
+            WhereOp::GreaterThan
+        ));
     }
 
     #[test]
-    fn where_value_match_string_float_match() {
+    fn where_value_compare_string_float_match() {
         let filter_value = WhereValue::Float(123.45);
-        assert!(where_value_match_string(&filter_value, "123.45"));
-        assert!(!where_value_match_string(&filter_value, "123.46"));
-        assert!(!where_value_match_string(&filter_value, "invalid"));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "123.45",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "123.46",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "invalid",
+            WhereOp::Equal
+        ));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "100.0",
+            WhereOp::LessThan
+        ));
+        assert!(where_value_compare_string(
+            &filter_value,
+            "150.0",
+            WhereOp::GreaterThan
+        ));
     }
 
     #[test]
-    fn where_value_match_string_boolean_match() {
+    fn where_value_compare_string_boolean_match() {
         let filter_value_true = WhereValue::Boolean(true);
         let filter_value_false = WhereValue::Boolean(false);
 
-        assert!(where_value_match_string(&filter_value_true, "true"));
-        assert!(!where_value_match_string(&filter_value_true, "false"));
-        assert!(!where_value_match_string(&filter_value_true, "1"));
+        assert!(where_value_compare_string(
+            &filter_value_true,
+            "true",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value_true,
+            "false",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value_true,
+            "1",
+            WhereOp::Equal
+        ));
 
-        assert!(where_value_match_string(&filter_value_false, "false"));
-        assert!(!where_value_match_string(&filter_value_false, "true"));
-        assert!(!where_value_match_string(&filter_value_false, "0"));
+        assert!(where_value_compare_string(
+            &filter_value_false,
+            "false",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value_false,
+            "true",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value_false,
+            "0",
+            WhereOp::Equal
+        ));
     }
 
     #[test]
-    fn where_value_match_string_null_never_matches() {
+    fn where_value_compare_string_null_never_matches() {
         let filter_value = WhereValue::Null;
-        assert!(!where_value_match_string(&filter_value, "anything"));
-        assert!(!where_value_match_string(&filter_value, "null"));
-        assert!(!where_value_match_string(&filter_value, "NULL"));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "anything",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "null",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "NULL",
+            WhereOp::Equal
+        ));
     }
 
     #[test]
-    fn where_value_match_string_parameter_never_matches() {
+    fn where_value_compare_string_parameter_never_matches() {
         let filter_value = WhereValue::Parameter("$1".to_string());
-        assert!(!where_value_match_string(&filter_value, "$1"));
-        assert!(!where_value_match_string(&filter_value, "anything"));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "$1",
+            WhereOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value,
+            "anything",
+            WhereOp::Equal
+        ));
     }
 
     // Helper function to create test table metadata
@@ -196,9 +355,9 @@ mod tests {
         }
     }
 
-    // Tests for expr_equal_evaluate function
+    // Tests for expr_comparison_evaluate function
     #[test]
-    fn expr_equal_evaluate_string_match() {
+    fn expr_comparison_evaluate_string_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
             Some("1".to_string()),
@@ -215,7 +374,7 @@ mod tests {
             rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
         };
 
-        assert!(expr_equal_evaluate(
+        assert!(expr_comparison_evaluate(
             &binary_expr,
             &row_data,
             &table_metadata
@@ -223,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_equal_evaluate_string_no_match() {
+    fn expr_comparison_evaluate_string_no_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
             Some("1".to_string()),
@@ -240,7 +399,7 @@ mod tests {
             rexpr: Box::new(WhereExpr::Value(WhereValue::String("jane".to_string()))),
         };
 
-        assert!(!expr_equal_evaluate(
+        assert!(!expr_comparison_evaluate(
             &binary_expr,
             &row_data,
             &table_metadata
@@ -248,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_equal_evaluate_integer_match() {
+    fn expr_comparison_evaluate_integer_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
             Some("123".to_string()),
@@ -265,7 +424,7 @@ mod tests {
             rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
         };
 
-        assert!(expr_equal_evaluate(
+        assert!(expr_comparison_evaluate(
             &binary_expr,
             &row_data,
             &table_metadata
@@ -273,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_equal_evaluate_null_value() {
+    fn expr_comparison_evaluate_null_value() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![Some("1".to_string()), None, Some("true".to_string())];
 
@@ -286,7 +445,7 @@ mod tests {
             rexpr: Box::new(WhereExpr::Value(WhereValue::Null)),
         };
 
-        assert!(expr_equal_evaluate(
+        assert!(expr_comparison_evaluate(
             &binary_expr,
             &row_data,
             &table_metadata
@@ -294,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_equal_evaluate_reverse_order() {
+    fn expr_comparison_evaluate_reverse_order() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
             Some("1".to_string()),
@@ -312,7 +471,7 @@ mod tests {
             })),
         };
 
-        assert!(expr_equal_evaluate(
+        assert!(expr_comparison_evaluate(
             &binary_expr,
             &row_data,
             &table_metadata
@@ -320,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_equal_evaluate_invalid_column() {
+    fn expr_comparison_evaluate_invalid_column() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
             Some("1".to_string()),
@@ -337,7 +496,7 @@ mod tests {
             rexpr: Box::new(WhereExpr::Value(WhereValue::String("test".to_string()))),
         };
 
-        assert!(!expr_equal_evaluate(
+        assert!(!expr_comparison_evaluate(
             &binary_expr,
             &row_data,
             &table_metadata
@@ -495,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_unsupported_operator() {
+    fn where_expr_evaluate_greater_than() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
             Some("123".to_string()),
@@ -504,7 +663,7 @@ mod tests {
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::GreaterThan, // Unsupported operator
+            op: WhereOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -512,7 +671,8 @@ mod tests {
             rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
         });
 
-        assert!(!where_expr_evaluate(&expr, &row_data, &table_metadata));
+        // Should return true since 123 > 100
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
     }
 
     #[test]
@@ -530,5 +690,458 @@ mod tests {
         };
 
         assert!(!where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    // Tests for NotEqual operator
+    #[test]
+    fn expr_not_equal_evaluate_string_match() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::NotEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::String("jane".to_string()))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    #[test]
+    fn expr_not_equal_evaluate_string_no_match() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::NotEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
+        };
+
+        assert!(!expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    // Tests for LessThan operator
+    #[test]
+    fn expr_less_than_evaluate_integer_true() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("50".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::LessThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    #[test]
+    fn expr_less_than_evaluate_integer_false() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("150".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::LessThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(!expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    // Tests for LessThanOrEqual operator
+    #[test]
+    fn expr_less_than_or_equal_evaluate_integer_equal() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("100".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::LessThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    #[test]
+    fn expr_less_than_or_equal_evaluate_integer_less() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("50".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::LessThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    #[test]
+    fn expr_less_than_or_equal_evaluate_integer_false() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("150".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::LessThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(!expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    // Tests for GreaterThan operator
+    #[test]
+    fn expr_greater_than_evaluate_integer_true() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("150".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    #[test]
+    fn expr_greater_than_evaluate_integer_false() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("50".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(!expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    // Tests for GreaterThanOrEqual operator
+    #[test]
+    fn expr_greater_than_or_equal_evaluate_integer_equal() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("100".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    #[test]
+    fn expr_greater_than_or_equal_evaluate_integer_greater() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("150".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    #[test]
+    fn expr_greater_than_or_equal_evaluate_integer_false() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("50".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+        };
+
+        assert!(!expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    // Tests for float comparisons
+    #[test]
+    fn expr_comparison_evaluate_float_operations() {
+        let table_metadata = create_test_table_metadata();
+
+        // Add a float column to metadata for testing
+        let mut columns = BiHashMap::new();
+        columns.insert_overwrite(ColumnMetadata {
+            name: "price".to_string(),
+            position: 4,
+            type_oid: 701, // FLOAT8
+            data_type: Type::FLOAT8,
+            type_name: "double precision".to_string(),
+            is_primary_key: false,
+        });
+
+        let mut table_metadata = table_metadata;
+        table_metadata.columns.insert_overwrite(ColumnMetadata {
+            name: "price".to_string(),
+            position: 4,
+            type_oid: 701,
+            data_type: Type::FLOAT8,
+            type_name: "double precision".to_string(),
+            is_primary_key: false,
+        });
+
+        let row_data = vec![
+            Some("1".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+            Some("99.50".to_string()),
+        ];
+
+        // Test less than
+        let binary_expr = BinaryExpr {
+            op: WhereOp::LessThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "price".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Float(100.0))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+
+        // Test greater than
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "price".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Float(50.0))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    // Tests for string comparisons
+    #[test]
+    fn expr_comparison_evaluate_string_operations() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_string()),
+            Some("john".to_string()),
+            Some("true".to_string()),
+        ];
+
+        // Test string less than (lexicographic)
+        let binary_expr = BinaryExpr {
+            op: WhereOp::LessThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::String("zebra".to_string()))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+
+        // Test string greater than
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::String("alice".to_string()))),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+    }
+
+    // Tests for NULL handling
+    #[test]
+    fn expr_comparison_evaluate_null_handling() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![Some("1".to_string()), None, Some("true".to_string())];
+
+        // NULL comparisons should return false (except equality with NULL)
+        let binary_expr = BinaryExpr {
+            op: WhereOp::GreaterThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::String("test".to_string()))),
+        };
+
+        assert!(!expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
+
+        // But equality with NULL should work
+        let binary_expr = BinaryExpr {
+            op: WhereOp::Equal,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "name".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Null)),
+        };
+
+        assert!(expr_comparison_evaluate(
+            &binary_expr,
+            &row_data,
+            &table_metadata
+        ));
     }
 }

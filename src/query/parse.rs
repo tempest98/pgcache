@@ -56,7 +56,7 @@ pub struct ColumnRef {
 }
 
 // Operators for WHERE expressions
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WhereOp {
     // Logical operators
     And,
@@ -328,18 +328,21 @@ fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<WhereOp, WhereParse
     }
 
     match name_nodes[0].node.as_ref() {
-        Some(NodeEnum::String(s)) => {
-            match s.sval.as_str() {
-                "=" => Ok(WhereOp::Equal),
-                // For now, only support equality - can add more later
-                op => {
-                    dbg!(op);
-                    Err(WhereParseError::UnsupportedOperator {
-                        operator: op.to_string(),
-                    })
-                }
+        Some(NodeEnum::String(s)) => match s.sval.as_str() {
+            "=" => Ok(WhereOp::Equal),
+            "!=" | "<>" => Ok(WhereOp::NotEqual),
+            "<" => Ok(WhereOp::LessThan),
+            "<=" => Ok(WhereOp::LessThanOrEqual),
+            ">" => Ok(WhereOp::GreaterThan),
+            ">=" => Ok(WhereOp::GreaterThanOrEqual),
+
+            op => {
+                dbg!(op);
+                Err(WhereParseError::UnsupportedOperator {
+                    operator: op.to_string(),
+                })
             }
-        }
+        },
         unsupported => {
             dbg!(unsupported);
             Err(WhereParseError::Other {
@@ -494,6 +497,26 @@ mod tests {
     }
 
     #[test]
+    fn where_clause_greater_than() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE cnt > 0").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: WhereOp::GreaterThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "cnt".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(0))),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
     fn where_clause_and_operation() {
         let result = query_where_clause_parse(
             &pg_query::parse("SELECT id FROM test WHERE str = 'hello' AND id = 123").unwrap(),
@@ -630,17 +653,118 @@ mod tests {
     }
 
     #[test]
+    fn where_clause_not_equal_with_exclamation() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE id != 123").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: WhereOp::NotEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_not_equal_with_angle_brackets() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE id <> 123").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: WhereOp::NotEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_less_than() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE id < 123").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: WhereOp::LessThan,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_less_than_or_equal() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE id <= 123").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: WhereOp::LessThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_greater_than_or_equal() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE id >= 123").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: WhereOp::GreaterThanOrEqual,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
     fn where_clause_unsupported_operator() {
         let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id > 123").unwrap(),
+            &pg_query::parse("SELECT id FROM test WHERE id LIKE 'test%'").unwrap(),
         );
 
         assert!(result.is_err());
+        // LIKE uses AexprLike, not AexprOp, so it fails with UnsupportedAExpr
         match result.unwrap_err() {
-            WhereParseError::UnsupportedOperator { operator } => {
-                assert_eq!(operator, ">");
+            WhereParseError::UnsupportedAExpr { .. } => {
+                // This is expected for LIKE operations
             }
-            _ => panic!("Expected UnsupportedPattern error"),
+            other => panic!("Expected UnsupportedAExpr error, got: {other:?}"),
         }
     }
 }
