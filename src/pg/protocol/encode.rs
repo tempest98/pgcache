@@ -8,7 +8,7 @@ use crate::pg::protocol::backend::{
     COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG,
 };
 
-#[instrument]
+#[instrument(skip_all)]
 pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
     let cnt = desc.len() as i16;
     let string_len = desc.iter().fold(0, |acc, col| acc + col.name().len() + 1);
@@ -28,7 +28,7 @@ pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
     }
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
     let cnt = row.len() as i16;
     let mut value_len = 0;
@@ -47,7 +47,7 @@ pub fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
     }
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
     let msg = format!("SELECT {cnt}");
 
@@ -57,7 +57,7 @@ pub fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
     buf.put_u8(0);
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub fn ready_for_query_encode(buf: &mut BytesMut) {
     buf.put_u8(READY_FOR_QUERY_TAG);
     buf.put_i32(5);

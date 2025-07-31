@@ -94,7 +94,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     }
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub fn proxy_run(settings: &Settings, cache_tx: SenderCacheType) -> Result<(), ConnectionError> {
     thread::scope(|scope| {
         let mut workers: Vec<_> = (0..settings.num_workers)
@@ -131,7 +131,7 @@ pub fn proxy_run(settings: &Settings, cache_tx: SenderCacheType) -> Result<(), C
     })
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
@@ -184,7 +184,7 @@ enum StreamSource {
 
 type StreamSourceResult = Result<StreamSource, ProtocolError>;
 
-#[instrument]
+#[instrument(skip_all)]
 async fn handle_connection(
     client_socket: &mut TcpStream,
     addrs: Vec<SocketAddr>,

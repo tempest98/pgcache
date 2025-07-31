@@ -36,7 +36,7 @@ impl CacheWorker {
         })
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     pub async fn handle_cached_query(&self, msg: &QueryRequest) -> Result<(), CacheError> {
         let data = &msg.data;
 
