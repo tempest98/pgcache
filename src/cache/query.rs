@@ -4,26 +4,37 @@ use pg_query::protobuf::{
 };
 
 use crate::query::{
+    ast::{SelectStatement, SqlQuery, Statement, WhereExpr, WhereOp, sql_query_convert},
     evaluate::{is_simple_comparison, where_expr_evaluate},
-    parse::{WhereExpr, WhereOp, query_select_has_sublink, query_where_clause_parse},
 };
 
 use super::*;
 
 pub fn is_cacheable(ast: &ParseResult) -> bool {
-    ast.statement_types().contains(&"SelectStmt")
-        && ast.select_tables().len() == 1
-        && !query_select_has_sublink(ast)
-        && has_cacheable_where_clause(ast)
+    // Try to convert to our custom AST - if conversion fails, not cacheable
+    let sql_query = match sql_query_convert(ast) {
+        Ok(query) => query,
+        Err(_) => return false,
+    };
+
+    is_cacheable_ast(&sql_query)
 }
 
-/// Check if the WHERE clause can be efficiently cached.
+pub fn is_cacheable_ast(sql_query: &SqlQuery) -> bool {
+    match &sql_query.statement {
+        Statement::Select(select) => {
+            // Must be single table
+            select.is_single_table() && !select.has_sublink() && is_cacheable_select(select)
+        } // _ => false, // Only SELECT statements are cacheable
+    }
+}
+
+/// Check if a SELECT statement can be efficiently cached.
 /// Currently supports: simple equality, AND of equalities, OR of equalities.
-fn has_cacheable_where_clause(ast: &ParseResult) -> bool {
-    match query_where_clause_parse(ast) {
-        Ok(Some(expr)) => is_cacheable_expr(&expr),
-        Ok(None) => true, // No WHERE clause is always cacheable
-        Err(_) => false,  // Can't parse WHERE clause, not cacheable
+fn is_cacheable_select(select: &SelectStatement) -> bool {
+    match &select.where_clause {
+        Some(where_expr) => is_cacheable_expr(where_expr),
+        None => true, // No WHERE clause is always cacheable
     }
 }
 
@@ -63,12 +74,13 @@ pub fn cache_query_row_matches(
     row_data: &[Option<String>],
     table_metadata: &TableMetadata,
 ) -> bool {
-    // Guard clause: if no filter expression, all rows match
-    // dbg!(&query.filter_expr);
-    // dbg!(&row_data);
-    // dbg!(&table_metadata);
+    // Get the WHERE clause from the SQL query AST
+    let where_clause = match &query.sql_query.statement {
+        Statement::Select(select) => &select.where_clause,
+        // _ => return false, // Non-SELECT queries don't match rows
+    };
 
-    match &query.filter_expr {
+    match where_clause {
         Some(expr) => where_expr_evaluate(expr, row_data, table_metadata),
         None => true, // No filter means all rows match
     }

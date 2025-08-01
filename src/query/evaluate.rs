@@ -1,6 +1,6 @@
 use crate::cache::TableMetadata;
 
-use super::parse::*;
+use super::ast::{BinaryExpr, LiteralValue, WhereExpr, WhereOp};
 
 /// Recursively evaluate a WHERE expression against row data.
 /// Returns true if the row matches the expression, false otherwise.
@@ -162,6 +162,7 @@ pub fn is_simple_comparison(binary_expr: &BinaryExpr) -> bool {
 mod tests {
     use super::*;
     use crate::cache::ColumnMetadata;
+    use crate::query::ast::ColumnRef;
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 

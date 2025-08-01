@@ -8,6 +8,7 @@ use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
 
 use crate::cache::query::{cache_query_row_matches, query_select_replace};
+use crate::query::ast::{ast_query_fingerprint, sql_query_convert};
 use crate::settings::Settings;
 
 use super::*;
@@ -75,7 +76,9 @@ impl QueryCache {
 
     #[instrument(skip_all)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
-        let fingerprint = query_fingerprint(&msg.ast).map_err(|_| ParseError::Other)?;
+        // Convert to our AST for fingerprinting and caching analysis
+        let sql_query = sql_query_convert(&msg.ast).map_err(|_| ParseError::Other)?;
+        let fingerprint = ast_query_fingerprint(&sql_query);
         let cached_query_state = self
             .cache
             .borrow()
@@ -96,7 +99,7 @@ impl QueryCache {
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
-                let table_oid = self.query_register(fingerprint, &msg.ast).await?;
+                let table_oid = self.query_register(fingerprint, &sql_query).await?;
                 let rows = self.query_cache_fetch(&msg.ast).await?;
                 self.query_cache_results(table_oid, &rows).await?;
                 self.cache
@@ -129,9 +132,14 @@ impl QueryCache {
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
-        ast: &ParseResult,
+        sql_query: &SqlQuery,
     ) -> Result<u32, CacheError> {
-        let table_name = &ast.select_tables()[0];
+        let table_names = sql_query.tables();
+        let table_name = table_names
+            .iter()
+            .next()
+            .ok_or(CacheError::UnknownTable)?
+            .clone();
 
         if !self
             .cache
@@ -139,7 +147,7 @@ impl QueryCache {
             .tables
             .contains_key2(table_name.as_str())
         {
-            let table = self.cache_table_create(table_name).await?;
+            let table = self.cache_table_create(table_name.as_str()).await?;
             self.cache.borrow_mut().tables.insert_overwrite(table);
         }
 
@@ -151,16 +159,13 @@ impl QueryCache {
             .ok_or(CacheError::UnknownTable)?
             .relation_oid;
 
-        // Parse WHERE conditions and store full expression AST
-        let filter_expr = query_where_clause_parse(ast).unwrap_or_default();
-
-        // Create CachedQuery entry
+        // Create CachedQuery entry using the already converted AST
         let cached_query = CachedQuery {
             state: CachedQueryState::Loading,
             fingerprint,
-            table_name: table_name.to_owned(),
+            table_name,
             relation_oid,
-            filter_expr,
+            sql_query: sql_query.clone(),
         };
 
         // Store cached query metadata

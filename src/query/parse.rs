@@ -11,6 +11,8 @@ use pg_query::protobuf::{
 };
 use pg_query::{NodeRef, ParseResult};
 
+use super::ast::{BinaryExpr, ColumnRef, LiteralValue, UnaryExpr, WhereExpr, WhereOp};
+
 error_set! {
     ParseError = WhereParseError || SqlError;
 
@@ -35,111 +37,6 @@ error_set! {
     SqlError = {
         DeparseError(pg_query::Error)
     };
-}
-
-// Core literal value types that can appear in SQL expressions
-#[derive(Debug, Clone, PartialEq)]
-pub enum LiteralValue {
-    String(String),
-    Integer(i64),
-    Float(f64),
-    Boolean(bool),
-    Null,
-    Parameter(String), // For $1, $2, etc.
-}
-
-// Column reference (potentially qualified: table.column)
-#[derive(Debug, Clone, PartialEq)]
-pub struct ColumnRef {
-    pub table: Option<String>,
-    pub column: String,
-}
-
-// Operators for WHERE expressions
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WhereOp {
-    // Logical operators
-    And,
-    Or,
-    Not,
-
-    // Comparison operators
-    Equal,
-    NotEqual,
-    LessThan,
-    LessThanOrEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
-
-    // Pattern matching
-    Like,
-    ILike,
-    NotLike,
-    NotILike,
-
-    // Set operations
-    In,
-    NotIn,
-
-    // Range operations
-    Between,
-    NotBetween,
-
-    // Null checks
-    IsNull,
-    IsNotNull,
-
-    // Array operations
-    Any,
-    All,
-
-    // Existence checks
-    Exists,
-    NotExists,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnaryExpr {
-    pub op: WhereOp,
-    pub expr: Box<WhereExpr>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BinaryExpr {
-    pub op: WhereOp,
-    pub lexpr: Box<WhereExpr>, // left expression
-    pub rexpr: Box<WhereExpr>, // right expression
-}
-
-// Multi-operand expressions (for IN, BETWEEN, etc.)
-#[derive(Debug, Clone, PartialEq)]
-pub struct MultiExpr {
-    pub op: WhereOp,
-    pub exprs: Vec<WhereExpr>,
-}
-
-// WHERE expression tree - more abstract and flexible
-#[derive(Debug, Clone, PartialEq)]
-pub enum WhereExpr {
-    // Leaf nodes
-    Value(LiteralValue),
-    Column(ColumnRef),
-
-    // Expression nodes
-    Unary(UnaryExpr),
-    Binary(BinaryExpr),
-    Multi(MultiExpr),
-
-    // Function calls (for extensibility)
-    Function {
-        name: String,
-        args: Vec<WhereExpr>,
-    },
-
-    // Subqueries (for future support)
-    Subquery {
-        query: String, // Placeholder for now
-    },
 }
 
 pub fn query_fingerprint(ast: &ParseResult) -> Result<u64, SqlError> {

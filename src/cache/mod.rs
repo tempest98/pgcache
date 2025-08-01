@@ -23,7 +23,7 @@ use crate::cache::cdc::CdcProcessor;
 use crate::cache::worker::CacheWorker;
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
-    query::parse::*,
+    query::ast::SqlQuery,
     settings::Settings,
 };
 
@@ -169,7 +169,7 @@ pub struct CachedQuery {
     pub fingerprint: u64,
     pub table_name: String,
     pub relation_oid: u32,
-    pub filter_expr: Option<WhereExpr>,
+    pub sql_query: SqlQuery,
 }
 
 impl IdHashItem for CachedQuery {
