@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::convert::AsRef;
 use std::hash::{Hash, Hasher};
 
 use error_set::error_set;
@@ -7,6 +8,8 @@ use pg_query::ParseResult;
 use pg_query::protobuf::{
     ColumnRef as PgColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum,
 };
+use postgres_protocol::escape;
+use strum_macros::AsRefStr;
 
 use super::parse::{WhereParseError, query_where_clause_parse};
 
@@ -24,6 +27,10 @@ error_set! {
         InvalidTableRef,
         WhereParseError(WhereParseError),
     };
+}
+
+pub trait Deparse {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String;
 }
 
 // Core literal value types that can appear in SQL expressions
@@ -69,6 +76,40 @@ impl std::hash::Hash for LiteralValue {
     }
 }
 
+impl Deparse for LiteralValue {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        match self {
+            LiteralValue::String(s) => {
+                let escaped = escape::escape_literal(s);
+                // Remove leading space if escape_literal added one
+                if escaped.starts_with(" E'") {
+                    buf.push_str(&escaped[1..]); // Skip the first space
+                } else {
+                    buf.push_str(&escaped);
+                }
+            }
+            LiteralValue::Integer(i) => {
+                buf.push_str(i.to_string().as_str());
+            }
+            LiteralValue::Float(f) => {
+                buf.push_str(f.to_string().as_str());
+            }
+            LiteralValue::Boolean(b) => {
+                buf.push_str(if *b { "true" } else { "false" });
+            }
+            LiteralValue::Null => {
+                buf.push_str("NULL");
+            }
+            LiteralValue::Parameter(p) => {
+                buf.push_str(p);
+            }
+        };
+
+        buf
+    }
+}
+
 // Column reference (potentially qualified: table.column)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ColumnRef {
@@ -76,8 +117,21 @@ pub struct ColumnRef {
     pub column: String,
 }
 
+impl Deparse for ColumnRef {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        if let Some(table) = &self.table {
+            buf.push_str(table);
+            buf.push('.');
+        }
+        buf.push_str(&self.column);
+
+        buf
+    }
+}
+
 // Operators for WHERE expressions
-#[derive(Debug, Clone, Copy, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, AsRefStr)]
+#[strum(serialize_all = "UPPERCASE")]
 pub enum WhereOp {
     // Logical operators
     And,
@@ -85,29 +139,41 @@ pub enum WhereOp {
     Not,
 
     // Comparison operators
+    #[strum(to_string = "=")]
     Equal,
+    #[strum(to_string = "!=")]
     NotEqual,
+    #[strum(to_string = "<")]
     LessThan,
+    #[strum(to_string = "<=")]
     LessThanOrEqual,
+    #[strum(to_string = ">")]
     GreaterThan,
+    #[strum(to_string = ">=")]
     GreaterThanOrEqual,
 
     // Pattern matching
     Like,
     ILike,
+    #[strum(to_string = "NOT LIKE")]
     NotLike,
+    #[strum(to_string = "NOT ILIKE")]
     NotILike,
 
     // Set operations
     In,
+    #[strum(to_string = "NOT IN")]
     NotIn,
 
     // Range operations
     Between,
+    #[strum(to_string = "NOT BETWEEN")]
     NotBetween,
 
     // Null checks
+    #[strum(to_string = "IS NULL")]
     IsNull,
+    #[strum(to_string = "IS NOT NULL")]
     IsNotNull,
 
     // Array operations
@@ -116,13 +182,33 @@ pub enum WhereOp {
 
     // Existence checks
     Exists,
+    #[strum(to_string = "NOT EXISTS")]
     NotExists,
+}
+
+impl Deparse for WhereOp {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        buf.push_str(self.as_ref());
+
+        buf
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct UnaryExpr {
     pub op: WhereOp,
     pub expr: Box<WhereExpr>,
+}
+
+impl Deparse for UnaryExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.op.deparse(buf);
+        buf.push(' ');
+        self.expr.deparse(buf);
+
+        buf
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -132,11 +218,27 @@ pub struct BinaryExpr {
     pub rexpr: Box<WhereExpr>, // right expression
 }
 
+impl Deparse for BinaryExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.lexpr.deparse(buf);
+        self.op.deparse(buf);
+        self.rexpr.deparse(buf);
+
+        buf
+    }
+}
+
 // Multi-operand expressions (for IN, BETWEEN, etc.)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct MultiExpr {
     pub op: WhereOp,
     pub exprs: Vec<WhereExpr>,
+}
+
+impl Deparse for MultiExpr {
+    fn deparse<'b>(&self, _buf: &'b mut String) -> &'b mut String {
+        todo!();
+    }
 }
 
 // WHERE expression tree - more abstract and flexible
@@ -163,16 +265,48 @@ pub enum WhereExpr {
     },
 }
 
+impl Deparse for WhereExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            WhereExpr::Value(literal) => literal.deparse(buf),
+            WhereExpr::Column(col) => col.deparse(buf),
+            WhereExpr::Unary(expr) => expr.deparse(buf),
+            WhereExpr::Binary(expr) => expr.deparse(buf),
+            WhereExpr::Multi(expr) => expr.deparse(buf),
+            WhereExpr::Function { .. } => todo!(),
+            WhereExpr::Subquery { .. } => todo!(),
+        };
+
+        buf
+    }
+}
+
 /// Simplified SQL AST focused on caching use cases
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SqlQuery {
     pub statement: Statement,
 }
 
+impl Deparse for SqlQuery {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.statement.deparse(buf)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Statement {
     Select(SelectStatement),
     // Future: Insert, Update, Delete for CDC
+}
+
+impl Deparse for Statement {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            Statement::Select(select) => select.deparse(buf),
+        };
+
+        buf
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -187,16 +321,89 @@ pub struct SelectStatement {
     pub distinct: bool,
 }
 
+impl Deparse for SelectStatement {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str("SELECT");
+        if self.distinct {
+            buf.push_str(" DISTINCT")
+        }
+        self.columns.deparse(buf);
+
+        if !self.from.is_empty() {
+            buf.push_str(" FROM");
+            let mut sep = "";
+            for table in &self.from {
+                buf.push_str(sep);
+                table.deparse(buf);
+                sep = ",";
+            }
+        }
+
+        if let Some(expr) = &self.where_clause {
+            buf.push_str(" WHERE ");
+            expr.deparse(buf);
+        }
+
+        if !self.group_by.is_empty() {
+            todo!();
+        }
+
+        if let Some(expr) = &self.having {
+            buf.push_str(" HAVING");
+            expr.deparse(buf);
+        }
+
+        if !self.order_by.is_empty() {
+            todo!();
+        }
+
+        if let Some(_limit) = &self.limit {
+            todo!();
+        }
+
+        buf
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum SelectColumns {
     All,                        // SELECT *
     Columns(Vec<SelectColumn>), // SELECT col1, col2, ...
 }
 
+impl Deparse for SelectColumns {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            SelectColumns::All => buf.push_str(" *"),
+            SelectColumns::Columns(cols) => {
+                let mut sep = "";
+                for col in cols {
+                    buf.push_str(sep);
+                    col.deparse(buf);
+                    sep = ",";
+                }
+            }
+        };
+
+        buf
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SelectColumn {
     pub expr: ColumnExpr,
     pub alias: Option<String>,
+}
+
+impl Deparse for SelectColumn {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        if let Some(alias) = &self.alias {
+            buf.push_str(alias);
+            buf.push('.');
+        }
+        self.expr.deparse(buf)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -206,10 +413,39 @@ pub enum ColumnExpr {
     Literal(LiteralValue),  // Constant values
 }
 
+impl Deparse for ColumnExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            ColumnExpr::Column(col) => col.deparse(buf),
+            ColumnExpr::Function(func) => func.deparse(buf),
+            ColumnExpr::Literal(lit) => lit.deparse(buf),
+        };
+
+        buf
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct FunctionCall {
     pub name: String,
     pub args: Vec<ColumnExpr>,
+}
+
+impl Deparse for FunctionCall {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        buf.push_str(self.name.as_str());
+        buf.push('(');
+        let mut sep = "";
+        for col in &self.args {
+            buf.push_str(sep);
+            col.deparse(buf);
+            sep = ",";
+        }
+        buf.push(')');
+
+        buf
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -218,6 +454,27 @@ pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
     pub join: Option<JoinClause>,
+}
+
+impl Deparse for TableRef {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        if let Some(schema) = &self.schema {
+            buf.push_str(schema);
+            buf.push('.');
+        }
+        buf.push_str(self.name.as_str());
+        if let Some(alias) = &self.alias {
+            buf.push_str(" AS ");
+            buf.push_str(alias);
+        }
+
+        if let Some(_join) = &self.join {
+            todo!();
+        }
+
+        buf
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -640,5 +897,260 @@ mod tests {
             assert_eq!(columns[0].alias, None);
             assert_eq!(columns[1].alias, None);
         }
+    }
+
+    #[test]
+    fn test_sql_query_deparse_simple() {
+        let sql = "SELECT id, name FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_literal_value_deparse() {
+        let mut buf = String::new();
+
+        // String literal
+        LiteralValue::String("hello".to_string()).deparse(&mut buf);
+        assert_eq!(buf, " 'hello'");
+        buf.clear();
+
+        // Integer literal
+        LiteralValue::Integer(42).deparse(&mut buf);
+        assert_eq!(buf, " 42");
+        buf.clear();
+
+        // Float literal
+        LiteralValue::Float(3.25).deparse(&mut buf);
+        assert_eq!(buf, " 3.25");
+        buf.clear();
+
+        // Boolean literals
+        LiteralValue::Boolean(true).deparse(&mut buf);
+        assert_eq!(buf, " true");
+        buf.clear();
+
+        LiteralValue::Boolean(false).deparse(&mut buf);
+        assert_eq!(buf, " false");
+        buf.clear();
+
+        // NULL literal
+        LiteralValue::Null.deparse(&mut buf);
+        assert_eq!(buf, " NULL");
+        buf.clear();
+
+        // Parameter
+        LiteralValue::Parameter("$1".to_string()).deparse(&mut buf);
+        assert_eq!(buf, " $1");
+    }
+
+    #[test]
+    fn test_column_ref_deparse() {
+        let mut buf = String::new();
+
+        // Simple column
+        ColumnRef {
+            table: None,
+            column: "id".to_string(),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, "id");
+        buf.clear();
+
+        // Qualified column
+        ColumnRef {
+            table: Some("users".to_string()),
+            column: "name".to_string(),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, "users.name");
+    }
+
+    #[test]
+    fn test_where_op_deparse() {
+        let mut buf = String::new();
+
+        // Comparison operators
+        WhereOp::Equal.deparse(&mut buf);
+        assert_eq!(buf, " =");
+        buf.clear();
+
+        WhereOp::NotEqual.deparse(&mut buf);
+        assert_eq!(buf, " !=");
+        buf.clear();
+
+        WhereOp::LessThan.deparse(&mut buf);
+        assert_eq!(buf, " <");
+        buf.clear();
+
+        WhereOp::GreaterThanOrEqual.deparse(&mut buf);
+        assert_eq!(buf, " >=");
+        buf.clear();
+
+        // Null checks (test the fix)
+        WhereOp::IsNull.deparse(&mut buf);
+        assert_eq!(buf, " IS NULL");
+        buf.clear();
+
+        WhereOp::IsNotNull.deparse(&mut buf);
+        assert_eq!(buf, " IS NOT NULL");
+        buf.clear();
+
+        // Pattern matching
+        WhereOp::Like.deparse(&mut buf);
+        assert_eq!(buf, " LIKE");
+        buf.clear();
+
+        WhereOp::NotLike.deparse(&mut buf);
+        assert_eq!(buf, " NOT LIKE");
+        buf.clear();
+
+        // Logical operators
+        WhereOp::And.deparse(&mut buf);
+        assert_eq!(buf, " AND");
+        buf.clear();
+
+        WhereOp::Or.deparse(&mut buf);
+        assert_eq!(buf, " OR");
+    }
+
+    #[test]
+    fn test_binary_expr_deparse() {
+        let mut buf = String::new();
+
+        // Simple equality: id = 1
+        let expr = BinaryExpr {
+            op: WhereOp::Equal,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(1))),
+        };
+
+        expr.deparse(&mut buf);
+        assert_eq!(buf, "id = 1");
+        buf.clear();
+
+        // Complex expression: users.name = 'john'
+        let expr = BinaryExpr {
+            op: WhereOp::Equal,
+            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                table: Some("users".to_string()),
+                column: "name".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+        };
+
+        expr.deparse(&mut buf);
+        assert_eq!(buf, "users.name = 'john'");
+    }
+
+    #[test]
+    fn test_unary_expr_deparse() {
+        let mut buf = String::new();
+
+        // NOT active
+        let expr = UnaryExpr {
+            op: WhereOp::Not,
+            expr: Box::new(WhereExpr::Column(ColumnRef {
+                table: None,
+                column: "active".to_string(),
+            })),
+        };
+
+        expr.deparse(&mut buf);
+        assert_eq!(buf, " NOT active");
+    }
+
+    #[test]
+    fn test_select_deparse_with_where() {
+        let sql = "SELECT * FROM users WHERE id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_distinct() {
+        let sql = "SELECT DISTINCT name FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_multiple_tables() {
+        let sql = "SELECT * FROM users, orders";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_schema_qualified() {
+        let sql = "SELECT * FROM public.users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_round_trip_simple() {
+        let original_sql = "SELECT id, name FROM users WHERE active = true";
+
+        // Parse original
+        let pg_ast1 = pg_query::parse(original_sql).unwrap();
+        let ast1 = sql_query_convert(&pg_ast1).unwrap();
+
+        // Deparse to string
+        let mut deparsed = String::with_capacity(1024);
+        ast1.deparse(&mut deparsed);
+
+        // Parse deparsed version
+        let pg_ast2 = pg_query::parse(&deparsed).unwrap();
+        let ast2 = sql_query_convert(&pg_ast2).unwrap();
+
+        // Should be equivalent
+        assert_eq!(ast1, ast2);
+    }
+
+    #[test]
+    fn test_literal_empty_string() {
+        let mut buf = String::new();
+        LiteralValue::String("".to_string()).deparse(&mut buf);
+        assert_eq!(buf, " ''");
+    }
+
+    #[test]
+    fn test_literal_string_with_quotes() {
+        let mut buf = String::new();
+        LiteralValue::String("test'quote".to_string()).deparse(&mut buf);
+        // postgres-protocol should properly escape the quote
+        assert_eq!(buf, " 'test''quote'");
+    }
+
+    #[test]
+    fn test_literal_string_with_backslashes() {
+        let mut buf = String::new();
+        LiteralValue::String("test\\path".to_string()).deparse(&mut buf);
+        // postgres-protocol should use E'' syntax for backslashes
+        assert_eq!(buf, " E'test\\\\path'");
     }
 }

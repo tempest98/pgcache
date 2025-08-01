@@ -1418,6 +1418,8 @@ dependencies = [
  "postgres-replication",
  "postgres-types 0.2.9 (git+https://github.com/tempest98/rust-postgres?branch=compat)",
  "serde",
+ "strum",
+ "strum_macros",
  "tokio",
  "tokio-postgres",
  "tokio-stream",
@@ -2249,6 +2251,24 @@ dependencies = [
  "unicode-bidi",
  "unicode-normalization",
  "unicode-properties",
+]
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.104",
 ]
 
 [[package]]
