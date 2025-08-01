@@ -73,7 +73,7 @@ fn expr_comparison_evaluate(
         Some(None) => {
             // Row has NULL value - for equality check if filter is also NULL,
             // for other comparisons NULL always returns false (SQL semantics)
-            matches!(binary_expr.op, WhereOp::Equal) && matches!(value, WhereValue::Null)
+            matches!(binary_expr.op, WhereOp::Equal) && matches!(value, LiteralValue::Null)
         }
         None => {
             // Column not found in table metadata
@@ -82,12 +82,16 @@ fn expr_comparison_evaluate(
     }
 }
 
-/// Compare a string value from row data with a WhereValue using the specified operator.
-fn where_value_compare_string(filter_value: &WhereValue, row_value_str: &str, op: WhereOp) -> bool {
+/// Compare a string value from row data with a LiteralValue using the specified operator.
+fn where_value_compare_string(
+    filter_value: &LiteralValue,
+    row_value_str: &str,
+    op: WhereOp,
+) -> bool {
     use std::cmp::Ordering;
 
     match filter_value {
-        WhereValue::String(filter_str) => {
+        LiteralValue::String(filter_str) => {
             let cmp = row_value_str.cmp(filter_str);
             match op {
                 WhereOp::Equal => cmp == Ordering::Equal,
@@ -99,7 +103,7 @@ fn where_value_compare_string(filter_value: &WhereValue, row_value_str: &str, op
                 _ => false,
             }
         }
-        WhereValue::Integer(filter_int) => {
+        LiteralValue::Integer(filter_int) => {
             if let Ok(row_int) = row_value_str.parse::<i64>() {
                 let cmp = row_int.cmp(filter_int);
                 match op {
@@ -115,7 +119,7 @@ fn where_value_compare_string(filter_value: &WhereValue, row_value_str: &str, op
                 false // Can't parse as integer
             }
         }
-        WhereValue::Float(filter_float) => {
+        LiteralValue::Float(filter_float) => {
             if let Ok(row_float) = row_value_str.parse::<f64>() {
                 match op {
                     WhereOp::Equal => (row_float - filter_float).abs() < f64::EPSILON,
@@ -130,7 +134,7 @@ fn where_value_compare_string(filter_value: &WhereValue, row_value_str: &str, op
                 false // Can't parse as float
             }
         }
-        WhereValue::Boolean(filter_bool) => {
+        LiteralValue::Boolean(filter_bool) => {
             if let Ok(row_bool) = row_value_str.parse::<bool>() {
                 match op {
                     WhereOp::Equal => row_bool == *filter_bool,
@@ -141,8 +145,8 @@ fn where_value_compare_string(filter_value: &WhereValue, row_value_str: &str, op
                 false // Can't parse as boolean
             }
         }
-        WhereValue::Null => false, // Row has non-NULL value, filter expects NULL
-        WhereValue::Parameter(_) => false, // Parameters not supported in cache matching
+        LiteralValue::Null => false, // Row has non-NULL value, filter expects NULL
+        LiteralValue::Parameter(_) => false, // Parameters not supported in cache matching
     }
 }
 
@@ -164,7 +168,7 @@ mod tests {
     // Tests for where_value_compare_string function
     #[test]
     fn where_value_compare_string_string_match() {
-        let filter_value = WhereValue::String("hello".to_string());
+        let filter_value = LiteralValue::String("hello".to_string());
         assert!(where_value_compare_string(
             &filter_value,
             "hello",
@@ -184,7 +188,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_integer_match() {
-        let filter_value = WhereValue::Integer(123);
+        let filter_value = LiteralValue::Integer(123);
         assert!(where_value_compare_string(
             &filter_value,
             "123",
@@ -214,7 +218,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_float_match() {
-        let filter_value = WhereValue::Float(123.45);
+        let filter_value = LiteralValue::Float(123.45);
         assert!(where_value_compare_string(
             &filter_value,
             "123.45",
@@ -244,8 +248,8 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_boolean_match() {
-        let filter_value_true = WhereValue::Boolean(true);
-        let filter_value_false = WhereValue::Boolean(false);
+        let filter_value_true = LiteralValue::Boolean(true);
+        let filter_value_false = LiteralValue::Boolean(false);
 
         assert!(where_value_compare_string(
             &filter_value_true,
@@ -282,7 +286,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_null_never_matches() {
-        let filter_value = WhereValue::Null;
+        let filter_value = LiteralValue::Null;
         assert!(!where_value_compare_string(
             &filter_value,
             "anything",
@@ -302,7 +306,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_parameter_never_matches() {
-        let filter_value = WhereValue::Parameter("$1".to_string());
+        let filter_value = LiteralValue::Parameter("$1".to_string());
         assert!(!where_value_compare_string(
             &filter_value,
             "$1",
@@ -371,7 +375,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -396,7 +400,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("jane".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -421,7 +425,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -442,7 +446,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Null)),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
         };
 
         assert!(expr_comparison_evaluate(
@@ -464,7 +468,7 @@ mod tests {
         // Test value = column (reverse order)
         let binary_expr = BinaryExpr {
             op: WhereOp::Equal,
-            lexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
+            lexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
             rexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -493,7 +497,7 @@ mod tests {
                 table: None,
                 column: "nonexistent".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("test".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("test".to_string()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -519,7 +523,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
         });
 
         assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
@@ -542,7 +546,7 @@ mod tests {
                     table: None,
                     column: "id".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: WhereOp::Equal,
@@ -550,7 +554,7 @@ mod tests {
                     table: None,
                     column: "name".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
             })),
         });
 
@@ -574,7 +578,7 @@ mod tests {
                     table: None,
                     column: "id".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(999))), // Different value
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // Different value
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: WhereOp::Equal,
@@ -582,7 +586,7 @@ mod tests {
                     table: None,
                     column: "name".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
             })),
         });
 
@@ -606,7 +610,7 @@ mod tests {
                     table: None,
                     column: "id".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(999))), // False condition
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // False condition
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: WhereOp::Equal,
@@ -614,7 +618,7 @@ mod tests {
                     table: None,
                     column: "name".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))), // True condition
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))), // True condition
             })),
         });
 
@@ -638,7 +642,7 @@ mod tests {
                     table: None,
                     column: "id".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(999))), // False condition
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // False condition
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: WhereOp::Equal,
@@ -646,7 +650,7 @@ mod tests {
                     table: None,
                     column: "name".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("jane".to_string()))), // False condition
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))), // False condition
             })),
         });
 
@@ -668,7 +672,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         });
 
         // Should return true since 123 > 100
@@ -708,7 +712,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("jane".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -733,7 +737,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("john".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -759,7 +763,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -784,7 +788,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -810,7 +814,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -835,7 +839,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -860,7 +864,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -886,7 +890,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -911,7 +915,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -937,7 +941,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -962,7 +966,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -987,7 +991,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(100))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -1037,7 +1041,7 @@ mod tests {
                 table: None,
                 column: "price".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Float(100.0))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(100.0))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1053,7 +1057,7 @@ mod tests {
                 table: None,
                 column: "price".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Float(50.0))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(50.0))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1080,7 +1084,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("zebra".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("zebra".to_string()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1096,7 +1100,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("alice".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("alice".to_string()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1119,7 +1123,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("test".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("test".to_string()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -1135,7 +1139,7 @@ mod tests {
                 table: None,
                 column: "name".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Null)),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
         };
 
         assert!(expr_comparison_evaluate(

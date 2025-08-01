@@ -37,9 +37,9 @@ error_set! {
     };
 }
 
-// Core value types that can appear in WHERE expressions
+// Core literal value types that can appear in SQL expressions
 #[derive(Debug, Clone, PartialEq)]
-pub enum WhereValue {
+pub enum LiteralValue {
     String(String),
     Integer(i64),
     Float(f64),
@@ -122,7 +122,7 @@ pub struct MultiExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WhereExpr {
     // Leaf nodes
-    Value(WhereValue),
+    Value(LiteralValue),
     Column(ColumnRef),
 
     // Expression nodes
@@ -266,25 +266,25 @@ fn column_ref_extract(col_ref: &PgColumnRef) -> Result<ColumnRef, WhereParseErro
 }
 
 /// Extract constant value from pg_query A_Const
-fn const_value_extract(const_val: &AConst) -> Result<WhereValue, WhereParseError> {
+fn const_value_extract(const_val: &AConst) -> Result<LiteralValue, WhereParseError> {
     use pg_query::protobuf::a_const::Val;
 
     // Check for NULL values first
     if const_val.isnull {
-        return Ok(WhereValue::Null);
+        return Ok(LiteralValue::Null);
     }
 
     match const_val.val.as_ref() {
-        Some(Val::Sval(s)) => Ok(WhereValue::String(s.sval.clone())),
-        Some(Val::Ival(i)) => Ok(WhereValue::Integer(i.ival as i64)),
-        Some(Val::Fval(f)) => f.fval.parse::<f64>().map(WhereValue::Float).map_err(|_| {
+        Some(Val::Sval(s)) => Ok(LiteralValue::String(s.sval.clone())),
+        Some(Val::Ival(i)) => Ok(LiteralValue::Integer(i.ival as i64)),
+        Some(Val::Fval(f)) => f.fval.parse::<f64>().map(LiteralValue::Float).map_err(|_| {
             WhereParseError::InvalidConstValue {
                 value: f.fval.clone(),
             }
         }),
-        Some(Val::Boolval(b)) => Ok(WhereValue::Boolean(b.boolval)),
-        Some(Val::Bsval(bs)) => Ok(WhereValue::String(bs.bsval.clone())), // Bit strings as strings for now
-        None => Ok(WhereValue::Null),                                     // Fallback for NULL
+        Some(Val::Boolval(b)) => Ok(LiteralValue::Boolean(b.boolval)),
+        Some(Val::Bsval(bs)) => Ok(LiteralValue::String(bs.bsval.clone())), // Bit strings as strings for now
+        None => Ok(LiteralValue::Null),                                     // Fallback for NULL
     }
 }
 
@@ -450,7 +450,7 @@ mod tests {
                 table: None,
                 column: "str".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("hello".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
         }));
 
         assert_eq!(where_clause, expected);
@@ -471,7 +471,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -491,7 +491,7 @@ mod tests {
                 table: None,
                 column: "active".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Boolean(true))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -511,7 +511,7 @@ mod tests {
                 table: None,
                 column: "cnt".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(0))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(0))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -533,7 +533,7 @@ mod tests {
                     table: None,
                     column: "str".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("hello".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: WhereOp::Equal,
@@ -541,7 +541,7 @@ mod tests {
                     table: None,
                     column: "id".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -564,7 +564,7 @@ mod tests {
                     table: None,
                     column: "str".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("hello".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: WhereOp::Equal,
@@ -572,7 +572,7 @@ mod tests {
                     table: None,
                     column: "str".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("world".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("world".to_string()))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -595,7 +595,7 @@ mod tests {
                     table: None,
                     column: "str".to_string(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(WhereValue::String("hello".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -616,7 +616,7 @@ mod tests {
                 table: Some("test".to_string()),
                 column: "str".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::String("hello".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -636,7 +636,7 @@ mod tests {
                 table: None,
                 column: "data".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Null)),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
         }));
 
         assert_eq!(where_clause, expected);
@@ -667,7 +667,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -687,7 +687,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -707,7 +707,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -727,7 +727,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -747,7 +747,7 @@ mod tests {
                 table: None,
                 column: "id".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(WhereValue::Integer(123))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
         assert_eq!(where_clause, expected);
     }
