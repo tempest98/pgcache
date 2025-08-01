@@ -1,14 +1,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use pg_query::ParseResult;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
 
 use crate::cache::query::{cache_query_row_matches, query_select_replace};
-use crate::query::ast::{ast_query_fingerprint, sql_query_convert};
+use crate::query::ast::{Deparse, ast_query_fingerprint};
 use crate::settings::Settings;
 
 use super::*;
@@ -16,7 +15,7 @@ use super::*;
 #[derive(Debug)]
 pub struct QueryRequest {
     pub data: BytesMut,
-    pub ast: ParseResult,
+    pub ast: Box<SqlQuery>,
     pub reply_tx: Sender<CacheReply>,
 }
 
@@ -76,9 +75,8 @@ impl QueryCache {
 
     #[instrument(skip_all)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
-        // Convert to our AST for fingerprinting and caching analysis
-        let sql_query = sql_query_convert(&msg.ast).map_err(|_| ParseError::Other)?;
-        let fingerprint = ast_query_fingerprint(&sql_query);
+        let sql_query = &msg.ast;
+        let fingerprint = ast_query_fingerprint(sql_query);
         let cached_query_state = self
             .cache
             .borrow()
@@ -99,8 +97,8 @@ impl QueryCache {
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
-                let table_oid = self.query_register(fingerprint, &sql_query).await?;
-                let rows = self.query_cache_fetch(&msg.ast).await?;
+                let table_oid = self.query_register(fingerprint, sql_query).await?;
+                let rows = self.query_cache_fetch(sql_query).await?;
                 self.query_cache_results(table_oid, &rows).await?;
                 self.cache
                     .borrow_mut()
@@ -117,12 +115,13 @@ impl QueryCache {
     #[instrument(skip_all)]
     pub async fn query_cache_fetch(
         &mut self,
-        ast: &ParseResult,
+        ast: &SqlQuery,
     ) -> Result<Vec<SimpleQueryMessage>, CacheError> {
         let new_ast = query_select_replace(ast);
-        let query = new_ast.deparse()?;
+        let mut buf = String::with_capacity(1024);
+        let query = new_ast.deparse(&mut buf);
         self.db_origin
-            .simple_query(&query)
+            .simple_query(query)
             .await
             .map_err(CacheError::PgError)
     }

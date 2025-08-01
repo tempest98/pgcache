@@ -78,7 +78,6 @@ impl std::hash::Hash for LiteralValue {
 
 impl Deparse for LiteralValue {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        buf.push(' ');
         match self {
             LiteralValue::String(s) => {
                 let escaped = escape::escape_literal(s);
@@ -188,7 +187,6 @@ pub enum WhereOp {
 
 impl Deparse for WhereOp {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        buf.push(' ');
         buf.push_str(self.as_ref());
 
         buf
@@ -221,7 +219,9 @@ pub struct BinaryExpr {
 impl Deparse for BinaryExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         self.lexpr.deparse(buf);
+        buf.push(' ');
         self.op.deparse(buf);
+        buf.push(' ');
         self.rexpr.deparse(buf);
 
         buf
@@ -465,7 +465,7 @@ impl Deparse for TableRef {
         }
         buf.push_str(self.name.as_str());
         if let Some(alias) = &self.alias {
-            buf.push_str(" AS ");
+            buf.push(' ');
             buf.push_str(alias);
         }
 
@@ -916,36 +916,36 @@ mod tests {
 
         // String literal
         LiteralValue::String("hello".to_string()).deparse(&mut buf);
-        assert_eq!(buf, " 'hello'");
+        assert_eq!(buf, "'hello'");
         buf.clear();
 
         // Integer literal
         LiteralValue::Integer(42).deparse(&mut buf);
-        assert_eq!(buf, " 42");
+        assert_eq!(buf, "42");
         buf.clear();
 
         // Float literal
         LiteralValue::Float(3.25).deparse(&mut buf);
-        assert_eq!(buf, " 3.25");
+        assert_eq!(buf, "3.25");
         buf.clear();
 
         // Boolean literals
         LiteralValue::Boolean(true).deparse(&mut buf);
-        assert_eq!(buf, " true");
+        assert_eq!(buf, "true");
         buf.clear();
 
         LiteralValue::Boolean(false).deparse(&mut buf);
-        assert_eq!(buf, " false");
+        assert_eq!(buf, "false");
         buf.clear();
 
         // NULL literal
         LiteralValue::Null.deparse(&mut buf);
-        assert_eq!(buf, " NULL");
+        assert_eq!(buf, "NULL");
         buf.clear();
 
         // Parameter
         LiteralValue::Parameter("$1".to_string()).deparse(&mut buf);
-        assert_eq!(buf, " $1");
+        assert_eq!(buf, "$1");
     }
 
     #[test]
@@ -976,46 +976,46 @@ mod tests {
 
         // Comparison operators
         WhereOp::Equal.deparse(&mut buf);
-        assert_eq!(buf, " =");
+        assert_eq!(buf, "=");
         buf.clear();
 
         WhereOp::NotEqual.deparse(&mut buf);
-        assert_eq!(buf, " !=");
+        assert_eq!(buf, "!=");
         buf.clear();
 
         WhereOp::LessThan.deparse(&mut buf);
-        assert_eq!(buf, " <");
+        assert_eq!(buf, "<");
         buf.clear();
 
         WhereOp::GreaterThanOrEqual.deparse(&mut buf);
-        assert_eq!(buf, " >=");
+        assert_eq!(buf, ">=");
         buf.clear();
 
         // Null checks (test the fix)
         WhereOp::IsNull.deparse(&mut buf);
-        assert_eq!(buf, " IS NULL");
+        assert_eq!(buf, "IS NULL");
         buf.clear();
 
         WhereOp::IsNotNull.deparse(&mut buf);
-        assert_eq!(buf, " IS NOT NULL");
+        assert_eq!(buf, "IS NOT NULL");
         buf.clear();
 
         // Pattern matching
         WhereOp::Like.deparse(&mut buf);
-        assert_eq!(buf, " LIKE");
+        assert_eq!(buf, "LIKE");
         buf.clear();
 
         WhereOp::NotLike.deparse(&mut buf);
-        assert_eq!(buf, " NOT LIKE");
+        assert_eq!(buf, "NOT LIKE");
         buf.clear();
 
         // Logical operators
         WhereOp::And.deparse(&mut buf);
-        assert_eq!(buf, " AND");
+        assert_eq!(buf, "AND");
         buf.clear();
 
         WhereOp::Or.deparse(&mut buf);
-        assert_eq!(buf, " OR");
+        assert_eq!(buf, "OR");
     }
 
     #[test]
@@ -1064,7 +1064,7 @@ mod tests {
         };
 
         expr.deparse(&mut buf);
-        assert_eq!(buf, " NOT active");
+        assert_eq!(buf, "NOT active");
     }
 
     #[test]
@@ -1135,7 +1135,7 @@ mod tests {
     fn test_literal_empty_string() {
         let mut buf = String::new();
         LiteralValue::String("".to_string()).deparse(&mut buf);
-        assert_eq!(buf, " ''");
+        assert_eq!(buf, "''");
     }
 
     #[test]
@@ -1143,7 +1143,7 @@ mod tests {
         let mut buf = String::new();
         LiteralValue::String("test'quote".to_string()).deparse(&mut buf);
         // postgres-protocol should properly escape the quote
-        assert_eq!(buf, " 'test''quote'");
+        assert_eq!(buf, "'test''quote'");
     }
 
     #[test]
@@ -1151,6 +1151,6 @@ mod tests {
         let mut buf = String::new();
         LiteralValue::String("test\\path".to_string()).deparse(&mut buf);
         // postgres-protocol should use E'' syntax for backslashes
-        assert_eq!(buf, " E'test\\\\path'");
+        assert_eq!(buf, "E'test\\\\path'");
     }
 }

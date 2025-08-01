@@ -9,17 +9,17 @@ use std::{
 };
 
 use crate::{
-    cache::{CacheMessage, CacheReply, ProxyMessage, query::is_cacheable},
+    cache::{CacheMessage, CacheReply, ProxyMessage, query::is_cacheable_ast},
     pg::protocol::{
         ProtocolError,
         backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
         frontend::{PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType},
     },
+    query::ast::{SqlQuery, sql_query_convert},
     settings::Settings,
 };
 
 use error_set::{ErrContext, error_set};
-use pg_query::ParseResult;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
@@ -227,7 +227,7 @@ async fn handle_connection(
     streams_read.insert("client", client_mapped_pin);
     streams_read.insert("origin", origin_mapped_pin);
 
-    let mut fingerprint_cache: HashMap<u64, bool> = HashMap::new();
+    let mut fingerprint_cache: HashMap<u64, Option<Box<SqlQuery>>> = HashMap::new();
 
     loop {
         // dbg!(&proxy_mode);
@@ -315,12 +315,12 @@ async fn handle_connection(
 
 enum Action {
     Forward,
-    CacheCheck(ParseResult),
+    CacheCheck(Box<SqlQuery>),
 }
 
 async fn handle_query(
     data: &BytesMut,
-    fp_cache: &mut HashMap<u64, bool>,
+    fp_cache: &mut HashMap<u64, Option<Box<SqlQuery>>>,
 ) -> Result<Action, ParseError> {
     let msg_len = (&data[1..5]).get_u32() as usize;
     let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
@@ -330,22 +330,24 @@ async fn handle_query(
     let fingerprint = hasher.finish();
 
     match fp_cache.get(&fingerprint) {
-        Some(true) => {
+        Some(Some(ast)) => {
             trace!("cache hit: cacheable true");
-            let ast = pg_query::parse(query)?;
-            Ok(Action::CacheCheck(ast))
+            Ok(Action::CacheCheck(Box::new(*ast.clone())))
         }
-        Some(false) => {
+        Some(None) => {
             trace!("cache hit: cacheable false");
             Ok(Action::Forward)
         }
         None => {
             let ast = pg_query::parse(query)?;
-            if is_cacheable(&ast) {
-                fp_cache.insert(fingerprint, true);
-                Ok(Action::CacheCheck(ast))
+
+            if let Ok(query) = sql_query_convert(&ast)
+                && is_cacheable_ast(&query)
+            {
+                fp_cache.insert(fingerprint, Some(Box::new(query.clone())));
+                Ok(Action::CacheCheck(Box::new(query)))
             } else {
-                fp_cache.insert(fingerprint, false);
+                fp_cache.insert(fingerprint, None);
                 Ok(Action::Forward)
             }
         }

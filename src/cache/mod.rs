@@ -2,7 +2,6 @@ use std::{io, thread};
 
 use error_set::error_set;
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
-use pg_query::ParseResult;
 use tokio::{
     runtime::Builder,
     sync::{
@@ -66,7 +65,7 @@ error_set! {
 
 #[derive(Debug)]
 pub enum CacheMessage {
-    Query(BytesMut, ParseResult),
+    Query(BytesMut, Box<SqlQuery>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
