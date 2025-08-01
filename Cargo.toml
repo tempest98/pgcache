@@ -45,3 +45,8 @@ iddqd = "0.3.8"
 
 [dev-dependencies]
 pgtemp = "0.6.0"
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "ast_conversion"
+harness = false
