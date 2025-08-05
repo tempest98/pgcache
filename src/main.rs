@@ -13,7 +13,6 @@ use tokio::sync::mpsc;
 use tracing::{Level, error};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // let settings = Settings::new()?;
     let settings = Settings::from_args()?;
 
     let subscriber = tracing_subscriber::fmt()
