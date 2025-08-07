@@ -102,7 +102,7 @@ enum StreamSource {
     Cdc(CdcMessage),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMetadata {
     pub relation_oid: u32,
     pub name: String,
@@ -128,7 +128,7 @@ impl BiHashItem for TableMetadata {
     bi_upcast!();
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMetadata {
     pub name: String,
     pub position: i16,

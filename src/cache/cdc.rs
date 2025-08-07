@@ -286,7 +286,7 @@ impl CdcProcessor {
 
     /// Processes relation (table schema) messages.
     async fn process_relation(&self, body: &RelationBody) -> Result<(), Error> {
-        // dbg!(body);
+        dbg!(body);
 
         // Parse RelationBody into TableMetadata
         let table_metadata = self.parse_relation_to_table_metadata(body);

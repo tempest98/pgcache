@@ -351,12 +351,15 @@ impl QueryCache {
             columns.push(column_sql);
         }
 
+        let drop_sql = format!("DROP TABLE IF EXISTS {}", table_metadata.name);
+
         let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (\n{}\n)",
+            "CREATE TABLE {} (\n{}\n)",
             table_metadata.name,
             columns.join(",\n")
         );
 
+        self.db_cache.execute(&drop_sql, &[]).await?;
         self.db_cache.execute(&sql, &[]).await?;
 
         Ok(())
@@ -370,29 +373,36 @@ impl QueryCache {
     ) -> Result<(), CacheError> {
         let relation_oid = table_metadata.relation_oid;
 
-        // Check if table already exists
-        let table_exists = self.cache.borrow().tables.contains_key1(&relation_oid);
+        {
+            let mut cache = self.cache.borrow_mut();
+            if let Some(current_table) = cache.tables.get1(&relation_oid) {
+                if current_table == &table_metadata {
+                    return Ok(());
+                }
 
-        if table_exists {
-            // TODO: Handle schema changes when table already exists
-            // Compare existing TableMetadata with new metadata from CDC
-            // Handle cases like:
-            // - Column additions/removals
-            // - Type changes
-            // - Primary key changes
-            // For now, we just skip re-registration
-            info!(
-                "Table {} (OID: {}) already exists, skipping registration",
-                table_metadata.name, relation_oid
-            );
-            return Ok(());
+                // invalidate all the cached queries that use this table and recreate the table.
+                info!(
+                    "Table {} (OID: {}) recreating table, invalidating queries",
+                    table_metadata.name, relation_oid
+                );
+
+                let fingerprints = cache
+                    .queries
+                    .iter()
+                    .filter(|q| q.relation_oid == relation_oid)
+                    .map(|q| q.fingerprint)
+                    .collect::<Vec<_>>();
+
+                for fp in fingerprints {
+                    trace!("invalidating query {fp}");
+                    cache.queries.remove(&fp);
+                }
+            }
         }
 
-        // Table doesn't exist, create cache table from CDC metadata
         self.cache_table_create_from_metadata(&table_metadata)
             .await?;
 
-        // Store CDC metadata in both indexes
         self.cache
             .borrow_mut()
             .tables
