@@ -266,21 +266,21 @@ impl CdcProcessor {
 
     /// Processes transaction begin messages.
     async fn process_begin(&self, _body: &BeginBody) -> Result<(), Error> {
-        // dbg!(body);
-        // TODO: Begin transaction in cache database when cache synchronization is added
+        // transaction begin and end messages can be ignored since all logical replication
+        // messages are sent after the transaction has been committed
         Ok(())
     }
 
     /// Processes transaction commit messages.
     async fn process_commit(&self, _body: &CommitBody) -> Result<(), Error> {
-        // dbg!(body);
-        // TODO: Commit transaction in cache database when cache synchronization is added
+        // transaction begin and end messages can be ignored since all logical replication
+        // messages are sent after the transaction has been committed
         Ok(())
     }
 
     /// Processes origin messages.
     async fn process_origin(&self, _body: &OriginBody) -> Result<(), Error> {
-        // dbg!(body);
+        // origin messages are not relevant to the cache
         Ok(())
     }
 
