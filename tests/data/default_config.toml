@@ -1,0 +1,20 @@
+num_workers = 2
+
+[origin]
+host = "localhost"
+port = 5432
+user = "postgres"
+database = "origin"
+
+[cache]
+host = "localhost"
+port = 7654
+user = "postgres"
+database = "cache"
+
+[cdc]
+publication_name = "pub_test"
+slot_name = "slot_test"
+
+[listen]
+socket = "127.0.0.1:6432"

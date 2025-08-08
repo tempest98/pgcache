@@ -52,6 +52,8 @@ async fn test_proxy() -> Result<(), Error> {
         .map_err(Error::other)?;
 
     let mut pgcache = Command::new(env!("CARGO_BIN_EXE_pgcache"))
+        .arg("--config")
+        .arg("tests/data/default_config.toml")
         .arg("--origin_host")
         .arg("127.0.0.1")
         .arg("--origin_port")
@@ -74,7 +76,7 @@ async fn test_proxy() -> Result<(), Error> {
         .expect("run pgcache");
 
     //wait to listening message from proxy before proceeding
-    util::proxy_wait_for_ready(&mut pgcache);
+    util::proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
 
     let (client, connection) = Config::new()
         .host("localhost")
