@@ -92,6 +92,7 @@ enum CdcMessage {
     Insert(u32, Vec<Option<String>>),
     Update(CdcMessageUpdate),
     Delete(u32, Vec<Option<String>>),
+    Truncate(Vec<u32>),
     RelationCheck(u32, oneshot::Sender<bool>),
 }
 
@@ -259,6 +260,9 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                                     }
                                     CdcMessage::Delete(relation_oid, row_data) => {
                                         let _ = qcache.handle_delete(relation_oid, row_data).await;
+                                    }
+                                    CdcMessage::Truncate(relation_oids) => {
+                                        let _ = qcache.handle_truncate(&relation_oids).await;
                                     }
                                     CdcMessage::RelationCheck(relation_oid, reply_tx) => {
                                         let exists =

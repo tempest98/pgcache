@@ -286,13 +286,12 @@ impl CdcProcessor {
 
     /// Processes relation (table schema) messages.
     async fn process_relation(&self, body: &RelationBody) -> Result<(), Error> {
-        dbg!(body);
+        // dbg!(body);
 
         // Parse RelationBody into TableMetadata
         let table_metadata = self.parse_relation_to_table_metadata(body);
 
         // Register table metadata in cache
-
         if let Err(e) = self.cdc_tx.send(CdcMessage::Register(table_metadata)) {
             //todo, halt use of cache and fallback to proxy only mode
             error!("Failed to register table from CDC: {e:?}");
@@ -384,9 +383,17 @@ impl CdcProcessor {
     }
 
     /// Processes truncate messages.
-    async fn process_truncate(&self, _body: &TruncateBody) -> Result<(), Error> {
-        // dbg!(body);
-        // TODO: Apply truncate to cache database when cache synchronization is added
+    async fn process_truncate(&mut self, body: &TruncateBody) -> Result<(), Error> {
+        let mut ids: Vec<u32> = Vec::with_capacity(body.rel_ids().len());
+        for &id in body.rel_ids() {
+            if self.is_relation_active(id).await {
+                ids.push(id);
+            }
+        }
+        if let Err(e) = self.cdc_tx.send(CdcMessage::Truncate(ids)) {
+            //todo, halt use of cache and fallback to proxy only mode
+            error!("Failed to handle truncate from CDC: {e:?}");
+        }
         Ok(())
     }
 

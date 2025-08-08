@@ -320,10 +320,14 @@ impl QueryCache {
             columns.insert_overwrite(column);
         }
 
+        let Some(relation_oid) = relation_oid else {
+            return Err(CacheError::NoPrimaryKey);
+        };
+
         let table = TableMetadata {
             name: table_name.to_owned(),
             schema: "public".to_owned(), //hardcoding for now
-            relation_oid: relation_oid.expect("relation_oid should be present"),
+            relation_oid,
             primary_key_columns,
             columns,
         };
@@ -373,31 +377,21 @@ impl QueryCache {
     ) -> Result<(), CacheError> {
         let relation_oid = table_metadata.relation_oid;
 
-        {
-            let mut cache = self.cache.borrow_mut();
-            if let Some(current_table) = cache.tables.get1(&relation_oid) {
-                if current_table == &table_metadata {
-                    return Ok(());
-                }
-
-                // invalidate all the cached queries that use this table and recreate the table.
-                info!(
-                    "Table {} (OID: {}) recreating table, invalidating queries",
-                    table_metadata.name, relation_oid
-                );
-
-                let fingerprints = cache
-                    .queries
-                    .iter()
-                    .filter(|q| q.relation_oid == relation_oid)
-                    .map(|q| q.fingerprint)
-                    .collect::<Vec<_>>();
-
-                for fp in fingerprints {
-                    trace!("invalidating query {fp}");
-                    cache.queries.remove(&fp);
-                }
+        let table_exists = self.cache.borrow().tables.contains_key1(&relation_oid);
+        if table_exists {
+            if let Some(current_table) = self.cache.borrow().tables.get1(&relation_oid)
+                && current_table == &table_metadata
+            {
+                return Ok(());
             }
+
+            // invalidate all the cached queries that use this table and recreate the table.
+            info!(
+                "Table {} (OID: {}) recreating table, invalidating queries",
+                table_metadata.name, relation_oid
+            );
+
+            self.cache_table_invalidate(relation_oid);
         }
 
         self.cache_table_create_from_metadata(&table_metadata)
@@ -409,6 +403,21 @@ impl QueryCache {
             .insert_overwrite(table_metadata);
 
         Ok(())
+    }
+
+    fn cache_table_invalidate(&mut self, relation_oid: u32) {
+        let mut cache = self.cache.borrow_mut();
+        let fingerprints = cache
+            .queries
+            .iter()
+            .filter(|q| q.relation_oid == relation_oid)
+            .map(|q| q.fingerprint)
+            .collect::<Vec<_>>();
+
+        for fp in fingerprints {
+            trace!("invalidating query {fp}");
+            cache.queries.remove(&fp);
+        }
     }
 
     fn cache_upsert_sql(
@@ -568,6 +577,28 @@ impl QueryCache {
         };
 
         self.db_cache.execute(delete_sql.as_str(), &[]).await?;
+
+        Ok(())
+    }
+
+    /// Handle Truncate operation by truncating table in cache.
+    #[instrument(skip_all)]
+    pub async fn handle_truncate(&self, relation_oids: &[u32]) -> Result<(), CacheError> {
+        // Get table metadata for column information
+        let truncate_sql = {
+            let mut table_names: Vec<&str> = Vec::new();
+
+            let cache = self.cache.borrow();
+            for oid in relation_oids {
+                if let Some(table_metadata) = cache.tables.get1(oid) {
+                    table_names.push(table_metadata.name.as_str());
+                };
+            }
+
+            format!("TRUNCATE {}", table_names.join(", "))
+        };
+
+        self.db_cache.execute(truncate_sql.as_str(), &[]).await?;
 
         Ok(())
     }
