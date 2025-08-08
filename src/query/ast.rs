@@ -567,37 +567,37 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
     let mut has_star = false;
 
     for target in target_list {
-        if let Some(NodeEnum::ResTarget(res_target)) = &target.node {
-            if let Some(val_node) = &res_target.val {
-                match val_node.node.as_ref() {
-                    Some(NodeEnum::ColumnRef(col_ref)) => {
-                        // Check if this is SELECT *
-                        if col_ref.fields.len() == 1 {
-                            if let Some(NodeEnum::AStar(_)) = &col_ref.fields[0].node {
-                                has_star = true;
-                                continue;
-                            }
-                        }
-
-                        // Regular column reference
-                        let column_ref = column_ref_convert(col_ref)?;
-                        let alias = if res_target.name.is_empty() {
-                            None
-                        } else {
-                            Some(res_target.name.clone())
-                        };
-
-                        columns.push(SelectColumn {
-                            expr: ColumnExpr::Column(column_ref),
-                            alias,
-                        });
+        if let Some(NodeEnum::ResTarget(res_target)) = &target.node
+            && let Some(val_node) = &res_target.val
+        {
+            match val_node.node.as_ref() {
+                Some(NodeEnum::ColumnRef(col_ref)) => {
+                    // Check if this is SELECT *
+                    if col_ref.fields.len() == 1
+                        && let Some(NodeEnum::AStar(_)) = &col_ref.fields[0].node
+                    {
+                        has_star = true;
+                        continue;
                     }
-                    // TODO: Add support for function calls, literals, etc.
-                    other => {
-                        return Err(AstError::UnsupportedSelectFeature {
-                            feature: format!("Column expression: {other:?}"),
-                        });
-                    }
+
+                    // Regular column reference
+                    let column_ref = column_ref_convert(col_ref)?;
+                    let alias = if res_target.name.is_empty() {
+                        None
+                    } else {
+                        Some(res_target.name.clone())
+                    };
+
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Column(column_ref),
+                        alias,
+                    });
+                }
+                // TODO: Add support for function calls, literals, etc.
+                other => {
+                    return Err(AstError::UnsupportedSelectFeature {
+                        feature: format!("Column expression: {other:?}"),
+                    });
                 }
             }
         }
@@ -725,27 +725,26 @@ impl SelectStatement {
     /// Check if this SELECT statement contains sublinks/subqueries
     pub fn has_sublink(&self) -> bool {
         // Check columns for subqueries
-        if let SelectColumns::Columns(columns) = &self.columns {
-            if columns
+        if let SelectColumns::Columns(columns) = &self.columns
+            && columns
                 .iter()
                 .any(|col| self.column_expr_has_sublink(&col.expr))
-            {
-                return true;
-            }
+        {
+            return true;
         }
 
         // Check WHERE clause for subqueries
-        if let Some(where_clause) = &self.where_clause {
-            if self.where_expr_has_sublink(where_clause) {
-                return true;
-            }
+        if let Some(where_clause) = &self.where_clause
+            && self.where_expr_has_sublink(where_clause)
+        {
+            return true;
         }
 
         // Check HAVING clause for subqueries
-        if let Some(having) = &self.having {
-            if self.where_expr_has_sublink(having) {
-                return true;
-            }
+        if let Some(having) = &self.having
+            && self.where_expr_has_sublink(having)
+        {
+            return true;
         }
 
         false

@@ -68,10 +68,10 @@ pub fn _query_select_columns(ast: &ParseResult) -> HashSet<String> {
     for target in &select_stmt.target_list {
         if let Some(node) = &target.node {
             node.nodes().iter().for_each(|&(node_ref, _, _, _)| {
-                if let NodeRef::ColumnRef(column_ref) = node_ref {
-                    if let Some(NodeEnum::String(column)) = &column_ref.fields[0].node {
-                        columns.insert(column.sval.clone());
-                    }
+                if let NodeRef::ColumnRef(column_ref) = node_ref
+                    && let Some(NodeEnum::String(column)) = &column_ref.fields[0].node
+                {
+                    columns.insert(column.sval.clone());
                 }
             });
         }
