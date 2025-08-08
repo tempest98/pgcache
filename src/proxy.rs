@@ -229,6 +229,8 @@ async fn handle_connection(
 
     let mut fingerprint_cache: HashMap<u64, Option<Box<SqlQuery>>> = HashMap::new();
 
+    let mut in_transaction = false;
+
     loop {
         // dbg!(&proxy_mode);
         match proxy_mode {
@@ -237,7 +239,9 @@ async fn handle_connection(
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
                             // dbg!(&msg);
-                            if matches!(msg.message_type, PgFrontendMessageType::Query) {
+                            if !in_transaction
+                                && matches!(msg.message_type, PgFrontendMessageType::Query)
+                            {
                                 proxy_mode =
                                     match handle_query(&msg.data, &mut fingerprint_cache).await {
                                         Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
@@ -254,6 +258,9 @@ async fn handle_connection(
                             }
                         }
                         Ok(StreamSource::OriginRead(msg)) => {
+                            if msg.message_type == PgBackendMessageType::ReadyForQuery {
+                                in_transaction = msg.data[5] == b'T' || msg.data[5] == b'E';
+                            }
                             proxy_mode = ProxyMode::ClientWrite(msg);
                         }
                         Ok(StreamSource::CacheRead(reply)) => match reply {
@@ -288,7 +295,6 @@ async fn handle_connection(
                 }
             }
             ProxyMode::ClientWrite(ref mut msg) => {
-                // dbg!(&msg);
                 client_write.write_buf(&mut msg.data).await?;
                 if !msg.data.has_remaining() {
                     proxy_mode = ProxyMode::Read;

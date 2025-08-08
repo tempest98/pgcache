@@ -6,7 +6,7 @@ use tokio_util::{
 
 use super::*;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgBackendMessageType {
     // startup
     SslRequestResponse,
