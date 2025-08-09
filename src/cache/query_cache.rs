@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
@@ -133,20 +134,11 @@ impl QueryCache {
         fingerprint: u64,
         sql_query: &SqlQuery,
     ) -> Result<u32, CacheError> {
-        let table_names = sql_query.tables();
-        let table_name = table_names
-            .iter()
-            .next()
-            .ok_or(CacheError::UnknownTable)?
-            .clone();
+        let tables = sql_query.tables();
+        let (schema, table_name) = tables.into_iter().next().ok_or(CacheError::UnknownTable)?;
 
-        if !self
-            .cache
-            .borrow()
-            .tables
-            .contains_key2(table_name.as_str())
-        {
-            let table = self.cache_table_create(table_name.as_str()).await?;
+        if !self.cache.borrow().tables.contains_key2(table_name) {
+            let table = self.cache_table_create(schema, table_name).await?;
             self.cache.borrow_mut().tables.insert_overwrite(table);
         }
 
@@ -154,7 +146,7 @@ impl QueryCache {
             .cache
             .borrow()
             .tables
-            .get2(table_name.as_str())
+            .get2(table_name)
             .ok_or(CacheError::UnknownTable)?
             .relation_oid;
 
@@ -162,7 +154,7 @@ impl QueryCache {
         let cached_query = CachedQuery {
             state: CachedQueryState::Loading,
             fingerprint,
-            table_name,
+            table_name: table_name.to_owned(),
             relation_oid,
             sql_query: sql_query.clone(),
         };
@@ -257,49 +249,37 @@ impl QueryCache {
     }
 
     #[instrument(skip_all)]
-    async fn cache_table_create(&self, table_name: &str) -> Result<TableMetadata, CacheError> {
-        let table = self.query_table_metadata(table_name).await?;
+    async fn cache_table_create(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<TableMetadata, CacheError> {
+        let table = self.query_table_metadata(schema, table).await?;
         self.cache_table_create_from_metadata(&table).await?;
         Ok(table)
     }
 
     #[instrument(skip_all)]
-    async fn query_table_metadata(&self, table_name: &str) -> Result<TableMetadata, CacheError> {
-        let create_table_sql = r"
-            SELECT
-                c.oid AS relation_oid,
-                c.relname AS table_name,
-                a.attname AS column_name,
-                a.attnum AS position,
-                a.atttypid AS type_oid,
-                pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
-                a.attnum = any(pgc.conkey) as is_primary_key
-            FROM pg_class c
-            JOIN pg_namespace n on n.oid = c.relnamespace
-            JOIN pg_attribute a on a.attrelid = c.oid
-            JOIN pg_type t on t.oid = a.atttypid
-            JOIN pg_constraint pgc on pgc.conrelid = c.oid
-            WHERE c.relname = $1
-            AND n.nspname = 'public'
-            AND a.attnum > 0
-            AND pgc.contype = 'p'
-            AND NOT a.attisdropped
-            ORDER BY a.attnum
-        ";
-
-        let rows = self
-            .db_origin
-            .query(create_table_sql, &[&table_name])
-            .await?;
+    async fn query_table_metadata(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<TableMetadata, CacheError> {
+        let rows = self.query_table_columns_get(schema, table).await?;
 
         let mut primary_key_columns: Vec<String> = Vec::new();
         let mut columns: BiHashMap<ColumnMetadata> = BiHashMap::with_capacity(rows.len());
         let mut relation_oid: Option<u32> = None;
+        let mut schema: Option<&str> = schema;
 
         for row in &rows {
             // Get relation_oid from first row
             if relation_oid.is_none() {
                 relation_oid = Some(row.get("relation_oid"));
+            }
+
+            if schema.is_none() {
+                schema = Some(row.get("table_schema"));
             }
 
             let type_oid = row.get("type_oid");
@@ -321,18 +301,94 @@ impl QueryCache {
         }
 
         let Some(relation_oid) = relation_oid else {
-            return Err(CacheError::NoPrimaryKey);
+            return Err(CacheError::UnknownTable);
+        };
+
+        let Some(schema) = schema else {
+            return Err(CacheError::UnknownSchema);
         };
 
         let table = TableMetadata {
-            name: table_name.to_owned(),
-            schema: "public".to_owned(), //hardcoding for now
+            name: table.to_owned(),
+            schema: schema.to_owned(),
             relation_oid,
             primary_key_columns,
             columns,
         };
 
         Ok(table)
+    }
+
+    #[instrument(skip_all)]
+    async fn query_table_columns_get(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<Row>, CacheError> {
+        // need a nicer way to do this, two separate queries for when the schema is known
+        // and for when it is not known.
+        let rows = if let Some(schema) = schema {
+            let sql = r"
+                SELECT
+                    c.oid AS relation_oid,
+                    n.nspname AS table_schema,
+                    c.relname AS table_name,
+                    a.attname AS column_name,
+                    a.attnum AS position,
+                    a.atttypid AS type_oid,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
+                    a.attnum = any(pgc.conkey) as is_primary_key
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a ON a.attrelid = c.oid
+                JOIN pg_type t ON t.oid = a.atttypid
+                JOIN pg_constraint pgc ON pgc.conrelid = c.oid
+                WHERE c.relname = $1
+                AND n.nspname = $2
+                AND a.attnum > 0
+                AND pgc.contype = 'p'
+                AND NOT a.attisdropped
+                ORDER BY a.attnum;
+            ";
+
+            self.db_origin.query(sql, &[&table, &schema]).await?
+        } else {
+            let sql = r"
+                SELECT
+                    c.oid AS relation_oid,
+                    n.nspname AS table_schema,
+                    c.relname AS table_name,
+                    a.attname AS column_name,
+                    a.attnum AS position,
+                    a.atttypid AS type_oid,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
+                    a.attnum = any(pgc.conkey) as is_primary_key
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a ON a.attrelid = c.oid
+                JOIN pg_type t ON t.oid = a.atttypid
+                JOIN pg_constraint pgc ON pgc.conrelid = c.oid
+                WHERE c.relname = $1
+                AND c.oid = (
+                    SELECT c2.oid
+                    FROM pg_class c2
+                    JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                    WHERE c2.relname = $1
+                    AND c2.relkind = 'r'
+                    AND n2.nspname = any(current_schemas(false))
+                    ORDER BY array_position(current_schemas(false), n2.nspname)
+                    LIMIT 1
+                )
+                AND a.attnum > 0
+                AND pgc.contype = 'p'
+                AND NOT a.attisdropped
+                ORDER BY a.attnum;
+            ";
+
+            self.db_origin.query(sql, &[&table]).await?
+        };
+
+        Ok(rows)
     }
 
     #[instrument(skip_all)]

@@ -683,9 +683,13 @@ fn column_ref_convert(col_ref: &PgColumnRef) -> Result<ColumnRef, AstError> {
 /// Helper functions for common query analysis tasks
 impl SqlQuery {
     /// Get all table names referenced in the query
-    pub fn tables(&self) -> HashSet<String> {
+    pub fn tables(&self) -> HashSet<(Option<&str>, &str)> {
         match &self.statement {
-            Statement::Select(select) => select.from.iter().map(|t| t.name.clone()).collect(),
+            Statement::Select(select) => select
+                .from
+                .iter()
+                .map(|t| (t.schema.as_ref().map(String::as_ref), t.name.as_str()))
+                .collect(),
         }
     }
 
@@ -798,7 +802,10 @@ mod tests {
         assert!(ast.is_single_table());
         assert!(ast.has_where_clause());
         assert!(!ast.is_select_star());
-        assert_eq!(ast.tables(), HashSet::from(["users".to_string()]));
+        assert_eq!(
+            ast.tables(),
+            HashSet::<(Option<&str>, _)>::from([(None, "users")])
+        );
     }
 
     #[test]
@@ -810,7 +817,10 @@ mod tests {
         assert!(ast.is_single_table());
         assert!(!ast.has_where_clause());
         assert!(ast.is_select_star());
-        assert_eq!(ast.tables(), HashSet::from(["products".to_string()]));
+        assert_eq!(
+            ast.tables(),
+            HashSet::<(Option<&str>, _)>::from([(None, "products")])
+        );
     }
 
     #[test]
@@ -825,6 +835,37 @@ mod tests {
         // Should convert the same WHERE clause as before
         // (reusing existing WhereExpr conversion)
         assert!(matches!(where_clause, WhereExpr::Binary(_)));
+    }
+
+    #[test]
+    fn test_sql_query_convert_table_schema() {
+        let sql = "SELECT id, name FROM test.users WHERE active = true";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Check table alias
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.from.len(), 1);
+        assert_eq!(select.from[0].schema, Some("test".to_owned()));
+        assert_eq!(select.from[0].name, "users");
+        assert_eq!(select.from[0].alias, None);
+
+        // Check column references
+        if let SelectColumns::Columns(columns) = &select.columns {
+            assert_eq!(columns.len(), 2);
+
+            // First column: id
+            if let ColumnExpr::Column(col_ref) = &columns[0].expr {
+                assert_eq!(col_ref.table, None);
+                assert_eq!(col_ref.column, "id");
+            }
+
+            // Second column: name
+            if let ColumnExpr::Column(col_ref) = &columns[1].expr {
+                assert_eq!(col_ref.table, None);
+                assert_eq!(col_ref.column, "name");
+            }
+        }
     }
 
     #[test]

@@ -59,6 +59,7 @@ error_set! {
     TableError = {
         UnknownTable,
         UnknownColumn,
+        UnknownSchema,
         NoPrimaryKey,
     };
 }
