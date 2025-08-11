@@ -18,12 +18,15 @@ use tokio_stream::{
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, instrument};
 
-use crate::cache::worker::CacheWorker;
-use crate::{cache::cdc::CdcProcessor, query::ast::SelectStatement};
+use crate::{
+    cache::cdc::CdcProcessor,
+    query::ast::{ColumnExpr, ColumnRef, SelectColumn, SelectStatement},
+};
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
     settings::Settings,
 };
+use crate::{cache::worker::CacheWorker, query::ast::SelectColumns};
 
 mod cdc;
 pub(crate) mod query;
@@ -103,15 +106,38 @@ enum StreamSource {
     Cdc(CdcMessage),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TableMetadata {
     pub relation_oid: u32,
     pub name: String,
     pub schema: String,
     pub primary_key_columns: Vec<String>,
     pub columns: BiHashMap<ColumnMetadata>,
-    // pub last_updated: std::time::SystemTime,
-    // pub estimated_row_count: Option<i64>,
+}
+
+//todo, move to a better location
+impl TableMetadata {
+    fn select_columns(&self, alias: Option<&str>) -> SelectColumns {
+        // Columns(Vec<SelectColumn>)
+
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| SelectColumn {
+                expr: ColumnExpr::Column(ColumnRef {
+                    table: if alias.is_some() {
+                        None
+                    } else {
+                        Some(self.name.clone())
+                    },
+                    column: c.name.clone(),
+                }),
+                alias: alias.map(|a| a.to_owned()),
+            })
+            .collect();
+
+        SelectColumns::Columns(columns)
+    }
 }
 
 impl BiHashItem for TableMetadata {
@@ -129,7 +155,7 @@ impl BiHashItem for TableMetadata {
     bi_upcast!();
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ColumnMetadata {
     pub name: String,
     pub position: i16,
@@ -137,9 +163,6 @@ pub struct ColumnMetadata {
     pub data_type: Type,
     pub type_name: String,
     pub is_primary_key: bool,
-    // pub is_nullable: bool,
-    // pub max_length: Option<i32>,
-    // pub default_value: Option<String>,
 }
 
 impl BiHashItem for ColumnMetadata {
@@ -163,12 +186,11 @@ pub enum CachedQueryState {
     Loading,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CachedQuery {
     pub state: CachedQueryState,
     pub fingerprint: u64,
-    pub table_name: String,
-    pub relation_oid: u32,
+    pub relation_oids: Vec<u32>,
     pub select_statement: SelectStatement,
 }
 
@@ -182,10 +204,27 @@ impl IdHashItem for CachedQuery {
     id_upcast!();
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct UpdateQueries {
+    pub relation_oid: u32,
+    pub select_statements: Vec<SelectStatement>,
+}
+
+impl IdHashItem for UpdateQueries {
+    type Key<'a> = u32;
+
+    fn key(&self) -> Self::Key<'_> {
+        self.relation_oid
+    }
+
+    id_upcast!();
+}
+
+#[derive(Debug)]
 pub struct Cache {
     pub tables: BiHashMap<TableMetadata>,
-    pub queries: IdHashMap<CachedQuery>,
+    pub update_queries: IdHashMap<UpdateQueries>,
+    pub cached_queries: IdHashMap<CachedQuery>,
 }
 
 #[instrument(skip_all)]
@@ -194,7 +233,8 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
         let rt = Builder::new_current_thread().enable_all().build()?;
         let cache = Cache {
             tables: BiHashMap::new(),
-            queries: IdHashMap::new(),
+            update_queries: IdHashMap::new(),
+            cached_queries: IdHashMap::new(),
         };
 
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
@@ -219,7 +259,7 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 
         debug!("cache loop");
         rt.block_on(async {
-            let qcache = QueryCache::new(settings, cache.clone(), worker_tx).await?;
+            let qcache = QueryCache::new(settings, cache, worker_tx).await?;
 
             LocalSet::new()
                 .run_until(async move {

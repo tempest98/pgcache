@@ -8,7 +8,7 @@ use super::*;
 pub fn is_cacheable_ast(sql_query: &SqlQuery) -> Option<&SelectStatement> {
     match &sql_query.statement {
         Statement::Select(select) => {
-            if select.is_single_table() && !select.has_sublink() && is_cacheable_select(select) {
+            if select.is_supported_from() && !select.has_sublink() && is_cacheable_select(select) {
                 Some(select)
             } else {
                 None

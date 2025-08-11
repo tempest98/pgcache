@@ -4,11 +4,14 @@ use std::hash::{Hash, Hasher};
 
 use error_set::error_set;
 use pg_query::ParseResult;
+use pg_query::protobuf::JoinExpr;
 use pg_query::protobuf::{
     ColumnRef as PgColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum,
 };
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
+
+use crate::query::parse::node_convert_to_expr;
 
 use super::parse::{WhereParseError, query_where_clause_parse};
 
@@ -24,6 +27,7 @@ error_set! {
         UnsupportedSelectFeature { feature: String },
         #[display("Invalid table reference")]
         InvalidTableRef,
+        UnsupportedJoinType,
         WhereParseError(WhereParseError),
     };
 }
@@ -288,7 +292,7 @@ pub struct SqlQuery {
 
 impl SqlQuery {
     /// Get all table names referenced in the query
-    pub fn tables(&self) -> impl Iterator<Item = &'_ TableRef> {
+    pub fn tables(&self) -> impl Iterator<Item = &'_ TableNode> {
         match &self.statement {
             Statement::Select(select) => select.tables(),
         }
@@ -346,7 +350,7 @@ impl Deparse for Statement {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SelectStatement {
     pub columns: SelectColumns,
-    pub from: Vec<TableRef>,
+    pub from: Vec<TableSource>,
     pub where_clause: Option<WhereExpr>,
     pub group_by: Vec<ColumnRef>,
     pub having: Option<WhereExpr>,
@@ -356,7 +360,7 @@ pub struct SelectStatement {
 }
 
 impl SelectStatement {
-    pub fn tables(&self) -> impl Iterator<Item = &'_ TableRef> {
+    pub fn tables(&self) -> impl Iterator<Item = &'_ TableNode> {
         let mut iter = self.from.iter();
         let table_iter = iter.next().map(|t| t.tables());
         SelectStatementTableIter { iter, table_iter }
@@ -364,7 +368,34 @@ impl SelectStatement {
 
     /// Check if this SELECT statement references only a single table
     pub fn is_single_table(&self) -> bool {
-        self.from.len() == 1 && self.from[0].join.is_none()
+        self.from.len() == 1 && matches!(self.from[0], TableSource::Table(_))
+    }
+
+    pub fn is_supported_from(&self) -> bool {
+        if self.from.len() == 1 {
+            if let TableSource::Join(join) = &self.from[0] {
+                self.is_supported_join(join)
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    fn is_supported_join(&self, join: &JoinNode) -> bool {
+        if join.join_type != JoinType::Inner {
+            return false;
+        }
+        match &join.condition {
+            Some(where_expr) => match where_expr {
+                WhereExpr::Binary(binary_expr) => {
+                    binary_expr.op == ExprOp::Equal && !self.where_expr_has_sublink(where_expr)
+                }
+                _ => false,
+            },
+            None => true,
+        }
     }
 
     /// Check if this SELECT statement contains sublinks/subqueries
@@ -422,30 +453,6 @@ impl SelectStatement {
     }
 }
 
-struct SelectStatementTableIter<'a> {
-    iter: std::slice::Iter<'a, TableRef>,
-    table_iter: Option<TableIter<'a>>,
-}
-
-impl<'a> Iterator for SelectStatementTableIter<'a> {
-    type Item = &'a TableRef;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.table_iter {
-            Some(ref mut table_iter) => {
-                let mut next = table_iter.next();
-                if next.is_none() {
-                    self.table_iter = self.iter.next().map(|t| t.tables());
-                    next = self.table_iter.as_mut().and_then(|iter| iter.next())
-                }
-
-                next
-            }
-            None => None,
-        }
-    }
-}
-
 impl Deparse for SelectStatement {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push_str("SELECT");
@@ -487,6 +494,30 @@ impl Deparse for SelectStatement {
         }
 
         buf
+    }
+}
+
+struct SelectStatementTableIter<'a> {
+    iter: std::slice::Iter<'a, TableSource>,
+    table_iter: Option<TableSourceIter<'a>>,
+}
+
+impl<'a> Iterator for SelectStatementTableIter<'a> {
+    type Item = &'a TableNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.table_iter {
+            Some(table_iter) => {
+                let mut table = table_iter.next();
+                if table.is_none() {
+                    self.table_iter = self.iter.next().map(|t| t.tables());
+                    table = self.table_iter.as_mut().and_then(|iter| iter.next())
+                }
+
+                table
+            }
+            None => None,
+        }
     }
 }
 
@@ -574,20 +605,66 @@ impl Deparse for FunctionCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub struct TableRef {
-    pub schema: Option<String>,
-    pub name: String,
-    pub alias: Option<String>,
-    pub join: Option<JoinClause>,
+pub enum TableSource {
+    Table(TableNode),
+    Join(JoinNode),
 }
 
-impl TableRef {
-    fn tables(&self) -> TableIter<'_> {
-        TableIter { table: Some(self) }
+impl TableSource {
+    fn tables(&self) -> TableSourceIter<'_> {
+        TableSourceIter {
+            source: Some(self),
+            join_iter: None,
+        }
     }
 }
 
-impl Deparse for TableRef {
+impl Deparse for TableSource {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match &self {
+            TableSource::Table(table) => table.deparse(buf),
+            TableSource::Join(join) => join.deparse(buf),
+        }
+    }
+}
+
+struct TableSourceIter<'a> {
+    source: Option<&'a TableSource>,
+    join_iter: Option<Box<JoinNodeIter<'a>>>,
+}
+
+impl<'a> Iterator for TableSourceIter<'a> {
+    type Item = &'a TableNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.source {
+            Some(TableSource::Table(table)) => {
+                self.source = None;
+                Some(table)
+            }
+            Some(TableSource::Join(join)) => {
+                if let Some(iter) = &mut self.join_iter {
+                    iter.next()
+                } else {
+                    let mut iter = join.tables();
+                    let table = iter.next();
+                    self.join_iter = Some(Box::new(iter));
+                    table
+                }
+            }
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableNode {
+    pub schema: Option<String>,
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+impl Deparse for TableNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push(' ');
         if let Some(schema) = &self.schema {
@@ -600,41 +677,51 @@ impl Deparse for TableRef {
             buf.push_str(alias);
         }
 
-        if let Some(_join) = &self.join {
-            todo!();
-        }
-
         buf
     }
 }
 
-struct TableIter<'a> {
-    table: Option<&'a TableRef>,
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct JoinNode {
+    pub join_type: JoinType,
+    pub left: Box<TableSource>,
+    pub right: Box<TableSource>,
+    pub condition: Option<WhereExpr>,
 }
 
-impl<'a> Iterator for TableIter<'a> {
-    type Item = &'a TableRef;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.table {
-            Some(table) => {
-                if let Some(join) = &table.join {
-                    self.table = Some(&join.table);
-                } else {
-                    self.table = None;
-                }
-                Some(table)
-            }
-            None => None,
+impl JoinNode {
+    fn tables(&self) -> JoinNodeIter<'_> {
+        JoinNodeIter {
+            left_iter: self.left.tables(),
+            right_iter: self.right.tables(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub struct JoinClause {
-    pub join_type: JoinType,
-    pub table: Box<TableRef>,
-    pub condition: Option<WhereExpr>,
+impl Deparse for JoinNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.left.deparse(buf);
+        buf.push_str(" JOIN");
+        self.right.deparse(buf);
+        if let Some(condition) = &self.condition {
+            buf.push_str(" ON ");
+            condition.deparse(buf);
+        }
+        buf
+    }
+}
+
+struct JoinNodeIter<'a> {
+    left_iter: TableSourceIter<'a>,
+    right_iter: TableSourceIter<'a>,
+}
+
+impl<'a> Iterator for JoinNodeIter<'a> {
+    type Item = &'a TableNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.left_iter.next().or_else(|| self.right_iter.next())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -643,6 +730,25 @@ pub enum JoinType {
     Left,
     Right,
     Full,
+}
+
+impl TryFrom<pg_query::protobuf::JoinType> for JoinType {
+    type Error = AstError;
+
+    fn try_from(v: pg_query::protobuf::JoinType) -> Result<Self, Self::Error> {
+        match v {
+            pg_query::protobuf::JoinType::Undefined => Err(AstError::UnsupportedJoinType),
+            pg_query::protobuf::JoinType::JoinInner => Ok(Self::Inner),
+            pg_query::protobuf::JoinType::JoinLeft => Ok(Self::Left),
+            pg_query::protobuf::JoinType::JoinFull => Ok(Self::Full),
+            pg_query::protobuf::JoinType::JoinRight => Ok(Self::Right),
+            pg_query::protobuf::JoinType::JoinSemi => Err(AstError::UnsupportedJoinType),
+            pg_query::protobuf::JoinType::JoinAnti => Err(AstError::UnsupportedJoinType),
+            pg_query::protobuf::JoinType::JoinRightAnti => Err(AstError::UnsupportedJoinType),
+            pg_query::protobuf::JoinType::JoinUniqueOuter => Err(AstError::UnsupportedJoinType),
+            pg_query::protobuf::JoinType::JoinUniqueInner => Err(AstError::UnsupportedJoinType),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -767,24 +873,66 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
     }
 }
 
-fn from_clause_convert(from_clause: &[Node]) -> Result<Vec<TableRef>, AstError> {
+fn from_clause_convert(from_clause: &[Node]) -> Result<Vec<TableSource>, AstError> {
     let mut tables = Vec::new();
 
     for from_node in from_clause {
-        if let Some(NodeEnum::RangeVar(range_var)) = &from_node.node {
-            let table_ref = table_ref_convert(range_var)?;
-            tables.push(table_ref);
-        } else {
-            return Err(AstError::UnsupportedSelectFeature {
-                feature: format!("FROM clause type: {from_node:?}"),
-            });
+        match &from_node.node {
+            Some(NodeEnum::RangeVar(range_var)) => {
+                let table_node = table_node_convert(range_var)?;
+                tables.push(table_node);
+            }
+            Some(NodeEnum::JoinExpr(join_expr)) => {
+                let join_node = join_expr_convert(join_expr)?;
+                tables.push(join_node);
+            }
+            _ => {
+                return Err(AstError::UnsupportedSelectFeature {
+                    feature: format!("FROM clause type: {from_node:?}"),
+                });
+            }
         }
     }
 
     Ok(tables)
 }
 
-fn table_ref_convert(range_var: &RangeVar) -> Result<TableRef, AstError> {
+fn join_expr_convert(join_expr: &JoinExpr) -> Result<TableSource, AstError> {
+    let left_table = if let Some(larg_node) = &join_expr.larg
+        && let Some(NodeEnum::RangeVar(range_var)) = &larg_node.node
+    {
+        table_node_convert(range_var)?
+    } else {
+        return Err(AstError::UnsupportedSelectFeature {
+            feature: format!("join expr: {join_expr:?}"),
+        });
+    };
+
+    let right_table = if let Some(rarg_node) = &join_expr.rarg
+        && let Some(NodeEnum::RangeVar(range_var)) = &rarg_node.node
+    {
+        table_node_convert(range_var)?
+    } else {
+        return Err(AstError::UnsupportedSelectFeature {
+            feature: format!("join expr: {join_expr:?}"),
+        });
+    };
+
+    let clause = if let Some(clause) = &join_expr.quals {
+        Some(node_convert_to_expr(clause)?)
+    } else {
+        None
+    };
+
+    Ok(TableSource::Join(JoinNode {
+        join_type: JoinType::try_from(join_expr.jointype())?,
+        left: Box::new(left_table),
+        right: Box::new(right_table),
+        condition: clause,
+    }))
+}
+
+fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
     let schema = if range_var.schemaname.is_empty() {
         None
     } else {
@@ -798,12 +946,11 @@ fn table_ref_convert(range_var: &RangeVar) -> Result<TableRef, AstError> {
         .as_ref()
         .map(|alias_node| alias_node.aliasname.clone());
 
-    Ok(TableRef {
+    Ok(TableSource::Table(TableNode {
         schema,
         name,
         alias,
-        join: None, // TODO: Convert JOIN clauses
-    })
+    }))
 }
 
 fn column_ref_convert(col_ref: &PgColumnRef) -> Result<ColumnRef, AstError> {
@@ -842,7 +989,7 @@ pub fn ast_query_fingerprint(select_statement: &SelectStatement) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, panic};
 
     use super::*;
 
@@ -903,9 +1050,14 @@ mod tests {
         // Check table alias
         let Statement::Select(select) = &ast.statement;
         assert_eq!(select.from.len(), 1);
-        assert_eq!(select.from[0].schema, Some("test".to_owned()));
-        assert_eq!(select.from[0].name, "users");
-        assert_eq!(select.from[0].alias, None);
+
+        let TableSource::Table(table) = &select.from[0] else {
+            panic!("exepected table");
+        };
+
+        assert_eq!(table.schema, Some("test".to_owned()));
+        assert_eq!(table.name, "users");
+        assert_eq!(table.alias, None);
 
         // Check column references
         if let SelectColumns::Columns(columns) = &select.columns {
@@ -934,8 +1086,13 @@ mod tests {
         // Check table alias
         let Statement::Select(select) = &ast.statement;
         assert_eq!(select.from.len(), 1);
-        assert_eq!(select.from[0].name, "users");
-        assert_eq!(select.from[0].alias, Some("u".to_string()));
+
+        let TableSource::Table(table) = &select.from[0] else {
+            panic!("exepected table");
+        };
+
+        assert_eq!(table.name, "users");
+        assert_eq!(table.alias, Some("u".to_string()));
 
         // Check column references
         if let SelectColumns::Columns(columns) = &select.columns {
@@ -986,14 +1143,37 @@ mod tests {
         let ast = sql_query_convert(&pg_ast).unwrap();
 
         let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.from.len(), 1);
+
+        let TableSource::Table(table) = &select.from[0] else {
+            panic!("exepected table");
+        };
+
         // Table should have no alias
-        assert_eq!(select.from[0].alias, None);
+        assert_eq!(table.alias, None);
 
         // Columns should have no aliases
         if let SelectColumns::Columns(columns) = &select.columns {
             assert_eq!(columns[0].alias, None);
             assert_eq!(columns[1].alias, None);
         }
+    }
+
+    #[test]
+    fn test_sql_query_join() {
+        let sql = "SELECT * FROM invoice JOIN product p ON p.id = invoice.product_id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        assert_eq!(
+            ast.tables()
+                .map(|t| (t.schema.as_deref(), t.name.as_str(), t.alias.as_deref()))
+                .collect::<HashSet<_>>(),
+            HashSet::<(Option<&str>, _, _)>::from([
+                (None, "invoice", None),
+                (None, "product", Some("p"))
+            ])
+        );
     }
 
     #[test]
@@ -1200,6 +1380,19 @@ mod tests {
     #[test]
     fn test_select_deparse_schema_qualified() {
         let sql = "SELECT * FROM public.users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_join() {
+        let sql = "SELECT first_name, last_name, film_id FROM actor a \
+                JOIN film_actor fa ON a.actor_id = fa.actor_id \
+                WHERE a.actor_id = 1";
         let pg_ast = pg_query::parse(sql).unwrap();
         let ast = sql_query_convert(&pg_ast).unwrap();
 

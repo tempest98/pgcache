@@ -9,7 +9,7 @@ use tracing::{info, instrument, trace};
 
 use crate::cache::query::cache_query_row_matches;
 use crate::query::ast::{Deparse, ast_query_fingerprint};
-use crate::query::transform::query_select_replace;
+use crate::query::transform::{query_select_replace, query_table_update_queries};
 use crate::settings::Settings;
 
 use super::*;
@@ -82,7 +82,7 @@ impl QueryCache {
         let cached_query_state = self
             .cache
             .borrow()
-            .queries
+            .cached_queries
             .get(&fingerprint)
             .map(|q| q.state);
 
@@ -99,14 +99,16 @@ impl QueryCache {
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
-                let table_oid = self.query_register(fingerprint, stmt).await?;
-                let rows = self.query_cache_fetch(stmt).await?;
-                self.query_cache_results(table_oid, &rows).await?;
-                self.cache
-                    .borrow_mut()
-                    .queries
-                    .entry(fingerprint)
-                    .and_modify(|mut query| query.state = CachedQueryState::Ready);
+                let table_oids = self.query_register(fingerprint, stmt).await?;
+                for table_oid in table_oids {
+                    let rows = self.query_cache_fetch(table_oid, stmt).await?;
+                    self.query_cache_results(table_oid, &rows).await?;
+                    self.cache
+                        .borrow_mut()
+                        .cached_queries
+                        .entry(fingerprint)
+                        .and_modify(|mut query| query.state = CachedQueryState::Ready);
+                }
                 trace!("cached query ready");
             };
 
@@ -117,11 +119,30 @@ impl QueryCache {
     #[instrument(skip_all)]
     pub async fn query_cache_fetch(
         &mut self,
+        relation_oid: u32,
         select_statement: &SelectStatement,
     ) -> Result<Vec<SimpleQueryMessage>, CacheError> {
-        let new_ast = query_select_replace(select_statement);
         let mut buf = String::with_capacity(1024);
-        let query = new_ast.deparse(&mut buf);
+        let query = {
+            let cache = self.cache.borrow();
+            let table = cache
+                .tables
+                .get1(&relation_oid)
+                .ok_or(CacheError::UnknownTable)?;
+
+            let maybe_alias = select_statement
+                .tables()
+                .filter(|&tn| tn.name == table.name)
+                .flat_map(|t| t.alias.as_deref())
+                .next();
+
+            let select_columns = table.select_columns(maybe_alias);
+
+            let new_ast = query_select_replace(select_statement, select_columns);
+            new_ast.deparse(&mut buf)
+        };
+
+        dbg!(&query);
         self.db_origin
             .simple_query(query)
             .await
@@ -134,51 +155,65 @@ impl QueryCache {
         &mut self,
         fingerprint: u64,
         select_statement: &SelectStatement,
-    ) -> Result<u32, CacheError> {
-        let tables = select_statement.tables();
-        let table = tables.into_iter().next().ok_or(CacheError::UnknownTable)?;
-        let schema = table.schema.as_deref();
-        let table_name = table.name.as_str();
+    ) -> Result<Vec<u32>, CacheError> {
+        let mut relation_oids = Vec::new();
+        for table_node in select_statement.tables() {
+            let table_name = table_node.name.as_str();
+            let schema = table_node.schema.as_deref();
 
-        if !self.cache.borrow().tables.contains_key2(table_name) {
-            let table = self.cache_table_create(schema, table_name).await?;
-            self.cache.borrow_mut().tables.insert_overwrite(table);
+            if !self.cache.borrow().tables.contains_key2(table_name) {
+                let table = self.cache_table_create(schema, table_name).await?;
+                self.cache.borrow_mut().tables.insert_overwrite(table);
+            }
         }
 
-        let relation_oid = self
-            .cache
-            .borrow()
-            .tables
-            .get2(table_name)
-            .ok_or(CacheError::UnknownTable)?
-            .relation_oid;
+        for (table_node, update_query) in query_table_update_queries(select_statement) {
+            let relation_oid = self
+                .cache
+                .borrow()
+                .tables
+                .get2(table_node.name.as_str())
+                .ok_or(CacheError::UnknownTable)?
+                .relation_oid;
+
+            self.cache
+                .borrow_mut()
+                .update_queries
+                .entry(relation_oid)
+                .and_modify(|mut queries| queries.select_statements.push(update_query.clone()))
+                .or_insert_with(|| UpdateQueries {
+                    relation_oid,
+                    select_statements: vec![update_query],
+                });
+
+            relation_oids.push(relation_oid);
+        }
 
         // Create CachedQuery entry using the already converted AST
         let cached_query = CachedQuery {
             state: CachedQueryState::Loading,
             fingerprint,
-            table_name: table_name.to_owned(),
-            relation_oid,
+            relation_oids: relation_oids.clone(),
             select_statement: select_statement.clone(),
         };
 
         // Store cached query metadata
         self.cache
             .borrow_mut()
-            .queries
+            .cached_queries
             .insert_overwrite(cached_query);
         trace!("cached query loading");
 
-        Ok(relation_oid)
+        Ok(relation_oids)
     }
 
     /// Check if there are any cached queries for a specific table by relation OID.
     pub async fn cached_queries_exist(&self, relation_oid: u32) -> bool {
         self.cache
             .borrow()
-            .queries
+            .cached_queries
             .iter()
-            .any(|query| query.relation_oid == relation_oid)
+            .any(|query| query.relation_oids.contains(&relation_oid))
     }
 
     /// Stores query results in the cache for faster retrieval.
@@ -300,6 +335,7 @@ impl QueryCache {
             if column.is_primary_key {
                 primary_key_columns.push(column.name.clone());
             }
+
             columns.insert_overwrite(column);
         }
 
@@ -401,25 +437,17 @@ impl QueryCache {
     ) -> Result<(), CacheError> {
         let mut columns = Vec::new();
         for column in &table_metadata.columns {
-            let column_sql = format!(
-                "    {} {} {}",
-                column.name,
-                column.type_name,
-                if column.is_primary_key {
-                    "PRIMARY KEY"
-                } else {
-                    ""
-                }
-            );
+            let column_sql = format!("    {} {}", column.name, column.type_name,);
             columns.push(column_sql);
         }
 
         let drop_sql = format!("DROP TABLE IF EXISTS {}", table_metadata.name);
 
         let sql = format!(
-            "CREATE TABLE {} (\n{}\n)",
+            "CREATE TABLE {} (\n{},\n\tPRIMARY KEY({})\n)",
             table_metadata.name,
-            columns.join(",\n")
+            columns.join(",\n"),
+            table_metadata.primary_key_columns.join(", "),
         );
 
         self.db_cache.execute(&drop_sql, &[]).await?;
@@ -467,15 +495,15 @@ impl QueryCache {
     fn cache_table_invalidate(&mut self, relation_oid: u32) {
         let mut cache = self.cache.borrow_mut();
         let fingerprints = cache
-            .queries
+            .cached_queries
             .iter()
-            .filter(|q| q.relation_oid == relation_oid)
+            .filter(|q| q.relation_oids.contains(&relation_oid))
             .map(|q| q.fingerprint)
             .collect::<Vec<_>>();
 
         for fp in fingerprints {
             trace!("invalidating query {fp}");
-            cache.queries.remove(&fp);
+            cache.cached_queries.remove(&fp);
         }
     }
 
@@ -533,9 +561,9 @@ impl QueryCache {
         let sql_list = {
             let cache = self.cache.borrow();
             let cached_queries = cache
-                .queries
+                .cached_queries
                 .iter()
-                .filter(|query| query.relation_oid == relation_oid);
+                .filter(|query| query.relation_oids.contains(&relation_oid));
 
             // Get table metadata for column information
             let table_metadata = match cache.tables.get1(&relation_oid) {
@@ -587,9 +615,9 @@ impl QueryCache {
 
             // Check each cached query to see if this UPDATE affects it
             let matched = cache
-                .queries
+                .cached_queries
                 .iter()
-                .filter(|query| query.relation_oid == relation_oid)
+                .filter(|query| query.relation_oids.contains(&relation_oid))
                 .any(|query| cache_query_row_matches(query, &new_row_data, table_metadata));
 
             let sql = if matched {

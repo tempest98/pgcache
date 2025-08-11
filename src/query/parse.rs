@@ -115,7 +115,7 @@ fn select_stmt_parse(select_stmt: &SelectStmt) -> Result<Option<WhereExpr>, Wher
 }
 
 /// Convert a pg_query Node to our WhereExpr - main entry point for recursion
-fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WhereParseError> {
+pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WhereParseError> {
     match node.node.as_ref() {
         Some(NodeEnum::AExpr(expr)) => a_expr_convert(expr),
         Some(NodeEnum::BoolExpr(expr)) => bool_expr_convert(expr),
