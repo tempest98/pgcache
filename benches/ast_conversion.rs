@@ -11,35 +11,35 @@ fn ast_conversion_benchmarks(c: &mut Criterion) {
     let test_queries = vec![
         ("simple_select", "SELECT id FROM users"),
         ("select_star", "SELECT * FROM products"),
-        (
-            "with_where",
-            "SELECT id, name FROM users WHERE active = true",
-        ),
-        (
-            "simple_and",
-            "SELECT * FROM users WHERE name = 'john' AND active = true",
-        ),
-        (
-            "with_alias",
-            "SELECT u.id, u.name FROM users u WHERE u.active = true",
-        ),
-        (
-            "column_alias",
-            "SELECT id as user_id, name as full_name FROM users",
-        ),
-        ("qualified_table", "SELECT id FROM public.users"),
-        (
-            "multiple_tables",
-            "SELECT u.id, p.title FROM users u, posts p WHERE u.id = p.user_id",
-        ),
-        (
-            "comparison_ops",
-            "SELECT * FROM users WHERE age >= 18 AND score <= 100",
-        ),
-        (
-            "simple_or",
-            "SELECT * FROM users WHERE active = true OR verified = true",
-        ),
+        // (
+        //     "with_where",
+        //     "SELECT id, name FROM users WHERE active = true",
+        // ),
+        // (
+        //     "simple_and",
+        //     "SELECT * FROM users WHERE name = 'john' AND active = true",
+        // ),
+        // (
+        //     "with_alias",
+        //     "SELECT u.id, u.name FROM users u WHERE u.active = true",
+        // ),
+        // (
+        //     "column_alias",
+        //     "SELECT id as user_id, name as full_name FROM users",
+        // ),
+        // ("qualified_table", "SELECT id FROM public.users"),
+        // (
+        //     "multiple_tables",
+        //     "SELECT u.id, p.title FROM users u, posts p WHERE u.id = p.user_id",
+        // ),
+        // (
+        //     "comparison_ops",
+        //     "SELECT * FROM users WHERE age >= 18 AND score <= 100",
+        // ),
+        // (
+        //     "simple_or",
+        //     "SELECT * FROM users WHERE active = true OR verified = true",
+        // ),
     ];
 
     // Benchmark our AST conversion
@@ -115,26 +115,26 @@ fn ast_cloning_benchmarks(c: &mut Criterion) {
     let test_cases = vec![
         ("simple_select", "SELECT id FROM users"),
         ("select_star", "SELECT * FROM products"),
-        (
-            "with_where",
-            "SELECT id, name FROM users WHERE active = true",
-        ),
-        (
-            "simple_and",
-            "SELECT * FROM users WHERE name = 'john' AND active = true",
-        ),
-        (
-            "with_alias",
-            "SELECT u.id, u.name FROM users u WHERE u.active = true",
-        ),
-        (
-            "column_alias",
-            "SELECT id as user_id, name as full_name FROM users",
-        ),
-        (
-            "simple_or",
-            "SELECT * FROM users WHERE active = true OR verified = true",
-        ),
+        // (
+        //     "with_where",
+        //     "SELECT id, name FROM users WHERE active = true",
+        // ),
+        // (
+        //     "simple_and",
+        //     "SELECT * FROM users WHERE name = 'john' AND active = true",
+        // ),
+        // (
+        //     "with_alias",
+        //     "SELECT u.id, u.name FROM users u WHERE u.active = true",
+        // ),
+        // (
+        //     "column_alias",
+        //     "SELECT id as user_id, name as full_name FROM users",
+        // ),
+        // (
+        //     "simple_or",
+        //     "SELECT * FROM users WHERE active = true OR verified = true",
+        // ),
     ];
 
     for (name, sql) in &test_cases {

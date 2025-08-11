@@ -53,3 +53,7 @@ criterion = { version = "0.7", features = ["html_reports"] }
 [[bench]]
 name = "ast_conversion"
 harness = false
+
+[[bench]]
+name = "query_parsing"
+harness = false
