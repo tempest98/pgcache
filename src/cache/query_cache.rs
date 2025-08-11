@@ -7,8 +7,9 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
 
-use crate::cache::query::{cache_query_row_matches, query_select_replace};
+use crate::cache::query::cache_query_row_matches;
 use crate::query::ast::{Deparse, ast_query_fingerprint};
+use crate::query::transform::query_select_replace;
 use crate::settings::Settings;
 
 use super::*;
