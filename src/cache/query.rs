@@ -6,12 +6,15 @@ use crate::query::{
 
 use super::*;
 
-pub fn is_cacheable_ast(sql_query: &SqlQuery) -> bool {
+pub fn is_cacheable_ast(sql_query: &SqlQuery) -> Option<&SelectStatement> {
     match &sql_query.statement {
         Statement::Select(select) => {
-            // Must be single table
-            select.is_single_table() && !select.has_sublink() && is_cacheable_select(select)
-        } // _ => false, // Only SELECT statements are cacheable
+            if select.is_single_table() && !select.has_sublink() && is_cacheable_select(select) {
+                Some(select)
+            } else {
+                None
+            }
+        } // _ => None, // Only SELECT statements are cacheable
     }
 }
 
@@ -60,32 +63,22 @@ pub fn cache_query_row_matches(
     row_data: &[Option<String>],
     table_metadata: &TableMetadata,
 ) -> bool {
-    // Get the WHERE clause from the SQL query AST
-    let where_clause = match &query.sql_query.statement {
-        Statement::Select(select) => &select.where_clause,
-        // _ => return false, // Non-SELECT queries don't match rows
-    };
-
-    match where_clause {
+    match &query.select_statement.where_clause {
         Some(expr) => where_expr_evaluate(expr, row_data, table_metadata),
         None => true, // No filter means all rows match
     }
 }
 
-pub fn query_select_replace(ast: &SqlQuery) -> SqlQuery {
-    // Only replace if this is a SELECT statement at the top level
-    // (not an INSERT, UPDATE, etc. that contains an embedded SELECT)
-
-    if !ast.is_single_table() {
+pub fn query_select_replace(select_statement: &SelectStatement) -> SelectStatement {
+    if !select_statement.is_single_table() {
         // Return original if not a pure SELECT statement
-        return ast.clone();
+        return select_statement.clone();
     }
 
-    let mut new_ast = ast.clone();
-    let Statement::Select(select) = &mut new_ast.statement;
-    select.columns = SelectColumns::All;
+    let mut new_stmt = select_statement.clone();
+    new_stmt.columns = SelectColumns::All;
 
-    new_ast
+    new_stmt
 }
 
 #[cfg(test)]
@@ -101,7 +94,8 @@ mod tests {
         let ast = pg_query::parse(original_query).expect("to parse query");
         let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
 
-        let result = query_select_replace(&sql_query);
+        let Statement::Select(stmt) = &sql_query.statement;
+        let result = query_select_replace(stmt);
 
         // Deparse to verify the transformation
         let mut buf = String::new();
@@ -134,7 +128,8 @@ mod tests {
         let ast = pg_query::parse(original_query).expect("to parse query");
         let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
 
-        let result = query_select_replace(&sql_query);
+        let Statement::Select(stmt) = &sql_query.statement;
+        let result = query_select_replace(stmt);
 
         // Deparse to verify the transformation
         let mut buf = String::new();

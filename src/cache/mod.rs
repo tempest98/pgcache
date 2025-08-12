@@ -18,11 +18,10 @@ use tokio_stream::{
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, instrument};
 
-use crate::cache::cdc::CdcProcessor;
 use crate::cache::worker::CacheWorker;
+use crate::{cache::cdc::CdcProcessor, query::ast::SelectStatement};
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
-    query::ast::SqlQuery,
     settings::Settings,
 };
 
@@ -66,7 +65,7 @@ error_set! {
 
 #[derive(Debug)]
 pub enum CacheMessage {
-    Query(BytesMut, Box<SqlQuery>),
+    Query(BytesMut, Box<SelectStatement>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +169,7 @@ pub struct CachedQuery {
     pub fingerprint: u64,
     pub table_name: String,
     pub relation_oid: u32,
-    pub sql_query: SqlQuery,
+    pub select_statement: SelectStatement,
 }
 
 impl IdHashItem for CachedQuery {
@@ -229,10 +228,10 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                         spawn_local(async move {
                             match src {
                                 StreamSource::Proxy((msg, reply_tx)) => match msg {
-                                    CacheMessage::Query(data, ast) => {
+                                    CacheMessage::Query(data, select_statement) => {
                                         let msg = QueryRequest {
                                             data,
-                                            ast,
+                                            select_statement,
                                             reply_tx,
                                         };
                                         match qcache.query_dispatch(msg).await {

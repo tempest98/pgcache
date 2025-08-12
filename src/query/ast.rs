@@ -685,11 +685,7 @@ impl SqlQuery {
     /// Get all table names referenced in the query
     pub fn tables(&self) -> HashSet<(Option<&str>, &str)> {
         match &self.statement {
-            Statement::Select(select) => select
-                .from
-                .iter()
-                .map(|t| (t.schema.as_ref().map(String::as_ref), t.name.as_str()))
-                .collect(),
+            Statement::Select(select) => select.tables(),
         }
     }
 
@@ -721,6 +717,13 @@ impl SqlQuery {
 }
 
 impl SelectStatement {
+    pub fn tables(&self) -> HashSet<(Option<&str>, &str)> {
+        self.from
+            .iter()
+            .map(|t| (t.schema.as_ref().map(String::as_ref), t.name.as_str()))
+            .collect()
+    }
+
     /// Check if this SELECT statement references only a single table
     pub fn is_single_table(&self) -> bool {
         self.from.len() == 1 && self.from[0].join.is_none()
@@ -782,10 +785,9 @@ impl SelectStatement {
 }
 
 /// Create a fingerprint hash for SQL query AST.
-/// This is faster and more normalized than string-based fingerprinting.
-pub fn ast_query_fingerprint(sql_query: &SqlQuery) -> u64 {
+pub fn ast_query_fingerprint(select_statement: &SelectStatement) -> u64 {
     let mut hasher = DefaultHasher::new();
-    sql_query.hash(&mut hasher);
+    select_statement.hash(&mut hasher);
     hasher.finish()
 }
 

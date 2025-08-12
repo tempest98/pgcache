@@ -15,7 +15,7 @@ use crate::{
         backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
         frontend::{PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType},
     },
-    query::ast::{SqlQuery, sql_query_convert},
+    query::ast::{SelectStatement, sql_query_convert},
     settings::Settings,
 };
 
@@ -227,7 +227,7 @@ async fn handle_connection(
     streams_read.insert("client", client_mapped_pin);
     streams_read.insert("origin", origin_mapped_pin);
 
-    let mut fingerprint_cache: HashMap<u64, Option<Box<SqlQuery>>> = HashMap::new();
+    let mut fingerprint_cache: HashMap<u64, Option<Box<SelectStatement>>> = HashMap::new();
 
     let mut in_transaction = false;
 
@@ -321,12 +321,12 @@ async fn handle_connection(
 
 enum Action {
     Forward,
-    CacheCheck(Box<SqlQuery>),
+    CacheCheck(Box<SelectStatement>),
 }
 
 async fn handle_query(
     data: &BytesMut,
-    fp_cache: &mut HashMap<u64, Option<Box<SqlQuery>>>,
+    fp_cache: &mut HashMap<u64, Option<Box<SelectStatement>>>,
 ) -> Result<Action, ParseError> {
     let msg_len = (&data[1..5]).get_u32() as usize;
     let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
@@ -336,9 +336,9 @@ async fn handle_query(
     let fingerprint = hasher.finish();
 
     match fp_cache.get(&fingerprint) {
-        Some(Some(ast)) => {
+        Some(Some(stmt)) => {
             trace!("cache hit: cacheable true");
-            Ok(Action::CacheCheck(Box::new(*ast.clone())))
+            Ok(Action::CacheCheck(Box::new(*stmt.clone())))
         }
         Some(None) => {
             trace!("cache hit: cacheable false");
@@ -348,10 +348,10 @@ async fn handle_query(
             let ast = pg_query::parse(query)?;
 
             if let Ok(query) = sql_query_convert(&ast)
-                && is_cacheable_ast(&query)
+                && let Some(select_statement) = is_cacheable_ast(&query)
             {
-                fp_cache.insert(fingerprint, Some(Box::new(query.clone())));
-                Ok(Action::CacheCheck(Box::new(query)))
+                fp_cache.insert(fingerprint, Some(Box::new(select_statement.clone())));
+                Ok(Action::CacheCheck(Box::new(select_statement.clone())))
             } else {
                 fp_cache.insert(fingerprint, None);
                 Ok(Action::Forward)

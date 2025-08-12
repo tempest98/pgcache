@@ -16,7 +16,7 @@ use super::*;
 #[derive(Debug)]
 pub struct QueryRequest {
     pub data: BytesMut,
-    pub ast: Box<SqlQuery>,
+    pub select_statement: Box<SelectStatement>,
     pub reply_tx: Sender<CacheReply>,
 }
 
@@ -76,8 +76,8 @@ impl QueryCache {
 
     #[instrument(skip_all)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
-        let sql_query = &msg.ast;
-        let fingerprint = ast_query_fingerprint(sql_query);
+        let stmt = &msg.select_statement;
+        let fingerprint = ast_query_fingerprint(stmt);
         let cached_query_state = self
             .cache
             .borrow()
@@ -98,8 +98,8 @@ impl QueryCache {
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
-                let table_oid = self.query_register(fingerprint, sql_query).await?;
-                let rows = self.query_cache_fetch(sql_query).await?;
+                let table_oid = self.query_register(fingerprint, stmt).await?;
+                let rows = self.query_cache_fetch(stmt).await?;
                 self.query_cache_results(table_oid, &rows).await?;
                 self.cache
                     .borrow_mut()
@@ -116,9 +116,9 @@ impl QueryCache {
     #[instrument(skip_all)]
     pub async fn query_cache_fetch(
         &mut self,
-        ast: &SqlQuery,
+        select_statement: &SelectStatement,
     ) -> Result<Vec<SimpleQueryMessage>, CacheError> {
-        let new_ast = query_select_replace(ast);
+        let new_ast = query_select_replace(select_statement);
         let mut buf = String::with_capacity(1024);
         let query = new_ast.deparse(&mut buf);
         self.db_origin
@@ -132,9 +132,9 @@ impl QueryCache {
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
-        sql_query: &SqlQuery,
+        select_statement: &SelectStatement,
     ) -> Result<u32, CacheError> {
-        let tables = sql_query.tables();
+        let tables = select_statement.tables();
         let (schema, table_name) = tables.into_iter().next().ok_or(CacheError::UnknownTable)?;
 
         if !self.cache.borrow().tables.contains_key2(table_name) {
@@ -156,7 +156,7 @@ impl QueryCache {
             fingerprint,
             table_name: table_name.to_owned(),
             relation_oid,
-            sql_query: sql_query.clone(),
+            select_statement: select_statement.clone(),
         };
 
         // Store cached query metadata
