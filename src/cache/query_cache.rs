@@ -136,7 +136,9 @@ impl QueryCache {
         select_statement: &SelectStatement,
     ) -> Result<u32, CacheError> {
         let tables = select_statement.tables();
-        let (schema, table_name) = tables.into_iter().next().ok_or(CacheError::UnknownTable)?;
+        let table = tables.into_iter().next().ok_or(CacheError::UnknownTable)?;
+        let schema = table.schema.as_deref();
+        let table_name = table.name.as_str();
 
         if !self.cache.borrow().tables.contains_key2(table_name) {
             let table = self.cache_table_create(schema, table_name).await?;

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::convert::AsRef;
 use std::hash::{Hash, Hasher};
@@ -287,6 +286,41 @@ pub struct SqlQuery {
     pub statement: Statement,
 }
 
+impl SqlQuery {
+    /// Get all table names referenced in the query
+    pub fn tables(&self) -> impl Iterator<Item = &'_ TableRef> {
+        match &self.statement {
+            Statement::Select(select) => select.tables(),
+        }
+    }
+
+    /// Check if query only references a single table
+    pub fn is_single_table(&self) -> bool {
+        self.tables().nth(1).is_none()
+    }
+
+    /// Check if query has a WHERE clause
+    pub fn has_where_clause(&self) -> bool {
+        match &self.statement {
+            Statement::Select(select) => select.where_clause.is_some(),
+        }
+    }
+
+    /// Get the WHERE clause if it exists
+    pub fn where_clause(&self) -> Option<&WhereExpr> {
+        match &self.statement {
+            Statement::Select(select) => select.where_clause.as_ref(),
+        }
+    }
+
+    /// Check if this is a SELECT * query
+    pub fn is_select_star(&self) -> bool {
+        match &self.statement {
+            Statement::Select(select) => matches!(select.columns, SelectColumns::All),
+        }
+    }
+}
+
 impl Deparse for SqlQuery {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         self.statement.deparse(buf)
@@ -319,6 +353,97 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<LimitClause>,
     pub distinct: bool,
+}
+
+impl SelectStatement {
+    pub fn tables(&self) -> impl Iterator<Item = &'_ TableRef> {
+        let mut iter = self.from.iter();
+        let table_iter = iter.next().map(|t| t.tables());
+        SelectStatementTableIter { iter, table_iter }
+    }
+
+    /// Check if this SELECT statement references only a single table
+    pub fn is_single_table(&self) -> bool {
+        self.from.len() == 1 && self.from[0].join.is_none()
+    }
+
+    /// Check if this SELECT statement contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        // Check columns for subqueries
+        if let SelectColumns::Columns(columns) = &self.columns
+            && columns
+                .iter()
+                .any(|col| self.column_expr_has_sublink(&col.expr))
+        {
+            return true;
+        }
+
+        // Check WHERE clause for subqueries
+        if let Some(where_clause) = &self.where_clause
+            && self.where_expr_has_sublink(where_clause)
+        {
+            return true;
+        }
+
+        // Check HAVING clause for subqueries
+        if let Some(having) = &self.having
+            && self.where_expr_has_sublink(having)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn column_expr_has_sublink(&self, expr: &ColumnExpr) -> bool {
+        match expr {
+            ColumnExpr::Function(func) => func
+                .args
+                .iter()
+                .any(|arg| self.column_expr_has_sublink(arg)),
+            _ => false, // Column references and literals don't contain sublinks
+        }
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn where_expr_has_sublink(&self, expr: &WhereExpr) -> bool {
+        match expr {
+            WhereExpr::Binary(binary) => {
+                self.where_expr_has_sublink(&binary.lexpr)
+                    || self.where_expr_has_sublink(&binary.rexpr)
+            }
+            WhereExpr::Unary(unary) => self.where_expr_has_sublink(&unary.expr),
+            WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| self.where_expr_has_sublink(e)),
+            WhereExpr::Function { args, .. } => args.iter().any(|e| self.where_expr_has_sublink(e)),
+            WhereExpr::Subquery { .. } => true, // Found a subquery!
+            _ => false,                         // Value and Column don't contain sublinks
+        }
+    }
+}
+
+struct SelectStatementTableIter<'a> {
+    iter: std::slice::Iter<'a, TableRef>,
+    table_iter: Option<TableIter<'a>>,
+}
+
+impl<'a> Iterator for SelectStatementTableIter<'a> {
+    type Item = &'a TableRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.table_iter {
+            Some(ref mut table_iter) => {
+                let mut next = table_iter.next();
+                if next.is_none() {
+                    self.table_iter = self.iter.next().map(|t| t.tables());
+                    next = self.table_iter.as_mut().and_then(|iter| iter.next())
+                }
+
+                next
+            }
+            None => None,
+        }
+    }
 }
 
 impl Deparse for SelectStatement {
@@ -456,6 +581,12 @@ pub struct TableRef {
     pub join: Option<JoinClause>,
 }
 
+impl TableRef {
+    fn tables(&self) -> TableIter<'_> {
+        TableIter { table: Some(self) }
+    }
+}
+
 impl Deparse for TableRef {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push(' ');
@@ -474,6 +605,28 @@ impl Deparse for TableRef {
         }
 
         buf
+    }
+}
+
+struct TableIter<'a> {
+    table: Option<&'a TableRef>,
+}
+
+impl<'a> Iterator for TableIter<'a> {
+    type Item = &'a TableRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.table {
+            Some(table) => {
+                if let Some(join) = &table.join {
+                    self.table = Some(&join.table);
+                } else {
+                    self.table = None;
+                }
+                Some(table)
+            }
+            None => None,
+        }
     }
 }
 
@@ -680,110 +833,6 @@ fn column_ref_convert(col_ref: &PgColumnRef) -> Result<ColumnRef, AstError> {
     Ok(ColumnRef { table, column })
 }
 
-/// Helper functions for common query analysis tasks
-impl SqlQuery {
-    /// Get all table names referenced in the query
-    pub fn tables(&self) -> HashSet<(Option<&str>, &str)> {
-        match &self.statement {
-            Statement::Select(select) => select.tables(),
-        }
-    }
-
-    /// Check if query only references a single table
-    pub fn is_single_table(&self) -> bool {
-        self.tables().len() == 1
-    }
-
-    /// Check if query has a WHERE clause
-    pub fn has_where_clause(&self) -> bool {
-        match &self.statement {
-            Statement::Select(select) => select.where_clause.is_some(),
-        }
-    }
-
-    /// Get the WHERE clause if it exists
-    pub fn where_clause(&self) -> Option<&WhereExpr> {
-        match &self.statement {
-            Statement::Select(select) => select.where_clause.as_ref(),
-        }
-    }
-
-    /// Check if this is a SELECT * query
-    pub fn is_select_star(&self) -> bool {
-        match &self.statement {
-            Statement::Select(select) => matches!(select.columns, SelectColumns::All),
-        }
-    }
-}
-
-impl SelectStatement {
-    pub fn tables(&self) -> HashSet<(Option<&str>, &str)> {
-        self.from
-            .iter()
-            .map(|t| (t.schema.as_ref().map(String::as_ref), t.name.as_str()))
-            .collect()
-    }
-
-    /// Check if this SELECT statement references only a single table
-    pub fn is_single_table(&self) -> bool {
-        self.from.len() == 1 && self.from[0].join.is_none()
-    }
-
-    /// Check if this SELECT statement contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
-        // Check columns for subqueries
-        if let SelectColumns::Columns(columns) = &self.columns
-            && columns
-                .iter()
-                .any(|col| self.column_expr_has_sublink(&col.expr))
-        {
-            return true;
-        }
-
-        // Check WHERE clause for subqueries
-        if let Some(where_clause) = &self.where_clause
-            && self.where_expr_has_sublink(where_clause)
-        {
-            return true;
-        }
-
-        // Check HAVING clause for subqueries
-        if let Some(having) = &self.having
-            && self.where_expr_has_sublink(having)
-        {
-            return true;
-        }
-
-        false
-    }
-
-    #[allow(clippy::only_used_in_recursion)]
-    fn column_expr_has_sublink(&self, expr: &ColumnExpr) -> bool {
-        match expr {
-            ColumnExpr::Function(func) => func
-                .args
-                .iter()
-                .any(|arg| self.column_expr_has_sublink(arg)),
-            _ => false, // Column references and literals don't contain sublinks
-        }
-    }
-
-    #[allow(clippy::only_used_in_recursion)]
-    fn where_expr_has_sublink(&self, expr: &WhereExpr) -> bool {
-        match expr {
-            WhereExpr::Binary(binary) => {
-                self.where_expr_has_sublink(&binary.lexpr)
-                    || self.where_expr_has_sublink(&binary.rexpr)
-            }
-            WhereExpr::Unary(unary) => self.where_expr_has_sublink(&unary.expr),
-            WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| self.where_expr_has_sublink(e)),
-            WhereExpr::Function { args, .. } => args.iter().any(|e| self.where_expr_has_sublink(e)),
-            WhereExpr::Subquery { .. } => true, // Found a subquery!
-            _ => false,                         // Value and Column don't contain sublinks
-        }
-    }
-}
-
 /// Create a fingerprint hash for SQL query AST.
 pub fn ast_query_fingerprint(select_statement: &SelectStatement) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -793,6 +842,8 @@ pub fn ast_query_fingerprint(select_statement: &SelectStatement) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -805,7 +856,9 @@ mod tests {
         assert!(ast.has_where_clause());
         assert!(!ast.is_select_star());
         assert_eq!(
-            ast.tables(),
+            ast.tables()
+                .map(|t| (t.schema.as_deref(), t.name.as_str()))
+                .collect::<HashSet<_>>(),
             HashSet::<(Option<&str>, _)>::from([(None, "users")])
         );
     }
@@ -820,7 +873,9 @@ mod tests {
         assert!(!ast.has_where_clause());
         assert!(ast.is_select_star());
         assert_eq!(
-            ast.tables(),
+            ast.tables()
+                .map(|t| (t.schema.as_deref(), t.name.as_str()))
+                .collect::<HashSet<_>>(),
             HashSet::<(Option<&str>, _)>::from([(None, "products")])
         );
     }
