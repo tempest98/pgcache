@@ -1,5 +1,5 @@
 use crate::query::{
-    ast::{SelectStatement, SqlQuery, Statement, WhereExpr, WhereOp},
+    ast::{ExprOp, SelectStatement, SqlQuery, Statement, WhereExpr},
     evaluate::{is_simple_comparison, where_expr_evaluate},
 };
 
@@ -32,20 +32,20 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
     match expr {
         WhereExpr::Binary(binary_expr) => {
             match binary_expr.op {
-                WhereOp::Equal
-                | WhereOp::NotEqual
-                | WhereOp::LessThan
-                | WhereOp::LessThanOrEqual
-                | WhereOp::GreaterThan
-                | WhereOp::GreaterThanOrEqual => {
+                ExprOp::Equal
+                | ExprOp::NotEqual
+                | ExprOp::LessThan
+                | ExprOp::LessThanOrEqual
+                | ExprOp::GreaterThan
+                | ExprOp::GreaterThanOrEqual => {
                     // Simple comparison: column op value
                     is_simple_comparison(binary_expr)
                 }
-                WhereOp::And => {
+                ExprOp::And => {
                     // AND: both sides must be cacheable
                     is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
                 }
-                WhereOp::Or => {
+                ExprOp::Or => {
                     // OR: both sides must be cacheable
                     is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
                 }

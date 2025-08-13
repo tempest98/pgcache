@@ -11,7 +11,7 @@ use pg_query::protobuf::{
 };
 use pg_query::{NodeRef, ParseResult};
 
-use super::ast::{BinaryExpr, ColumnRef, LiteralValue, UnaryExpr, WhereExpr, WhereOp};
+use super::ast::{BinaryExpr, ColumnRef, LiteralValue, UnaryExpr, WhereExpr, ExprOp};
 
 error_set! {
     ParseError = WhereParseError || SqlError;
@@ -217,7 +217,7 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
 }
 
 /// Extract operator from pg_query operator name nodes
-fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<WhereOp, WhereParseError> {
+fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<ExprOp, WhereParseError> {
     if name_nodes.len() != 1 {
         return Err(WhereParseError::Other {
             error: "Multi-part operator names not supported".to_string(),
@@ -226,12 +226,12 @@ fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<WhereOp, WhereParse
 
     match name_nodes[0].node.as_ref() {
         Some(NodeEnum::String(s)) => match s.sval.as_str() {
-            "=" => Ok(WhereOp::Equal),
-            "!=" | "<>" => Ok(WhereOp::NotEqual),
-            "<" => Ok(WhereOp::LessThan),
-            "<=" => Ok(WhereOp::LessThanOrEqual),
-            ">" => Ok(WhereOp::GreaterThan),
-            ">=" => Ok(WhereOp::GreaterThanOrEqual),
+            "=" => Ok(ExprOp::Equal),
+            "!=" | "<>" => Ok(ExprOp::NotEqual),
+            "<" => Ok(ExprOp::LessThan),
+            "<=" => Ok(ExprOp::LessThanOrEqual),
+            ">" => Ok(ExprOp::GreaterThan),
+            ">=" => Ok(ExprOp::GreaterThanOrEqual),
 
             op => {
                 dbg!(op);
@@ -260,7 +260,7 @@ fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
             }
 
             Ok(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::And,
+                op: ExprOp::And,
                 lexpr: Box::new(node_convert_to_expr(&expr.args[0])?),
                 rexpr: Box::new(node_convert_to_expr(&expr.args[1])?),
             }))
@@ -273,7 +273,7 @@ fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
             }
 
             Ok(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Or,
+                op: ExprOp::Or,
                 lexpr: Box::new(node_convert_to_expr(&expr.args[0])?),
                 rexpr: Box::new(node_convert_to_expr(&expr.args[1])?),
             }))
@@ -286,7 +286,7 @@ fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
             }
 
             Ok(WhereExpr::Unary(UnaryExpr {
-                op: WhereOp::Not,
+                op: ExprOp::Not,
                 expr: Box::new(node_convert_to_expr(&expr.args[0])?),
             }))
         }
@@ -342,7 +342,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "str".to_string(),
@@ -363,7 +363,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -383,7 +383,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "active".to_string(),
@@ -403,7 +403,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::GreaterThan,
+            op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "cnt".to_string(),
@@ -423,9 +423,9 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::And,
+            op: ExprOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "str".to_string(),
@@ -433,7 +433,7 @@ mod tests {
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "id".to_string(),
@@ -454,9 +454,9 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Or,
+            op: ExprOp::Or,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "str".to_string(),
@@ -464,7 +464,7 @@ mod tests {
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "str".to_string(),
@@ -485,9 +485,9 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Unary(UnaryExpr {
-            op: WhereOp::Not,
+            op: ExprOp::Not,
             expr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "str".to_string(),
@@ -508,7 +508,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: Some("test".to_string()),
                 column: "str".to_string(),
@@ -528,7 +528,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "data".to_string(),
@@ -559,7 +559,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::NotEqual,
+            op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -579,7 +579,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::NotEqual,
+            op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -599,7 +599,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::LessThan,
+            op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -619,7 +619,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::LessThanOrEqual,
+            op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -639,7 +639,7 @@ mod tests {
         let where_clause = result.unwrap();
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::GreaterThanOrEqual,
+            op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),

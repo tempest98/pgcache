@@ -1,6 +1,6 @@
 use crate::cache::TableMetadata;
 
-use super::ast::{BinaryExpr, LiteralValue, WhereExpr, WhereOp};
+use super::ast::{BinaryExpr, LiteralValue, WhereExpr, ExprOp};
 
 /// Recursively evaluate a WHERE expression against row data.
 /// Returns true if the row matches the expression, false otherwise.
@@ -12,20 +12,20 @@ pub fn where_expr_evaluate(
     match expr {
         WhereExpr::Binary(binary_expr) => {
             match binary_expr.op {
-                WhereOp::Equal
-                | WhereOp::NotEqual
-                | WhereOp::LessThan
-                | WhereOp::LessThanOrEqual
-                | WhereOp::GreaterThan
-                | WhereOp::GreaterThanOrEqual => {
+                ExprOp::Equal
+                | ExprOp::NotEqual
+                | ExprOp::LessThan
+                | ExprOp::LessThanOrEqual
+                | ExprOp::GreaterThan
+                | ExprOp::GreaterThanOrEqual => {
                     expr_comparison_evaluate(binary_expr, row_data, table_metadata)
                 }
-                WhereOp::And => {
+                ExprOp::And => {
                     // Both sides must be true
                     where_expr_evaluate(&binary_expr.lexpr, row_data, table_metadata)
                         && where_expr_evaluate(&binary_expr.rexpr, row_data, table_metadata)
                 }
-                WhereOp::Or => {
+                ExprOp::Or => {
                     // Either side can be true
                     where_expr_evaluate(&binary_expr.lexpr, row_data, table_metadata)
                         || where_expr_evaluate(&binary_expr.rexpr, row_data, table_metadata)
@@ -73,7 +73,7 @@ fn expr_comparison_evaluate(
         Some(None) => {
             // Row has NULL value - for equality check if filter is also NULL,
             // for other comparisons NULL always returns false (SQL semantics)
-            matches!(binary_expr.op, WhereOp::Equal) && matches!(value, LiteralValue::Null)
+            matches!(binary_expr.op, ExprOp::Equal) && matches!(value, LiteralValue::Null)
         }
         None => {
             // Column not found in table metadata
@@ -86,7 +86,7 @@ fn expr_comparison_evaluate(
 fn where_value_compare_string(
     filter_value: &LiteralValue,
     row_value_str: &str,
-    op: WhereOp,
+    op: ExprOp,
 ) -> bool {
     use std::cmp::Ordering;
 
@@ -94,12 +94,12 @@ fn where_value_compare_string(
         LiteralValue::String(filter_str) => {
             let cmp = row_value_str.cmp(filter_str);
             match op {
-                WhereOp::Equal => cmp == Ordering::Equal,
-                WhereOp::NotEqual => cmp != Ordering::Equal,
-                WhereOp::LessThan => cmp == Ordering::Less,
-                WhereOp::LessThanOrEqual => cmp != Ordering::Greater,
-                WhereOp::GreaterThan => cmp == Ordering::Greater,
-                WhereOp::GreaterThanOrEqual => cmp != Ordering::Less,
+                ExprOp::Equal => cmp == Ordering::Equal,
+                ExprOp::NotEqual => cmp != Ordering::Equal,
+                ExprOp::LessThan => cmp == Ordering::Less,
+                ExprOp::LessThanOrEqual => cmp != Ordering::Greater,
+                ExprOp::GreaterThan => cmp == Ordering::Greater,
+                ExprOp::GreaterThanOrEqual => cmp != Ordering::Less,
                 _ => false,
             }
         }
@@ -107,12 +107,12 @@ fn where_value_compare_string(
             if let Ok(row_int) = row_value_str.parse::<i64>() {
                 let cmp = row_int.cmp(filter_int);
                 match op {
-                    WhereOp::Equal => cmp == Ordering::Equal,
-                    WhereOp::NotEqual => cmp != Ordering::Equal,
-                    WhereOp::LessThan => cmp == Ordering::Less,
-                    WhereOp::LessThanOrEqual => cmp != Ordering::Greater,
-                    WhereOp::GreaterThan => cmp == Ordering::Greater,
-                    WhereOp::GreaterThanOrEqual => cmp != Ordering::Less,
+                    ExprOp::Equal => cmp == Ordering::Equal,
+                    ExprOp::NotEqual => cmp != Ordering::Equal,
+                    ExprOp::LessThan => cmp == Ordering::Less,
+                    ExprOp::LessThanOrEqual => cmp != Ordering::Greater,
+                    ExprOp::GreaterThan => cmp == Ordering::Greater,
+                    ExprOp::GreaterThanOrEqual => cmp != Ordering::Less,
                     _ => false,
                 }
             } else {
@@ -122,12 +122,12 @@ fn where_value_compare_string(
         LiteralValue::Float(filter_float) => {
             if let Ok(row_float) = row_value_str.parse::<f64>() {
                 match op {
-                    WhereOp::Equal => (row_float - filter_float).abs() < f64::EPSILON,
-                    WhereOp::NotEqual => (row_float - filter_float).abs() >= f64::EPSILON,
-                    WhereOp::LessThan => row_float < *filter_float,
-                    WhereOp::LessThanOrEqual => row_float <= *filter_float,
-                    WhereOp::GreaterThan => row_float > *filter_float,
-                    WhereOp::GreaterThanOrEqual => row_float >= *filter_float,
+                    ExprOp::Equal => (row_float - filter_float).abs() < f64::EPSILON,
+                    ExprOp::NotEqual => (row_float - filter_float).abs() >= f64::EPSILON,
+                    ExprOp::LessThan => row_float < *filter_float,
+                    ExprOp::LessThanOrEqual => row_float <= *filter_float,
+                    ExprOp::GreaterThan => row_float > *filter_float,
+                    ExprOp::GreaterThanOrEqual => row_float >= *filter_float,
                     _ => false,
                 }
             } else {
@@ -137,8 +137,8 @@ fn where_value_compare_string(
         LiteralValue::Boolean(filter_bool) => {
             if let Ok(row_bool) = row_value_str.parse::<bool>() {
                 match op {
-                    WhereOp::Equal => row_bool == *filter_bool,
-                    WhereOp::NotEqual => row_bool != *filter_bool,
+                    ExprOp::Equal => row_bool == *filter_bool,
+                    ExprOp::NotEqual => row_bool != *filter_bool,
                     _ => false, // Boolean comparisons other than equality don't make sense
                 }
             } else {
@@ -173,17 +173,17 @@ mod tests {
         assert!(where_value_compare_string(
             &filter_value,
             "hello",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "world",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(where_value_compare_string(
             &filter_value,
             "world",
-            WhereOp::NotEqual
+            ExprOp::NotEqual
         ));
     }
 
@@ -193,27 +193,27 @@ mod tests {
         assert!(where_value_compare_string(
             &filter_value,
             "123",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "124",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "abc",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(where_value_compare_string(
             &filter_value,
             "100",
-            WhereOp::LessThan
+            ExprOp::LessThan
         ));
         assert!(where_value_compare_string(
             &filter_value,
             "150",
-            WhereOp::GreaterThan
+            ExprOp::GreaterThan
         ));
     }
 
@@ -223,27 +223,27 @@ mod tests {
         assert!(where_value_compare_string(
             &filter_value,
             "123.45",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "123.46",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "invalid",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(where_value_compare_string(
             &filter_value,
             "100.0",
-            WhereOp::LessThan
+            ExprOp::LessThan
         ));
         assert!(where_value_compare_string(
             &filter_value,
             "150.0",
-            WhereOp::GreaterThan
+            ExprOp::GreaterThan
         ));
     }
 
@@ -255,33 +255,33 @@ mod tests {
         assert!(where_value_compare_string(
             &filter_value_true,
             "true",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value_true,
             "false",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value_true,
             "1",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
 
         assert!(where_value_compare_string(
             &filter_value_false,
             "false",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value_false,
             "true",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value_false,
             "0",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
     }
 
@@ -291,17 +291,17 @@ mod tests {
         assert!(!where_value_compare_string(
             &filter_value,
             "anything",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "null",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "NULL",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
     }
 
@@ -311,12 +311,12 @@ mod tests {
         assert!(!where_value_compare_string(
             &filter_value,
             "$1",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
         assert!(!where_value_compare_string(
             &filter_value,
             "anything",
-            WhereOp::Equal
+            ExprOp::Equal
         ));
     }
 
@@ -371,7 +371,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -396,7 +396,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -421,7 +421,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -442,7 +442,7 @@ mod tests {
         let row_data = vec![Some("1".to_string()), None, Some("true".to_string())];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -468,7 +468,7 @@ mod tests {
 
         // Test value = column (reverse order)
         let binary_expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
             rexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
@@ -493,7 +493,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "nonexistent".to_string(),
@@ -519,7 +519,7 @@ mod tests {
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -540,9 +540,9 @@ mod tests {
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::And,
+            op: ExprOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "id".to_string(),
@@ -550,7 +550,7 @@ mod tests {
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "name".to_string(),
@@ -572,9 +572,9 @@ mod tests {
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::And,
+            op: ExprOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "id".to_string(),
@@ -582,7 +582,7 @@ mod tests {
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // Different value
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "name".to_string(),
@@ -604,9 +604,9 @@ mod tests {
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Or,
+            op: ExprOp::Or,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "id".to_string(),
@@ -614,7 +614,7 @@ mod tests {
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // False condition
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "name".to_string(),
@@ -636,9 +636,9 @@ mod tests {
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::Or,
+            op: ExprOp::Or,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "id".to_string(),
@@ -646,7 +646,7 @@ mod tests {
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // False condition
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: WhereOp::Equal,
+                op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnRef {
                     table: None,
                     column: "name".to_string(),
@@ -668,7 +668,7 @@ mod tests {
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
-            op: WhereOp::GreaterThan,
+            op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -708,7 +708,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::NotEqual,
+            op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -733,7 +733,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::NotEqual,
+            op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -759,7 +759,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::LessThan,
+            op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -784,7 +784,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::LessThan,
+            op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -810,7 +810,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::LessThanOrEqual,
+            op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -835,7 +835,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::LessThanOrEqual,
+            op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -860,7 +860,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::LessThanOrEqual,
+            op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -886,7 +886,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThan,
+            op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -911,7 +911,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThan,
+            op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -937,7 +937,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThanOrEqual,
+            op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -962,7 +962,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThanOrEqual,
+            op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -987,7 +987,7 @@ mod tests {
         ];
 
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThanOrEqual,
+            op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -1037,7 +1037,7 @@ mod tests {
 
         // Test less than
         let binary_expr = BinaryExpr {
-            op: WhereOp::LessThan,
+            op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "price".to_string(),
@@ -1053,7 +1053,7 @@ mod tests {
 
         // Test greater than
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThan,
+            op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "price".to_string(),
@@ -1080,7 +1080,7 @@ mod tests {
 
         // Test string less than (lexicographic)
         let binary_expr = BinaryExpr {
-            op: WhereOp::LessThan,
+            op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -1096,7 +1096,7 @@ mod tests {
 
         // Test string greater than
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThan,
+            op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -1119,7 +1119,7 @@ mod tests {
 
         // NULL comparisons should return false (except equality with NULL)
         let binary_expr = BinaryExpr {
-            op: WhereOp::GreaterThan,
+            op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),
@@ -1135,7 +1135,7 @@ mod tests {
 
         // But equality with NULL should work
         let binary_expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "name".to_string(),

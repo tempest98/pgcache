@@ -131,7 +131,7 @@ impl Deparse for ColumnRef {
 // Operators for WHERE expressions
 #[derive(Debug, Clone, Copy, PartialEq, Hash, AsRefStr)]
 #[strum(serialize_all = "UPPERCASE")]
-pub enum WhereOp {
+pub enum ExprOp {
     // Logical operators
     And,
     Or,
@@ -185,7 +185,7 @@ pub enum WhereOp {
     NotExists,
 }
 
-impl Deparse for WhereOp {
+impl Deparse for ExprOp {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push_str(self.as_ref());
 
@@ -195,7 +195,7 @@ impl Deparse for WhereOp {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct UnaryExpr {
-    pub op: WhereOp,
+    pub op: ExprOp,
     pub expr: Box<WhereExpr>,
 }
 
@@ -211,7 +211,7 @@ impl Deparse for UnaryExpr {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BinaryExpr {
-    pub op: WhereOp,
+    pub op: ExprOp,
     pub lexpr: Box<WhereExpr>, // left expression
     pub rexpr: Box<WhereExpr>, // right expression
 }
@@ -231,7 +231,7 @@ impl Deparse for BinaryExpr {
 // Multi-operand expressions (for IN, BETWEEN, etc.)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct MultiExpr {
-    pub op: WhereOp,
+    pub op: ExprOp,
     pub exprs: Vec<WhereExpr>,
 }
 
@@ -1013,50 +1013,50 @@ mod tests {
     }
 
     #[test]
-    fn test_where_op_deparse() {
+    fn test_expr_op_deparse() {
         let mut buf = String::new();
 
         // Comparison operators
-        WhereOp::Equal.deparse(&mut buf);
+        ExprOp::Equal.deparse(&mut buf);
         assert_eq!(buf, "=");
         buf.clear();
 
-        WhereOp::NotEqual.deparse(&mut buf);
+        ExprOp::NotEqual.deparse(&mut buf);
         assert_eq!(buf, "!=");
         buf.clear();
 
-        WhereOp::LessThan.deparse(&mut buf);
+        ExprOp::LessThan.deparse(&mut buf);
         assert_eq!(buf, "<");
         buf.clear();
 
-        WhereOp::GreaterThanOrEqual.deparse(&mut buf);
+        ExprOp::GreaterThanOrEqual.deparse(&mut buf);
         assert_eq!(buf, ">=");
         buf.clear();
 
         // Null checks (test the fix)
-        WhereOp::IsNull.deparse(&mut buf);
+        ExprOp::IsNull.deparse(&mut buf);
         assert_eq!(buf, "IS NULL");
         buf.clear();
 
-        WhereOp::IsNotNull.deparse(&mut buf);
+        ExprOp::IsNotNull.deparse(&mut buf);
         assert_eq!(buf, "IS NOT NULL");
         buf.clear();
 
         // Pattern matching
-        WhereOp::Like.deparse(&mut buf);
+        ExprOp::Like.deparse(&mut buf);
         assert_eq!(buf, "LIKE");
         buf.clear();
 
-        WhereOp::NotLike.deparse(&mut buf);
+        ExprOp::NotLike.deparse(&mut buf);
         assert_eq!(buf, "NOT LIKE");
         buf.clear();
 
         // Logical operators
-        WhereOp::And.deparse(&mut buf);
+        ExprOp::And.deparse(&mut buf);
         assert_eq!(buf, "AND");
         buf.clear();
 
-        WhereOp::Or.deparse(&mut buf);
+        ExprOp::Or.deparse(&mut buf);
         assert_eq!(buf, "OR");
     }
 
@@ -1066,7 +1066,7 @@ mod tests {
 
         // Simple equality: id = 1
         let expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "id".to_string(),
@@ -1080,7 +1080,7 @@ mod tests {
 
         // Complex expression: users.name = 'john'
         let expr = BinaryExpr {
-            op: WhereOp::Equal,
+            op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnRef {
                 table: Some("users".to_string()),
                 column: "name".to_string(),
@@ -1098,7 +1098,7 @@ mod tests {
 
         // NOT active
         let expr = UnaryExpr {
-            op: WhereOp::Not,
+            op: ExprOp::Not,
             expr: Box::new(WhereExpr::Column(ColumnRef {
                 table: None,
                 column: "active".to_string(),
