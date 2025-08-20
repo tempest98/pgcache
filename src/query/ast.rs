@@ -1091,7 +1091,6 @@ fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
 }
 
 fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<TableSource, AstError> {
-    dbg!(range_subselect);
     let Some(NodeEnum::SelectStmt(select_stmt)) = range_subselect
         .subquery
         .as_ref()
@@ -1654,8 +1653,6 @@ mod tests {
             WHERE a.actor_id = 1";
         let pg_ast = pg_query::parse(sql).unwrap();
         let ast = sql_query_convert(&pg_ast).unwrap();
-
-        dbg!(pg_ast);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);

@@ -20,7 +20,6 @@ async fn test_proxy() -> Result<(), Error> {
         .with_dbname("cache_test")
         .start_async()
         .await;
-    dbg!(db.data_dir());
 
     //set up logical replication on origin
     let (origin, origin_connection) = Config::new()

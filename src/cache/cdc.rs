@@ -286,8 +286,6 @@ impl CdcProcessor {
 
     /// Processes relation (table schema) messages.
     async fn process_relation(&self, body: &RelationBody) -> Result<(), Error> {
-        // dbg!(body);
-
         // Parse RelationBody into TableMetadata
         let table_metadata = self.parse_relation_to_table_metadata(body);
 
@@ -302,13 +300,11 @@ impl CdcProcessor {
 
     /// Processes type definition messages.
     async fn process_type(&self, _body: &TypeBody) -> Result<(), Error> {
-        // dbg!(body);
         Ok(())
     }
 
     /// Processes insert messages with query-aware filtering.
     async fn process_insert(&mut self, body: &InsertBody) -> Result<(), Error> {
-        // dbg!(body);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
@@ -318,8 +314,6 @@ impl CdcProcessor {
 
         // Parse row data from InsertBody
         let row_data = self.parse_insert_row_data(body)?;
-
-        // dbg!(&row_data);
 
         // Let cache handle the insert with query-aware filtering
         if let Err(e) = self.cdc_tx.send(CdcMessage::Insert(relation_oid, row_data)) {
@@ -332,7 +326,6 @@ impl CdcProcessor {
 
     /// Processes update messages with query-aware filtering.
     async fn process_update(&mut self, body: &UpdateBody) -> Result<(), Error> {
-        // dbg!(body);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
@@ -342,8 +335,6 @@ impl CdcProcessor {
 
         // Parse old and new row data from UpdateBody
         let (key_data, new_row_data) = self.parse_update_row_data(body)?;
-
-        // dbg!(&key_data, &new_row_data);
 
         // Let cache handle the update with query-aware filtering
         if let Err(e) = self.cdc_tx.send(CdcMessage::Update(CdcMessageUpdate {
@@ -360,7 +351,6 @@ impl CdcProcessor {
 
     /// Processes delete messages with query-aware filtering.
     async fn process_delete(&mut self, body: &DeleteBody) -> Result<(), Error> {
-        // dbg!(body);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
@@ -370,8 +360,6 @@ impl CdcProcessor {
 
         // Parse row data from DeleteBody
         let row_data = self.parse_delete_row_data(body)?;
-
-        // dbg!(&row_data);
 
         // Let cache handle the delete with query-aware filtering
         if let Err(e) = self.cdc_tx.send(CdcMessage::Delete(relation_oid, row_data)) {
