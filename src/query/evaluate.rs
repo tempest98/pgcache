@@ -103,6 +103,18 @@ fn where_value_compare_string(
                 _ => false,
             }
         }
+        LiteralValue::StringWithCast(filter_str, _cast) => {
+            let cmp = row_value_str.cmp(filter_str);
+            match op {
+                ExprOp::Equal => cmp == Ordering::Equal,
+                ExprOp::NotEqual => cmp != Ordering::Equal,
+                ExprOp::LessThan => cmp == Ordering::Less,
+                ExprOp::LessThanOrEqual => cmp != Ordering::Greater,
+                ExprOp::GreaterThan => cmp == Ordering::Greater,
+                ExprOp::GreaterThanOrEqual => cmp != Ordering::Less,
+                _ => false,
+            }
+        }
         LiteralValue::Integer(filter_int) => {
             if let Ok(row_int) = row_value_str.parse::<i64>() {
                 let cmp = row_int.cmp(filter_int);

@@ -1,6 +1,18 @@
-use crate::query::ast::{
-    ColumnExpr, LiteralValue, SelectColumn, SelectColumns, SelectStatement, TableNode,
+use error_set::error_set;
+
+use crate::{
+    cache::TableMetadata,
+    query::ast::{
+        ColumnExpr, LiteralValue, SelectColumn, SelectColumns, SelectStatement, TableAlias,
+        TableNode, TableSource, TableSubqueryNode,
+    },
 };
+
+error_set! {
+    AstTransformError = {
+        MissingTable,
+    };
+}
 
 pub fn query_select_replace(
     select_statement: &SelectStatement,
@@ -33,6 +45,84 @@ pub fn query_table_update_queries(select: &SelectStatement) -> Vec<(&TableNode, 
     }
 
     queries
+}
+
+pub fn query_table_replace_with_values(
+    select: &SelectStatement,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<String>],
+) -> Result<SelectStatement, AstTransformError> {
+    let mut select_new = select.clone();
+
+    //find first matching table source
+    let mut frontier = vec![&mut select_new.from[0]];
+    let mut source_node: Option<&mut TableSource> = None;
+    while let Some(cur) = frontier.pop() {
+        match cur {
+            TableSource::Join(join) => {
+                frontier.push(&mut join.left);
+                frontier.push(&mut join.right);
+            }
+            TableSource::Table(table) => {
+                if table.name == table_metadata.name {
+                    source_node = Some(cur);
+                    break;
+                }
+            }
+            _ => (),
+        }
+    }
+
+    let Some(source_node) = source_node else {
+        return Err(AstTransformError::MissingTable);
+    };
+    let TableSource::Table(table_node) = source_node else {
+        return Err(AstTransformError::MissingTable);
+    };
+
+    let mut column_names = Vec::new();
+    let mut values = Vec::new();
+
+    for column_meta in &table_metadata.columns {
+        let position = column_meta.position as usize - 1;
+        if position < row_data.len() {
+            let value = row_data[position]
+                .as_deref()
+                .map_or(LiteralValue::Null, |v| {
+                    //some ugly casting
+                    LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone())
+                });
+
+            column_names.push(column_meta.name.as_str());
+            values.push(value);
+        }
+    }
+
+    let alias = if let Some(table_alias) = &table_node.alias {
+        let mut alias = table_alias.clone();
+        if table_alias.columns.is_empty() {
+            for name in column_names {
+                alias.columns.push(name.to_owned());
+            }
+        }
+        alias
+    } else {
+        TableAlias {
+            name: table_metadata.name.clone(),
+            columns: Vec::new(),
+        }
+    };
+
+    *source_node = TableSource::Subquery(TableSubqueryNode {
+        lateral: false,
+        select: Box::new(SelectStatement {
+            values: vec![values],
+            ..Default::default()
+        }),
+        alias: Some(alias),
+    });
+
+    Ok(select_new)
 }
 
 #[cfg(test)]

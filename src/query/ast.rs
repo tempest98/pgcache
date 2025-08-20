@@ -40,6 +40,7 @@ pub trait Deparse {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
     String(String),
+    StringWithCast(String, String),
     Integer(i64),
     Float(f64),
     Boolean(bool),
@@ -55,24 +56,29 @@ impl std::hash::Hash for LiteralValue {
                 0u8.hash(state);
                 s.hash(state);
             }
-            LiteralValue::Integer(i) => {
+            LiteralValue::StringWithCast(s, cast) => {
                 1u8.hash(state);
+                s.hash(state);
+                cast.hash(state);
+            }
+            LiteralValue::Integer(i) => {
+                2u8.hash(state);
                 i.hash(state);
             }
             LiteralValue::Float(f) => {
-                2u8.hash(state);
+                3u8.hash(state);
                 // Convert f64 to bits for hashing to handle NaN/infinity consistently
                 f.to_bits().hash(state);
             }
             LiteralValue::Boolean(b) => {
-                3u8.hash(state);
+                4u8.hash(state);
                 b.hash(state);
             }
             LiteralValue::Null => {
-                4u8.hash(state);
+                5u8.hash(state);
             }
             LiteralValue::Parameter(p) => {
-                5u8.hash(state);
+                6u8.hash(state);
                 p.hash(state);
             }
         }
@@ -90,6 +96,17 @@ impl Deparse for LiteralValue {
                 } else {
                     buf.push_str(&escaped);
                 }
+            }
+            LiteralValue::StringWithCast(s, cast) => {
+                let escaped = escape::escape_literal(s);
+                // Remove leading space if escape_literal added one
+                if escaped.starts_with(" E'") {
+                    buf.push_str(&escaped[1..]); // Skip the first space
+                } else {
+                    buf.push_str(&escaped);
+                }
+                buf.push_str("::");
+                buf.push_str(cast);
             }
             LiteralValue::Integer(i) => {
                 buf.push_str(i.to_string().as_str());
@@ -358,6 +375,22 @@ pub struct SelectStatement {
     pub limit: Option<LimitClause>,
     pub distinct: bool,
     pub values: Vec<Vec<LiteralValue>>,
+}
+
+impl Default for SelectStatement {
+    fn default() -> Self {
+        Self {
+            columns: SelectColumns::None,
+            from: Vec::new(),
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            distinct: false,
+            values: vec![vec![]],
+        }
+    }
 }
 
 impl SelectStatement {
