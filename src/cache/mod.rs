@@ -21,6 +21,7 @@ use tracing::{debug, error, instrument};
 use crate::{
     cache::cdc::CdcProcessor,
     query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectStatement, TableAlias},
+    query::transform::AstTransformError,
 };
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
@@ -45,11 +46,13 @@ error_set! {
         NoConnection,
         PgError(Error),
         CdcFailure,
+        TooManyModifiedRows,
     };
 
     ParseError = {
         InvalidUtf8,
         Parse(pg_query::Error),
+        AstTransformError(AstTransformError),
         Other(),
     };
 
@@ -59,7 +62,11 @@ error_set! {
     };
 
     TableError = {
-        UnknownTable,
+        #[display("Oid: {oid:?} Name {name:?}")]
+        UnknownTable {
+            oid: Option<u32>,
+            name: Option<String>,
+        },
         UnknownColumn,
         UnknownSchema,
         NoPrimaryKey,
@@ -212,10 +219,16 @@ impl IdHashItem for CachedQuery {
     id_upcast!();
 }
 
+#[derive(Debug, Clone)]
+pub struct UpdateQuery {
+    pub fingerprint: u64, //fingerprint of cached query that generated this update query
+    pub query: SelectStatement,
+}
+
 #[derive(Debug)]
 pub struct UpdateQueries {
     pub relation_oid: u32,
-    pub select_statements: Vec<SelectStatement>,
+    pub queries: Vec<UpdateQuery>,
 }
 
 impl IdHashItem for UpdateQueries {

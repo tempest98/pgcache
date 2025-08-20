@@ -44,8 +44,6 @@ impl CacheWorker {
         let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
         // let stmt = query_target.prepare(query).await.unwrap();
         let res = self.db_cache.simple_query(query).await?;
-        // let res = query_target.query(query, &[]).await;
-        // dbg!(&res);
 
         let SimpleQueryMessage::RowDescription(desc) = &res[0] else {
             return Err(CacheError::InvalidMessage);

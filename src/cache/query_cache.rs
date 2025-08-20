@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -7,9 +8,10 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
 
-use crate::cache::query::cache_query_row_matches;
-use crate::query::ast::{Deparse, ast_query_fingerprint, TableNode};
-use crate::query::transform::{query_select_replace, query_table_update_queries};
+use crate::query::ast::{Deparse, JoinNode, TableNode, ast_query_fingerprint};
+use crate::query::transform::{
+    query_select_replace, query_table_replace_with_values, query_table_update_queries,
+};
 use crate::settings::Settings;
 
 use super::*;
@@ -128,7 +130,10 @@ impl QueryCache {
             let table = cache
                 .tables
                 .get1(&relation_oid)
-                .ok_or(CacheError::UnknownTable)?;
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(relation_oid),
+                    name: None,
+                })?;
 
             let maybe_alias = select_statement
                 .nodes::<TableNode>()
@@ -166,23 +171,31 @@ impl QueryCache {
             }
         }
 
-        for (table_node, update_query) in query_table_update_queries(select_statement) {
+        for (table_node, update_select) in query_table_update_queries(select_statement) {
+            let update_query = UpdateQuery {
+                fingerprint,
+                query: update_select,
+            };
+
             let relation_oid = self
                 .cache
                 .borrow()
                 .tables
                 .get2(table_node.name.as_str())
-                .ok_or(CacheError::UnknownTable)?
+                .ok_or(CacheError::UnknownTable {
+                    oid: None,
+                    name: Some(table_node.name.clone()),
+                })?
                 .relation_oid;
 
             self.cache
                 .borrow_mut()
                 .update_queries
                 .entry(relation_oid)
-                .and_modify(|mut queries| queries.select_statements.push(update_query.clone()))
+                .and_modify(|mut queries| queries.queries.push(update_query.clone()))
                 .or_insert_with(|| UpdateQueries {
                     relation_oid,
-                    select_statements: vec![update_query],
+                    queries: vec![update_query],
                 });
 
             relation_oids.push(relation_oid);
@@ -231,7 +244,10 @@ impl QueryCache {
             let table = cache
                 .tables
                 .get1(&table_oid)
-                .ok_or(CacheError::UnknownTable)?;
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(table_oid),
+                    name: None,
+                })?;
 
             let pkey_columns = &table.primary_key_columns;
             let table_name = table.name.as_str();
@@ -341,7 +357,10 @@ impl QueryCache {
         }
 
         let Some(relation_oid) = relation_oid else {
-            return Err(CacheError::UnknownTable);
+            return Err(CacheError::UnknownTable {
+                oid: relation_oid,
+                name: None,
+            });
         };
 
         let Some(schema) = schema else {
@@ -431,6 +450,69 @@ impl QueryCache {
         Ok(rows)
     }
 
+    async fn query_row_changes(
+        &self,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) -> Result<Vec<Row>, CacheError> {
+        let sql = {
+            let cache = self.cache.borrow();
+            let table_metadata =
+                cache
+                    .tables
+                    .get1(&relation_oid)
+                    .ok_or(CacheError::UnknownTable {
+                        oid: Some(relation_oid),
+                        name: None,
+                    })?;
+
+            // Build WHERE clause using primary key columns
+            let mut where_conditions = Vec::new();
+            for pk_column in &table_metadata.primary_key_columns {
+                if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
+                    let position = column_meta.position as usize - 1;
+                    if position < row_data.len() {
+                        let value = row_data[position]
+                            .as_deref()
+                            .map_or("NULL".to_string(), |v| format!("'{v}'"));
+                        where_conditions.push(format!("{pk_column} = {value}"));
+                    }
+                }
+            }
+
+            if where_conditions.is_empty() {
+                return Err(CacheError::NoPrimaryKey);
+            }
+
+            // Build comparison columns
+            let mut comparison_columns = Vec::new();
+            for column_meta in &table_metadata.columns {
+                let position = column_meta.position as usize - 1;
+                if position < row_data.len() {
+                    let value = row_data[position]
+                        .as_deref()
+                        .map_or("NULL".to_string(), |v| format!("'{v}'"));
+                    comparison_columns.push(format!(
+                        "{} IS DISTINCT FROM {} AS {}",
+                        column_meta.name, value, column_meta.name
+                    ));
+                }
+            }
+
+            format!(
+                "SELECT {} FROM {} WHERE {}",
+                comparison_columns.join(", "),
+                table_metadata.name,
+                where_conditions.join(" AND ")
+            )
+        };
+
+        self.db_cache
+            .query(&sql, &[])
+            .await
+            .map_err(CacheError::PgError)
+    }
+
     #[instrument(skip_all)]
     async fn cache_table_create_from_metadata(
         &self,
@@ -495,21 +577,47 @@ impl QueryCache {
 
     fn cache_table_invalidate(&mut self, relation_oid: u32) {
         let mut cache = self.cache.borrow_mut();
-        let fingerprints = cache
+        let (fingerprints, oids): (Vec<_>, Vec<_>) = cache
             .cached_queries
             .iter()
-            .filter(|q| q.relation_oids.contains(&relation_oid))
-            .map(|q| q.fingerprint)
-            .collect::<Vec<_>>();
+            .filter(|&q| q.relation_oids.contains(&relation_oid))
+            .map(|q| (q.fingerprint, q.relation_oids.iter()))
+            .unzip();
+
+        let oids = oids.into_iter().flatten().copied().collect::<HashSet<_>>();
 
         for fp in fingerprints {
             trace!("invalidating query {fp}");
             cache.cached_queries.remove(&fp);
+
+            trace!("invalidating update queries {fp}");
+            for oid in &oids {
+                if let Some(mut queries) = cache.update_queries.get_mut(oid) {
+                    queries.queries.retain(|q| q.fingerprint != fp);
+                }
+            }
         }
     }
 
-    fn cache_upsert_sql(
+    fn cache_query_invalidate(&mut self, fingerprint: u64) {
+        let mut cache = self.cache.borrow_mut();
+        let Some(query) = cache.cached_queries.remove(&fingerprint) else {
+            return;
+        };
+
+        trace!("invalidating query {fingerprint}");
+
+        trace!("invalidating update queries {fingerprint}");
+        for oid in &query.relation_oids {
+            if let Some(mut queries) = cache.update_queries.get_mut(oid) {
+                queries.queries.retain(|q| q.fingerprint != fingerprint);
+            }
+        }
+    }
+
+    fn cache_upsert_with_predicate_sql(
         &self,
+        select: &SelectStatement,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> Result<String, CacheError> {
@@ -531,63 +639,162 @@ impl QueryCache {
             }
         }
 
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
-            table_metadata.name,
-            column_names.to_vec().join(", "),
-            values.to_vec().join(", "),
-            table_metadata.primary_key_columns.join(", "),
-            column_names
-                .iter()
-                .filter(|&col| !table_metadata
+        let value_select = query_table_replace_with_values(select, table_metadata, row_data)?;
+        let mut select = String::with_capacity(1024);
+        value_select.deparse(&mut select);
+
+        let table_name = &table_metadata.name;
+        let column_list = column_names.to_vec().join(", ");
+        let value_list = values.to_vec().join(", ");
+        let pk_column_list = table_metadata.primary_key_columns.join(", ");
+        let update_list = column_names
+            .iter()
+            .filter(|&col| {
+                !table_metadata
                     .primary_key_columns
-                    .contains(&col.to_string()))
-                .map(|col| format!("{col} = EXCLUDED.{col}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+                    .contains(&col.to_string())
+            })
+            .map(|col| format!("{col} = EXCLUDED.{col}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "INSERT INTO {table_name} ({column_list}) \
+            SELECT {value_list} WHERE EXISTS ({select}) \
+            ON CONFLICT ({pk_column_list}) \
+            DO UPDATE SET {update_list}"
         );
 
         Ok(sql)
+    }
+
+    fn update_queries_sql_list(
+        &self,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) -> Result<Vec<String>, CacheError> {
+        let cache = self.cache.borrow();
+        let update_queries =
+            cache
+                .update_queries
+                .get(&relation_oid)
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(relation_oid),
+                    name: None,
+                })?;
+
+        // Get table metadata for column information
+        let Some(table_metadata) = cache.tables.get1(&relation_oid) else {
+            error!("No table metadata found for relation_oid: {}", relation_oid);
+            return Err(CacheError::UnknownTable {
+                oid: Some(relation_oid),
+                name: None,
+            });
+        };
+
+        let mut sql_list = Vec::new();
+        for update_query in &update_queries.queries {
+            let select = &update_query.query;
+            sql_list.push(self.cache_upsert_with_predicate_sql(
+                select,
+                table_metadata,
+                row_data,
+            )?);
+        }
+
+        Ok(sql_list)
+    }
+
+    fn update_queries_check_invalidate(
+        &self,
+        relation_oid: u32,
+        row_changes: &Option<&Row>,
+        _row_data: &[Option<String>],
+    ) -> Result<Vec<u64>, CacheError> {
+        let cache = self.cache.borrow();
+        let update_queries =
+            cache
+                .update_queries
+                .get(&relation_oid)
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(relation_oid),
+                    name: None,
+                })?;
+
+        // Get table metadata for column information
+        let Some(table_metadata) = cache.tables.get1(&relation_oid) else {
+            error!("No table metadata found for relation_oid: {}", relation_oid);
+            return Err(CacheError::UnknownTable {
+                oid: Some(relation_oid),
+                name: None,
+            });
+        };
+
+        // invalidate queries that have a column from the table as part of
+        // a join condition
+        // coarse invalidation, can be refined later
+        let mut fp_list = Vec::new();
+        for update_query in &update_queries.queries {
+            let select = &update_query.query;
+            let tables = select
+                .nodes::<TableNode>()
+                .flat_map(|t| {
+                    [
+                        (Some(t.name.as_str()), t.name.as_str()),
+                        (
+                            t.alias.as_ref().map(|alias| alias.name.as_str()),
+                            t.name.as_str(),
+                        ),
+                    ]
+                })
+                .collect::<HashMap<_, _>>();
+            let joins = select.nodes::<JoinNode>().collect::<Vec<_>>();
+
+            for join in joins {
+                //extract tables and columns used in the join condition
+                let columns = join
+                    .nodes::<ColumnNode>()
+                    .map(|c| (tables.get(&c.table.as_deref()), c.column.as_str()))
+                    .collect::<Vec<_>>();
+
+                for (table, column) in columns {
+                    let invalidate = table.is_some_and(|t| t == &table_metadata.name)
+                        && row_changes.is_none_or(|row| row.get::<&str, bool>(column));
+
+                    if invalidate {
+                        fp_list.push(update_query.fingerprint);
+                    }
+                }
+            }
+        }
+
+        Ok(fp_list)
     }
 
     /// Handle INSERT operation with query-aware filtering.
     /// Applies the insert to cache entries that match the filter conditions.
     #[instrument(skip_all)]
     pub async fn handle_insert(
-        &self,
+        &mut self,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
-        // Get cached queries that reference this table
-        let sql_list = {
-            let cache = self.cache.borrow();
-            let cached_queries = cache
-                .cached_queries
-                .iter()
-                .filter(|query| query.relation_oids.contains(&relation_oid));
+        // Get cached queries that need to be invalidated
+        let fp_list = self.update_queries_check_invalidate(relation_oid, &None, &row_data)?;
+        for fp in fp_list {
+            self.cache_query_invalidate(fp)
+        }
 
-            // Get table metadata for column information
-            let table_metadata = match cache.tables.get1(&relation_oid) {
-                Some(metadata) => metadata,
-                None => {
-                    error!("No table metadata found for relation_oid: {}", relation_oid);
-                    return Ok(());
-                }
-            };
-
-            // Check each cached query to see if this INSERT affects it
-            let mut sql_list = Vec::new();
-            for query in cached_queries {
-                if cache_query_row_matches(query, &row_data, table_metadata) {
-                    sql_list.push(self.cache_upsert_sql(table_metadata, &row_data)?);
-                }
-            }
-
-            sql_list
-        };
+        // Get update queries that reference this table
+        let sql_list = self.update_queries_sql_list(relation_oid, &row_data)?;
 
         for sql in sql_list {
-            self.db_cache.execute(sql.as_str(), &[]).await?;
+            let modified_cnt = self.db_cache.execute(sql.as_str(), &[]).await?;
+            if modified_cnt == 1 {
+                break;
+            } else if modified_cnt > 1 {
+                return Err(CacheError::TooManyModifiedRows);
+            }
         }
 
         Ok(())
@@ -596,48 +803,67 @@ impl QueryCache {
     /// Handle UPDATE operation with query-aware filtering.
     /// Analyzes old and new values to determine cache operations needed.
     #[instrument(skip_all)]
-
     pub async fn handle_update(
-        &self,
+        &mut self,
         relation_oid: u32,
         key_data: Vec<Option<String>>,
         new_row_data: Vec<Option<String>>,
     ) -> Result<(), CacheError> {
-        // Get table metadata for column information
-        let (sql, maybe_key_sql) = {
-            let cache = self.cache.borrow();
-            let table_metadata = match cache.tables.get1(&relation_oid) {
-                Some(metadata) => metadata,
-                None => {
-                    error!("No table metadata found for relation_oid: {relation_oid}");
-                    return Ok(());
-                }
-            };
+        let row_changes = self.query_row_changes(relation_oid, &new_row_data).await?;
 
-            // Check each cached query to see if this UPDATE affects it
-            let matched = cache
-                .cached_queries
-                .iter()
-                .filter(|query| query.relation_oids.contains(&relation_oid))
-                .any(|query| cache_query_row_matches(query, &new_row_data, table_metadata));
+        // Get cached queries that need to be invalidated
+        let fp_list = self.update_queries_check_invalidate(
+            relation_oid,
+            &row_changes.first(),
+            &new_row_data,
+        )?;
+        for fp in fp_list {
+            self.cache_query_invalidate(fp)
+        }
 
-            let sql = if matched {
-                self.cache_upsert_sql(table_metadata, &new_row_data)?
-            } else {
+        let sql_list = self.update_queries_sql_list(relation_oid, &new_row_data)?;
+
+        let mut matched = false;
+        for sql in sql_list {
+            let modified_cnt = self.db_cache.execute(sql.as_str(), &[]).await?;
+            if modified_cnt == 1 {
+                matched = true;
+                break;
+            } else if modified_cnt > 1 {
+                return Err(CacheError::TooManyModifiedRows);
+            }
+        }
+
+        if !matched {
+            let delete_sql = {
+                let cache = self.cache.borrow();
+                let Some(table_metadata) = cache.tables.get1(&relation_oid) else {
+                    error!("No table metadata found for relation_oid: {}", relation_oid);
+                    return Err(CacheError::UnknownTable {
+                        oid: Some(relation_oid),
+                        name: None,
+                    });
+                };
+
                 self.cache_delete_sql(table_metadata, &new_row_data)?
             };
+            self.db_cache.execute(delete_sql.as_str(), &[]).await?;
+        }
 
-            let maybe_key_sql = if !key_data.is_empty() {
-                Some(self.cache_delete_sql(table_metadata, &key_data)?)
-            } else {
-                None
+        if !key_data.is_empty() {
+            let delete_sql = {
+                let cache = self.cache.borrow();
+                let Some(table_metadata) = cache.tables.get1(&relation_oid) else {
+                    error!("No table metadata found for relation_oid: {}", relation_oid);
+                    return Err(CacheError::UnknownTable {
+                        oid: Some(relation_oid),
+                        name: None,
+                    });
+                };
+
+                self.cache_delete_sql(table_metadata, &key_data)?
             };
-            (sql, maybe_key_sql)
-        };
-
-        self.db_cache.execute(sql.as_str(), &[]).await?;
-        if let Some(key_sql) = maybe_key_sql {
-            self.db_cache.execute(key_sql.as_str(), &[]).await?;
+            self.db_cache.execute(delete_sql.as_str(), &[]).await?;
         }
 
         Ok(())

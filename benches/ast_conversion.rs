@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use pgcache_lib::query::ast::sql_query_convert;
+use pgcache_lib::query::ast::{TableNode, sql_query_convert};
 use pgcache_lib::query::parse::query_where_clause_parse;
 
 fn ast_conversion_benchmarks(c: &mut Criterion) {
@@ -102,7 +102,7 @@ fn ast_helper_methods_benchmarks(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("tables", name), &ast, |b, ast| {
-            b.iter(|| black_box(ast.tables()))
+            b.iter(|| black_box(ast.nodes::<TableNode>()))
         });
     }
 

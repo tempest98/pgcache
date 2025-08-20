@@ -232,13 +232,11 @@ async fn handle_connection(
     let mut in_transaction = false;
 
     loop {
-        // dbg!(&proxy_mode);
         match proxy_mode {
             ProxyMode::Read => {
                 if let Some((_, res)) = streams_read.next().await {
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
-                            // dbg!(&msg);
                             if !in_transaction
                                 && matches!(msg.message_type, PgFrontendMessageType::Query)
                             {

@@ -1,9 +1,7 @@
 use crate::query::{
     ast::{ExprOp, SelectStatement, SqlQuery, Statement, WhereExpr},
-    evaluate::{is_simple_comparison, where_expr_evaluate},
+    evaluate::is_simple_comparison,
 };
-
-use super::*;
 
 pub fn is_cacheable_ast(sql_query: &SqlQuery) -> Option<&SelectStatement> {
     match &sql_query.statement {
@@ -53,17 +51,5 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
             }
         }
         _ => false, // Other expression types not supported yet
-    }
-}
-
-/// Check if a row matches the filter conditions of a cached query.
-pub fn cache_query_row_matches(
-    query: &CachedQuery,
-    row_data: &[Option<String>],
-    table_metadata: &TableMetadata,
-) -> bool {
-    match &query.select_statement.where_clause {
-        Some(expr) => where_expr_evaluate(expr, row_data, table_metadata),
-        None => true, // No filter means all rows match
     }
 }

@@ -1843,7 +1843,6 @@ mod tests {
 
         // Test extracting TableNode instances using the generic nodes function
         let tables = ast.nodes::<TableNode>().collect::<Vec<_>>();
-        dbg!(&tables);
 
         assert_eq!(tables.len(), 2);
 

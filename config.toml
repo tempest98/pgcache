@@ -5,6 +5,7 @@ host = "localhost"
 port = 5432
 user = "postgres"
 database = "origin"
+#database = "sakila"
 
 [cache]
 host = "localhost"
@@ -13,6 +14,8 @@ user = "postgres"
 database = "cache"
 
 [cdc]
+#publication_name = "sakila_pub"
+#slot_name = "sakila_slot"
 publication_name = "pub_test"
 slot_name = "slot_test"
 
