@@ -4,10 +4,10 @@ use std::hash::{Hash, Hasher};
 
 use error_set::error_set;
 use pg_query::ParseResult;
-use pg_query::protobuf::JoinExpr;
 use pg_query::protobuf::{
     ColumnRef as PgColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum,
 };
+use pg_query::protobuf::{JoinExpr, RangeSubselect};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
@@ -612,6 +612,7 @@ impl Deparse for FunctionCall {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum TableSource {
     Table(TableNode),
+    Subquery(TableSubqueryNode),
     Join(JoinNode),
 }
 
@@ -626,8 +627,9 @@ impl TableSource {
 
 impl Deparse for TableSource {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        match &self {
+        match self {
             TableSource::Table(table) => table.deparse(buf),
+            TableSource::Subquery(subquery) => subquery.deparse(buf),
             TableSource::Join(join) => join.deparse(buf),
         }
     }
@@ -646,6 +648,9 @@ impl<'a> Iterator for TableSourceIter<'a> {
             Some(TableSource::Table(table)) => {
                 self.source = None;
                 Some(table)
+            }
+            Some(TableSource::Subquery(_)) => {
+                todo!()
             }
             Some(TableSource::Join(join)) => {
                 if let Some(iter) = &mut self.join_iter {
@@ -677,6 +682,33 @@ impl Deparse for TableNode {
             buf.push('.');
         }
         buf.push_str(self.name.as_str());
+        if let Some(alias) = &self.alias {
+            buf.push(' ');
+            buf.push_str(alias);
+        }
+
+        buf
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct TableSubqueryNode {
+    pub lateral: bool,
+    pub select: SelectStatement,
+    pub alias: Option<String>,
+}
+
+impl Deparse for TableSubqueryNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        if self.lateral {
+            buf.push_str("LATERAL ");
+        }
+
+        buf.push('(');
+        self.select.deparse(buf);
+        buf.push(')');
+
         if let Some(alias) = &self.alias {
             buf.push(' ');
             buf.push_str(alias);
@@ -901,6 +933,10 @@ fn from_clause_convert(from_clause: &[Node]) -> Result<Vec<TableSource>, AstErro
                 let table_node = table_node_convert(range_var)?;
                 tables.push(table_node);
             }
+            Some(NodeEnum::RangeSubselect(range_subselect)) => {
+                let table_subquery_node = table_subquery_node_convert(range_subselect)?;
+                tables.push(table_subquery_node);
+            }
             Some(NodeEnum::JoinExpr(join_expr)) => {
                 let join_node = join_expr_convert(join_expr)?;
                 tables.push(join_node);
@@ -968,6 +1004,31 @@ fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
     Ok(TableSource::Table(TableNode {
         schema,
         name,
+        alias,
+    }))
+}
+
+fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<TableSource, AstError> {
+    let Some(NodeEnum::SelectStmt(select_stmt)) = range_subselect
+        .subquery
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        return Err(AstError::UnsupportedSelectFeature {
+            feature: format!("{:?}", range_subselect.subquery),
+        });
+    };
+
+    let select = select_statement_convert(select_stmt)?;
+
+    let alias = range_subselect
+        .alias
+        .as_ref()
+        .map(|alias_node| alias_node.aliasname.clone());
+
+    Ok(TableSource::Subquery(TableSubqueryNode {
+        lateral: range_subselect.lateral,
+        select,
         alias,
     }))
 }
@@ -1222,6 +1283,23 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_query_table_subquery() {
+        let sql = "SELECT * FROM (SELECT * FROM invoice WHERE id = 2) inv";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.from.len(), 1);
+
+        let TableSource::Subquery(subquery) = &select.from[0] else {
+            panic!("exepected subquery");
+        };
+
+        assert!(!subquery.lateral);
+        assert_eq!(subquery.alias, Some("inv".to_owned()));
+    }
+
+    #[test]
     fn test_sql_query_deparse_simple() {
         let sql = "SELECT id, name FROM users";
         let pg_ast = pg_query::parse(sql).unwrap();
@@ -1447,23 +1525,35 @@ mod tests {
     }
 
     #[test]
-    fn test_round_trip_simple() {
-        let original_sql = "SELECT id, name FROM users WHERE active = true";
+    fn test_round_trip() {
+        fn round_trip(sql: &str) {
+            // Parse original
+            let pg_ast1 = pg_query::parse(sql).unwrap();
+            let ast1 = sql_query_convert(&pg_ast1).unwrap();
 
-        // Parse original
-        let pg_ast1 = pg_query::parse(original_sql).unwrap();
-        let ast1 = sql_query_convert(&pg_ast1).unwrap();
+            // Deparse to string
+            let mut deparsed = String::with_capacity(1024);
+            ast1.deparse(&mut deparsed);
 
-        // Deparse to string
-        let mut deparsed = String::with_capacity(1024);
-        ast1.deparse(&mut deparsed);
+            // Parse deparsed version
+            let pg_ast2 = pg_query::parse(&deparsed).unwrap();
+            let ast2 = sql_query_convert(&pg_ast2).unwrap();
 
-        // Parse deparsed version
-        let pg_ast2 = pg_query::parse(&deparsed).unwrap();
-        let ast2 = sql_query_convert(&pg_ast2).unwrap();
+            // Should be equivalent
+            assert_eq!(ast1, ast2);
+        }
 
-        // Should be equivalent
-        assert_eq!(ast1, ast2);
+        round_trip("SELECT id, name FROM users WHERE active = true");
+        round_trip(
+            "SELECT id, name \
+            FROM users JOIN address a on a.is = users.address_id \
+            WHERE active = true",
+        );
+        round_trip(
+            "SELECT id, name \
+            FROM (SELECT * FROM users) u \
+            WHERE active = true",
+        );
     }
 
     #[test]
