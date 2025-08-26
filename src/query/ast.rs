@@ -11,9 +11,9 @@ use pg_query::protobuf::{
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
-use crate::query::parse::node_convert_to_expr;
+use crate::query::parse::{node_convert_to_expr, select_stmt_parse};
 
-use super::parse::{WhereParseError, query_where_clause_parse};
+use super::parse::WhereParseError;
 
 error_set! {
     AstError = {
@@ -567,6 +567,7 @@ pub enum ColumnExpr {
     Column(ColumnRef),      // column_name, table.column_name
     Function(FunctionCall), // COUNT(*), SUM(col), etc.
     Literal(LiteralValue),  // Constant values
+    Subquery(SelectStatement),
 }
 
 impl Deparse for ColumnExpr {
@@ -575,9 +576,13 @@ impl Deparse for ColumnExpr {
             ColumnExpr::Column(col) => col.deparse(buf),
             ColumnExpr::Function(func) => func.deparse(buf),
             ColumnExpr::Literal(lit) => lit.deparse(buf),
-        };
-
-        buf
+            ColumnExpr::Subquery(select) => {
+                buf.push('(');
+                select.deparse(buf);
+                buf.push(')');
+                buf
+            }
+        }
     }
 }
 
@@ -780,7 +785,7 @@ pub fn sql_query_convert(ast: &ParseResult) -> Result<SqlQuery, AstError> {
 
     match stmt_node.node.as_ref() {
         Some(NodeEnum::SelectStmt(select_stmt)) => {
-            let statement = select_statement_convert(select_stmt, ast)?;
+            let statement = select_statement_convert(select_stmt)?;
             Ok(SqlQuery {
                 statement: Statement::Select(statement),
             })
@@ -792,13 +797,10 @@ pub fn sql_query_convert(ast: &ParseResult) -> Result<SqlQuery, AstError> {
     }
 }
 
-fn select_statement_convert(
-    select_stmt: &SelectStmt,
-    ast: &ParseResult,
-) -> Result<SelectStatement, AstError> {
+fn select_statement_convert(select_stmt: &SelectStmt) -> Result<SelectStatement, AstError> {
     let columns = select_columns_convert(&select_stmt.target_list)?;
     let from = from_clause_convert(&select_stmt.from_clause)?;
-    let where_clause = query_where_clause_parse(ast)?;
+    let where_clause = select_stmt_parse(select_stmt)?;
 
     // For now, only convert the features we need for basic caching
     // TODO: Add GROUP BY, HAVING, ORDER BY, LIMIT when needed
@@ -829,6 +831,12 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
         if let Some(NodeEnum::ResTarget(res_target)) = &target.node
             && let Some(val_node) = &res_target.val
         {
+            let alias = if res_target.name.is_empty() {
+                None
+            } else {
+                Some(res_target.name.clone())
+            };
+
             match val_node.node.as_ref() {
                 Some(NodeEnum::ColumnRef(col_ref)) => {
                     // Check if this is SELECT *
@@ -841,16 +849,27 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
 
                     // Regular column reference
                     let column_ref = column_ref_convert(col_ref)?;
-                    let alias = if res_target.name.is_empty() {
-                        None
-                    } else {
-                        Some(res_target.name.clone())
-                    };
 
                     columns.push(SelectColumn {
                         expr: ColumnExpr::Column(column_ref),
                         alias,
                     });
+                }
+                Some(NodeEnum::SubLink(sub_link)) => {
+                    match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
+                        Some(NodeEnum::SelectStmt(select_stmt)) => {
+                            let statement = select_statement_convert(select_stmt)?;
+                            columns.push(SelectColumn {
+                                expr: ColumnExpr::Subquery(statement),
+                                alias,
+                            });
+                        }
+                        other => {
+                            return Err(AstError::UnsupportedSelectFeature {
+                                feature: format!("Column expression: {other:?}"),
+                            });
+                        }
+                    }
                 }
                 // TODO: Add support for function calls, literals, etc.
                 other => {
@@ -1174,6 +1193,32 @@ mod tests {
                 (None, "product", Some("p"))
             ])
         );
+    }
+
+    #[test]
+    fn test_sql_query_select_subquery() {
+        let sql = "SELECT invoice.id, (SELECT x.data FROM x WHERE 1 = 1) as one FROM invoice";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!();
+        };
+
+        assert_eq!(
+            columns[0],
+            SelectColumn {
+                expr: ColumnExpr::Column(ColumnRef {
+                    table: Some("invoice".to_owned()),
+                    column: "id".to_owned()
+                }),
+                alias: None,
+            }
+        );
+
+        assert!(matches!(columns[1].expr, ColumnExpr::Subquery(_)));
+        assert_eq!(columns[1].alias, Some("one".to_owned()));
     }
 
     #[test]

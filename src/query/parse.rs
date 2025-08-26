@@ -11,7 +11,7 @@ use pg_query::protobuf::{
 };
 use pg_query::{NodeRef, ParseResult};
 
-use super::ast::{BinaryExpr, ColumnRef, LiteralValue, UnaryExpr, WhereExpr, ExprOp};
+use super::ast::{BinaryExpr, ColumnRef, ExprOp, LiteralValue, UnaryExpr, WhereExpr};
 
 error_set! {
     ParseError = WhereParseError || SqlError;
@@ -104,7 +104,7 @@ fn query_select_statement(ast: &ParseResult) -> &SelectStmt {
 
 /// Parse a WHERE clause from a pg_query AST
 /// Currently supports: equality comparisons (=) and boolean operations (AND, OR)
-fn select_stmt_parse(select_stmt: &SelectStmt) -> Result<Option<WhereExpr>, WhereParseError> {
+pub fn select_stmt_parse(select_stmt: &SelectStmt) -> Result<Option<WhereExpr>, WhereParseError> {
     let expr = if let Some(where_node) = &select_stmt.where_clause {
         Some(node_convert_to_expr(where_node)?)
     } else {
