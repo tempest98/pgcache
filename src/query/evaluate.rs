@@ -1,6 +1,6 @@
 use crate::cache::TableMetadata;
 
-use super::ast::{BinaryExpr, LiteralValue, WhereExpr, ExprOp};
+use super::ast::{BinaryExpr, ExprOp, LiteralValue, WhereExpr};
 
 /// Recursively evaluate a WHERE expression against row data.
 /// Returns true if the row matches the expression, false otherwise.
@@ -162,7 +162,7 @@ pub fn is_simple_comparison(binary_expr: &BinaryExpr) -> bool {
 mod tests {
     use super::*;
     use crate::cache::ColumnMetadata;
-    use crate::query::ast::ColumnRef;
+    use crate::query::ast::ColumnNode;
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 
@@ -372,7 +372,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -397,7 +397,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -422,7 +422,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -443,7 +443,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -470,7 +470,7 @@ mod tests {
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
-            rexpr: Box::new(WhereExpr::Column(ColumnRef {
+            rexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -494,7 +494,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "nonexistent".to_string(),
             })),
@@ -520,7 +520,7 @@ mod tests {
 
         let expr = WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -543,7 +543,7 @@ mod tests {
             op: ExprOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "id".to_string(),
                 })),
@@ -551,7 +551,7 @@ mod tests {
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "name".to_string(),
                 })),
@@ -575,7 +575,7 @@ mod tests {
             op: ExprOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "id".to_string(),
                 })),
@@ -583,7 +583,7 @@ mod tests {
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "name".to_string(),
                 })),
@@ -607,7 +607,7 @@ mod tests {
             op: ExprOp::Or,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "id".to_string(),
                 })),
@@ -615,7 +615,7 @@ mod tests {
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "name".to_string(),
                 })),
@@ -639,7 +639,7 @@ mod tests {
             op: ExprOp::Or,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "id".to_string(),
                 })),
@@ -647,7 +647,7 @@ mod tests {
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "name".to_string(),
                 })),
@@ -669,7 +669,7 @@ mod tests {
 
         let expr = WhereExpr::Binary(BinaryExpr {
             op: ExprOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -709,7 +709,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::NotEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -734,7 +734,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::NotEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -760,7 +760,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -785,7 +785,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -811,7 +811,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -836,7 +836,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -861,7 +861,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -887,7 +887,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -912,7 +912,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -938,7 +938,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -963,7 +963,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -988,7 +988,7 @@ mod tests {
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -1038,7 +1038,7 @@ mod tests {
         // Test less than
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "price".to_string(),
             })),
@@ -1054,7 +1054,7 @@ mod tests {
         // Test greater than
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "price".to_string(),
             })),
@@ -1081,7 +1081,7 @@ mod tests {
         // Test string less than (lexicographic)
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -1097,7 +1097,7 @@ mod tests {
         // Test string greater than
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -1120,7 +1120,7 @@ mod tests {
         // NULL comparisons should return false (except equality with NULL)
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),
@@ -1136,7 +1136,7 @@ mod tests {
         // But equality with NULL should work
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "name".to_string(),
             })),

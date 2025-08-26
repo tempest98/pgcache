@@ -20,7 +20,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     cache::cdc::CdcProcessor,
-    query::ast::{ColumnExpr, ColumnRef, SelectColumn, SelectStatement},
+    query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectStatement},
 };
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
@@ -124,7 +124,7 @@ impl TableMetadata {
             .columns
             .iter()
             .map(|c| SelectColumn {
-                expr: ColumnExpr::Column(ColumnRef {
+                expr: ColumnExpr::Column(ColumnNode {
                     table: if alias.is_some() {
                         None
                     } else {

@@ -6,12 +6,10 @@ use error_set::error_set;
 
 use pg_query::protobuf::SelectStmt;
 use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::{
-    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef as PgColumnRef,
-};
+use pg_query::protobuf::{AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef};
 use pg_query::{NodeRef, ParseResult};
 
-use super::ast::{BinaryExpr, ColumnRef, ExprOp, LiteralValue, UnaryExpr, WhereExpr};
+use super::ast::{BinaryExpr, ColumnNode, ExprOp, LiteralValue, UnaryExpr, WhereExpr};
 
 error_set! {
     ParseError = WhereParseError || SqlError;
@@ -135,7 +133,7 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
 }
 
 /// Extract column reference from pg_query ColumnRef
-fn column_ref_extract(col_ref: &PgColumnRef) -> Result<ColumnRef, WhereParseError> {
+fn column_ref_extract(col_ref: &ColumnRef) -> Result<ColumnNode, WhereParseError> {
     if col_ref.fields.is_empty() {
         return Err(WhereParseError::InvalidColumnRef);
     }
@@ -159,7 +157,7 @@ fn column_ref_extract(col_ref: &PgColumnRef) -> Result<ColumnRef, WhereParseErro
     }
 
     let column = column.ok_or(WhereParseError::InvalidColumnRef)?;
-    Ok(ColumnRef { table, column })
+    Ok(ColumnNode { table, column })
 }
 
 /// Extract constant value from pg_query A_Const
@@ -343,7 +341,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "str".to_string(),
             })),
@@ -364,7 +362,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -384,7 +382,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "active".to_string(),
             })),
@@ -404,7 +402,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "cnt".to_string(),
             })),
@@ -426,7 +424,7 @@ mod tests {
             op: ExprOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "str".to_string(),
                 })),
@@ -434,7 +432,7 @@ mod tests {
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "id".to_string(),
                 })),
@@ -457,7 +455,7 @@ mod tests {
             op: ExprOp::Or,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "str".to_string(),
                 })),
@@ -465,7 +463,7 @@ mod tests {
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "str".to_string(),
                 })),
@@ -488,7 +486,7 @@ mod tests {
             op: ExprOp::Not,
             expr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnRef {
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
                     column: "str".to_string(),
                 })),
@@ -509,7 +507,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: Some("test".to_string()),
                 column: "str".to_string(),
             })),
@@ -529,7 +527,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "data".to_string(),
             })),
@@ -560,7 +558,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::NotEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -580,7 +578,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::NotEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -600,7 +598,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::LessThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -620,7 +618,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::LessThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -640,7 +638,7 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::GreaterThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),

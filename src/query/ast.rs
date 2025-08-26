@@ -4,9 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use error_set::error_set;
 use pg_query::ParseResult;
-use pg_query::protobuf::{
-    ColumnRef as PgColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum,
-};
+use pg_query::protobuf::{ColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum};
 use pg_query::protobuf::{JoinExpr, RangeSubselect};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
@@ -114,12 +112,12 @@ impl Deparse for LiteralValue {
 
 // Column reference (potentially qualified: table.column)
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub struct ColumnRef {
+pub struct ColumnNode {
     pub table: Option<String>,
     pub column: String,
 }
 
-impl Deparse for ColumnRef {
+impl Deparse for ColumnNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         if let Some(table) = &self.table {
             buf.push_str(table);
@@ -249,7 +247,7 @@ impl Deparse for MultiExpr {
 pub enum WhereExpr {
     // Leaf nodes
     Value(LiteralValue),
-    Column(ColumnRef),
+    Column(ColumnNode),
 
     // Expression nodes
     Unary(UnaryExpr),
@@ -352,7 +350,7 @@ pub struct SelectStatement {
     pub columns: SelectColumns,
     pub from: Vec<TableSource>,
     pub where_clause: Option<WhereExpr>,
-    pub group_by: Vec<ColumnRef>,
+    pub group_by: Vec<ColumnNode>,
     pub having: Option<WhereExpr>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<LimitClause>,
@@ -564,7 +562,7 @@ impl Deparse for SelectColumn {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ColumnExpr {
-    Column(ColumnRef),      // column_name, table.column_name
+    Column(ColumnNode),     // column_name, table.column_name
     Function(FunctionCall), // COUNT(*), SUM(col), etc.
     Literal(LiteralValue),  // Constant values
     Subquery(SelectStatement),
@@ -1033,7 +1031,7 @@ fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<Table
     }))
 }
 
-fn column_ref_convert(col_ref: &PgColumnRef) -> Result<ColumnRef, AstError> {
+fn column_ref_convert(col_ref: &ColumnRef) -> Result<ColumnNode, AstError> {
     if col_ref.fields.is_empty() {
         return Err(AstError::InvalidTableRef);
     }
@@ -1057,7 +1055,7 @@ fn column_ref_convert(col_ref: &PgColumnRef) -> Result<ColumnRef, AstError> {
     }
 
     let column = column.ok_or(AstError::InvalidTableRef)?;
-    Ok(ColumnRef { table, column })
+    Ok(ColumnNode { table, column })
 }
 
 /// Create a fingerprint hash for SQL query AST.
@@ -1270,7 +1268,7 @@ mod tests {
         assert_eq!(
             columns[0],
             SelectColumn {
-                expr: ColumnExpr::Column(ColumnRef {
+                expr: ColumnExpr::Column(ColumnNode {
                     table: Some("invoice".to_owned()),
                     column: "id".to_owned()
                 }),
@@ -1353,7 +1351,7 @@ mod tests {
         let mut buf = String::new();
 
         // Simple column
-        ColumnRef {
+        ColumnNode {
             table: None,
             column: "id".to_string(),
         }
@@ -1362,7 +1360,7 @@ mod tests {
         buf.clear();
 
         // Qualified column
-        ColumnRef {
+        ColumnNode {
             table: Some("users".to_string()),
             column: "name".to_string(),
         }
@@ -1425,7 +1423,7 @@ mod tests {
         // Simple equality: id = 1
         let expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_string(),
             })),
@@ -1439,7 +1437,7 @@ mod tests {
         // Complex expression: users.name = 'john'
         let expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnRef {
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: Some("users".to_string()),
                 column: "name".to_string(),
             })),
@@ -1457,7 +1455,7 @@ mod tests {
         // NOT active
         let expr = UnaryExpr {
             op: ExprOp::Not,
-            expr: Box::new(WhereExpr::Column(ColumnRef {
+            expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "active".to_string(),
             })),
