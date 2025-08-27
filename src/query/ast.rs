@@ -9,7 +9,7 @@ use pg_query::protobuf::{JoinExpr, RangeSubselect};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
-use crate::query::parse::{node_convert_to_expr, select_stmt_parse};
+use crate::query::parse::{const_value_extract, node_convert_to_expr, select_stmt_parse_where};
 
 use super::parse::WhereParseError;
 
@@ -23,6 +23,8 @@ error_set! {
         MissingStatement,
         #[display("Unsupported SELECT feature: {feature}")]
         UnsupportedSelectFeature { feature: String },
+        #[display("Unsupported feature: {feature}")]
+        UnsupportedFeature { feature: String },
         #[display("Invalid table reference")]
         InvalidTableRef,
         UnsupportedJoinType,
@@ -355,6 +357,7 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<LimitClause>,
     pub distinct: bool,
+    pub values: Vec<Vec<LiteralValue>>,
 }
 
 impl SelectStatement {
@@ -453,42 +456,60 @@ impl SelectStatement {
 
 impl Deparse for SelectStatement {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        buf.push_str("SELECT");
-        if self.distinct {
-            buf.push_str(" DISTINCT")
-        }
-        self.columns.deparse(buf);
-
-        if !self.from.is_empty() {
-            buf.push_str(" FROM");
-            let mut sep = "";
-            for table in &self.from {
-                buf.push_str(sep);
-                table.deparse(buf);
-                sep = ",";
+        //if values is present, ignore the rest (would be nice to represent this in the type system)
+        if !self.values.is_empty() {
+            buf.push_str("VALUES ");
+            let mut row_sep = "";
+            buf.push('(');
+            for row in &self.values {
+                buf.push_str(row_sep);
+                let mut sep = "";
+                for value in row {
+                    buf.push_str(sep);
+                    value.deparse(buf);
+                    sep = ", ";
+                }
+                row_sep = "), (";
             }
-        }
+            buf.push(')');
+        } else {
+            buf.push_str("SELECT");
+            if self.distinct {
+                buf.push_str(" DISTINCT")
+            }
+            self.columns.deparse(buf);
 
-        if let Some(expr) = &self.where_clause {
-            buf.push_str(" WHERE ");
-            expr.deparse(buf);
-        }
+            if !self.from.is_empty() {
+                buf.push_str(" FROM");
+                let mut sep = "";
+                for table in &self.from {
+                    buf.push_str(sep);
+                    table.deparse(buf);
+                    sep = ",";
+                }
+            }
 
-        if !self.group_by.is_empty() {
-            todo!();
-        }
+            if let Some(expr) = &self.where_clause {
+                buf.push_str(" WHERE ");
+                expr.deparse(buf);
+            }
 
-        if let Some(expr) = &self.having {
-            buf.push_str(" HAVING");
-            expr.deparse(buf);
-        }
+            if !self.group_by.is_empty() {
+                todo!();
+            }
 
-        if !self.order_by.is_empty() {
-            todo!();
-        }
+            if let Some(expr) = &self.having {
+                buf.push_str(" HAVING");
+                expr.deparse(buf);
+            }
 
-        if let Some(_limit) = &self.limit {
-            todo!();
+            if !self.order_by.is_empty() {
+                todo!();
+            }
+
+            if let Some(_limit) = &self.limit {
+                todo!();
+            }
         }
 
         buf
@@ -521,6 +542,7 @@ impl<'a> Iterator for SelectStatementTableIter<'a> {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum SelectColumns {
+    None,
     All,                        // SELECT *
     Columns(Vec<SelectColumn>), // SELECT col1, col2, ...
 }
@@ -528,6 +550,7 @@ pub enum SelectColumns {
 impl Deparse for SelectColumns {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
+            SelectColumns::None => buf.push(' '),
             SelectColumns::All => buf.push_str(" *"),
             SelectColumns::Columns(cols) => {
                 let mut sep = "";
@@ -617,7 +640,7 @@ impl Deparse for TableAlias {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push_str(&self.name);
         if !self.columns.is_empty() {
-            buf.push_str(" (");
+            buf.push('(');
             buf.push_str(&self.columns.join(", "));
             buf.push(')');
         }
@@ -711,7 +734,7 @@ impl Deparse for TableNode {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct TableSubqueryNode {
     pub lateral: bool,
-    pub select: SelectStatement,
+    pub select: Box<SelectStatement>,
     pub alias: Option<TableAlias>,
 }
 
@@ -849,7 +872,8 @@ pub fn sql_query_convert(ast: &ParseResult) -> Result<SqlQuery, AstError> {
 fn select_statement_convert(select_stmt: &SelectStmt) -> Result<SelectStatement, AstError> {
     let columns = select_columns_convert(&select_stmt.target_list)?;
     let from = from_clause_convert(&select_stmt.from_clause)?;
-    let where_clause = select_stmt_parse(select_stmt)?;
+    let where_clause = select_stmt_parse_where(select_stmt)?;
+    let values = value_list_convert(&select_stmt.values_lists)?;
 
     // For now, only convert the features we need for basic caching
     // TODO: Add GROUP BY, HAVING, ORDER BY, LIMIT when needed
@@ -863,14 +887,41 @@ fn select_statement_convert(select_stmt: &SelectStmt) -> Result<SelectStatement,
         order_by: vec![], // TODO: Convert sort_clause
         limit: None,      // TODO: Convert limit_count/limit_offset
         distinct: !select_stmt.distinct_clause.is_empty(),
+        values,
     })
+}
+
+fn value_list_convert(value_list: &[Node]) -> Result<Vec<Vec<LiteralValue>>, AstError> {
+    let mut rv = Vec::new();
+    for value in value_list {
+        let mut row = Vec::new();
+        if let Some(NodeEnum::List(node_list)) = &value.node {
+            for item in &node_list.items {
+                match &item.node {
+                    Some(NodeEnum::AConst(const_val)) => {
+                        row.push(const_value_extract(const_val)?);
+                    }
+                    other => {
+                        return Err(AstError::UnsupportedFeature {
+                            feature: format!("Value expression: {other:?}"),
+                        });
+                    }
+                }
+            }
+        } else {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("Values: {value:?}"),
+            });
+        }
+        rv.push(row);
+    }
+
+    Ok(rv)
 }
 
 fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstError> {
     if target_list.is_empty() {
-        return Err(AstError::UnsupportedSelectFeature {
-            feature: "Empty target list".to_string(),
-        });
+        return Ok(SelectColumns::None);
     }
 
     let mut columns = Vec::new();
@@ -927,6 +978,10 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                     });
                 }
             }
+        } else {
+            return Err(AstError::UnsupportedSelectFeature {
+                feature: format!("Target: {target:?}"),
+            });
         }
     }
 
@@ -1036,6 +1091,7 @@ fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
 }
 
 fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<TableSource, AstError> {
+    dbg!(range_subselect);
     let Some(NodeEnum::SelectStmt(select_stmt)) = range_subselect
         .subquery
         .as_ref()
@@ -1065,7 +1121,7 @@ fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<Table
 
     Ok(TableSource::Subquery(TableSubqueryNode {
         lateral: range_subselect.lateral,
-        select,
+        select: Box::new(select),
         alias,
     }))
 }
@@ -1346,6 +1402,27 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_query_values() {
+        let sql = "SELECT * FROM (VALUES(1, 2, 'test'), (3, 4, 'a')) v";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.from.len(), 1);
+
+        let TableSource::Subquery(subquery) = &select.from[0] else {
+            panic!("exepected subquery");
+        };
+
+        assert!(!subquery.lateral);
+        assert_eq!(subquery.alias.as_ref().unwrap().name, "v".to_owned());
+
+        assert_eq!(subquery.select.values.len(), 2);
+        assert_eq!(subquery.select.values[0].len(), 3);
+        assert_eq!(subquery.select.values[1].len(), 3);
+    }
+
+    #[test]
     fn test_sql_query_deparse_simple() {
         let sql = "SELECT id, name FROM users";
         let pg_ast = pg_query::parse(sql).unwrap();
@@ -1564,6 +1641,21 @@ mod tests {
                 WHERE a.actor_id = 1";
         let pg_ast = pg_query::parse(sql).unwrap();
         let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_table_values() {
+        let sql = "SELECT fa.actor_id \
+            FROM (VALUES ('1', '2'), ('3', '4')) fa(actor_id, film_id) \
+            WHERE a.actor_id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        dbg!(pg_ast);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);

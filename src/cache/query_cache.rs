@@ -142,7 +142,6 @@ impl QueryCache {
             new_ast.deparse(&mut buf)
         };
 
-        dbg!(&query);
         self.db_origin
             .simple_query(query)
             .await

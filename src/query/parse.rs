@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use error_set::error_set;
 
 use pg_query::protobuf::SelectStmt;
+use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef};
 use pg_query::{NodeRef, ParseResult};
@@ -80,7 +81,7 @@ pub fn _query_select_columns(ast: &ParseResult) -> HashSet<String> {
 
 pub fn query_where_clause_parse(ast: &ParseResult) -> Result<Option<WhereExpr>, WhereParseError> {
     let select_stmt = query_select_statement(ast);
-    select_stmt_parse(select_stmt)
+    select_stmt_parse_where(select_stmt)
 }
 
 fn query_select_statement(ast: &ParseResult) -> &SelectStmt {
@@ -102,7 +103,9 @@ fn query_select_statement(ast: &ParseResult) -> &SelectStmt {
 
 /// Parse a WHERE clause from a pg_query AST
 /// Currently supports: equality comparisons (=) and boolean operations (AND, OR)
-pub fn select_stmt_parse(select_stmt: &SelectStmt) -> Result<Option<WhereExpr>, WhereParseError> {
+pub fn select_stmt_parse_where(
+    select_stmt: &SelectStmt,
+) -> Result<Option<WhereExpr>, WhereParseError> {
     let expr = if let Some(where_node) = &select_stmt.where_clause {
         Some(node_convert_to_expr(where_node)?)
     } else {
@@ -161,9 +164,7 @@ fn column_ref_extract(col_ref: &ColumnRef) -> Result<ColumnNode, WhereParseError
 }
 
 /// Extract constant value from pg_query A_Const
-fn const_value_extract(const_val: &AConst) -> Result<LiteralValue, WhereParseError> {
-    use pg_query::protobuf::a_const::Val;
-
+pub fn const_value_extract(const_val: &AConst) -> Result<LiteralValue, WhereParseError> {
     // Check for NULL values first
     if const_val.isnull {
         return Ok(LiteralValue::Null);
