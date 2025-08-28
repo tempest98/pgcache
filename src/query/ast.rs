@@ -607,6 +607,25 @@ impl Deparse for FunctionCall {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableAlias {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+impl Deparse for TableAlias {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str(&self.name);
+        if !self.columns.is_empty() {
+            buf.push_str(" (");
+            buf.push_str(&self.columns.join(", "));
+            buf.push(')');
+        }
+
+        buf
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum TableSource {
     Table(TableNode),
@@ -669,7 +688,7 @@ impl<'a> Iterator for TableSourceIter<'a> {
 pub struct TableNode {
     pub schema: Option<String>,
     pub name: String,
-    pub alias: Option<String>,
+    pub alias: Option<TableAlias>,
 }
 
 impl Deparse for TableNode {
@@ -682,7 +701,7 @@ impl Deparse for TableNode {
         buf.push_str(self.name.as_str());
         if let Some(alias) = &self.alias {
             buf.push(' ');
-            buf.push_str(alias);
+            alias.deparse(buf);
         }
 
         buf
@@ -693,7 +712,7 @@ impl Deparse for TableNode {
 pub struct TableSubqueryNode {
     pub lateral: bool,
     pub select: SelectStatement,
-    pub alias: Option<String>,
+    pub alias: Option<TableAlias>,
 }
 
 impl Deparse for TableSubqueryNode {
@@ -709,7 +728,7 @@ impl Deparse for TableSubqueryNode {
 
         if let Some(alias) = &self.alias {
             buf.push(' ');
-            buf.push_str(alias);
+            alias.deparse(buf);
         }
 
         buf
@@ -994,10 +1013,20 @@ fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
 
     let name = range_var.relname.clone();
 
-    let alias = range_var
-        .alias
-        .as_ref()
-        .map(|alias_node| alias_node.aliasname.clone());
+    let alias = range_var.alias.as_ref().map(|alias_node| TableAlias {
+        name: alias_node.aliasname.clone(),
+        columns: alias_node
+            .colnames
+            .iter()
+            .flat_map(|n| {
+                if let Some(NodeEnum::String(string_node)) = &n.node {
+                    Some(string_node.sval.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>(),
+    });
 
     Ok(TableSource::Table(TableNode {
         schema,
@@ -1019,10 +1048,20 @@ fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<Table
 
     let select = select_statement_convert(select_stmt)?;
 
-    let alias = range_subselect
-        .alias
-        .as_ref()
-        .map(|alias_node| alias_node.aliasname.clone());
+    let alias = range_subselect.alias.as_ref().map(|alias_node| TableAlias {
+        name: alias_node.aliasname.clone(),
+        columns: alias_node
+            .colnames
+            .iter()
+            .flat_map(|n| {
+                if let Some(NodeEnum::String(string_node)) = &n.node {
+                    Some(string_node.sval.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>(),
+    });
 
     Ok(TableSource::Subquery(TableSubqueryNode {
         lateral: range_subselect.lateral,
@@ -1170,7 +1209,8 @@ mod tests {
         };
 
         assert_eq!(table.name, "users");
-        assert_eq!(table.alias, Some("u".to_string()));
+        assert_eq!(table.alias.as_ref().unwrap().name, "u".to_owned());
+        assert!(table.alias.as_ref().unwrap().columns.is_empty());
 
         // Check column references
         if let SelectColumns::Columns(columns) = &select.columns {
@@ -1245,11 +1285,18 @@ mod tests {
 
         assert_eq!(
             ast.tables()
-                .map(|t| (t.schema.as_deref(), t.name.as_str(), t.alias.as_deref()))
+                .map(|t| (t.schema.as_deref(), t.name.as_str(), t.alias.as_ref()))
                 .collect::<HashSet<_>>(),
             HashSet::<(Option<&str>, _, _)>::from([
                 (None, "invoice", None),
-                (None, "product", Some("p"))
+                (
+                    None,
+                    "product",
+                    Some(&TableAlias {
+                        name: "p".to_owned(),
+                        columns: Vec::new()
+                    })
+                )
             ])
         );
     }
@@ -1294,7 +1341,8 @@ mod tests {
         };
 
         assert!(!subquery.lateral);
-        assert_eq!(subquery.alias, Some("inv".to_owned()));
+        assert_eq!(subquery.alias.as_ref().unwrap().name, "inv".to_owned());
+        assert!(subquery.alias.as_ref().unwrap().columns.is_empty());
     }
 
     #[test]

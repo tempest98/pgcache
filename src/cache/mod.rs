@@ -20,7 +20,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     cache::cdc::CdcProcessor,
-    query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectStatement},
+    query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectStatement, TableAlias},
 };
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
@@ -117,7 +117,7 @@ pub struct TableMetadata {
 
 //todo, move to a better location
 impl TableMetadata {
-    fn select_columns(&self, alias: Option<&str>) -> SelectColumns {
+    fn select_columns(&self, alias: Option<&TableAlias>) -> SelectColumns {
         // Columns(Vec<SelectColumn>)
 
         let columns = self
@@ -125,14 +125,22 @@ impl TableMetadata {
             .iter()
             .map(|c| SelectColumn {
                 expr: ColumnExpr::Column(ColumnNode {
-                    table: if alias.is_some() {
-                        None
+                    table: if let Some(alias) = alias {
+                        Some(alias.name.clone())
                     } else {
                         Some(self.name.clone())
                     },
-                    column: c.name.clone(),
+                    column: if let Some(alias) = alias {
+                        alias
+                            .columns
+                            .get(c.position as usize - 1)
+                            .unwrap_or(&c.name)
+                            .clone()
+                    } else {
+                        c.name.clone()
+                    },
                 }),
-                alias: alias.map(|a| a.to_owned()),
+                alias: None,
             })
             .collect();
 

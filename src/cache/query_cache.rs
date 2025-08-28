@@ -133,7 +133,7 @@ impl QueryCache {
             let maybe_alias = select_statement
                 .tables()
                 .filter(|&tn| tn.name == table.name)
-                .flat_map(|t| t.alias.as_deref())
+                .flat_map(|t| t.alias.as_ref())
                 .next();
 
             let select_columns = table.select_columns(maybe_alias);
