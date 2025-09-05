@@ -321,13 +321,15 @@ impl QueryCache {
 
             let type_oid = row.get("type_oid");
             let data_type = Type::from_oid(type_oid).expect("valid type");
+            let type_name = data_type.name().to_string(); // Get the type name from tokio_postgres Type
+            let pg_position: i64 = row.get("position");
 
             let column = ColumnMetadata {
                 name: row.get("column_name"),
-                position: row.get("position"),
+                position: pg_position as i16,
                 type_oid,
                 data_type,
-                type_name: row.get("type_name"),
+                type_name,
                 is_primary_key: row.get("is_primary_key"),
             };
 
@@ -372,7 +374,7 @@ impl QueryCache {
                     n.nspname AS table_schema,
                     c.relname AS table_name,
                     a.attname AS column_name,
-                    a.attnum AS position,
+                    RANK() OVER (order by a.attnum) AS position,
                     a.atttypid AS type_oid,
                     pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
                     a.attnum = any(pgc.conkey) as is_primary_key
@@ -397,7 +399,7 @@ impl QueryCache {
                     n.nspname AS table_schema,
                     c.relname AS table_name,
                     a.attname AS column_name,
-                    a.attnum AS position,
+                    RANK() OVER (order by a.attnum) AS position,
                     a.atttypid AS type_oid,
                     pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
                     a.attnum = any(pgc.conkey) as is_primary_key
