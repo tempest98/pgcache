@@ -1746,4 +1746,39 @@ mod tests {
         // postgres-protocol should use E'' syntax for backslashes
         assert_eq!(buf, "E'test\\\\path'");
     }
+
+    #[test]
+    fn test_tables() {
+        let sql = "SELECT first_name, last_name, film_id \
+                    FROM actor a \
+                    JOIN public.film_actor fa ON a.actor_id = fa.actor_id \
+                    WHERE a.actor_id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let tables = ast.tables().collect::<Vec<_>>();
+        dbg!(&tables);
+
+        assert_eq!(tables.len(), 2);
+
+        assert_eq!(tables[0].schema, None);
+        assert_eq!(tables[0].name, "actor");
+        assert_eq!(
+            tables[0].alias,
+            Some(TableAlias {
+                name: "a".to_owned(),
+                columns: vec![]
+            })
+        );
+
+        assert_eq!(tables[1].schema, Some("public".to_owned()));
+        assert_eq!(tables[1].name, "film_actor");
+        assert_eq!(
+            tables[1].alias,
+            Some(TableAlias {
+                name: "fa".to_owned(),
+                columns: vec![]
+            })
+        );
+    }
 }
