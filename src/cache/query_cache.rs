@@ -8,7 +8,7 @@ use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
 
 use crate::cache::query::cache_query_row_matches;
-use crate::query::ast::{Deparse, ast_query_fingerprint};
+use crate::query::ast::{Deparse, ast_query_fingerprint, TableNode};
 use crate::query::transform::{query_select_replace, query_table_update_queries};
 use crate::settings::Settings;
 
@@ -131,7 +131,7 @@ impl QueryCache {
                 .ok_or(CacheError::UnknownTable)?;
 
             let maybe_alias = select_statement
-                .tables()
+                .nodes::<TableNode>()
                 .filter(|&tn| tn.name == table.name)
                 .flat_map(|t| t.alias.as_ref())
                 .next();
@@ -156,7 +156,7 @@ impl QueryCache {
         select_statement: &SelectStatement,
     ) -> Result<Vec<u32>, CacheError> {
         let mut relation_oids = Vec::new();
-        for table_node in select_statement.tables() {
+        for table_node in select_statement.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
             let schema = table_node.schema.as_deref();
 

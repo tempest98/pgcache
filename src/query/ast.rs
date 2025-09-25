@@ -1,6 +1,8 @@
+use std::any::{Any, TypeId};
 use std::collections::hash_map::DefaultHasher;
 use std::convert::AsRef;
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 
 use error_set::error_set;
 use pg_query::ParseResult;
@@ -285,6 +287,40 @@ pub enum WhereExpr {
     },
 }
 
+type WhereExprNodeIter<'a, N> =
+    std::iter::Chain<std::option::IntoIter<&'a N>, Box<dyn Iterator<Item = &'a N> + 'a>>;
+
+impl WhereExpr {
+    /// Get all nodes of the given type within this WhereExpr tree
+    pub fn nodes<N: Any>(&self) -> WhereExprNodeIter<'_, N> {
+        let current = ((self as &dyn Any)
+            .downcast_ref::<N>()
+            .or_else(|| match self {
+                WhereExpr::Value(val) => (val as &dyn Any).downcast_ref::<N>(),
+                WhereExpr::Column(col) => (col as &dyn Any).downcast_ref::<N>(),
+                WhereExpr::Unary(unary) => (unary as &dyn Any).downcast_ref::<N>(),
+                WhereExpr::Binary(binary) => (binary as &dyn Any).downcast_ref::<N>(),
+                WhereExpr::Multi(multi) => (multi as &dyn Any).downcast_ref::<N>(),
+                WhereExpr::Function { .. } => None,
+                WhereExpr::Subquery { .. } => None,
+            }))
+        .into_iter();
+
+        // Chain with child nodes
+        let children = match self {
+            WhereExpr::Unary(unary) => Box::new(unary.expr.nodes()) as Box<dyn Iterator<Item = &N>>,
+            WhereExpr::Binary(binary) => Box::new(binary.lexpr.nodes().chain(binary.rexpr.nodes())),
+            WhereExpr::Multi(multi) => Box::new(multi.exprs.iter().flat_map(|expr| expr.nodes())),
+            WhereExpr::Function { args, .. } => Box::new(args.iter().flat_map(|expr| expr.nodes())),
+            WhereExpr::Value(_) | WhereExpr::Column(_) | WhereExpr::Subquery { .. } => {
+                Box::new(std::iter::empty())
+            }
+        };
+
+        current.chain(children)
+    }
+}
+
 impl Deparse for WhereExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
@@ -308,16 +344,16 @@ pub struct SqlQuery {
 }
 
 impl SqlQuery {
-    /// Get all table names referenced in the query
-    pub fn tables(&self) -> impl Iterator<Item = &'_ TableNode> {
+    /// Get all nodes of the given type
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         match &self.statement {
-            Statement::Select(select) => select.tables(),
+            Statement::Select(select) => select.nodes(),
         }
     }
 
     /// Check if query only references a single table
     pub fn is_single_table(&self) -> bool {
-        self.tables().nth(1).is_none()
+        self.nodes::<TableNode>().nth(1).is_none()
     }
 
     /// Check if query has a WHERE clause
@@ -394,10 +430,14 @@ impl Default for SelectStatement {
 }
 
 impl SelectStatement {
-    pub fn tables(&self) -> impl Iterator<Item = &'_ TableNode> {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         let mut iter = self.from.iter();
-        let table_iter = iter.next().map(|t| t.tables());
-        SelectStatementTableIter { iter, table_iter }
+        let table_iter = iter.next().map(|t| t.nodes());
+        SelectStatementNodeIter {
+            iter,
+            table_iter,
+            _phantom: PhantomData,
+        }
     }
 
     /// Check if this SELECT statement references only a single table
@@ -549,26 +589,31 @@ impl Deparse for SelectStatement {
     }
 }
 
-struct SelectStatementTableIter<'a> {
+struct SelectStatementNodeIter<'a, N> {
     iter: std::slice::Iter<'a, TableSource>,
-    table_iter: Option<TableSourceIter<'a>>,
+    table_iter: Option<TableSourceNodeIter<'a, N>>,
+    _phantom: PhantomData<N>,
 }
 
-impl<'a> Iterator for SelectStatementTableIter<'a> {
-    type Item = &'a TableNode;
+impl<'a, N: Any> Iterator for SelectStatementNodeIter<'a, N> {
+    type Item = &'a N;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.table_iter {
-            Some(table_iter) => {
-                let mut table = table_iter.next();
-                if table.is_none() {
-                    self.table_iter = self.iter.next().map(|t| t.tables());
-                    table = self.table_iter.as_mut().and_then(|iter| iter.next())
+        loop {
+            match &mut self.table_iter {
+                Some(table_iter) => {
+                    if let Some(node) = table_iter.next() {
+                        return Some(node);
+                    }
+                    // Current iterator is exhausted, try the next table source
+                    self.table_iter = self.iter.next().map(|t| t.nodes());
                 }
-
-                table
+                None => {
+                    // No current iterator, start with the first table source
+                    self.table_iter = self.iter.next().map(|t| t.nodes());
+                    self.table_iter.as_ref()?;
+                }
             }
-            None => None,
         }
     }
 }
@@ -690,10 +735,11 @@ pub enum TableSource {
 }
 
 impl TableSource {
-    fn tables(&self) -> TableSourceIter<'_> {
-        TableSourceIter {
+    fn nodes<N: Any>(&self) -> TableSourceNodeIter<'_, N> {
+        TableSourceNodeIter {
             source: Some(self),
             join_iter: None,
+            _phantom: PhantomData,
         }
     }
 }
@@ -708,31 +754,51 @@ impl Deparse for TableSource {
     }
 }
 
-struct TableSourceIter<'a> {
+struct TableSourceNodeIter<'a, N> {
     source: Option<&'a TableSource>,
-    join_iter: Option<Box<JoinNodeIter<'a>>>,
+    join_iter: Option<Box<JoinNodeIter<'a, N>>>,
+    _phantom: PhantomData<N>,
 }
 
-impl<'a> Iterator for TableSourceIter<'a> {
-    type Item = &'a TableNode;
+impl<'a, N: Any> Iterator for TableSourceNodeIter<'a, N> {
+    type Item = &'a N;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.source {
             Some(TableSource::Table(table)) => {
                 self.source = None;
-                Some(table)
+                (table as &dyn Any).downcast_ref::<N>()
             }
             Some(TableSource::Subquery(_)) => {
-                todo!()
+                self.source = None;
+                None // TODO: implement subquery node iteration if needed
             }
             Some(TableSource::Join(join)) => {
                 if let Some(iter) = &mut self.join_iter {
-                    iter.next()
+                    // Continue with the existing join iterator
+                    if let Some(node) = iter.next() {
+                        Some(node)
+                    } else {
+                        // Join iterator exhausted
+                        self.source = None;
+                        None
+                    }
                 } else {
-                    let mut iter = join.tables();
-                    let table = iter.next();
-                    self.join_iter = Some(Box::new(iter));
-                    table
+                    // First time processing this join
+                    if TypeId::of::<N>() == TypeId::of::<JoinNode>() {
+                        self.source = None;
+                        (join as &dyn Any).downcast_ref::<N>()
+                    } else {
+                        // Start iterating through the join's nodes of type N
+                        let mut iter = join.nodes();
+                        if let Some(node) = iter.next() {
+                            self.join_iter = Some(Box::new(iter));
+                            Some(node)
+                        } else {
+                            self.source = None;
+                            None
+                        }
+                    }
                 }
             }
             None => None,
@@ -800,10 +866,12 @@ pub struct JoinNode {
 }
 
 impl JoinNode {
-    fn tables(&self) -> JoinNodeIter<'_> {
+    pub fn nodes<N: Any>(&self) -> JoinNodeIter<'_, N> {
         JoinNodeIter {
-            left_iter: self.left.tables(),
-            right_iter: self.right.tables(),
+            left_iter: self.left.nodes(),
+            right_iter: self.right.nodes(),
+            condition_iter: self.condition.as_ref().map(|c| c.nodes()),
+            _phantom: PhantomData,
         }
     }
 }
@@ -821,16 +889,33 @@ impl Deparse for JoinNode {
     }
 }
 
-struct JoinNodeIter<'a> {
-    left_iter: TableSourceIter<'a>,
-    right_iter: TableSourceIter<'a>,
+pub struct JoinNodeIter<'a, N> {
+    left_iter: TableSourceNodeIter<'a, N>,
+    right_iter: TableSourceNodeIter<'a, N>,
+    condition_iter: Option<WhereExprNodeIter<'a, N>>,
+    _phantom: PhantomData<N>,
 }
 
-impl<'a> Iterator for JoinNodeIter<'a> {
-    type Item = &'a TableNode;
+impl<'a, N: Any> Iterator for JoinNodeIter<'a, N> {
+    type Item = &'a N;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.left_iter.next().or_else(|| self.right_iter.next())
+        // Try left iterator first
+        if let Some(item) = self.left_iter.next() {
+            return Some(item);
+        }
+
+        // Then try right iterator
+        if let Some(item) = self.right_iter.next() {
+            return Some(item);
+        }
+
+        // Finally try condition iterator
+        if let Some(ref mut condition_iter) = self.condition_iter {
+            condition_iter.next()
+        } else {
+            None
+        }
     }
 }
 
@@ -1208,7 +1293,7 @@ mod tests {
         assert!(ast.has_where_clause());
         assert!(!ast.is_select_star());
         assert_eq!(
-            ast.tables()
+            ast.nodes::<TableNode>()
                 .map(|t| (t.schema.as_deref(), t.name.as_str()))
                 .collect::<HashSet<_>>(),
             HashSet::<(Option<&str>, _)>::from([(None, "users")])
@@ -1225,7 +1310,7 @@ mod tests {
         assert!(!ast.has_where_clause());
         assert!(ast.is_select_star());
         assert_eq!(
-            ast.tables()
+            ast.nodes::<TableNode>()
                 .map(|t| (t.schema.as_deref(), t.name.as_str()))
                 .collect::<HashSet<_>>(),
             HashSet::<(Option<&str>, _)>::from([(None, "products")])
@@ -1372,7 +1457,7 @@ mod tests {
         let ast = sql_query_convert(&pg_ast).unwrap();
 
         assert_eq!(
-            ast.tables()
+            ast.nodes::<TableNode>()
                 .map(|t| (t.schema.as_deref(), t.name.as_str(), t.alias.as_ref()))
                 .collect::<HashSet<_>>(),
             HashSet::<(Option<&str>, _, _)>::from([
@@ -1748,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tables() {
+    fn test_nodes_table_extraction() {
         let sql = "SELECT first_name, last_name, film_id \
                     FROM actor a \
                     JOIN public.film_actor fa ON a.actor_id = fa.actor_id \
@@ -1756,7 +1841,8 @@ mod tests {
         let pg_ast = pg_query::parse(sql).unwrap();
         let ast = sql_query_convert(&pg_ast).unwrap();
 
-        let tables = ast.tables().collect::<Vec<_>>();
+        // Test extracting TableNode instances using the generic nodes function
+        let tables = ast.nodes::<TableNode>().collect::<Vec<_>>();
         dbg!(&tables);
 
         assert_eq!(tables.len(), 2);
@@ -1780,5 +1866,153 @@ mod tests {
                 columns: vec![]
             })
         );
+    }
+
+    #[test]
+    fn test_nodes_table_nodes() {
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Test getting TableNode instances using the nodes function
+        let table_nodes: Vec<&TableNode> = ast.nodes().collect();
+        assert_eq!(table_nodes.len(), 2);
+
+        assert_eq!(table_nodes[0].name, "users");
+        assert_eq!(table_nodes[0].alias.as_ref().unwrap().name, "u");
+
+        assert_eq!(table_nodes[1].name, "orders");
+        assert_eq!(table_nodes[1].alias.as_ref().unwrap().name, "o");
+    }
+
+    #[test]
+    fn test_nodes_join_nodes() {
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Test getting JoinNode instances using the nodes function
+        let join_nodes: Vec<&JoinNode> = ast.nodes().collect();
+        assert_eq!(join_nodes.len(), 1);
+
+        assert_eq!(join_nodes[0].join_type, JoinType::Inner);
+        assert!(join_nodes[0].condition.is_some());
+    }
+
+    #[test]
+    fn test_nodes_mixed_types() {
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Should find both table nodes and join nodes independently
+        let table_nodes: Vec<&TableNode> = ast.nodes().collect();
+        let join_nodes: Vec<&JoinNode> = ast.nodes().collect();
+
+        assert_eq!(table_nodes.len(), 2);
+        assert_eq!(join_nodes.len(), 1);
+
+        // Verify the types are different queries but same AST
+        assert_eq!(table_nodes[0].name, "users");
+        assert_eq!(table_nodes[1].name, "orders");
+        assert_eq!(join_nodes[0].join_type, JoinType::Inner);
+    }
+
+    #[test]
+    fn test_where_expr_nodes_column() {
+        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let where_clause = ast.where_clause().unwrap();
+        let columns: Vec<&ColumnNode> = where_clause.nodes().collect();
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].column, "name");
+        assert_eq!(columns[1].column, "age");
+    }
+
+    #[test]
+    fn test_where_expr_nodes_literal() {
+        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let where_clause = ast.where_clause().unwrap();
+        let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
+
+        assert_eq!(literals.len(), 2);
+        assert_eq!(literals[0], &LiteralValue::String("john".to_string()));
+        assert_eq!(literals[1], &LiteralValue::Integer(25));
+    }
+
+    #[test]
+    fn test_where_expr_nodes_binary() {
+        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let where_clause = ast.where_clause().unwrap();
+        let binary_exprs: Vec<&BinaryExpr> = where_clause.nodes().collect();
+
+        assert_eq!(binary_exprs.len(), 3); // AND, =, >
+        assert_eq!(binary_exprs[0].op, ExprOp::And);
+        assert_eq!(binary_exprs[1].op, ExprOp::Equal);
+        assert_eq!(binary_exprs[2].op, ExprOp::GreaterThan);
+    }
+
+    #[test]
+    fn test_where_expr_nodes_whole_expr() {
+        let sql = "SELECT * FROM users WHERE name = 'john'";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let where_clause = ast.where_clause().unwrap();
+        let where_exprs: Vec<&WhereExpr> = where_clause.nodes().collect();
+
+        // Should find the root expression plus all child expressions
+        assert_eq!(where_exprs.len(), 3); // Binary(name = 'john'), Column(name), Value('john')
+    }
+
+    #[test]
+    fn test_where_expr_nodes_nested() {
+        let sql = "SELECT * FROM users WHERE (name = 'john' OR name = 'jane') AND age > 18";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let where_clause = ast.where_clause().unwrap();
+        let columns: Vec<&ColumnNode> = where_clause.nodes().collect();
+
+        // Should find all column references in nested structure
+        assert_eq!(columns.len(), 3); // name, name, age
+        assert_eq!(columns[0].column, "name");
+        assert_eq!(columns[1].column, "name");
+        assert_eq!(columns[2].column, "age");
+    }
+
+    #[test]
+    fn test_join_condition_nodes() {
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Get the join node from the query
+        let join_nodes: Vec<&JoinNode> = ast.nodes().collect();
+        assert_eq!(join_nodes.len(), 1);
+
+        let join_node = join_nodes[0];
+
+        // Test that we can extract column nodes from the join condition
+        let columns: Vec<&ColumnNode> = join_node.nodes().collect();
+
+        // Should find only the condition columns (u.id, o.user_id)
+        // since we're specifically collecting ColumnNode instances
+        assert_eq!(columns.len(), 2);
+
+        // Verify the condition columns
+        assert_eq!(columns[0].table, Some("u".to_string()));
+        assert_eq!(columns[0].column, "id");
+        assert_eq!(columns[1].table, Some("o".to_string()));
+        assert_eq!(columns[1].column, "user_id");
     }
 }

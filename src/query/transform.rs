@@ -26,7 +26,7 @@ pub fn query_select_replace(
 
 //generate queries used to check if a dml statement applies to a given table
 pub fn query_table_update_queries(select: &SelectStatement) -> Vec<(&TableNode, SelectStatement)> {
-    let tables = select.tables().collect::<Vec<_>>();
+    let tables = select.nodes::<TableNode>().collect::<Vec<_>>();
 
     let column = SelectColumn {
         expr: ColumnExpr::Literal(LiteralValue::Boolean(true)),
