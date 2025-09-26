@@ -1934,16 +1934,17 @@ mod tests {
 
     #[test]
     fn test_where_expr_nodes_literal() {
-        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25";
+        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25 AND active = true";
         let pg_ast = pg_query::parse(sql).unwrap();
         let ast = sql_query_convert(&pg_ast).unwrap();
 
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
 
-        assert_eq!(literals.len(), 2);
+        assert_eq!(literals.len(), 3);
         assert_eq!(literals[0], &LiteralValue::String("john".to_string()));
         assert_eq!(literals[1], &LiteralValue::Integer(25));
+        assert_eq!(literals[2], &LiteralValue::Boolean(true));
     }
 
     #[test]

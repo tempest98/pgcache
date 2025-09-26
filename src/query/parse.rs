@@ -252,30 +252,56 @@ fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<ExprOp, WhereParseE
 fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
     match expr.boolop() {
         BoolExprType::AndExpr => {
-            if expr.args.len() != 2 {
+            if expr.args.len() < 2 {
                 return Err(WhereParseError::Other {
-                    error: "AND with != 2 arguments not supported".to_string(),
+                    error: "AND with < 2 arguments not supported".to_string(),
                 });
             }
 
-            Ok(WhereExpr::Binary(BinaryExpr {
+            // For chained AND expressions (a AND b AND c), build a left-associative tree:
+            // ((a AND b) AND c)
+            let mut result = WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::And,
                 lexpr: Box::new(node_convert_to_expr(&expr.args[0])?),
                 rexpr: Box::new(node_convert_to_expr(&expr.args[1])?),
-            }))
-        }
-        BoolExprType::OrExpr => {
-            if expr.args.len() != 2 {
-                return Err(WhereParseError::Other {
-                    error: "OR with != 2 arguments not supported".to_string(),
+            });
+
+            // Chain additional arguments
+            for arg in &expr.args[2..] {
+                result = WhereExpr::Binary(BinaryExpr {
+                    op: ExprOp::And,
+                    lexpr: Box::new(result),
+                    rexpr: Box::new(node_convert_to_expr(arg)?),
                 });
             }
 
-            Ok(WhereExpr::Binary(BinaryExpr {
+            Ok(result)
+        }
+        BoolExprType::OrExpr => {
+            if expr.args.len() < 2 {
+                return Err(WhereParseError::Other {
+                    error: "OR with < 2 arguments not supported".to_string(),
+                });
+            }
+
+            // For chained OR expressions (a OR b OR c), build a left-associative tree:
+            // ((a OR b) OR c)
+            let mut result = WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Or,
                 lexpr: Box::new(node_convert_to_expr(&expr.args[0])?),
                 rexpr: Box::new(node_convert_to_expr(&expr.args[1])?),
-            }))
+            });
+
+            // Chain additional arguments
+            for arg in &expr.args[2..] {
+                result = WhereExpr::Binary(BinaryExpr {
+                    op: ExprOp::Or,
+                    lexpr: Box::new(result),
+                    rexpr: Box::new(node_convert_to_expr(arg)?),
+                });
+            }
+
+            Ok(result)
         }
         BoolExprType::NotExpr => {
             if expr.args.len() != 1 {
@@ -662,5 +688,93 @@ mod tests {
             }
             other => panic!("Expected UnsupportedAExpr error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn where_clause_chained_and_operation() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE name = 'john' AND age > 25 AND active = true").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        // Should build a left-associative tree: ((name = 'john' AND age > 25) AND active = true)
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: ExprOp::And,
+            lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::And,
+                lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                    op: ExprOp::Equal,
+                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                        table: None,
+                        column: "name".to_string(),
+                    })),
+                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+                })),
+                rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                    op: ExprOp::GreaterThan,
+                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                        table: None,
+                        column: "age".to_string(),
+                    })),
+                    rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(25))),
+                })),
+            })),
+            rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::Equal,
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "active".to_string(),
+                })),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
+            })),
+        }));
+
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_chained_or_operation() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE name = 'john' OR name = 'jane' OR name = 'bob'").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        // Should build a left-associative tree: ((name = 'john' OR name = 'jane') OR name = 'bob')
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: ExprOp::Or,
+            lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::Or,
+                lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                    op: ExprOp::Equal,
+                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                        table: None,
+                        column: "name".to_string(),
+                    })),
+                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+                })),
+                rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                    op: ExprOp::Equal,
+                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                        table: None,
+                        column: "name".to_string(),
+                    })),
+                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))),
+                })),
+            })),
+            rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::Equal,
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "name".to_string(),
+                })),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("bob".to_string()))),
+            })),
+        }));
+
+        assert_eq!(where_clause, expected);
     }
 }
