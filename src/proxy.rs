@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    cache::{CacheMessage, CacheReply, ProxyMessage, query::is_cacheable_ast},
+    cache::{CacheMessage, CacheReply, ProxyMessage, cache_run, query::is_cacheable_ast},
     pg::protocol::{
         ProtocolError,
         backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
@@ -35,7 +35,7 @@ use tokio_util::{
 use tracing::{debug, error, instrument, trace};
 
 error_set! {
-    ConnectionError = ConnectError || ReadError || WriteError;
+    ConnectionError = ConnectError || ReadError || WriteError || DegradedModeExit;
 
     ReadError = {
         ProtocolError(ProtocolError),
@@ -50,6 +50,10 @@ error_set! {
         NoConnection,
     };
 
+    DegradedModeExit = {
+        CacheDead,
+    };
+
     ParseError = {
         InvalidUtf8,
         Parse(pg_query::Error)
@@ -57,7 +61,7 @@ error_set! {
 }
 
 type Worker<'scope> = (
-    thread::ScopedJoinHandle<'scope, Result<(), Error>>,
+    thread::ScopedJoinHandle<'scope, Result<(), ConnectionError>>,
     UnboundedSender<TcpStream>,
 );
 
@@ -68,7 +72,7 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     cache_tx: SenderCacheType,
-) -> Result<Worker<'scope>, Error> {
+) -> Result<Worker<'scope>, ConnectionError> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
@@ -77,26 +81,55 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     Ok((join, tx))
 }
 
+enum WorkerStatus {
+    Alive,
+    Exited,
+    CacheDead,
+}
+
 fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     workers: &mut [Worker<'scope>],
     worker_index: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     cache_tx: SenderCacheType,
-) -> Result<bool, Error> {
+) -> Result<WorkerStatus, ConnectionError> {
     if workers[worker_index].0.is_finished() {
         let new_worker = worker_create(worker_index, scope, settings, cache_tx)?;
         let old_worker = mem::replace(&mut workers[worker_index], new_worker);
-        let _ = old_worker.0.join();
-        Ok(true)
+        match old_worker.0.join() {
+            Ok(Err(ConnectionError::CacheDead)) => Ok(WorkerStatus::CacheDead),
+            _ => Ok(WorkerStatus::Exited),
+        }
     } else {
-        Ok(false)
+        Ok(WorkerStatus::Alive)
     }
 }
 
+type Cache<'scope> = (
+    thread::ScopedJoinHandle<'scope, Result<(), crate::cache::CacheError>>,
+    SenderCacheType,
+);
+
+fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+) -> Result<Cache<'scope>, Error> {
+    const DEFAULT_CHANNEL_SIZE: usize = 100;
+    let (cache_tx, cache_rx) = channel(DEFAULT_CHANNEL_SIZE);
+
+    let cache_handle = thread::Builder::new()
+        .name("cache".to_owned())
+        .spawn_scoped(scope, || cache_run(settings, cache_rx))?;
+
+    Ok((cache_handle, cache_tx))
+}
+
 #[instrument(skip_all)]
-pub fn proxy_run(settings: &Settings, cache_tx: SenderCacheType) -> Result<(), ConnectionError> {
+pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
     thread::scope(|scope| {
+        let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
+
         let mut workers: Vec<_> = (0..settings.num_workers)
             .map(|i| worker_create(i, scope, settings, cache_tx.clone()))
             .collect::<Result<Vec<_>, _>>()?;
@@ -116,13 +149,23 @@ pub fn proxy_run(settings: &Settings, cache_tx: SenderCacheType) -> Result<(), C
 
                 let _ = workers[cur_worker].1.send(socket);
 
-                let _ = worker_ensure_alive(
+                let status = worker_ensure_alive(
                     &mut workers,
                     cur_worker,
                     scope,
                     settings,
                     cache_tx.clone(),
                 )?;
+
+                if matches!(status, WorkerStatus::CacheDead) {
+                    error!("cache thread detected as dead, restarting...");
+                    if cache_handle.is_finished() {
+                        let _ = cache_handle.join(); // Clean up old cache thread
+                    }
+                    (cache_handle, cache_tx) = cache_create(scope, settings)?;
+                    debug!("cache thread restarted");
+                }
+
                 cur_worker = (cur_worker + 1) % settings.num_workers;
             }
 
@@ -136,7 +179,7 @@ pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
     cache_tx: SenderCacheType,
-) -> Result<(), Error> {
+) -> Result<(), ConnectionError> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 
     debug!("handle connection start");
@@ -153,10 +196,18 @@ pub fn connection_run(
                     let cache_tx = cache_tx.clone();
                     spawn_local(async move {
                         debug!("task spawn");
-                        let _ = handle_connection(&mut socket, addrs, cache_tx)
-                            .await
-                            .inspect_err(|e| error!("{}", e));
+                        match handle_connection(&mut socket, addrs, cache_tx).await {
+                            Err(ConnectionError::CacheDead) => {
+                                debug!("connection closed in degraded mode");
+                                return Err(Error::other("cache dead"));
+                            }
+                            Err(e) => {
+                                error!("{}", e);
+                            }
+                            Ok(_) => {}
+                        }
                         debug!("task done");
+                        Ok(())
                     });
                 }
 
@@ -172,6 +223,12 @@ enum ProxyMode {
     OriginWrite(PgFrontendMessage),
     ClientWrite(PgBackendMessage),
     CacheWrite(CacheMessage),
+}
+
+#[derive(Debug)]
+enum ProxyStatus {
+    Normal,
+    Degraded,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -206,6 +263,7 @@ async fn handle_connection(
     let _ = origin_stream.set_nodelay(true);
 
     let mut proxy_mode = ProxyMode::Read;
+    let mut proxy_status = ProxyStatus::Normal;
 
     let (client_read, mut client_write) = client_socket.split();
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
@@ -300,21 +358,31 @@ async fn handle_connection(
             }
             ProxyMode::CacheWrite(msg) => {
                 let (resp_tx, resp_rx) = channel(10);
-                let stream_rx = Box::pin(
-                    ReceiverStream::new(resp_rx).map(|item| Ok(StreamSource::CacheRead(item))),
-                );
-                streams_read.insert("cache_reply", stream_rx);
 
-                cache_tx.send((msg, resp_tx)).await.map_err(|e| {
-                    error!("{}", e);
-                    WriteError::MpscError
-                })?;
-                proxy_mode = ProxyMode::Read;
+                if let Err(e) = cache_tx.send((msg, resp_tx)).await {
+                    // Cache is unavailable, fall back to proxying directly to origin
+                    debug!("cache unavailable, degrading to proxy mode: {}", e);
+                    proxy_status = ProxyStatus::Degraded;
+                    let CacheMessage::Query(data, _) = e.0.0;
+                    proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
+                        message_type: PgFrontendMessageType::Query,
+                        data,
+                    });
+                } else {
+                    let stream_rx = Box::pin(
+                        ReceiverStream::new(resp_rx).map(|item| Ok(StreamSource::CacheRead(item))),
+                    );
+                    streams_read.insert("cache_reply", stream_rx);
+                    proxy_mode = ProxyMode::Read;
+                }
             }
         }
     }
 
-    Ok(())
+    match proxy_status {
+        ProxyStatus::Degraded => Err(ConnectionError::CacheDead),
+        ProxyStatus::Normal => Ok(()),
+    }
 }
 
 enum Action {
