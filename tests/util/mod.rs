@@ -3,6 +3,7 @@
 use std::{
     io::Error,
     io::Read,
+    net::TcpListener,
     process::{Child, Command, Stdio},
 };
 
@@ -10,6 +11,15 @@ use pgtemp::{PgTempDB, PgTempDBBuilder};
 use postgres_types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, ToStatement};
 use tokio_util::bytes::{Buf, BytesMut};
+
+fn find_available_port() -> Result<u16, Error> {
+    // Bind to port 0 to let the OS assign an available port
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    // Drop the listener to free the port
+    drop(listener);
+    Ok(port)
+}
 
 pub fn proxy_wait_for_ready(pgcache: &mut Child) -> Result<(), String> {
     const NEEDLE: &str = "Listening to";
@@ -89,6 +99,10 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
 }
 
 pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(Child, Client), Error> {
+    // Find a random available port
+    let listen_port = find_available_port()?;
+    let listen_socket = format!("127.0.0.1:{}", listen_port);
+
     let mut pgcache = Command::new(env!("CARGO_BIN_EXE_pgcache"))
         .arg("--config")
         .arg("tests/data/default_config.toml")
@@ -108,6 +122,8 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(Child, Client), Error> {
         .arg(dbs.cache.db_user())
         .arg("--cache_database")
         .arg(dbs.cache.db_name())
+        .arg("--listen_socket")
+        .arg(&listen_socket)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -118,7 +134,7 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(Child, Client), Error> {
 
     let (client, connection) = Config::new()
         .host("localhost")
-        .port(6432)
+        .port(listen_port)
         .user("postgres")
         .dbname("origin_test")
         .connect(NoTls)
