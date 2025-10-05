@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use postgres_protocol::escape;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
@@ -270,7 +271,7 @@ impl QueryCache {
                 for idx in 0..row.columns().len() {
                     values.push(
                         row.get(idx)
-                            .map(|v| format!("'{v}'"))
+                            .map(escape::escape_literal)
                             .unwrap_or("NULL".to_owned()),
                     );
                 }
@@ -474,7 +475,7 @@ impl QueryCache {
                     if position < row_data.len() {
                         let value = row_data[position]
                             .as_deref()
-                            .map_or("NULL".to_string(), |v| format!("'{v}'"));
+                            .map_or("NULL".to_string(), escape::escape_literal);
                         where_conditions.push(format!("{pk_column} = {value}"));
                     }
                 }
@@ -491,7 +492,7 @@ impl QueryCache {
                 if position < row_data.len() {
                     let value = row_data[position]
                         .as_deref()
-                        .map_or("NULL".to_string(), |v| format!("'{v}'"));
+                        .map_or("NULL".to_string(), escape::escape_literal);
                     comparison_columns.push(format!(
                         "{} IS DISTINCT FROM {} AS {}",
                         column_meta.name, value, column_meta.name
@@ -632,7 +633,7 @@ impl QueryCache {
             if position < row_data.len() {
                 let value = row_data[position]
                     .as_deref()
-                    .map_or("NULL".to_string(), |v| format!("'{v}'"));
+                    .map_or("NULL".to_string(), escape::escape_literal);
 
                 column_names.push(column_meta.name.as_str());
                 values.push(value);
@@ -931,8 +932,10 @@ impl QueryCache {
             if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
                 if position < row_data.len() {
-                    let value = row_data[position].as_deref().unwrap_or("NULL");
-                    where_conditions.push(format!("{pk_column} = '{value}'"));
+                    let value = row_data[position]
+                        .as_deref()
+                        .map_or("NULL".to_string(), escape::escape_literal);
+                    where_conditions.push(format!("{pk_column} = {value}"));
                 }
             }
         }
