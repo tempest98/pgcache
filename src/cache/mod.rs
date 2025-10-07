@@ -20,6 +20,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     cache::cdc::CdcProcessor,
+    cache::query::CacheableQuery,
     query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectStatement, TableAlias},
     query::transform::AstTransformError,
 };
@@ -75,7 +76,7 @@ error_set! {
 
 #[derive(Debug)]
 pub enum CacheMessage {
-    Query(BytesMut, Box<SelectStatement>),
+    Query(BytesMut, Box<CacheableQuery>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,10 +290,10 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                         spawn_local(async move {
                             match src {
                                 StreamSource::Proxy((msg, reply_tx)) => match msg {
-                                    CacheMessage::Query(data, select_statement) => {
+                                    CacheMessage::Query(data, cacheable_query) => {
                                         let msg = QueryRequest {
                                             data,
-                                            select_statement,
+                                            cacheable_query,
                                             reply_tx,
                                         };
                                         match qcache.query_dispatch(msg).await {

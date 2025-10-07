@@ -355,6 +355,18 @@ impl WhereExpr {
 
         current.chain(children)
     }
+
+    /// Check if this WHERE expression contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        match self {
+            WhereExpr::Binary(binary) => binary.lexpr.has_sublink() || binary.rexpr.has_sublink(),
+            WhereExpr::Unary(unary) => unary.expr.has_sublink(),
+            WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_sublink()),
+            WhereExpr::Function { args, .. } => args.iter().any(|e| e.has_sublink()),
+            WhereExpr::Subquery { .. } => true, // Found a subquery!
+            _ => false,                         // Value and Column don't contain sublinks
+        }
+    }
 }
 
 impl Deparse for WhereExpr {
@@ -490,7 +502,10 @@ impl SelectStatement {
         let where_nodes = self.where_clause.iter().flat_map(|w| w.nodes());
         let group_by_nodes = self.group_by.iter().flat_map(|c| c.nodes());
         let having_nodes = self.having.iter().flat_map(|h| h.nodes());
-        let values_nodes = self.values.iter().flat_map(|row| row.iter().flat_map(|v| v.nodes()));
+        let values_nodes = self
+            .values
+            .iter()
+            .flat_map(|row| row.iter().flat_map(|v| v.nodes()));
 
         columns_nodes
             .chain(from_nodes)
@@ -503,33 +518,6 @@ impl SelectStatement {
     /// Check if this SELECT statement references only a single table
     pub fn is_single_table(&self) -> bool {
         self.from.len() == 1 && matches!(self.from[0], TableSource::Table(_))
-    }
-
-    pub fn is_supported_from(&self) -> bool {
-        if self.from.len() == 1 {
-            if let TableSource::Join(join) = &self.from[0] {
-                self.is_supported_join(join)
-            } else {
-                true
-            }
-        } else {
-            false
-        }
-    }
-
-    fn is_supported_join(&self, join: &JoinNode) -> bool {
-        if join.join_type != JoinType::Inner {
-            return false;
-        }
-        match &join.condition {
-            Some(where_expr) => match where_expr {
-                WhereExpr::Binary(binary_expr) => {
-                    binary_expr.op == ExprOp::Equal && !self.where_expr_has_sublink(where_expr)
-                }
-                _ => false,
-            },
-            None => true,
-        }
     }
 
     /// Check if this SELECT statement contains sublinks/subqueries
@@ -545,14 +533,14 @@ impl SelectStatement {
 
         // Check WHERE clause for subqueries
         if let Some(where_clause) = &self.where_clause
-            && self.where_expr_has_sublink(where_clause)
+            && where_clause.has_sublink()
         {
             return true;
         }
 
         // Check HAVING clause for subqueries
         if let Some(having) = &self.having
-            && self.where_expr_has_sublink(having)
+            && having.has_sublink()
         {
             return true;
         }
@@ -568,21 +556,6 @@ impl SelectStatement {
                 .iter()
                 .any(|arg| self.column_expr_has_sublink(arg)),
             _ => false, // Column references and literals don't contain sublinks
-        }
-    }
-
-    #[allow(clippy::only_used_in_recursion)]
-    fn where_expr_has_sublink(&self, expr: &WhereExpr) -> bool {
-        match expr {
-            WhereExpr::Binary(binary) => {
-                self.where_expr_has_sublink(&binary.lexpr)
-                    || self.where_expr_has_sublink(&binary.rexpr)
-            }
-            WhereExpr::Unary(unary) => self.where_expr_has_sublink(&unary.expr),
-            WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| self.where_expr_has_sublink(e)),
-            WhereExpr::Function { args, .. } => args.iter().any(|e| self.where_expr_has_sublink(e)),
-            WhereExpr::Subquery { .. } => true, // Found a subquery!
-            _ => false,                         // Value and Column don't contain sublinks
         }
     }
 }
@@ -691,9 +664,7 @@ impl SelectColumns {
 
         let children: Box<dyn Iterator<Item = &N> + '_> = match self {
             SelectColumns::None | SelectColumns::All => Box::new(std::iter::empty()),
-            SelectColumns::Columns(columns) => {
-                Box::new(columns.iter().flat_map(|col| col.nodes()))
-            }
+            SelectColumns::Columns(columns) => Box::new(columns.iter().flat_map(|col| col.nodes())),
         };
 
         Box::new(current.chain(children))
@@ -763,7 +734,7 @@ impl ColumnExpr {
                     ColumnExpr::Literal(lit) => (lit as &dyn Any).downcast_ref::<N>(),
                     ColumnExpr::Subquery(select) => (select as &dyn Any).downcast_ref::<N>(),
                 }))
-            .into_iter()
+            .into_iter(),
         )
     }
 }
@@ -2182,12 +2153,10 @@ mod tests {
         // This test verifies the nodes() implementation works for the structure
         let func = FunctionCall {
             name: "COUNT".to_string(),
-            args: vec![
-                ColumnExpr::Column(ColumnNode {
-                    table: None,
-                    column: "id".to_string(),
-                }),
-            ],
+            args: vec![ColumnExpr::Column(ColumnNode {
+                table: None,
+                column: "id".to_string(),
+            })],
         };
 
         // Test that FunctionCall::nodes() can extract ColumnNode from args

@@ -1,17 +1,80 @@
 use crate::query::{
-    ast::{ExprOp, SelectStatement, SqlQuery, Statement, WhereExpr},
+    ast::{ExprOp, JoinNode, JoinType, SelectStatement, SqlQuery, Statement, TableSource, WhereExpr},
     evaluate::is_simple_comparison,
 };
+use error_set::error_set;
 
-pub fn is_cacheable_ast(sql_query: &SqlQuery) -> Option<&SelectStatement> {
-    match &sql_query.statement {
-        Statement::Select(select) => {
-            if select.is_supported_from() && !select.has_sublink() && is_cacheable_select(select) {
-                Some(select)
-            } else {
-                None
+error_set! {
+    CacheabilityError = {
+        NotSelect,
+        UnsupportedFrom,
+        HasSublink,
+        UnsupportedWhereClause,
+    };
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheableQuery {
+    statement: SelectStatement,
+}
+
+impl CacheableQuery {
+    pub fn statement(&self) -> &SelectStatement {
+        &self.statement
+    }
+
+    pub fn into_statement(self) -> SelectStatement {
+        self.statement
+    }
+}
+
+impl TryFrom<&SqlQuery> for CacheableQuery {
+    type Error = CacheabilityError;
+
+    fn try_from(query: &SqlQuery) -> Result<Self, Self::Error> {
+        match &query.statement {
+            Statement::Select(select) => {
+                if !is_supported_from(select) {
+                    return Err(CacheabilityError::UnsupportedFrom);
+                }
+                if select.has_sublink() {
+                    return Err(CacheabilityError::HasSublink);
+                }
+                if !is_cacheable_select(select) {
+                    return Err(CacheabilityError::UnsupportedWhereClause);
+                }
+                Ok(CacheableQuery {
+                    statement: select.clone(),
+                })
             }
-        } // _ => None, // Only SELECT statements are cacheable
+        }
+    }
+}
+
+fn is_supported_from(select: &SelectStatement) -> bool {
+    if select.from.len() == 1 {
+        if let TableSource::Join(join) = &select.from[0] {
+            is_supported_join(join)
+        } else {
+            true
+        }
+    } else {
+        false
+    }
+}
+
+fn is_supported_join(join: &JoinNode) -> bool {
+    if join.join_type != JoinType::Inner {
+        return false;
+    }
+    match &join.condition {
+        Some(where_expr) => match where_expr {
+            WhereExpr::Binary(binary_expr) => {
+                binary_expr.op == ExprOp::Equal && !where_expr.has_sublink()
+            }
+            _ => false,
+        },
+        None => true,
     }
 }
 

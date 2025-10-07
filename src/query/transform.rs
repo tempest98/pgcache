@@ -1,7 +1,7 @@
 use error_set::error_set;
 
 use crate::{
-    cache::TableMetadata,
+    cache::{TableMetadata, query::CacheableQuery},
     query::ast::{
         ColumnExpr, LiteralValue, SelectColumn, SelectColumns, SelectStatement, TableAlias,
         TableNode, TableSource, TableSubqueryNode,
@@ -25,7 +25,10 @@ pub fn query_select_replace(
 }
 
 //generate queries used to check if a dml statement applies to a given table
-pub fn query_table_update_queries(select: &SelectStatement) -> Vec<(&TableNode, SelectStatement)> {
+pub fn query_table_update_queries(
+    cacheable_query: &CacheableQuery,
+) -> Vec<(&TableNode, SelectStatement)> {
+    let select = cacheable_query.statement();
     let tables = select.nodes::<TableNode>().collect::<Vec<_>>();
 
     let column = SelectColumn {
@@ -38,8 +41,8 @@ pub fn query_table_update_queries(select: &SelectStatement) -> Vec<(&TableNode, 
     let mut queries = Vec::new();
     if tables.len() == 1 {
         queries.push((tables[0], query_select_replace(select, select_list)));
-    } else if tables.len() == 2 && select.is_supported_from() {
-        //can use same query for both tables
+    } else if tables.len() == 2 {
+        //can use same query for both tables (CacheableQuery guarantees is_supported_from)
         queries.push((tables[0], query_select_replace(select, select_list.clone())));
         queries.push((tables[1], query_select_replace(select, select_list)));
     }
@@ -218,8 +221,8 @@ mod tests {
         let ast = pg_query::parse(original_query).expect("to parse query");
         let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
 
-        let Statement::Select(stmt) = &sql_query.statement;
-        let result = query_table_update_queries(stmt);
+        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 1);
 
@@ -237,8 +240,8 @@ mod tests {
         let ast = pg_query::parse(original_query).expect("to parse query");
         let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
 
-        let Statement::Select(stmt) = &sql_query.statement;
-        let result = query_table_update_queries(stmt);
+        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 2);
 

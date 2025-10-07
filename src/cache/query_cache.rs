@@ -9,7 +9,7 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
 
-use crate::query::ast::{Deparse, JoinNode, TableNode, ast_query_fingerprint};
+use crate::query::ast::{Deparse, JoinNode, SelectStatement, TableNode, ast_query_fingerprint};
 use crate::query::transform::{
     query_select_replace, query_table_replace_with_values, query_table_update_queries,
 };
@@ -20,7 +20,7 @@ use super::*;
 #[derive(Debug)]
 pub struct QueryRequest {
     pub data: BytesMut,
-    pub select_statement: Box<SelectStatement>,
+    pub cacheable_query: Box<CacheableQuery>,
     pub reply_tx: Sender<CacheReply>,
 }
 
@@ -80,7 +80,7 @@ impl QueryCache {
 
     #[instrument(skip_all)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
-        let stmt = &msg.select_statement;
+        let stmt = msg.cacheable_query.statement();
         let fingerprint = ast_query_fingerprint(stmt);
         let cached_query_state = self
             .cache
@@ -102,7 +102,7 @@ impl QueryCache {
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
-                let table_oids = self.query_register(fingerprint, stmt).await?;
+                let table_oids = self.query_register(fingerprint, &msg.cacheable_query).await?;
                 for table_oid in table_oids {
                     let rows = self.query_cache_fetch(table_oid, stmt).await?;
                     self.query_cache_results(table_oid, &rows).await?;
@@ -159,8 +159,9 @@ impl QueryCache {
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
-        select_statement: &SelectStatement,
+        cacheable_query: &CacheableQuery,
     ) -> Result<Vec<u32>, CacheError> {
+        let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
         for table_node in select_statement.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
@@ -172,7 +173,7 @@ impl QueryCache {
             }
         }
 
-        for (table_node, update_select) in query_table_update_queries(select_statement) {
+        for (table_node, update_select) in query_table_update_queries(cacheable_query) {
             let update_query = UpdateQuery {
                 fingerprint,
                 query: update_select,
