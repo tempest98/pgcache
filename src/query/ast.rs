@@ -1011,7 +1011,7 @@ impl<'a, N: Any> Iterator for JoinNodeIter<'a, N> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub enum JoinType {
     Inner,
     Left,
