@@ -1,7 +1,7 @@
 use std::{io, thread};
 
 use error_set::error_set;
-use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
+use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
 use tokio::{
     runtime::Builder,
     sync::{
@@ -10,7 +10,7 @@ use tokio::{
     },
     task::{LocalSet, spawn_local},
 };
-use tokio_postgres::{Error, types::Type};
+use tokio_postgres::Error;
 use tokio_stream::{
     StreamExt,
     wrappers::{ReceiverStream, UnboundedReceiverStream},
@@ -21,14 +21,15 @@ use tracing::{debug, error, instrument};
 use crate::{
     cache::cdc::CdcProcessor,
     cache::query::CacheableQuery,
-    query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectStatement, TableAlias},
+    catalog::TableMetadata,
+    query::ast::SelectStatement,
     query::transform::AstTransformError,
 };
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
     settings::Settings,
 };
-use crate::{cache::worker::CacheWorker, query::ast::SelectColumns};
+use crate::cache::worker::CacheWorker;
 
 mod cdc;
 pub(crate) mod query;
@@ -114,87 +115,6 @@ enum StreamSource {
     Cdc(CdcMessage),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct TableMetadata {
-    pub relation_oid: u32,
-    pub name: String,
-    pub schema: String,
-    pub primary_key_columns: Vec<String>,
-    pub columns: BiHashMap<ColumnMetadata>,
-}
-
-//todo, move to a better location
-impl TableMetadata {
-    fn select_columns(&self, alias: Option<&TableAlias>) -> SelectColumns {
-        // Columns(Vec<SelectColumn>)
-
-        let columns = self
-            .columns
-            .iter()
-            .map(|c| SelectColumn {
-                expr: ColumnExpr::Column(ColumnNode {
-                    table: if let Some(alias) = alias {
-                        Some(alias.name.clone())
-                    } else {
-                        Some(self.name.clone())
-                    },
-                    column: if let Some(alias) = alias {
-                        alias
-                            .columns
-                            .get(c.position as usize - 1)
-                            .unwrap_or(&c.name)
-                            .clone()
-                    } else {
-                        c.name.clone()
-                    },
-                }),
-                alias: None,
-            })
-            .collect();
-
-        SelectColumns::Columns(columns)
-    }
-}
-
-impl BiHashItem for TableMetadata {
-    type K1<'a> = u32;
-    type K2<'a> = &'a str;
-
-    fn key1(&self) -> Self::K1<'_> {
-        self.relation_oid
-    }
-
-    fn key2(&self) -> Self::K2<'_> {
-        self.name.as_str()
-    }
-
-    bi_upcast!();
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct ColumnMetadata {
-    pub name: String,
-    pub position: i16,
-    pub type_oid: u32,
-    pub data_type: Type,
-    pub type_name: String,
-    pub is_primary_key: bool,
-}
-
-impl BiHashItem for ColumnMetadata {
-    type K1<'a> = &'a str;
-    type K2<'a> = i16;
-
-    fn key1(&self) -> Self::K1<'_> {
-        self.name.as_str()
-    }
-
-    fn key2(&self) -> Self::K2<'_> {
-        self.position
-    }
-
-    bi_upcast!();
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedQueryState {

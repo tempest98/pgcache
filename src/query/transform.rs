@@ -1,7 +1,8 @@
 use error_set::error_set;
 
 use crate::{
-    cache::{TableMetadata, query::CacheableQuery},
+    cache::query::CacheableQuery,
+    catalog::TableMetadata,
     query::ast::{
         ColumnExpr, LiteralValue, SelectColumn, SelectColumns, SelectStatement, TableAlias,
         TableNode, TableSource, TableSubqueryNode,

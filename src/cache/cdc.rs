@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use iddqd::BiHashMap;
 use postgres_replication::{
     LogicalReplicationStream,
     protocol::{
@@ -20,6 +21,8 @@ use tokio_postgres::config::ReplicationMode;
 use tokio_postgres::{Client, Config, Error, NoTls};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
+
+use crate::catalog::{ColumnMetadata, TableMetadata};
 
 use super::*;
 

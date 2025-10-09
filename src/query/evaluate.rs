@@ -1,4 +1,4 @@
-use crate::cache::TableMetadata;
+use crate::catalog::TableMetadata;
 
 use super::ast::{BinaryExpr, ExprOp, LiteralValue, WhereExpr};
 
@@ -173,7 +173,7 @@ pub fn is_simple_comparison(binary_expr: &BinaryExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::ColumnMetadata;
+    use crate::catalog::ColumnMetadata;
     use crate::query::ast::ColumnNode;
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
