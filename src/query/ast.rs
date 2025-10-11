@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
 use error_set::error_set;
+use ordered_float::NotNan;
 use pg_query::ParseResult;
 use pg_query::protobuf::{ColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum};
 use pg_query::protobuf::{JoinExpr, RangeSubselect};
@@ -39,12 +40,12 @@ pub trait Deparse {
 }
 
 // Core literal value types that can appear in SQL expressions
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LiteralValue {
     String(String),
     StringWithCast(String, String),
     Integer(i64),
-    Float(f64),
+    Float(NotNan<f64>),
     Boolean(bool),
     Null,
     Parameter(String), // For $1, $2, etc.
@@ -53,43 +54,6 @@ pub enum LiteralValue {
 impl LiteralValue {
     pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         (self as &dyn Any).downcast_ref::<N>().into_iter()
-    }
-}
-
-// Custom Hash implementation for LiteralValue to handle f64
-impl std::hash::Hash for LiteralValue {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            LiteralValue::String(s) => {
-                0u8.hash(state);
-                s.hash(state);
-            }
-            LiteralValue::StringWithCast(s, cast) => {
-                1u8.hash(state);
-                s.hash(state);
-                cast.hash(state);
-            }
-            LiteralValue::Integer(i) => {
-                2u8.hash(state);
-                i.hash(state);
-            }
-            LiteralValue::Float(f) => {
-                3u8.hash(state);
-                // Convert f64 to bits for hashing to handle NaN/infinity consistently
-                f.to_bits().hash(state);
-            }
-            LiteralValue::Boolean(b) => {
-                4u8.hash(state);
-                b.hash(state);
-            }
-            LiteralValue::Null => {
-                5u8.hash(state);
-            }
-            LiteralValue::Parameter(p) => {
-                6u8.hash(state);
-                p.hash(state);
-            }
-        }
     }
 }
 
@@ -120,7 +84,7 @@ impl Deparse for LiteralValue {
                 buf.push_str(i.to_string().as_str());
             }
             LiteralValue::Float(f) => {
-                buf.push_str(f.to_string().as_str());
+                buf.push_str(f.into_inner().to_string().as_str());
             }
             LiteralValue::Boolean(b) => {
                 buf.push_str(if *b { "true" } else { "false" });
@@ -1657,7 +1621,7 @@ mod tests {
         buf.clear();
 
         // Float literal
-        LiteralValue::Float(3.25).deparse(&mut buf);
+        LiteralValue::Float(NotNan::new(3.25).unwrap()).deparse(&mut buf);
         assert_eq!(buf, "3.25");
         buf.clear();
 

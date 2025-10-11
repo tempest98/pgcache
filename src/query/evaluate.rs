@@ -133,13 +133,14 @@ fn where_value_compare_string(
         }
         LiteralValue::Float(filter_float) => {
             if let Ok(row_float) = row_value_str.parse::<f64>() {
+                let filter_f64 = filter_float.into_inner();
                 match op {
-                    ExprOp::Equal => (row_float - filter_float).abs() < f64::EPSILON,
-                    ExprOp::NotEqual => (row_float - filter_float).abs() >= f64::EPSILON,
-                    ExprOp::LessThan => row_float < *filter_float,
-                    ExprOp::LessThanOrEqual => row_float <= *filter_float,
-                    ExprOp::GreaterThan => row_float > *filter_float,
-                    ExprOp::GreaterThanOrEqual => row_float >= *filter_float,
+                    ExprOp::Equal => (row_float - filter_f64).abs() < f64::EPSILON,
+                    ExprOp::NotEqual => (row_float - filter_f64).abs() >= f64::EPSILON,
+                    ExprOp::LessThan => row_float < filter_f64,
+                    ExprOp::LessThanOrEqual => row_float <= filter_f64,
+                    ExprOp::GreaterThan => row_float > filter_f64,
+                    ExprOp::GreaterThanOrEqual => row_float >= filter_f64,
                     _ => false,
                 }
             } else {
@@ -176,6 +177,7 @@ mod tests {
     use crate::catalog::ColumnMetadata;
     use crate::query::ast::ColumnNode;
     use iddqd::BiHashMap;
+    use ordered_float::NotNan;
     use tokio_postgres::types::Type;
 
     // Tests for where_value_compare_string function
@@ -231,7 +233,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_float_match() {
-        let filter_value = LiteralValue::Float(123.45);
+        let filter_value = LiteralValue::Float(NotNan::new(123.45).unwrap());
         assert!(where_value_compare_string(
             &filter_value,
             "123.45",
@@ -1054,7 +1056,7 @@ mod tests {
                 table: None,
                 column: "price".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(100.0))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(NotNan::new(100.0).unwrap()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1070,7 +1072,7 @@ mod tests {
                 table: None,
                 column: "price".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(50.0))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(NotNan::new(50.0).unwrap()))),
         };
 
         assert!(expr_comparison_evaluate(

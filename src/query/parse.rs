@@ -3,6 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use error_set::error_set;
+use ordered_float::NotNan;
 
 use pg_query::protobuf::SelectStmt;
 use pg_query::protobuf::a_const::Val;
@@ -173,11 +174,15 @@ pub fn const_value_extract(const_val: &AConst) -> Result<LiteralValue, WherePars
     match const_val.val.as_ref() {
         Some(Val::Sval(s)) => Ok(LiteralValue::String(s.sval.clone())),
         Some(Val::Ival(i)) => Ok(LiteralValue::Integer(i.ival as i64)),
-        Some(Val::Fval(f)) => f.fval.parse::<f64>().map(LiteralValue::Float).map_err(|_| {
-            WhereParseError::InvalidConstValue {
+        Some(Val::Fval(f)) => f
+            .fval
+            .parse::<f64>()
+            .ok()
+            .and_then(|v| NotNan::new(v).ok())
+            .map(LiteralValue::Float)
+            .ok_or_else(|| WhereParseError::InvalidConstValue {
                 value: f.fval.clone(),
-            }
-        }),
+            }),
         Some(Val::Boolval(b)) => Ok(LiteralValue::Boolean(b.boolval)),
         Some(Val::Bsval(bs)) => Ok(LiteralValue::String(bs.bsval.clone())), // Bit strings as strings for now
         None => Ok(LiteralValue::Null),                                     // Fallback for NULL
