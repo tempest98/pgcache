@@ -698,7 +698,10 @@ mod tests {
     #[test]
     fn where_clause_chained_and_operation() {
         let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE name = 'john' AND age > 25 AND active = true").unwrap(),
+            &pg_query::parse(
+                "SELECT id FROM test WHERE name = 'john' AND age > 25 AND active = true",
+            )
+            .unwrap(),
         );
 
         assert!(result.is_ok());
@@ -742,7 +745,10 @@ mod tests {
     #[test]
     fn where_clause_chained_or_operation() {
         let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE name = 'john' OR name = 'jane' OR name = 'bob'").unwrap(),
+            &pg_query::parse(
+                "SELECT id FROM test WHERE name = 'john' OR name = 'jane' OR name = 'bob'",
+            )
+            .unwrap(),
         );
 
         assert!(result.is_ok());

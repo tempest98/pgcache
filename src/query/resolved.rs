@@ -96,9 +96,7 @@ pub enum ResolvedWhereExpr {
         args: Vec<ResolvedWhereExpr>,
     },
     /// Subquery (for future support)
-    Subquery {
-        query: Box<ResolvedSelectStatement>,
-    },
+    Subquery { query: Box<ResolvedSelectStatement> },
 }
 
 /// Resolved column expression in SELECT list
@@ -255,11 +253,12 @@ fn table_resolve(
     let table_name = &table_node.name;
 
     // Look up table in metadata
-    let table_metadata = tables
-        .get2(table_name.as_str())
-        .ok_or_else(|| ResolveError::TableNotFound {
-            name: table_name.clone(),
-        })?;
+    let table_metadata =
+        tables
+            .get2(table_name.as_str())
+            .ok_or_else(|| ResolveError::TableNotFound {
+                name: table_name.clone(),
+            })?;
 
     // Verify schema matches (if schema was explicitly specified)
     if table_node.schema.is_some() && table_metadata.schema != schema {
@@ -285,11 +284,12 @@ fn column_resolve<'a>(
 
     // If column has table qualifier, resolve directly
     if let Some(table_qualifier) = &column_node.table {
-        let (table_metadata, _) = scope
-            .table_scope_find(table_qualifier)
-            .ok_or_else(|| ResolveError::TableNotFound {
-                name: table_qualifier.clone(),
-            })?;
+        let (table_metadata, _) =
+            scope
+                .table_scope_find(table_qualifier)
+                .ok_or_else(|| ResolveError::TableNotFound {
+                    name: table_qualifier.clone(),
+                })?;
 
         let column_metadata = table_metadata
             .columns
@@ -535,10 +535,10 @@ pub fn select_statement_resolve(
         columns: resolved_columns,
         from: resolved_from,
         where_clause: resolved_where,
-        group_by: Vec::new(),    // TODO
-        having: None,            // TODO
-        order_by: Vec::new(),    // TODO
-        limit: None,             // TODO
+        group_by: Vec::new(), // TODO
+        having: None,         // TODO
+        order_by: Vec::new(), // TODO
+        limit: None,          // TODO
         distinct: stmt.distinct,
         values: stmt.values.clone(),
     })
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_table_resolve_simple() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_table_resolve_with_alias() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn test_table_resolve_not_found() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let tables = BiHashMap::new();
 
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_column_resolve_qualified() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn test_column_resolve_with_alias() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn test_column_resolve_unqualified() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_column_resolve_ambiguous() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_select_star_expansion() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_select_specific_columns() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn test_join_resolution() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_join_with_aliases() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_where_expr_complex() {
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{Statement, sql_query_convert};
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));

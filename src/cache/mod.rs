@@ -18,18 +18,15 @@ use tokio_stream::{
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, instrument};
 
+use crate::cache::worker::CacheWorker;
 use crate::{
-    cache::cdc::CdcProcessor,
-    cache::query::CacheableQuery,
-    catalog::TableMetadata,
-    query::ast::SelectStatement,
-    query::transform::AstTransformError,
+    cache::cdc::CdcProcessor, cache::query::CacheableQuery, catalog::TableMetadata,
+    query::ast::SelectStatement, query::transform::AstTransformError,
 };
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
     settings::Settings,
 };
-use crate::cache::worker::CacheWorker;
 
 mod cdc;
 pub(crate) mod query;
@@ -114,7 +111,6 @@ enum StreamSource {
     Proxy(ProxyMessage),
     Cdc(CdcMessage),
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedQueryState {

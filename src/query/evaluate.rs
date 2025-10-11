@@ -1056,7 +1056,9 @@ mod tests {
                 table: None,
                 column: "price".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(NotNan::new(100.0).unwrap()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(
+                NotNan::new(100.0).unwrap(),
+            ))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1072,7 +1074,9 @@ mod tests {
                 table: None,
                 column: "price".to_string(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(NotNan::new(50.0).unwrap()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(
+                NotNan::new(50.0).unwrap(),
+            ))),
         };
 
         assert!(expr_comparison_evaluate(

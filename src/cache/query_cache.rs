@@ -11,7 +11,9 @@ use tokio_util::bytes::BytesMut;
 use tracing::{info, instrument, trace};
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
-use crate::query::ast::{ColumnNode, Deparse, JoinNode, SelectStatement, TableNode, ast_query_fingerprint};
+use crate::query::ast::{
+    ColumnNode, Deparse, JoinNode, SelectStatement, TableNode, ast_query_fingerprint,
+};
 use crate::query::transform::{
     query_select_replace, query_table_replace_with_values, query_table_update_queries,
 };
@@ -104,7 +106,9 @@ impl QueryCache {
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
-                let table_oids = self.query_register(fingerprint, &msg.cacheable_query).await?;
+                let table_oids = self
+                    .query_register(fingerprint, &msg.cacheable_query)
+                    .await?;
                 for table_oid in table_oids {
                     let rows = self.query_cache_fetch(table_oid, stmt).await?;
                     self.query_cache_results(table_oid, &rows).await?;

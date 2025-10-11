@@ -1,5 +1,7 @@
 use crate::query::{
-    ast::{ExprOp, JoinNode, JoinType, SelectStatement, SqlQuery, Statement, TableSource, WhereExpr},
+    ast::{
+        ExprOp, JoinNode, JoinType, SelectStatement, SqlQuery, Statement, TableSource, WhereExpr,
+    },
     evaluate::is_simple_comparison,
 };
 use error_set::error_set;
