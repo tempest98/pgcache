@@ -14,6 +14,8 @@ use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
     ColumnNode, Deparse, JoinNode, SelectStatement, TableNode, ast_query_fingerprint,
 };
+use crate::query::constraints::analyze_query_constraints;
+use crate::query::resolved::select_statement_resolve;
 use crate::query::transform::{
     query_select_replace, query_table_replace_with_values, query_table_update_queries,
 };
@@ -169,6 +171,8 @@ impl QueryCache {
     ) -> Result<Vec<u32>, CacheError> {
         let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
+
+        // Ensure all tables are registered in the cache
         for table_node in select_statement.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
             let schema = table_node.schema.as_deref();
@@ -178,6 +182,12 @@ impl QueryCache {
                 self.cache.borrow_mut().tables.insert_overwrite(table);
             }
         }
+
+        // Resolve the query using catalog metadata
+        let resolved = select_statement_resolve(select_statement, &self.cache.borrow().tables)?;
+
+        // Analyze constraints from the resolved query
+        let query_constraints = analyze_query_constraints(&resolved);
 
         for (table_node, update_select) in query_table_update_queries(cacheable_query) {
             let update_query = UpdateQuery {
@@ -209,12 +219,14 @@ impl QueryCache {
             relation_oids.push(relation_oid);
         }
 
-        // Create CachedQuery entry using the already converted AST
+        // Create CachedQuery entry with resolved AST and constraints
         let cached_query = CachedQuery {
             state: CachedQueryState::Loading,
             fingerprint,
             relation_oids: relation_oids.clone(),
             select_statement: select_statement.clone(),
+            resolved,
+            constraints: query_constraints,
         };
 
         // Store cached query metadata
@@ -717,7 +729,7 @@ impl QueryCache {
         &self,
         relation_oid: u32,
         row_changes: &Option<&Row>,
-        _row_data: &[Option<String>],
+        row_data: &[Option<String>],
     ) -> Result<Vec<u64>, CacheError> {
         let cache = self.cache.borrow();
         let update_queries =
@@ -743,6 +755,43 @@ impl QueryCache {
         // coarse invalidation, can be refined later
         let mut fp_list = Vec::new();
         for update_query in &update_queries.queries {
+            // Get the cached query to access constraints
+            let cached_query = cache.cached_queries.get(&update_query.fingerprint)
+                .ok_or_else(|| {
+                    error!("Cached query not found for fingerprint: {}", update_query.fingerprint);
+                    CacheError::Other
+                })?;
+
+            // Check if this is an INSERT (row_changes is None)
+            if row_changes.is_none() {
+                // For INSERTs: Check if new row matches all table constraints
+                // If it doesn't match, the row won't appear in results, no invalidation needed
+                if let Some(constraints) = cached_query.constraints.table_constraints.get(&table_metadata.name) {
+                    let mut all_match = true;
+                    for (column_name, constraint_value) in constraints {
+                        if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str()) {
+                            let position = column_meta.position as usize - 1;
+                            if position < row_data.len() {
+                                if !self.value_matches_constraint(&row_data[position], constraint_value) {
+                                    all_match = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if !all_match {
+                        // Row doesn't match constraints, won't appear in results
+                        continue;
+                    }
+                }
+
+                // Row matches constraints or no constraints exist
+                // Must invalidate because result set will grow
+                fp_list.push(update_query.fingerprint);
+                continue;
+            }
+
             let select = &update_query.query;
             let tables = select
                 .nodes::<TableNode>()
@@ -758,6 +807,9 @@ impl QueryCache {
                 .collect::<HashMap<_, _>>();
             let joins = select.nodes::<JoinNode>().collect::<Vec<_>>();
 
+            // Check if we need to invalidate based on constraint analysis
+            let mut needs_invalidation = false;
+
             for join in joins {
                 //extract tables and columns used in the join condition
                 let columns = join
@@ -766,13 +818,58 @@ impl QueryCache {
                     .collect::<Vec<_>>();
 
                 for (table, column) in columns {
-                    let invalidate = table.is_some_and(|t| t == &table_metadata.name)
-                        && row_changes.is_none_or(|row| row.get::<&str, bool>(column));
+                    if table.is_none_or(|t| t != &table_metadata.name) {
+                        continue;
+                    }
 
-                    if invalidate {
-                        fp_list.push(update_query.fingerprint);
+                    let column_changed = row_changes
+                        .is_some_and(|row| row.get::<&str, bool>(column));
+
+                    if !column_changed {
+                        continue;
+                    }
+
+                    // JOIN column changed - use constraint-based optimization
+                    if let Some(constraints) = cached_query.constraints.table_constraints.get(&table_metadata.name) {
+                        // Check if new values match all constraints for this table
+                        let mut all_constraints_match = true;
+                        for (constraint_column, constraint_value) in constraints {
+                            if let Some(column_meta) = table_metadata.columns.get1(constraint_column.as_str()) {
+                                let position = column_meta.position as usize - 1;
+                                if position < row_data.len() {
+                                    if !self.value_matches_constraint(&row_data[position], constraint_value) {
+                                        all_constraints_match = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !all_constraints_match {
+                            // New values don't match all constraints
+                            // Row leaving or staying out of result set, UPDATE handles removal
+                            continue;
+                        }
+
+                        // New values match all constraints AND column changed
+                        // Since column changed, old value was different (didn't match constraint)
+                        // Therefore: row is entering result set → need invalidation
+                        needs_invalidation = true;
+                        break;
+                    } else {
+                        // No constraints available, use conservative approach
+                        needs_invalidation = true;
+                        break;
                     }
                 }
+
+                if needs_invalidation {
+                    break;
+                }
+            }
+
+            if needs_invalidation {
+                fp_list.push(update_query.fingerprint);
             }
         }
 
@@ -959,5 +1056,37 @@ impl QueryCache {
         );
 
         Ok(sql)
+    }
+
+    /// Check if a row value matches a constraint value
+    /// TODO: Refactor to use TryFrom<Option<String>> for LiteralValue
+    fn value_matches_constraint(
+        &self,
+        row_value: &Option<String>,
+        constraint_value: &crate::query::ast::LiteralValue,
+    ) -> bool {
+        use crate::query::ast::LiteralValue;
+
+        match (row_value, constraint_value) {
+            (None, LiteralValue::Null) => true,
+            (None, _) => false,
+            (Some(row_str), LiteralValue::String(constraint_str)) => row_str == constraint_str,
+            (Some(row_str), LiteralValue::StringWithCast(constraint_str, _)) => {
+                row_str == constraint_str
+            }
+            (Some(row_str), LiteralValue::Integer(constraint_int)) => {
+                row_str.parse::<i64>().ok() == Some(*constraint_int)
+            }
+            (Some(row_str), LiteralValue::Float(constraint_float)) => row_str
+                .parse::<f64>()
+                .ok()
+                .and_then(|f| ordered_float::NotNan::new(f).ok())
+                == Some(*constraint_float),
+            (Some(row_str), LiteralValue::Boolean(constraint_bool)) => {
+                row_str.parse::<bool>().ok() == Some(*constraint_bool)
+            }
+            (Some(_), LiteralValue::Null) => false,
+            (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints
+        }
     }
 }

@@ -20,8 +20,13 @@ use tracing::{debug, error, instrument};
 
 use crate::cache::worker::CacheWorker;
 use crate::{
-    cache::cdc::CdcProcessor, cache::query::CacheableQuery, catalog::TableMetadata,
-    query::ast::SelectStatement, query::transform::AstTransformError,
+    cache::cdc::CdcProcessor,
+    cache::query::CacheableQuery,
+    catalog::TableMetadata,
+    query::ast::SelectStatement,
+    query::constraints::QueryConstraints,
+    query::resolved::{ResolveError, ResolvedSelectStatement},
+    query::transform::AstTransformError,
 };
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
@@ -34,7 +39,7 @@ mod query_cache;
 mod worker;
 
 error_set! {
-    CacheError = ReadError || DbError || ParseError || TableError || SendError;
+    CacheError = ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError;
 
     ReadError = {
         IoError(io::Error),
@@ -69,6 +74,10 @@ error_set! {
         UnknownColumn,
         UnknownSchema,
         NoPrimaryKey,
+    };
+
+    QueryResolutionError = {
+        ResolveError(ResolveError),
     };
 }
 
@@ -124,6 +133,8 @@ pub struct CachedQuery {
     pub fingerprint: u64,
     pub relation_oids: Vec<u32>,
     pub select_statement: SelectStatement,
+    pub resolved: ResolvedSelectStatement,
+    pub constraints: QueryConstraints,
 }
 
 impl IdHashItem for CachedQuery {

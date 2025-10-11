@@ -184,3 +184,46 @@ pub async fn simple_query(
 
     Ok(rv)
 }
+
+/// Setup test and test_map tables with base data for constraint invalidation tests
+/// Creates tables and inserts base data:
+/// - test: (1, 'foo'), (2, 'bar'), (3, 'baz')
+/// - test_map: (1, 1, 'alpha'), (2, 1, 'beta'), (3, 2, 'gamma')
+pub async fn setup_constraint_test_tables(
+    pgcache: &mut Child,
+    client: &Client,
+) -> Result<(), Error> {
+    query(
+        pgcache,
+        client,
+        "create table test (id integer primary key, data text)",
+        &[],
+    )
+    .await?;
+
+    query(
+        pgcache,
+        client,
+        "create table test_map (id serial primary key, test_id integer, data text)",
+        &[],
+    )
+    .await?;
+
+    query(
+        pgcache,
+        client,
+        "insert into test (id, data) values (1, 'foo'), (2, 'bar'), (3, 'baz')",
+        &[],
+    )
+    .await?;
+
+    query(
+        pgcache,
+        client,
+        "insert into test_map (test_id, data) values (1, 'alpha'), (1, 'beta'), (2, 'gamma')",
+        &[],
+    )
+    .await?;
+
+    Ok(())
+}
