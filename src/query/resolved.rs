@@ -43,7 +43,7 @@ pub struct ResolvedTableNode {
 }
 
 /// Resolved column reference with type information
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedColumnNode {
     /// Schema name where the table is located
     pub schema: String,

@@ -98,6 +98,17 @@ pub struct ColumnMetadata {
     pub is_primary_key: bool,
 }
 
+impl std::hash::Hash for ColumnMetadata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Hash all fields except data_type (which doesn't implement Hash)
+        self.name.hash(state);
+        self.position.hash(state);
+        self.type_oid.hash(state);
+        self.type_name.hash(state);
+        self.is_primary_key.hash(state);
+    }
+}
+
 impl BiHashItem for ColumnMetadata {
     type K1<'a> = &'a str;
     type K2<'a> = i16;
