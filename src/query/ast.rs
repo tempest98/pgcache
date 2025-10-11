@@ -819,28 +819,32 @@ impl<'a, N: Any> Iterator for TableSourceNodeIter<'a, N> {
                 if let Some(iter) = &mut self.join_iter {
                     // Continue with the existing join iterator
                     if let Some(node) = iter.next() {
-                        Some(node)
+                        return Some(node);
                     } else {
                         // Join iterator exhausted
                         self.source = None;
-                        None
+                        return None;
                     }
+                }
+
+                // First time processing this join
+                // Check if we're looking for JoinNode types - if so, yield this join first
+                if TypeId::of::<N>() == TypeId::of::<JoinNode>()
+                    && let Some(this_join) = (join as &dyn Any).downcast_ref::<N>()
+                {
+                    // Yield this join, and set up iterator for children
+                    self.join_iter = Some(Box::new(join.nodes()));
+                    return Some(this_join);
+                }
+
+                // For other types (like TableNode), iterate through children
+                let mut iter = join.nodes();
+                if let Some(node) = iter.next() {
+                    self.join_iter = Some(Box::new(iter));
+                    Some(node)
                 } else {
-                    // First time processing this join
-                    if TypeId::of::<N>() == TypeId::of::<JoinNode>() {
-                        self.source = None;
-                        (join as &dyn Any).downcast_ref::<N>()
-                    } else {
-                        // Start iterating through the join's nodes of type N
-                        let mut iter = join.nodes();
-                        if let Some(node) = iter.next() {
-                            self.join_iter = Some(Box::new(iter));
-                            Some(node)
-                        } else {
-                            self.source = None;
-                            None
-                        }
-                    }
+                    self.source = None;
+                    None
                 }
             }
             None => None,
@@ -1198,24 +1202,38 @@ fn from_clause_convert(from_clause: &[Node]) -> Result<Vec<TableSource>, AstErro
     Ok(tables)
 }
 
+fn join_arg_convert(node: &Node, side: &str) -> Result<TableSource, AstError> {
+    match &node.node {
+        Some(NodeEnum::RangeVar(range_var)) => table_node_convert(range_var),
+        Some(NodeEnum::RangeSubselect(range_subselect)) => {
+            table_subquery_node_convert(range_subselect)
+        }
+        Some(NodeEnum::JoinExpr(nested_join)) => {
+            // Recursively handle nested joins
+            join_expr_convert(nested_join)
+        }
+        _ => Err(AstError::UnsupportedSelectFeature {
+            feature: format!("join {side} argument: {node:?}"),
+        }),
+    }
+}
+
 fn join_expr_convert(join_expr: &JoinExpr) -> Result<TableSource, AstError> {
-    let left_table = if let Some(larg_node) = &join_expr.larg
-        && let Some(NodeEnum::RangeVar(range_var)) = &larg_node.node
-    {
-        table_node_convert(range_var)?
+    // Convert left argument - can be a table, subquery, or another join
+    let left_table = if let Some(larg_node) = &join_expr.larg {
+        join_arg_convert(larg_node, "left")?
     } else {
         return Err(AstError::UnsupportedSelectFeature {
-            feature: format!("join expr: {join_expr:?}"),
+            feature: "join missing left argument".to_string(),
         });
     };
 
-    let right_table = if let Some(rarg_node) = &join_expr.rarg
-        && let Some(NodeEnum::RangeVar(range_var)) = &rarg_node.node
-    {
-        table_node_convert(range_var)?
+    // Convert right argument - can be a table, subquery, or another join
+    let right_table = if let Some(rarg_node) = &join_expr.rarg {
+        join_arg_convert(rarg_node, "right")?
     } else {
         return Err(AstError::UnsupportedSelectFeature {
-            feature: format!("join expr: {join_expr:?}"),
+            feature: "join missing right argument".to_string(),
         });
     };
 
@@ -1528,6 +1546,98 @@ mod tests {
                 )
             ])
         );
+    }
+
+    #[test]
+    fn test_sql_query_multiple_joins_two_tables() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id WHERE a.id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Should parse successfully with three tables
+        let tables: Vec<&TableNode> = ast.nodes().collect();
+        assert_eq!(tables.len(), 3);
+        assert_eq!(tables[0].name, "a");
+        assert_eq!(tables[1].name, "b");
+        assert_eq!(tables[2].name, "c");
+
+        // Should have 2 join nodes (nested structure)
+        let joins: Vec<&JoinNode> = ast.nodes().collect();
+        assert_eq!(joins.len(), 2);
+        assert_eq!(joins[0].join_type, JoinType::Inner);
+        assert_eq!(joins[1].join_type, JoinType::Inner);
+
+        // Verify each join's condition contains the expected columns
+        // Note: We count each join's condition separately to avoid double-counting
+        // columns from nested joins (since joins can be nested in the AST)
+        let mut col_count = 0;
+        for join in &joins {
+            if let Some(condition) = &join.condition {
+                col_count += condition.nodes::<ColumnNode>().count();
+            }
+        }
+        assert_eq!(col_count, 4); // a.id, b.id from first join + b.id, c.id from second join
+    }
+
+    #[test]
+    fn test_sql_query_multiple_joins_three_tables() {
+        let sql =
+            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id JOIN d ON c.id = d.id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Should parse successfully with four tables
+        let tables: Vec<&TableNode> = ast.nodes().collect();
+        assert_eq!(tables.len(), 4);
+        assert_eq!(tables[0].name, "a");
+        assert_eq!(tables[1].name, "b");
+        assert_eq!(tables[2].name, "c");
+        assert_eq!(tables[3].name, "d");
+
+        // Should have 3 join nodes (deeply nested structure)
+        let joins: Vec<&JoinNode> = ast.nodes().collect();
+        assert_eq!(joins.len(), 3);
+        assert!(joins.iter().all(|j| j.join_type == JoinType::Inner));
+    }
+
+    #[test]
+    fn test_sql_query_mixed_join_types() {
+        let sql = "SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id LEFT JOIN payments p ON o.id = p.order_id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Should parse successfully with three tables
+        let tables: Vec<&TableNode> = ast.nodes().collect();
+        assert_eq!(tables.len(), 3);
+        assert_eq!(tables[0].name, "users");
+        assert_eq!(tables[1].name, "orders");
+        assert_eq!(tables[2].name, "payments");
+
+        // Should have 2 join nodes with different types
+        // Note: Joins are returned in traversal order (outer join first, then nested joins)
+        // For this query, PostgreSQL creates: (users INNER JOIN orders) LEFT JOIN payments
+        // So the outer LEFT join is returned first, then the inner INNER join
+        let joins: Vec<&JoinNode> = ast.nodes().collect();
+        assert_eq!(joins.len(), 2);
+        assert_eq!(joins[0].join_type, JoinType::Left); // Outer join
+        assert_eq!(joins[1].join_type, JoinType::Inner); // Nested join
+    }
+
+    #[test]
+    fn test_sql_query_multiple_joins_deparse() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+
+        // Parse the deparsed SQL to verify it's valid
+        let pg_ast2 = pg_query::parse(&buf).unwrap();
+        let ast2 = sql_query_convert(&pg_ast2).unwrap();
+
+        // Should produce identical AST
+        assert_eq!(ast, ast2);
     }
 
     #[test]
