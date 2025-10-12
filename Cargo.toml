@@ -10,6 +10,7 @@ path = "src/main.rs"
 [lib]
 name = "pgcache_lib"
 path = "src/lib.rs"
+doctest = false
 
 [profile.profiling]
 inherits = "release"
