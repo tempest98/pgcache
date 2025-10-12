@@ -55,6 +55,34 @@ impl LiteralValue {
     pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         (self as &dyn Any).downcast_ref::<N>().into_iter()
     }
+
+    /// Check if an Option<String> (from CDC row data) matches this LiteralValue.
+    /// Parses the string value according to the type of this LiteralValue.
+    pub fn matches(&self, row_value: &Option<String>) -> bool {
+        match (row_value, self) {
+            (None, LiteralValue::Null) => true,
+            (None, _) => false,
+            (Some(row_str), LiteralValue::String(constraint_str)) => row_str == constraint_str,
+            (Some(row_str), LiteralValue::StringWithCast(constraint_str, _)) => {
+                row_str == constraint_str
+            }
+            (Some(row_str), LiteralValue::Integer(constraint_int)) => {
+                row_str.parse::<i64>().ok() == Some(*constraint_int)
+            }
+            (Some(row_str), LiteralValue::Float(constraint_float)) => {
+                row_str
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(|f| NotNan::new(f).ok())
+                    == Some(*constraint_float)
+            }
+            (Some(row_str), LiteralValue::Boolean(constraint_bool)) => {
+                row_str.parse::<bool>().ok() == Some(*constraint_bool)
+            }
+            (Some(_), LiteralValue::Null) => false,
+            (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints
+        }
+    }
 }
 
 impl Deparse for LiteralValue {

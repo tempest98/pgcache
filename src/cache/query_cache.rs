@@ -772,7 +772,7 @@ impl QueryCache {
                         if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str()) {
                             let position = column_meta.position as usize - 1;
                             if position < row_data.len() {
-                                if !self.value_matches_constraint(&row_data[position], constraint_value) {
+                                if !constraint_value.matches(&row_data[position]) {
                                     all_match = false;
                                     break;
                                 }
@@ -837,7 +837,7 @@ impl QueryCache {
                             if let Some(column_meta) = table_metadata.columns.get1(constraint_column.as_str()) {
                                 let position = column_meta.position as usize - 1;
                                 if position < row_data.len() {
-                                    if !self.value_matches_constraint(&row_data[position], constraint_value) {
+                                    if !constraint_value.matches(&row_data[position]) {
                                         all_constraints_match = false;
                                         break;
                                     }
@@ -1056,37 +1056,5 @@ impl QueryCache {
         );
 
         Ok(sql)
-    }
-
-    /// Check if a row value matches a constraint value
-    /// TODO: Refactor to use TryFrom<Option<String>> for LiteralValue
-    fn value_matches_constraint(
-        &self,
-        row_value: &Option<String>,
-        constraint_value: &crate::query::ast::LiteralValue,
-    ) -> bool {
-        use crate::query::ast::LiteralValue;
-
-        match (row_value, constraint_value) {
-            (None, LiteralValue::Null) => true,
-            (None, _) => false,
-            (Some(row_str), LiteralValue::String(constraint_str)) => row_str == constraint_str,
-            (Some(row_str), LiteralValue::StringWithCast(constraint_str, _)) => {
-                row_str == constraint_str
-            }
-            (Some(row_str), LiteralValue::Integer(constraint_int)) => {
-                row_str.parse::<i64>().ok() == Some(*constraint_int)
-            }
-            (Some(row_str), LiteralValue::Float(constraint_float)) => row_str
-                .parse::<f64>()
-                .ok()
-                .and_then(|f| ordered_float::NotNan::new(f).ok())
-                == Some(*constraint_float),
-            (Some(row_str), LiteralValue::Boolean(constraint_bool)) => {
-                row_str.parse::<bool>().ok() == Some(*constraint_bool)
-            }
-            (Some(_), LiteralValue::Null) => false,
-            (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints
-        }
     }
 }
