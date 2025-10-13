@@ -5,10 +5,12 @@ use std::{
     io::Read,
     net::TcpListener,
     process::{Child, Command, Stdio},
+    time::Duration,
 };
 
 use pgtemp::{PgTempDB, PgTempDBBuilder};
 use postgres_types::ToSql;
+use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, ToStatement};
 use tokio_util::bytes::{Buf, BytesMut};
 
@@ -183,6 +185,57 @@ pub async fn simple_query(
     })?;
 
     Ok(rv)
+}
+
+/// Wait for CDC events to be processed by the cache system
+/// Uses a short sleep to allow logical replication changes to propagate
+pub async fn wait_for_cdc() {
+    // TODO: Replace with proper synchronization mechanism (polling, notification, etc.)
+    sleep(Duration::from_millis(250)).await;
+}
+
+/// Extract a row from SimpleQueryMessage results at the specified index
+/// Returns an error with context if the message at that index is not a Row
+pub fn extract_row(
+    results: &[SimpleQueryMessage],
+    index: usize,
+) -> Result<&tokio_postgres::SimpleQueryRow, Error> {
+    match results.get(index) {
+        Some(SimpleQueryMessage::Row(row)) => Ok(row),
+        Some(_) => Err(Error::other(format!(
+            "Expected SimpleQueryMessage::Row at index {}, found different variant",
+            index
+        ))),
+        None => Err(Error::other(format!(
+            "Index {} out of bounds for results with length {}",
+            index,
+            results.len()
+        ))),
+    }
+}
+
+/// Assert that a row contains the expected field values
+/// Panics with a descriptive message if any assertion fails
+pub fn assert_row_fields(row: &tokio_postgres::SimpleQueryRow, expected: &[(&str, &str)]) {
+    for (field, expected_value) in expected {
+        assert_eq!(
+            row.get::<&str>(field),
+            Some(*expected_value),
+            "Field '{}' did not match expected value",
+            field
+        );
+    }
+}
+
+/// Convenience function combining row extraction and field assertion
+pub fn assert_row_at(
+    results: &[SimpleQueryMessage],
+    index: usize,
+    expected: &[(&str, &str)],
+) -> Result<(), Error> {
+    let row = extract_row(results, index)?;
+    assert_row_fields(row, expected);
+    Ok(())
 }
 
 /// Setup test and test_map tables with base data for constraint invalidation tests

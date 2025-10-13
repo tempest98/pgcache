@@ -1,9 +1,9 @@
-use std::{io::Error, time::Duration};
+use std::io::Error;
 
-use tokio::time::sleep;
-use tokio_postgres::SimpleQueryMessage;
-
-use crate::util::{connect_pgcache, query, setup_constraint_test_tables, simple_query, start_databases};
+use crate::util::{
+    assert_row_at, connect_pgcache, query, setup_constraint_test_tables, simple_query,
+    start_databases, wait_for_cdc,
+};
 
 mod util;
 
@@ -40,7 +40,7 @@ async fn test_insert_matching_constraint() -> Result<(), Error> {
     )
     .await?;
 
-    sleep(Duration::from_millis(250)).await;
+    wait_for_cdc().await;
 
     // Query should show all 3 rows with test_id = 1
     let res = simple_query(
@@ -54,30 +54,9 @@ async fn test_insert_matching_constraint() -> Result<(), Error> {
 
     // RowDescription + 3 data rows + CommandComplete = 5
     assert_eq!(res.len(), 5);
-
-    // Verify first row (alpha)
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("expected SimpleQueryMessage::Row at index 1");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("alpha"));
-
-    // Verify second row (beta)
-    let SimpleQueryMessage::Row(row) = &res[2] else {
-        panic!("expected SimpleQueryMessage::Row at index 2");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("2"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("beta"));
-
-    // Verify third row (delta - the newly inserted row)
-    let SimpleQueryMessage::Row(row) = &res[3] else {
-        panic!("expected SimpleQueryMessage::Row at index 3");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("4"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("delta"));
+    assert_row_at(&res, 1, &[("id", "1"), ("test_id", "1"), ("data", "alpha")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
+    assert_row_at(&res, 3, &[("id", "4"), ("test_id", "1"), ("data", "delta")])?;
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");
@@ -113,7 +92,7 @@ async fn test_insert_non_matching_constraint() -> Result<(), Error> {
     )
     .await?;
 
-    sleep(Duration::from_millis(250)).await;
+    wait_for_cdc().await;
 
     // Query should still return only the original 2 rows (cache not invalidated, new row doesn't match)
     let res = simple_query(
@@ -127,22 +106,8 @@ async fn test_insert_non_matching_constraint() -> Result<(), Error> {
 
     // RowDescription + 2 data rows + CommandComplete = 4
     assert_eq!(res.len(), 4);
-
-    // Verify first row (alpha)
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("expected SimpleQueryMessage::Row at index 1");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("alpha"));
-
-    // Verify second row (beta)
-    let SimpleQueryMessage::Row(row) = &res[2] else {
-        panic!("expected SimpleQueryMessage::Row at index 2");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("2"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("beta"));
+    assert_row_at(&res, 1, &[("id", "1"), ("test_id", "1"), ("data", "alpha")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");
@@ -179,7 +144,7 @@ async fn test_update_entering_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    sleep(Duration::from_millis(250)).await;
+    wait_for_cdc().await;
 
     // Query should now show 3 rows including gamma
     let res = simple_query(
@@ -193,30 +158,9 @@ async fn test_update_entering_result_set() -> Result<(), Error> {
 
     // RowDescription + 3 data rows + CommandComplete = 5
     assert_eq!(res.len(), 5);
-
-    // Verify first row (alpha)
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("expected SimpleQueryMessage::Row at index 1");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("alpha"));
-
-    // Verify second row (beta)
-    let SimpleQueryMessage::Row(row) = &res[2] else {
-        panic!("expected SimpleQueryMessage::Row at index 2");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("2"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("beta"));
-
-    // Verify third row (gamma - now entering result set)
-    let SimpleQueryMessage::Row(row) = &res[3] else {
-        panic!("expected SimpleQueryMessage::Row at index 3");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("3"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("gamma"));
+    assert_row_at(&res, 1, &[("id", "1"), ("test_id", "1"), ("data", "alpha")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
+    assert_row_at(&res, 3, &[("id", "3"), ("test_id", "1"), ("data", "gamma")])?;
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");
@@ -253,7 +197,7 @@ async fn test_update_leaving_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    sleep(Duration::from_millis(250)).await;
+    wait_for_cdc().await;
 
     // Query should now return 1 row (only beta)
     let res = simple_query(
@@ -267,14 +211,7 @@ async fn test_update_leaving_result_set() -> Result<(), Error> {
 
     // RowDescription + 1 data row + CommandComplete = 3
     assert_eq!(res.len(), 3);
-
-    // Verify only beta remains
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("expected SimpleQueryMessage::Row at index 1");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("2"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("beta"));
+    assert_row_at(&res, 1, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");
@@ -311,7 +248,7 @@ async fn test_update_non_join_column() -> Result<(), Error> {
     )
     .await?;
 
-    sleep(Duration::from_millis(250)).await;
+    wait_for_cdc().await;
 
     // Query should show updated data
     let res = simple_query(
@@ -325,22 +262,12 @@ async fn test_update_non_join_column() -> Result<(), Error> {
 
     // RowDescription + 2 data rows + CommandComplete = 4
     assert_eq!(res.len(), 4);
-
-    // Verify first row (alpha_updated)
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("expected SimpleQueryMessage::Row at index 1");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("alpha_updated"));
-
-    // Verify second row (beta)
-    let SimpleQueryMessage::Row(row) = &res[2] else {
-        panic!("expected SimpleQueryMessage::Row at index 2");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("2"));
-    assert_eq!(row.get::<&str>("test_id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("beta"));
+    assert_row_at(
+        &res,
+        1,
+        &[("id", "1"), ("test_id", "1"), ("data", "alpha_updated")],
+    )?;
+    assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");

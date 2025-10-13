@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use tokio_postgres::SimpleQueryMessage;
-
-use crate::util::{connect_pgcache, query, simple_query, start_databases};
+use crate::util::{assert_row_at, connect_pgcache, query, simple_query, start_databases};
 
 mod util;
 
@@ -35,11 +33,7 @@ async fn test_proxy() -> Result<(), Error> {
     .await?;
 
     assert_eq!(res.len(), 3);
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("exepcted SimpleQueryMessage::Row");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("foo"));
+    assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");

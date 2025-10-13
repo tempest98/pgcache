@@ -1,9 +1,8 @@
-use std::{io::Error, time::Duration};
+use std::io::Error;
 
-use tokio::time::sleep;
-use tokio_postgres::SimpleQueryMessage;
-
-use crate::util::{connect_pgcache, query, simple_query, start_databases};
+use crate::util::{
+    assert_row_at, connect_pgcache, query, simple_query, start_databases, wait_for_cdc,
+};
 
 mod util;
 
@@ -36,11 +35,7 @@ async fn test_cache() -> Result<(), Error> {
     .await?;
 
     assert_eq!(res.len(), 3);
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("exepcted SimpleQueryMessage::Row");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("foo"));
+    assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
 
     let res = simple_query(
         &mut pgcache,
@@ -50,11 +45,7 @@ async fn test_cache() -> Result<(), Error> {
     .await?;
 
     assert_eq!(res.len(), 3);
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("exepcted SimpleQueryMessage::Row");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("foo"));
+    assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
 
     query(
         &mut pgcache,
@@ -64,7 +55,7 @@ async fn test_cache() -> Result<(), Error> {
     )
     .await?;
 
-    sleep(Duration::from_millis(250)).await; //is there a better way to do this?
+    wait_for_cdc().await;
 
     let res = simple_query(
         &mut pgcache,
@@ -74,17 +65,153 @@ async fn test_cache() -> Result<(), Error> {
     .await?;
 
     assert_eq!(res.len(), 4);
-    let SimpleQueryMessage::Row(row) = &res[1] else {
-        panic!("exepcted SimpleQueryMessage::Row");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("1"));
-    assert_eq!(row.get::<&str>("data"), Some("foo"));
+    assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("data", "foo")])?;
 
-    let SimpleQueryMessage::Row(row) = &res[2] else {
-        panic!("exepcted SimpleQueryMessage::Row");
-    };
-    assert_eq!(row.get::<&str>("id"), Some("3"));
-    assert_eq!(row.get::<&str>("data"), Some("foo"));
+    pgcache.kill().expect("command killed");
+    pgcache.wait().expect("exit_status");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cache_join() -> Result<(), Error> {
+    let (dbs, origin) = start_databases().await?;
+    let (mut pgcache, client) = connect_pgcache(&dbs).await?;
+
+    query(
+        &mut pgcache,
+        &client,
+        "create table test (id integer primary key, data text)",
+        &[],
+    )
+    .await?;
+
+    query(
+        &mut pgcache,
+        &client,
+        "create table test_map (id serial primary key, test_id integer, data text)",
+        &[],
+    )
+    .await?;
+
+    query(
+        &mut pgcache,
+        &client,
+        "insert into test (id, data) values (1, 'foo'), (2, 'bar')",
+        &[],
+    )
+    .await?;
+
+    query(
+        &mut pgcache,
+        &client,
+        "insert into test_map (test_id, data) values \
+        (1, 'foo'), \
+        (1, 'bar'), \
+        (1, 'baz'), \
+        (2, 'foo'), \
+        (2, 'bar'), \
+        (2, 'baz')",
+        &[],
+    )
+    .await?;
+
+    let query_str = "select t.id, t.data as test_data, tm.test_id, tm.data as map_data \
+        from test t join test_map tm on tm.test_id = t.id where t.id = 1
+        order by tm.id;";
+
+    // First query to populate cache
+    let _ = simple_query(&mut pgcache, &client, query_str).await?;
+
+    // Second query should hit cache
+    let res = simple_query(&mut pgcache, &client, query_str).await?;
+
+    assert_eq!(res.len(), 5);
+    assert_row_at(
+        &res,
+        1,
+        &[
+            ("id", "1"),
+            ("test_data", "foo"),
+            ("test_id", "1"),
+            ("map_data", "foo"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[
+            ("id", "1"),
+            ("test_data", "foo"),
+            ("test_id", "1"),
+            ("map_data", "bar"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        3,
+        &[
+            ("id", "1"),
+            ("test_data", "foo"),
+            ("test_id", "1"),
+            ("map_data", "baz"),
+        ],
+    )?;
+
+    // Trigger CDC events by modifying the test table
+    query(
+        &mut pgcache,
+        &origin,
+        "update test set id = 10 where id = 1",
+        &[],
+    )
+    .await?;
+
+    query(
+        &mut pgcache,
+        &origin,
+        "update test set id = 1 where id = 10",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Query after CDC should still return correct results
+    let res = simple_query(&mut pgcache, &client, query_str).await?;
+
+    assert_eq!(res.len(), 5);
+    assert_row_at(
+        &res,
+        1,
+        &[
+            ("id", "1"),
+            ("test_data", "foo"),
+            ("test_id", "1"),
+            ("map_data", "foo"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[
+            ("id", "1"),
+            ("test_data", "foo"),
+            ("test_id", "1"),
+            ("map_data", "bar"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        3,
+        &[
+            ("id", "1"),
+            ("test_data", "foo"),
+            ("test_id", "1"),
+            ("map_data", "baz"),
+        ],
+    )?;
 
     pgcache.kill().expect("command killed");
     pgcache.wait().expect("exit_status");
