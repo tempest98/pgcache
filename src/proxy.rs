@@ -126,6 +126,7 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
 }
 
 #[instrument(skip_all)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
     thread::scope(|scope| {
         let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
@@ -175,6 +176,7 @@ pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
 }
 
 #[instrument(skip_all)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
@@ -242,6 +244,7 @@ enum StreamSource {
 type StreamSourceResult = Result<StreamSource, ProtocolError>;
 
 #[instrument(skip_all)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_connection(
     client_socket: &mut TcpStream,
     addrs: Vec<SocketAddr>,
@@ -390,6 +393,7 @@ enum Action {
     CacheCheck(Box<CacheableQuery>),
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_query(
     data: &BytesMut,
     fp_cache: &mut HashMap<u64, Option<Box<CacheableQuery>>>,

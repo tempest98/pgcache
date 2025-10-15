@@ -85,6 +85,7 @@ impl QueryCache {
     }
 
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
         let stmt = msg.cacheable_query.statement();
         let fingerprint = ast_query_fingerprint(stmt);
@@ -128,6 +129,7 @@ impl QueryCache {
     }
 
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_cache_fetch(
         &mut self,
         relation_oid: u32,
@@ -164,6 +166,7 @@ impl QueryCache {
 
     /// Registers a query in the cache for future lookups.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
@@ -756,9 +759,14 @@ impl QueryCache {
         let mut fp_list = Vec::new();
         for update_query in &update_queries.queries {
             // Get the cached query to access constraints
-            let cached_query = cache.cached_queries.get(&update_query.fingerprint)
+            let cached_query = cache
+                .cached_queries
+                .get(&update_query.fingerprint)
                 .ok_or_else(|| {
-                    error!("Cached query not found for fingerprint: {}", update_query.fingerprint);
+                    error!(
+                        "Cached query not found for fingerprint: {}",
+                        update_query.fingerprint
+                    );
                     CacheError::Other
                 })?;
 
@@ -766,10 +774,15 @@ impl QueryCache {
             if row_changes.is_none() {
                 // For INSERTs: Check if new row matches all table constraints
                 // If it doesn't match, the row won't appear in results, no invalidation needed
-                if let Some(constraints) = cached_query.constraints.table_constraints.get(&table_metadata.name) {
+                if let Some(constraints) = cached_query
+                    .constraints
+                    .table_constraints
+                    .get(&table_metadata.name)
+                {
                     let mut all_match = true;
                     for (column_name, constraint_value) in constraints {
-                        if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str()) {
+                        if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str())
+                        {
                             let position = column_meta.position as usize - 1;
                             if position < row_data.len() {
                                 if !constraint_value.matches(&row_data[position]) {
@@ -822,19 +835,25 @@ impl QueryCache {
                         continue;
                     }
 
-                    let column_changed = row_changes
-                        .is_some_and(|row| row.get::<&str, bool>(column));
+                    let column_changed =
+                        row_changes.is_some_and(|row| row.get::<&str, bool>(column));
 
                     if !column_changed {
                         continue;
                     }
 
                     // JOIN column changed - use constraint-based optimization
-                    if let Some(constraints) = cached_query.constraints.table_constraints.get(&table_metadata.name) {
+                    if let Some(constraints) = cached_query
+                        .constraints
+                        .table_constraints
+                        .get(&table_metadata.name)
+                    {
                         // Check if new values match all constraints for this table
                         let mut all_constraints_match = true;
                         for (constraint_column, constraint_value) in constraints {
-                            if let Some(column_meta) = table_metadata.columns.get1(constraint_column.as_str()) {
+                            if let Some(column_meta) =
+                                table_metadata.columns.get1(constraint_column.as_str())
+                            {
                                 let position = column_meta.position as usize - 1;
                                 if position < row_data.len() {
                                     if !constraint_value.matches(&row_data[position]) {
@@ -879,6 +898,7 @@ impl QueryCache {
     /// Handle INSERT operation with query-aware filtering.
     /// Applies the insert to cache entries that match the filter conditions.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_insert(
         &mut self,
         relation_oid: u32,
@@ -908,6 +928,7 @@ impl QueryCache {
     /// Handle UPDATE operation with query-aware filtering.
     /// Analyzes old and new values to determine cache operations needed.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_update(
         &mut self,
         relation_oid: u32,
@@ -976,6 +997,7 @@ impl QueryCache {
 
     /// Handle DELETE operation by removing the row from cache.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_delete(
         &self,
         relation_oid: u32,
@@ -1002,6 +1024,7 @@ impl QueryCache {
 
     /// Handle Truncate operation by truncating table in cache.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_truncate(&self, relation_oids: &[u32]) -> Result<(), CacheError> {
         // Get table metadata for column information
         let truncate_sql = {
