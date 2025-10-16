@@ -19,7 +19,7 @@ use crate::{
     settings::Settings,
 };
 
-use error_set::{ErrContext, error_set};
+use error_set::error_set;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
@@ -35,29 +35,29 @@ use tokio_util::{
 use tracing::{debug, error, instrument, trace};
 
 error_set! {
-    ConnectionError = ConnectError || ReadError || WriteError || DegradedModeExit;
+    ConnectionError := ConnectError || ReadError || WriteError || DegradedModeExit
 
-    ReadError = {
+    ReadError := {
         ProtocolError(ProtocolError),
         IoError(io::Error),
-    };
+    }
 
-    WriteError = {
+    WriteError := {
         MpscError,
-    };
+    }
 
-    ConnectError = {
+    ConnectError := {
         NoConnection,
-    };
+    }
 
-    DegradedModeExit = {
+    DegradedModeExit := {
         CacheDead,
-    };
+    }
 
-    ParseError = {
+    ParseError := {
         InvalidUtf8,
         Parse(pg_query::Error)
-    };
+    }
 }
 
 type Worker<'scope> = (
@@ -141,7 +141,7 @@ pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
         rt.block_on(async {
             let listener = TcpListener::bind(&settings.listen.socket)
                 .await
-                .with_error_context(|e| format!("bind error [{}] {e}", &settings.listen.socket))?;
+                .map_err(|e| ConnectionError::IoError(io::Error::other(format!("bind error [{}] {e}", &settings.listen.socket))))?;
             debug!("Listening to {}", &settings.listen.socket);
 
             let mut cur_worker = 0;

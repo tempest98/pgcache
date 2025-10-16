@@ -8,7 +8,7 @@ use crate::query::ast::{
 };
 
 error_set! {
-    ResolveError = {
+    ResolveError := {
         #[display("Table not found: {name}")]
         TableNotFound { name: String },
 
@@ -26,7 +26,7 @@ error_set! {
 
         #[display("Invalid table reference")]
         InvalidTableRef,
-    };
+    }
 }
 
 /// Resolved table reference with complete metadata

@@ -14,9 +14,9 @@ use pg_query::{NodeRef, ParseResult};
 use super::ast::{BinaryExpr, ColumnNode, ExprOp, LiteralValue, UnaryExpr, WhereExpr};
 
 error_set! {
-    ParseError = WhereParseError || SqlError;
+    ParseError := WhereParseError || SqlError
 
-    WhereParseError = {
+    WhereParseError := {
         #[display("Unsupported WHERE clause pattern")]
         UnsupportedPattern,
         #[display("Unsupported A expression")]
@@ -32,11 +32,11 @@ error_set! {
         #[display("Missing expression")]
         MissingExpression,
         Other { error: String }
-    };
+    }
 
-    SqlError = {
+    SqlError := {
         DeparseError(pg_query::Error)
-    };
+    }
 }
 
 pub fn query_fingerprint(ast: &ParseResult) -> Result<u64, SqlError> {

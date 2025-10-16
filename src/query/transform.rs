@@ -10,9 +10,9 @@ use crate::{
 };
 
 error_set! {
-    AstTransformError = {
+    AstTransformError := {
         MissingTable,
-    };
+    }
 }
 
 pub fn query_select_replace(

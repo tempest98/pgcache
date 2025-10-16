@@ -17,7 +17,7 @@ use crate::query::parse::{const_value_extract, node_convert_to_expr, select_stmt
 use super::parse::WhereParseError;
 
 error_set! {
-    AstError = {
+    AstError := {
         #[display("Unsupported statement type: {statement_type}")]
         UnsupportedStatement { statement_type: String },
         #[display("Multiple statements not supported")]
@@ -32,7 +32,7 @@ error_set! {
         InvalidTableRef,
         UnsupportedJoinType,
         WhereParseError(WhereParseError),
-    };
+    }
 }
 
 pub trait Deparse {

@@ -10,7 +10,7 @@ pub(crate) mod encode;
 pub(crate) mod frontend;
 
 error_set! {
-    ProtocolError = {
+    ProtocolError := {
         #[display("Invalid protocal version: {major}.{minor}")]
         InvalidProtocolVersion {
             major: i16,
@@ -22,7 +22,7 @@ error_set! {
             tag: String,
         },
         IoError(io::Error),
-    };
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

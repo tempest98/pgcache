@@ -5,14 +5,14 @@ use lexopt::prelude::*;
 use serde::Deserialize;
 
 error_set! {
-    ConfigError = {
+    ConfigError := {
         ArgumentError(Box<dyn Error + Send + Sync + 'static>),
         TomlError(Box<dyn Error + Send + Sync + 'static>),
 
         #[display("Missing argument: {name}")]
         ArgumentMissing{ name: &'static str},
         IoError(io::Error),
-    };
+    }
 }
 
 impl From<lexopt::Error> for ConfigError {

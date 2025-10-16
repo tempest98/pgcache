@@ -39,33 +39,33 @@ mod query_cache;
 mod worker;
 
 error_set! {
-    CacheError = ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError;
+    CacheError := ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError
 
-    ReadError = {
+    ReadError := {
         IoError(io::Error),
         InvalidMessage,
-    };
+    }
 
-    DbError = {
+    DbError := {
         NoConnection,
         PgError(Error),
         CdcFailure,
         TooManyModifiedRows,
-    };
+    }
 
-    ParseError = {
+    ParseError := {
         InvalidUtf8,
         Parse(pg_query::Error),
         AstTransformError(AstTransformError),
-        Other(),
-    };
+        Other,
+    }
 
-    SendError = {
+    SendError := {
         WorkerSend,
         Reply,
-    };
+    }
 
-    TableError = {
+    TableError := {
         #[display("Oid: {oid:?} Name {name:?}")]
         UnknownTable {
             oid: Option<u32>,
@@ -74,11 +74,11 @@ error_set! {
         UnknownColumn,
         UnknownSchema,
         NoPrimaryKey,
-    };
+    }
 
-    QueryResolutionError = {
+    QueryResolutionError := {
         ResolveError(ResolveError),
-    };
+    }
 }
 
 #[derive(Debug)]

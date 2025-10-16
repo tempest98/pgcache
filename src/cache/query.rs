@@ -7,12 +7,12 @@ use crate::query::{
 use error_set::error_set;
 
 error_set! {
-    CacheabilityError = {
+    CacheabilityError := {
         NotSelect,
         UnsupportedFrom,
         HasSublink,
         UnsupportedWhereClause,
-    };
+    }
 }
 
 #[derive(Debug, Clone)]
