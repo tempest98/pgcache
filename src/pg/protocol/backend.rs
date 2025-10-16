@@ -33,7 +33,7 @@ pub enum PgBackendMessageType {
     // data
     ParameterDescription,
     RowDescription,
-    DataRow,
+    DataRows, //represent one or more data rows
     NoData,
 
     // copy
@@ -87,7 +87,7 @@ const BACKEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgBackendMessageType> = phf_map! {
     b'G' => PgBackendMessageType::CopyInResponse,
     b'H' => PgBackendMessageType::CopyOutResponse,
     b'W' => PgBackendMessageType::CopyBothResponse,
-    b'D' => PgBackendMessageType::DataRow,
+    b'D' => PgBackendMessageType::DataRows,
     b'I' => PgBackendMessageType::EmptyQueryResponse,
     b'E' => PgBackendMessageType::ErrorResponse,
     b'V' => PgBackendMessageType::FunctionCallResponse,
@@ -176,10 +176,52 @@ impl Decoder for PgBackendMessageCodec {
                         return Ok(None);
                     }
 
-                    Ok(Some(PgBackendMessage {
-                        message_type: *msg_type,
-                        data: buf.split_to(msg_len),
-                    }))
+                    if *msg_type == PgBackendMessageType::DataRows {
+                        const MAX_BATCH_SIZE: usize = 64 * 1024;
+
+                        // Start with the first DataRow message
+                        let mut total_bytes = msg_len;
+                        let mut position = msg_len;
+
+                        // Look ahead for more consecutive DataRow messages
+                        while position + 5 <= buf.remaining() {
+                            let next_tag = buf[position];
+
+                            // Stop if not a DataRow message
+                            if next_tag != DATA_ROW_TAG {
+                                break;
+                            }
+
+                            // Read the next message length
+                            let next_msg_len =
+                                (&buf[position + 1..position + 5]).get_i32() as usize + 1;
+
+                            // Stop if message is incomplete in buffer
+                            if position + next_msg_len > buf.remaining() {
+                                break;
+                            }
+
+                            // Stop if we would exceed the 64KB limit
+                            if total_bytes + next_msg_len > MAX_BATCH_SIZE {
+                                break;
+                            }
+
+                            // Accumulate this message
+                            total_bytes += next_msg_len;
+                            position += next_msg_len;
+                        }
+
+                        // Return all accumulated DataRow messages
+                        Ok(Some(PgBackendMessage {
+                            message_type: PgBackendMessageType::DataRows,
+                            data: buf.split_to(total_bytes),
+                        }))
+                    } else {
+                        Ok(Some(PgBackendMessage {
+                            message_type: *msg_type,
+                            data: buf.split_to(msg_len),
+                        }))
+                    }
                 } else {
                     Err(ProtocolError::UnrecognizedMessageType {
                         tag: buf[0].escape_ascii().to_string(),
