@@ -3,6 +3,7 @@ use std::{io, thread};
 use error_set::error_set;
 use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
 use tokio::{
+    net::TcpStream,
     runtime::Builder,
     sync::{
         mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
@@ -39,7 +40,7 @@ mod query_cache;
 mod worker;
 
 error_set! {
-    CacheError := ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError
+    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError
 
     ReadError := {
         IoError(io::Error),
@@ -64,6 +65,11 @@ error_set! {
         WorkerSend,
         Reply,
     }
+
+    WriteError := {
+        Write,
+    }
+
 
     TableError := {
         #[display("Oid: {oid:?} Name {name:?}")]
@@ -94,7 +100,6 @@ pub enum DataStreamState {
 
 #[derive(Debug)]
 pub enum CacheReply {
-    Data(BytesMut, DataStreamState),
     Forward(BytesMut),
     Error(BytesMut),
 }
@@ -114,7 +119,7 @@ enum CdcMessage {
     RelationCheck(u32, oneshot::Sender<bool>),
 }
 
-pub type ProxyMessage = (CacheMessage, Sender<CacheReply>);
+pub type ProxyMessage = (CacheMessage, TcpStream, Sender<CacheReply>);
 
 enum StreamSource {
     Proxy(ProxyMessage),
@@ -216,11 +221,12 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                         let mut qcache = qcache.clone();
                         spawn_local(async move {
                             match src {
-                                StreamSource::Proxy((msg, reply_tx)) => match msg {
+                                StreamSource::Proxy((msg, client_socket, reply_tx)) => match msg {
                                     CacheMessage::Query(data, cacheable_query) => {
                                         let msg = QueryRequest {
                                             data,
                                             cacheable_query,
+                                            client_socket,
                                             reply_tx,
                                         };
                                         match qcache.query_dispatch(msg).await {
@@ -286,11 +292,11 @@ fn worker_run(
 
         LocalSet::new()
             .run_until(async move {
-                while let Some(msg) = worker_rx.recv().await {
+                while let Some(mut msg) = worker_rx.recv().await {
                     let worker = worker.clone();
                     spawn_local(async move {
                         debug!("cache worker task spawn");
-                        match worker.handle_cached_query(&msg).await {
+                        match worker.handle_cached_query(&mut msg).await {
                             Ok(_) => (),
                             Err(e) => {
                                 error!("handle_cached_query failed {e}");

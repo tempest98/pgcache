@@ -4,7 +4,8 @@ use std::rc::Rc;
 
 use iddqd::BiHashMap;
 use postgres_protocol::escape;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::{net::TcpStream, sync::mpsc::UnboundedSender};
+
 use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
@@ -27,6 +28,7 @@ use super::*;
 pub struct QueryRequest {
     pub data: BytesMut,
     pub cacheable_query: Box<CacheableQuery>,
+    pub client_socket: TcpStream,
     pub reply_tx: Sender<CacheReply>,
 }
 

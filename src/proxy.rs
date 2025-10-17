@@ -4,6 +4,7 @@ use std::{
     io::{self, Error},
     mem,
     net::SocketAddr,
+    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     thread,
 };
@@ -20,6 +21,7 @@ use crate::{
 };
 
 use error_set::error_set;
+use nix::{errno::Errno, unistd::dup};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
@@ -35,7 +37,11 @@ use tokio_util::{
 use tracing::{debug, error, instrument, trace};
 
 error_set! {
-    ConnectionError := ConnectError || ReadError || WriteError || DegradedModeExit
+    ConnectionError := FdError || ConnectError || ReadError || WriteError || DegradedModeExit
+
+    FdError := {
+        NixError(Errno),
+    }
 
     ReadError := {
         ProtocolError(ProtocolError),
@@ -141,7 +147,12 @@ pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
         rt.block_on(async {
             let listener = TcpListener::bind(&settings.listen.socket)
                 .await
-                .map_err(|e| ConnectionError::IoError(io::Error::other(format!("bind error [{}] {e}", &settings.listen.socket))))?;
+                .map_err(|e| {
+                    ConnectionError::IoError(io::Error::other(format!(
+                        "bind error [{}] {e}",
+                        &settings.listen.socket
+                    )))
+                })?;
             debug!("Listening to {}", &settings.listen.socket);
 
             let mut cur_worker = 0;
@@ -243,6 +254,14 @@ enum StreamSource {
 
 type StreamSourceResult = Result<StreamSource, ProtocolError>;
 
+// SAFETY: fd has to refer to a valid TcpStream
+unsafe fn fd_dup_to_stream(fd: OwnedFd) -> Result<TcpStream, ConnectionError> {
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd.into_raw_fd()) };
+    std_stream.set_nonblocking(true)?;
+    let rv = TcpStream::from_std(std_stream)?;
+    Ok(rv)
+}
+
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_connection(
@@ -267,6 +286,8 @@ async fn handle_connection(
 
     let mut proxy_mode = ProxyMode::Read;
     let mut proxy_status = ProxyStatus::Normal;
+
+    let client_fd_dup = dup(&client_socket)?;
 
     let (client_read, mut client_write) = client_socket.split();
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
@@ -323,12 +344,6 @@ async fn handle_connection(
                             proxy_mode = ProxyMode::ClientWrite(msg);
                         }
                         Ok(StreamSource::CacheRead(reply)) => match reply {
-                            CacheReply::Data(buf, _is_complete) => {
-                                proxy_mode = ProxyMode::ClientWrite(PgBackendMessage {
-                                    message_type: PgBackendMessageType::Multi,
-                                    data: buf,
-                                })
-                            }
                             CacheReply::Error(buf) | CacheReply::Forward(buf) => {
                                 debug!("forwarding to origin");
                                 //send query to origin instead
@@ -362,7 +377,12 @@ async fn handle_connection(
             ProxyMode::CacheWrite(msg) => {
                 let (resp_tx, resp_rx) = channel(10);
 
-                if let Err(e) = cache_tx.send((msg, resp_tx)).await {
+                let client_socket_dup = unsafe {
+                    // SAFETY: client_fd_dup is created from a valid TcpStream
+                    fd_dup_to_stream(client_fd_dup.try_clone()?)?
+                };
+
+                if let Err(e) = cache_tx.send((msg, client_socket_dup, resp_tx)).await {
                     // Cache is unavailable, fall back to proxying directly to origin
                     debug!("cache unavailable, degrading to proxy mode: {}", e);
                     proxy_status = ProxyStatus::Degraded;

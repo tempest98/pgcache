@@ -42,9 +42,6 @@ pub enum PgBackendMessageType {
     CopyInResponse,
     CopyOutResponse,
     CopyBothResponse,
-
-    //ugly?
-    Multi, //used for sending a buf that has multiple messages encoded into it
 }
 
 impl PgMessageType for PgBackendMessageType {}

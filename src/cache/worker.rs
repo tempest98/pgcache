@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
+use tokio::io::AsyncWriteExt;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
-use tokio_util::bytes::{Buf, BytesMut};
+use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tracing::{debug, instrument};
 
 use crate::pg::protocol::encode::*;
@@ -37,9 +38,11 @@ impl CacheWorker {
     }
 
     #[instrument(skip_all)]
-    pub async fn handle_cached_query(&self, msg: &QueryRequest) -> Result<(), CacheError> {
-        let data = &msg.data;
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn handle_cached_query(&self, msg: &mut QueryRequest) -> Result<(), CacheError> {
+        const BUFFER_SIZE_THRESHOLD: usize = 64 * 1024;
 
+        let data = &msg.data;
         let msg_len = (&data[1..5]).get_u32() as usize;
         let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
         // let stmt = query_target.prepare(query).await.unwrap();
@@ -51,33 +54,39 @@ impl CacheWorker {
 
         let mut buf = BytesMut::new();
         row_description_encode(desc, &mut buf);
-        if msg
-            .reply_tx
-            .send(CacheReply::Data(buf, DataStreamState::Incomplete))
-            .await
-            .is_err()
-        {
-            error!("no receiver");
-            return Err(CacheError::Reply);
+        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+            error!("no client");
+            return Err(CacheError::Write);
         }
 
+        buf.clear();
         for query_msg in &res[1..(res.len() - 1)] {
-            let mut buf = BytesMut::new();
             match query_msg {
                 SimpleQueryMessage::Row(row) => {
-                    simple_query_row_encode(row, &mut buf);
+                    // Use raw buffer directly to avoid decode/encode overhead
+                    // The raw buffer contains field data but not the field count
+                    let raw_data = row.raw_buffer_bytes();
+                    let field_count = row.len() as u16;
+
+                    buf.put_u8(b'D'); // DATA_ROW_TAG
+                    buf.put_i32(4 + 2 + raw_data.len() as i32); // 4 (length field) + 2 (field count) + data
+                    buf.put_u16(field_count);
+                    buf.put_slice(raw_data);
                 }
                 _ => return Err(CacheError::InvalidMessage),
             }
-            if msg
-                .reply_tx
-                .send(CacheReply::Data(buf, DataStreamState::Incomplete))
-                .await
-                .is_err()
+
+            //send data if more than 64kB have been accumulated
+            if buf.len() > BUFFER_SIZE_THRESHOLD
+                && msg.client_socket.write_all_buf(&mut buf).await.is_err()
             {
-                error!("no receiver");
-                return Err(CacheError::Reply);
+                error!("no client");
+                return Err(CacheError::Write);
             }
+        }
+        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+            error!("no client");
+            return Err(CacheError::Write);
         }
 
         let SimpleQueryMessage::CommandComplete(cnt) = &res[res.len() - 1] else {
@@ -89,14 +98,9 @@ impl CacheWorker {
 
         ready_for_query_encode(&mut buf);
 
-        if msg
-            .reply_tx
-            .send(CacheReply::Data(buf, DataStreamState::Complete))
-            .await
-            .is_err()
-        {
-            error!("no receiver");
-            return Err(CacheError::Reply);
+        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+            error!("no client");
+            return Err(CacheError::Write);
         }
 
         debug!("cache hit");
