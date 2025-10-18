@@ -119,7 +119,11 @@ enum CdcMessage {
     RelationCheck(u32, oneshot::Sender<bool>),
 }
 
-pub type ProxyMessage = (CacheMessage, TcpStream, Sender<CacheReply>);
+pub struct ProxyMessage {
+    pub message: CacheMessage,
+    pub client_socket: TcpStream,
+    pub reply_tx: Sender<CacheReply>,
+}
 
 enum StreamSource {
     Proxy(ProxyMessage),
@@ -221,13 +225,13 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                         let mut qcache = qcache.clone();
                         spawn_local(async move {
                             match src {
-                                StreamSource::Proxy((msg, client_socket, reply_tx)) => match msg {
+                                StreamSource::Proxy(proxy_msg) => match proxy_msg.message {
                                     CacheMessage::Query(data, cacheable_query) => {
                                         let msg = QueryRequest {
                                             data,
                                             cacheable_query,
-                                            client_socket,
-                                            reply_tx,
+                                            client_socket: proxy_msg.client_socket,
+                                            reply_tx: proxy_msg.reply_tx,
                                         };
                                         match qcache.query_dispatch(msg).await {
                                             Ok(_) => (),

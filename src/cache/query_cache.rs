@@ -786,11 +786,11 @@ impl QueryCache {
                         if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str())
                         {
                             let position = column_meta.position as usize - 1;
-                            if position < row_data.len() {
-                                if !constraint_value.matches(&row_data[position]) {
-                                    all_match = false;
-                                    break;
-                                }
+                            if position < row_data.len()
+                                && !constraint_value.matches(&row_data[position])
+                            {
+                                all_match = false;
+                                break;
                             }
                         }
                     }
@@ -857,11 +857,11 @@ impl QueryCache {
                                 table_metadata.columns.get1(constraint_column.as_str())
                             {
                                 let position = column_meta.position as usize - 1;
-                                if position < row_data.len() {
-                                    if !constraint_value.matches(&row_data[position]) {
-                                        all_constraints_match = false;
-                                        break;
-                                    }
+                                if position < row_data.len()
+                                    && !constraint_value.matches(&row_data[position])
+                                {
+                                    all_constraints_match = false;
+                                    break;
                                 }
                             }
                         }

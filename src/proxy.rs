@@ -24,7 +24,7 @@ use error_set::error_set;
 use nix::{errno::Errno, unistd::dup};
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpListener, TcpStream, lookup_host},
+    net::{TcpListener, TcpStream, lookup_host, tcp::WriteHalf},
     runtime::Builder,
     sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel},
     task::{LocalSet, spawn_local},
@@ -254,6 +254,121 @@ enum StreamSource {
 
 type StreamSourceResult = Result<StreamSource, ProtocolError>;
 
+/// Manages state for a single client connection.
+/// Encapsulates transaction state, query fingerprint cache, and protocol state.
+struct ConnectionState {
+    /// Cache of query fingerprints to cacheability decisions
+    fingerprint_cache: HashMap<u64, Option<Box<CacheableQuery>>>,
+
+    /// Whether the connection is currently in a transaction
+    in_transaction: bool,
+
+    /// Current proxy mode (reading, writing to client/origin/cache)
+    proxy_mode: ProxyMode,
+
+    /// Proxy status (normal or degraded if cache is unavailable)
+    proxy_status: ProxyStatus,
+
+    /// Duplicated client socket file descriptor for cache worker
+    client_fd_dup: OwnedFd,
+}
+
+impl ConnectionState {
+    fn new(client_fd_dup: OwnedFd) -> Self {
+        Self {
+            fingerprint_cache: HashMap::new(),
+            in_transaction: false,
+            proxy_mode: ProxyMode::Read,
+            proxy_status: ProxyStatus::Normal,
+            client_fd_dup,
+        }
+    }
+
+    /// Handle a message from the client (frontend).
+    /// Determines whether to forward to origin, check cache, or take other action.
+    async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
+        if !self.in_transaction && matches!(msg.message_type, PgFrontendMessageType::Query) {
+            self.proxy_mode = match handle_query(&msg.data, &mut self.fingerprint_cache).await {
+                Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
+                Ok(Action::CacheCheck(ast)) => {
+                    ProxyMode::CacheWrite(CacheMessage::Query(msg.data, ast))
+                }
+                Err(e) => {
+                    error!("handle_query {}", e);
+                    ProxyMode::OriginWrite(msg)
+                }
+            };
+        } else {
+            // Not a cacheable query message - forward to origin
+            self.proxy_mode = ProxyMode::OriginWrite(msg);
+        }
+    }
+
+    /// Handle a message from the origin database (backend).
+    /// Updates transaction state and forwards to client.
+    fn handle_origin_message(&mut self, msg: PgBackendMessage) {
+        if msg.message_type == PgBackendMessageType::ReadyForQuery {
+            // ReadyForQuery message contains transaction status at byte 5
+            // 'I' = idle (not in transaction)
+            // 'T' = in transaction block
+            // 'E' = in failed transaction block
+            self.in_transaction = msg.data[5] == b'T' || msg.data[5] == b'E';
+        }
+        self.proxy_mode = ProxyMode::ClientWrite(msg);
+    }
+
+    /// Handle a reply from the cache.
+    /// If cache indicates error or needs forwarding, send query to origin instead.
+    fn handle_cache_reply(&mut self, reply: CacheReply) {
+        match reply {
+            CacheReply::Error(buf) | CacheReply::Forward(buf) => {
+                debug!("forwarding to origin");
+                self.proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
+                    message_type: PgFrontendMessageType::Query,
+                    data: buf,
+                })
+            }
+        }
+    }
+}
+
+/// Connect to the origin database server.
+/// Tries each address in sequence until one succeeds.
+async fn origin_connect(addrs: &[SocketAddr]) -> Result<TcpStream, ConnectionError> {
+    for addr in addrs {
+        if let Ok(stream) = TcpStream::connect(addr).await {
+            return Ok(stream);
+        }
+    }
+    Err(ConnectionError::NoConnection)
+}
+
+type ProxyStreamMap<'a> =
+    StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult> + 'a>>>;
+
+/// Set up the stream map for multiplexing client and origin messages.
+fn streams_setup<'a>(
+    client_socket: &'a mut TcpStream,
+    origin_stream: &'a mut TcpStream,
+) -> (ProxyStreamMap<'a>, WriteHalf<'a>, WriteHalf<'a>) {
+    let (client_read, client_write) = client_socket.split();
+    let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
+
+    let (origin_read, origin_write) = origin_stream.split();
+    let origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
+
+    let client_mapped = client_framed_read.map(|item| item.map(StreamSource::ClientRead));
+    let origin_mapped = origin_framed_read.map(|item| item.map(StreamSource::OriginRead));
+
+    let mut streams_read: StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult>>>> =
+        StreamMap::new();
+
+    streams_read.insert("client", Box::pin(client_mapped));
+    streams_read.insert("origin", Box::pin(origin_mapped));
+
+    (streams_read, origin_write, client_write)
+}
+
 // SAFETY: fd has to refer to a valid TcpStream
 unsafe fn fd_dup_to_stream(fd: OwnedFd) -> Result<TcpStream, ConnectionError> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd.into_raw_fd()) };
@@ -269,90 +384,35 @@ async fn handle_connection(
     addrs: Vec<SocketAddr>,
     cache_tx: SenderCacheType,
 ) -> Result<(), ConnectionError> {
-    let mut maybe_stream: Option<TcpStream> = None;
-    for addr in &addrs {
-        maybe_stream = TcpStream::connect(addr).await.ok();
-        if maybe_stream.is_some() {
-            break;
-        }
-    }
+    // Connect to origin database
+    let mut origin_stream = origin_connect(&addrs).await?;
 
-    let Some(mut origin_stream) = maybe_stream else {
-        return Err(ConnectionError::NoConnection);
-    };
-
+    // Configure TCP settings
     let _ = client_socket.set_nodelay(true);
     let _ = origin_stream.set_nodelay(true);
 
-    let mut proxy_mode = ProxyMode::Read;
-    let mut proxy_status = ProxyStatus::Normal;
-
+    // Initialize connection state
     let client_fd_dup = dup(&client_socket)?;
+    let mut state = ConnectionState::new(client_fd_dup);
 
-    let (client_read, mut client_write) = client_socket.split();
-    let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
-
-    let (origin_read, mut origin_write) = origin_stream.split();
-    let origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
-
-    let client_mapped = client_framed_read.map(|item| item.map(StreamSource::ClientRead));
-    let origin_mapped = origin_framed_read.map(|item| item.map(StreamSource::OriginRead));
-
-    // let mut framed_read = client_mapped.merge(origin_mapped);
-
-    let mut streams_read: StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult>>>> =
-        StreamMap::new();
-
-    let client_mapped_pin = Box::pin(client_mapped); // as Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>;
-    let origin_mapped_pin = Box::pin(origin_mapped); // as Pin<Box<dyn Stream<Item = Result<StreamSource, ProtocolError>>>>;
-
-    streams_read.insert("client", client_mapped_pin);
-    streams_read.insert("origin", origin_mapped_pin);
-
-    let mut fingerprint_cache: HashMap<u64, Option<Box<CacheableQuery>>> = HashMap::new();
-
-    let mut in_transaction = false;
+    // Set up stream multiplexing
+    let (mut streams_read, mut origin_write, mut client_write) =
+        streams_setup(client_socket, &mut origin_stream);
 
     loop {
-        match proxy_mode {
+        match state.proxy_mode {
             ProxyMode::Read => {
                 if let Some((_, res)) = streams_read.next().await {
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
-                            if !in_transaction
-                                && matches!(msg.message_type, PgFrontendMessageType::Query)
-                            {
-                                proxy_mode =
-                                    match handle_query(&msg.data, &mut fingerprint_cache).await {
-                                        Ok(Action::Forward) => ProxyMode::OriginWrite(msg),
-                                        Ok(Action::CacheCheck(ast)) => ProxyMode::CacheWrite(
-                                            CacheMessage::Query(msg.data, ast),
-                                        ),
-                                        Err(e) => {
-                                            error!("handle_query {}", e);
-                                            ProxyMode::OriginWrite(msg)
-                                        }
-                                    };
-                            } else {
-                                proxy_mode = ProxyMode::OriginWrite(msg);
-                            }
+                            state.handle_client_message(msg).await;
                         }
                         Ok(StreamSource::OriginRead(msg)) => {
-                            if msg.message_type == PgBackendMessageType::ReadyForQuery {
-                                in_transaction = msg.data[5] == b'T' || msg.data[5] == b'E';
-                            }
-                            proxy_mode = ProxyMode::ClientWrite(msg);
+                            state.handle_origin_message(msg);
                         }
-                        Ok(StreamSource::CacheRead(reply)) => match reply {
-                            CacheReply::Error(buf) | CacheReply::Forward(buf) => {
-                                debug!("forwarding to origin");
-                                //send query to origin instead
-                                proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
-                                    message_type: PgFrontendMessageType::Query,
-                                    data: buf,
-                                })
-                            }
-                        },
+                        Ok(StreamSource::CacheRead(reply)) => {
+                            state.handle_cache_reply(reply);
+                        }
                         Err(err) => {
                             debug!("read error [{}]", err);
                             return Err(ConnectionError::ProtocolError(err));
@@ -365,44 +425,55 @@ async fn handle_connection(
             ProxyMode::OriginWrite(ref mut msg) => {
                 origin_write.write_buf(&mut msg.data).await?;
                 if !msg.data.has_remaining() {
-                    proxy_mode = ProxyMode::Read;
+                    state.proxy_mode = ProxyMode::Read;
                 }
             }
             ProxyMode::ClientWrite(ref mut msg) => {
                 client_write.write_buf(&mut msg.data).await?;
                 if !msg.data.has_remaining() {
-                    proxy_mode = ProxyMode::Read;
+                    state.proxy_mode = ProxyMode::Read;
                 }
             }
             ProxyMode::CacheWrite(msg) => {
-                let (resp_tx, resp_rx) = channel(10);
+                let (reply_tx, reply_rx) = channel(10);
 
                 let client_socket_dup = unsafe {
                     // SAFETY: client_fd_dup is created from a valid TcpStream
-                    fd_dup_to_stream(client_fd_dup.try_clone()?)?
+                    fd_dup_to_stream(state.client_fd_dup.try_clone()?)?
                 };
 
-                if let Err(e) = cache_tx.send((msg, client_socket_dup, resp_tx)).await {
-                    // Cache is unavailable, fall back to proxying directly to origin
-                    debug!("cache unavailable, degrading to proxy mode: {}", e);
-                    proxy_status = ProxyStatus::Degraded;
-                    let CacheMessage::Query(data, _) = e.0.0;
-                    proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
-                        message_type: PgFrontendMessageType::Query,
-                        data,
-                    });
-                } else {
-                    let stream_rx = Box::pin(
-                        ReceiverStream::new(resp_rx).map(|item| Ok(StreamSource::CacheRead(item))),
-                    );
-                    streams_read.insert("cache_reply", stream_rx);
-                    proxy_mode = ProxyMode::Read;
+                let proxy_msg = ProxyMessage {
+                    message: msg,
+                    client_socket: client_socket_dup,
+                    reply_tx,
+                };
+
+                match cache_tx.send(proxy_msg).await {
+                    Ok(()) => {
+                        // Cache accepted the message, wait for reply via stream
+                        let stream_rx = Box::pin(
+                            ReceiverStream::new(reply_rx)
+                                .map(|item| Ok(StreamSource::CacheRead(item))),
+                        );
+                        streams_read.insert("cache_reply", stream_rx);
+                        state.proxy_mode = ProxyMode::Read;
+                    }
+                    Err(e) => {
+                        // Cache is unavailable, fall back to proxying directly to origin
+                        debug!("cache unavailable, degrading to proxy mode: {}", e);
+                        state.proxy_status = ProxyStatus::Degraded;
+                        let CacheMessage::Query(data, _) = e.0.message;
+                        state.proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
+                            message_type: PgFrontendMessageType::Query,
+                            data,
+                        });
+                    }
                 }
             }
         }
     }
 
-    match proxy_status {
+    match state.proxy_status {
         ProxyStatus::Degraded => Err(ConnectionError::CacheDead),
         ProxyStatus::Normal => Ok(()),
     }
