@@ -2004,6 +2004,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parameterized_query_single_param() {
+        let sql = "SELECT * FROM users WHERE id = $1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Verify the WHERE clause contains a parameter
+        let where_clause = ast.where_clause().unwrap();
+        let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
+        assert_eq!(literals.len(), 1);
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_string()));
+
+        // Test deparsing
+        let mut deparsed = String::with_capacity(1024);
+        ast.deparse(&mut deparsed);
+        assert_eq!(deparsed, sql);
+    }
+
+    #[test]
+    fn test_parameterized_query_multiple_params() {
+        let sql = "SELECT * FROM users WHERE name = $1 AND age > $2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Verify the WHERE clause contains both parameters
+        let where_clause = ast.where_clause().unwrap();
+        let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
+        assert_eq!(literals.len(), 2);
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_string()));
+        assert_eq!(literals[1], &LiteralValue::Parameter("$2".to_string()));
+
+        // Test deparsing
+        let mut deparsed = String::with_capacity(1024);
+        ast.deparse(&mut deparsed);
+        assert_eq!(deparsed, sql);
+    }
+
+    #[test]
+    fn test_parameterized_query_mixed_params_and_literals() {
+        let sql = "SELECT * FROM users WHERE name = $1 AND active = true";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Verify the WHERE clause contains parameter and boolean literal
+        let where_clause = ast.where_clause().unwrap();
+        let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
+        assert_eq!(literals.len(), 2);
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_string()));
+        assert_eq!(literals[1], &LiteralValue::Boolean(true));
+
+        // Test deparsing
+        let mut deparsed = String::with_capacity(1024);
+        ast.deparse(&mut deparsed);
+        assert_eq!(deparsed, sql);
+    }
+
+    #[test]
     fn test_literal_empty_string() {
         let mut buf = String::new();
         LiteralValue::String("".to_string()).deparse(&mut buf);

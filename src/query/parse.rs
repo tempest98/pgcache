@@ -8,7 +8,7 @@ use ordered_float::NotNan;
 use pg_query::protobuf::SelectStmt;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::{AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef};
+use pg_query::protobuf::{AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, ParamRef};
 use pg_query::{NodeRef, ParseResult};
 
 use super::ast::{BinaryExpr, ColumnNode, ExprOp, LiteralValue, UnaryExpr, WhereExpr};
@@ -129,6 +129,10 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
             let value = const_value_extract(const_val)?;
             Ok(WhereExpr::Value(value))
         }
+        Some(NodeEnum::ParamRef(param_ref)) => {
+            let value = param_ref_extract(param_ref);
+            Ok(WhereExpr::Value(value))
+        }
         unsupported => {
             dbg!(unsupported);
             Err(WhereParseError::UnsupportedPattern)
@@ -187,6 +191,11 @@ pub fn const_value_extract(const_val: &AConst) -> Result<LiteralValue, WherePars
         Some(Val::Bsval(bs)) => Ok(LiteralValue::String(bs.bsval.clone())), // Bit strings as strings for now
         None => Ok(LiteralValue::Null),                                     // Fallback for NULL
     }
+}
+
+/// Extract parameter reference from pg_query ParamRef
+fn param_ref_extract(param_ref: &ParamRef) -> LiteralValue {
+    LiteralValue::Parameter(format!("${}", param_ref.number))
 }
 
 /// Convert PostgreSQL A_Expr (expressions like col = value)
@@ -786,6 +795,88 @@ mod tests {
             })),
         }));
 
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_parameterized_query_single() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE id = $1").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: ExprOp::Equal,
+            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "id".to_string(),
+            })),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_string()))),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_parameterized_query_multiple() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE name = $1 AND age > $2").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: ExprOp::And,
+            lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::Equal,
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "name".to_string(),
+                })),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_string()))),
+            })),
+            rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::GreaterThan,
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "age".to_string(),
+                })),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$2".to_string()))),
+            })),
+        }));
+        assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_parameterized_query_mixed_with_literals() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE name = $1 AND active = true").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap();
+
+        let expected = Some(WhereExpr::Binary(BinaryExpr {
+            op: ExprOp::And,
+            lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::Equal,
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "name".to_string(),
+                })),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_string()))),
+            })),
+            rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
+                op: ExprOp::Equal,
+                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "active".to_string(),
+                })),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
+            })),
+        }));
         assert_eq!(where_clause, expected);
     }
 }
