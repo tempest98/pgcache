@@ -2,10 +2,11 @@ use std::rc::Rc;
 
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
-use tokio_util::bytes::{Buf, BufMut, BytesMut};
+use tokio_util::bytes::{BufMut, BytesMut};
 use tracing::{debug, instrument};
 
 use crate::pg::protocol::encode::*;
+use crate::query::ast::Deparse;
 use crate::settings::Settings;
 
 use super::*;
@@ -42,21 +43,26 @@ impl CacheWorker {
     pub async fn handle_cached_query(&self, msg: &mut QueryRequest) -> Result<(), CacheError> {
         const BUFFER_SIZE_THRESHOLD: usize = 64 * 1024;
 
-        let data = &msg.data;
-        let msg_len = (&data[1..5]).get_u32() as usize;
-        let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
-        // let stmt = query_target.prepare(query).await.unwrap();
-        let res = self.db_cache.simple_query(query).await?;
+        // Generate SQL query from AST (parameters are already replaced if present)
+        let mut sql = String::new();
+        msg.cacheable_query.statement().deparse(&mut sql);
+
+        // Execute query against cache database
+        let res = self.db_cache.simple_query(&sql).await?;
 
         let SimpleQueryMessage::RowDescription(desc) = &res[0] else {
             return Err(CacheError::InvalidMessage);
         };
 
         let mut buf = BytesMut::new();
-        row_description_encode(desc, &mut buf);
-        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
-            error!("no client");
-            return Err(CacheError::Write);
+
+        if msg.query_type == QueryType::Simple {
+            row_description_encode(desc, &mut buf);
+            trace!("(w) client write {:?}", buf);
+            if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+                error!("no client");
+                return Err(CacheError::Write);
+            }
         }
 
         buf.clear();
@@ -80,10 +86,13 @@ impl CacheWorker {
             if buf.len() > BUFFER_SIZE_THRESHOLD
                 && msg.client_socket.write_all_buf(&mut buf).await.is_err()
             {
+                trace!("(w) client write data");
+
                 error!("no client");
                 return Err(CacheError::Write);
             }
         }
+        trace!("(w) client write data");
         if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
             return Err(CacheError::Write);
@@ -96,8 +105,11 @@ impl CacheWorker {
         let mut buf = BytesMut::new();
         command_complete_encode(*cnt, &mut buf);
 
-        ready_for_query_encode(&mut buf);
+        if msg.query_type == QueryType::Simple {
+            ready_for_query_encode(&mut buf);
+        }
 
+        trace!("(w) client write {:?}", buf);
         if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
             return Err(CacheError::Write);

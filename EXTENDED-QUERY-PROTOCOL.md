@@ -78,13 +78,105 @@ The protocol handling code in `pgcache/src/pg/protocol/frontend.rs` already reco
 
 ### Phase 1: Basic Extended Protocol Support (No Caching)
 
-**Goal:** Handle extended protocol messages without caching prepared statements
+**Goal:** Handle extended protocol messages without caching prepared statements. This phase is broken into three sub-phases to enable incremental progress and testing.
+
+---
+
+#### Phase 1A: Message Parsing (Read-only)
+
+**Goal:** Parse extended protocol messages and extract their data without storing state or changing behavior.
 
 **Tasks:**
-1. **Add state to `ConnectionState`:**
+
+1. **Create new file `src/pg/protocol/extended.rs`:**
+   - Add module declaration in `src/pg/protocol/mod.rs`
+
+2. **Define data structures in `extended.rs`:**
    ```rust
+   pub struct PreparedStatement {
+       pub name: String,
+       pub sql: String,
+       pub parameter_count: usize,
+   }
+
+   pub struct Portal {
+       pub name: String,
+       pub statement_name: String,
+       pub parameter_values: Vec<Option<Vec<u8>>>,
+       pub parameter_formats: Vec<i16>,  // 0=text, 1=binary
+       pub result_formats: Vec<i16>,
+   }
+
+   pub struct ParsedParseMessage {
+       pub statement_name: String,
+       pub sql: String,
+       pub parameter_oids: Vec<u32>,
+   }
+
+   pub struct ParsedBindMessage {
+       pub portal_name: String,
+       pub statement_name: String,
+       pub parameter_formats: Vec<i16>,
+       pub parameter_values: Vec<Option<Vec<u8>>>,
+       pub result_formats: Vec<i16>,
+   }
+
+   pub struct ParsedExecuteMessage {
+       pub portal_name: String,
+       pub max_rows: i32,
+   }
+
+   pub struct ParsedDescribeMessage {
+       pub describe_type: u8,  // b'S' for statement, b'P' for portal
+       pub name: String,
+   }
+
+   pub struct ParsedCloseMessage {
+       pub close_type: u8,  // b'S' for statement, b'P' for portal
+       pub name: String,
+   }
+   ```
+
+3. **Implement message parsers in `extended.rs`:**
+   - `parse_parse_message(data: &BytesMut) -> Result<ParsedParseMessage, ProtocolError>`
+   - `parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, ProtocolError>`
+   - `parse_execute_message(data: &BytesMut) -> Result<ParsedExecuteMessage, ProtocolError>`
+   - `parse_describe_message(data: &BytesMut) -> Result<ParsedDescribeMessage, ProtocolError>`
+   - `parse_close_message(data: &BytesMut) -> Result<ParsedCloseMessage, ProtocolError>`
+
+   **Note:** Forward original raw bytes to origin, not re-encoded data. Parsing is for state tracking only.
+
+4. **Add unit tests for all parsers:**
+   - Test parsing valid messages
+   - Test parsing edge cases (empty names, zero parameters, NULL values)
+   - Test parsing error cases (truncated messages, invalid format)
+
+**Success Criteria:**
+- ✅ All parser functions compile and pass unit tests
+- ✅ Can extract statement names, SQL, parameter data from messages
+- ✅ No changes to connection handling behavior yet
+- ✅ All existing tests still pass
+
+---
+
+#### Phase 1B: State Management (No behavior changes)
+
+**Goal:** Track prepared statements and portals in memory without changing message forwarding behavior.
+
+**Tasks:**
+
+1. **Add fields to `ConnectionState` in `proxy.rs`:**
+   ```rust
+   use crate::pg::protocol::extended::{PreparedStatement, Portal};
+   use std::collections::HashMap;
+
    struct ConnectionState {
        // Existing fields...
+       fingerprint_cache: HashMap<u64, Option<Box<CacheableQuery>>>,
+       in_transaction: bool,
+       proxy_mode: ProxyMode,
+       proxy_status: ProxyStatus,
+       client_fd_dup: OwnedFd,
 
        // Extended protocol state
        prepared_statements: HashMap<String, PreparedStatement>,
@@ -92,72 +184,217 @@ The protocol handling code in `pgcache/src/pg/protocol/frontend.rs` already reco
    }
    ```
 
-2. **Define new data structures:**
+2. **Update `ConnectionState::new()` to initialize new fields:**
    ```rust
-   struct PreparedStatement {
-       name: String,
-       sql: String,
-       ast: pg_query::protobuf::ParseResult,
-       cacheable_query: Option<Box<CacheableQuery>>,
-       parameter_count: usize,
-   }
-
-   struct Portal {
-       name: String,
-       statement_name: String,
-       parameter_values: Vec<Option<Vec<u8>>>,
-       parameter_formats: Vec<i16>,  // 0=text, 1=binary
-       result_formats: Vec<i16>,
-   }
-   ```
-
-3. **Implement message parsers in `pg/protocol/frontend.rs` or new `pg/protocol/extended.rs`:**
-   - `parse_parse_message()` - Extract statement name, SQL, parameter OIDs
-   - `parse_bind_message()` - Extract portal name, statement name, format codes, parameters
-   - `parse_execute_message()` - Extract portal name, row limit
-   - `parse_describe_message()` - Extract type (S/P), name
-   - `parse_close_message()` - Extract type (S/P), name
-
-4. **Add message handlers to `ConnectionState`:**
-   - `handle_parse_message()` - Store prepared statement, forward to origin
-   - `handle_bind_message()` - Store portal, forward to origin
-   - `handle_execute_message()` - Forward to origin (no caching yet)
-   - `handle_describe_message()` - Forward to origin
-   - `handle_close_message()` - Clean up state, forward to origin
-   - `handle_sync_message()` - Forward to origin, return ReadyForQuery
-
-5. **Update `handle_client_message()` to dispatch extended protocol messages:**
-   ```rust
-   async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
-       match msg.message_type {
-           PgFrontendMessageType::Query => { /* existing */ }
-           PgFrontendMessageType::Parse => self.handle_parse_message(msg),
-           PgFrontendMessageType::Bind => self.handle_bind_message(msg),
-           PgFrontendMessageType::Execute => self.handle_execute_message(msg),
-           PgFrontendMessageType::Describe => self.handle_describe_message(msg),
-           PgFrontendMessageType::Close => self.handle_close_message(msg),
-           PgFrontendMessageType::Sync => self.handle_sync_message(msg),
-           _ => self.proxy_mode = ProxyMode::OriginWrite(msg),
+   fn new(client_fd_dup: OwnedFd) -> Self {
+       Self {
+           // ... existing initialization ...
+           prepared_statements: HashMap::new(),
+           portals: HashMap::new(),
        }
    }
    ```
 
-6. **Add error handling:**
-   - Unknown statement/portal names
-   - Parameter count mismatch
-   - Invalid message sequences (e.g., Execute before Bind)
+3. **Implement state tracking methods (no forwarding changes yet):**
+   ```rust
+   impl ConnectionState {
+       fn statement_store(&mut self, parsed: ParsedParseMessage) {
+           let stmt = PreparedStatement {
+               name: parsed.statement_name.clone(),
+               sql: parsed.sql,
+               parameter_count: parsed.parameter_oids.len(),
+           };
+           self.prepared_statements.insert(parsed.statement_name, stmt);
+       }
 
-7. **Testing:**
-   - Test with psycopg2/psycopg3 (uses extended protocol by default)
-   - Test with JDBC driver
-   - Verify all messages forward correctly
-   - Verify state cleanup on Close
+       fn portal_store(&mut self, parsed: ParsedBindMessage) {
+           let portal = Portal {
+               name: parsed.portal_name.clone(),
+               statement_name: parsed.statement_name,
+               parameter_values: parsed.parameter_values,
+               parameter_formats: parsed.parameter_formats,
+               result_formats: parsed.result_formats,
+           };
+           self.portals.insert(parsed.portal_name, portal);
+       }
+
+       fn statement_close(&mut self, name: &str) {
+           self.prepared_statements.remove(name);
+       }
+
+       fn portal_close(&mut self, name: &str) {
+           self.portals.remove(name);
+       }
+
+       fn statements_clear(&mut self) {
+           self.prepared_statements.clear();
+       }
+
+       fn portals_clear(&mut self) {
+           self.portals.clear();
+       }
+   }
+   ```
+
+4. **Add state cleanup on transaction boundaries:**
+   - Update `handle_origin_message()` to clear unnamed portals on ReadyForQuery with status 'I' (idle)
+   - Unnamed statements/portals have empty string names (`""`)
 
 **Success Criteria:**
+- ✅ State tracking methods compile and work correctly
+- ✅ HashMap operations succeed without panics
+- ✅ All existing tests still pass
+- ✅ No changes to message forwarding behavior yet
+
+---
+
+#### Phase 1C: Message Dispatch and Integration
+
+**Goal:** Wire up extended protocol message handling end-to-end with proper forwarding and cleanup.
+
+**Tasks:**
+
+1. **Implement message handlers in `ConnectionState`:**
+   ```rust
+   impl ConnectionState {
+       fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
+           // Parse the message
+           if let Ok(parsed) = parse_parse_message(&msg.data) {
+               // Store in state
+               self.statement_store(parsed);
+           }
+           // Forward original bytes to origin unchanged
+           self.proxy_mode = ProxyMode::OriginWrite(msg);
+       }
+
+       fn handle_bind_message(&mut self, msg: PgFrontendMessage) {
+           if let Ok(parsed) = parse_bind_message(&msg.data) {
+               self.portal_store(parsed);
+           }
+           self.proxy_mode = ProxyMode::OriginWrite(msg);
+       }
+
+       fn handle_execute_message(&mut self, msg: PgFrontendMessage) {
+           // No state changes, just forward
+           self.proxy_mode = ProxyMode::OriginWrite(msg);
+       }
+
+       fn handle_describe_message(&mut self, msg: PgFrontendMessage) {
+           // No state changes, just forward
+           self.proxy_mode = ProxyMode::OriginWrite(msg);
+       }
+
+       fn handle_close_message(&mut self, msg: PgFrontendMessage) {
+           if let Ok(parsed) = parse_close_message(&msg.data) {
+               match parsed.close_type {
+                   b'S' => self.statement_close(&parsed.name),
+                   b'P' => self.portal_close(&parsed.name),
+                   _ => {}
+               }
+           }
+           self.proxy_mode = ProxyMode::OriginWrite(msg);
+       }
+
+       fn handle_sync_message(&mut self, msg: PgFrontendMessage) {
+           // Sync marks end of extended protocol message group
+           self.proxy_mode = ProxyMode::OriginWrite(msg);
+       }
+   }
+   ```
+
+2. **Update `handle_client_message()` to dispatch extended protocol messages:**
+   ```rust
+   async fn handle_client_message(&mut self, msg: PgFrontendMessage) -> Result<(), ParseError> {
+       match msg.message_type {
+           PgFrontendMessageType::Query => {
+               // ... existing Query handling ...
+           }
+           PgFrontendMessageType::Parse => {
+               self.handle_parse_message(msg);
+               Ok(())
+           }
+           PgFrontendMessageType::Bind => {
+               self.handle_bind_message(msg);
+               Ok(())
+           }
+           PgFrontendMessageType::Execute => {
+               self.handle_execute_message(msg);
+               Ok(())
+           }
+           PgFrontendMessageType::Describe => {
+               self.handle_describe_message(msg);
+               Ok(())
+           }
+           PgFrontendMessageType::Close => {
+               self.handle_close_message(msg);
+               Ok(())
+           }
+           PgFrontendMessageType::Sync => {
+               self.handle_sync_message(msg);
+               Ok(())
+           }
+           PgFrontendMessageType::Flush => {
+               // Flush just requests the server to send any pending data
+               self.proxy_mode = ProxyMode::OriginWrite(msg);
+               Ok(())
+           }
+           _ => {
+               self.proxy_mode = ProxyMode::OriginWrite(msg);
+               Ok(())
+           }
+       }
+   }
+   ```
+
+3. **Update `handle_origin_message()` for transaction cleanup:**
+   ```rust
+   fn handle_origin_message(&mut self, msg: PgBackendMessage) {
+       if msg.message_type == PgBackendMessageType::ReadyForQuery {
+           if msg.data.len() >= 6 {
+               let status = msg.data[5];
+               self.in_transaction = status == b'T' || status == b'E';
+
+               // Clean up unnamed portals when transaction ends (status 'I' = idle)
+               if status == b'I' {
+                   self.portals.retain(|name, _| !name.is_empty());
+               }
+           }
+       }
+       self.proxy_mode = ProxyMode::ClientWrite(msg);
+   }
+   ```
+
+4. **Integration testing:**
+   - Write Rust integration test using `tokio-postgres` client (uses extended protocol by default)
+   - Test basic prepared statement: Parse → Bind → Execute → Sync
+   - Test statement reuse: Parse once, Bind+Execute multiple times
+   - Test Close statement and Close portal
+   - Test unnamed statements (empty name)
+   - Verify all messages forward correctly to origin
+   - Verify responses come back to client unchanged
+
+5. **Manual testing:**
+   - Test with `psql` (uses simple protocol by default)
+   - Test with Rust `tokio-postgres` client examples
+   - Verify no memory leaks (statements/portals cleaned up properly)
+
+**Success Criteria:**
+- ✅ Extended protocol clients (tokio-postgres) can connect and execute queries
+- ✅ All messages forward to origin with original bytes unchanged
+- ✅ State is tracked correctly (statements and portals stored/removed)
+- ✅ Transaction boundaries properly clear unnamed portals
+- ✅ Close messages properly clean up state
+- ✅ All existing tests still pass
+- ✅ New integration tests pass
+
+---
+
+**Phase 1 Overall Success Criteria:**
 - Extended protocol clients can connect and execute queries
 - All queries forward to origin (no caching yet)
 - Proper state management (no memory leaks)
 - All existing tests still pass
+- Ready for Phase 2 (cache integration)
 
 ### Phase 2: Cache Integration for Prepared Statements
 
@@ -333,10 +570,10 @@ For extended protocol queries, the cache key must include:
 - CDC invalidation
 
 ### Client Compatibility Tests
-- psycopg2/psycopg3 (Python)
-- JDBC (Java)
-- node-postgres (JavaScript)
-- pgx (Rust)
+- tokio-postgres (Rust) - primary testing client
+- pgx (Rust) - alternative Rust client
+- psql (command-line tool)
+- Any other PostgreSQL clients as needed
 
 ### Performance Tests
 - Compare simple vs extended protocol performance

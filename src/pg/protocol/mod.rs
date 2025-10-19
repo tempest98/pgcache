@@ -7,6 +7,7 @@ use tokio_util::bytes::BytesMut;
 
 pub(crate) mod backend;
 pub(crate) mod encode;
+pub(crate) mod extended;
 pub(crate) mod frontend;
 
 error_set! {

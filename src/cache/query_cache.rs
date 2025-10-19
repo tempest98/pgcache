@@ -24,8 +24,15 @@ use crate::settings::Settings;
 
 use super::*;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum QueryType {
+    Simple,
+    Extended,
+}
+
 #[derive(Debug)]
 pub struct QueryRequest {
+    pub query_type: QueryType,
     pub data: BytesMut,
     pub cacheable_query: Box<CacheableQuery>,
     pub client_socket: TcpStream,
@@ -89,8 +96,10 @@ impl QueryCache {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
+        // Generate fingerprint from AST (parameters are already replaced if this was a parameterized query)
         let stmt = msg.cacheable_query.statement();
         let fingerprint = ast_query_fingerprint(stmt);
+
         let cached_query_state = self
             .cache
             .borrow()

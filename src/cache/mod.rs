@@ -17,21 +17,21 @@ use tokio_stream::{
     wrappers::{ReceiverStream, UnboundedReceiverStream},
 };
 use tokio_util::bytes::BytesMut;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, trace};
 
-use crate::cache::worker::CacheWorker;
-use crate::{
-    cache::cdc::CdcProcessor,
-    cache::query::CacheableQuery,
-    catalog::TableMetadata,
-    query::ast::SelectStatement,
-    query::constraints::QueryConstraints,
-    query::resolved::{ResolveError, ResolvedSelectStatement},
-    query::transform::AstTransformError,
-};
 use crate::{
     cache::query_cache::{QueryCache, QueryRequest},
     settings::Settings,
+};
+use crate::{cache::worker::CacheWorker, query::transform::AstTransformError};
+use crate::{
+    cache::{cdc::CdcProcessor, query::CacheableQuery, query_cache::QueryType},
+    catalog::TableMetadata,
+    query::{
+        ast::SelectStatement,
+        constraints::QueryConstraints,
+        resolved::{ResolveError, ResolvedSelectStatement},
+    },
 };
 
 mod cdc;
@@ -90,6 +90,7 @@ error_set! {
 #[derive(Debug)]
 pub enum CacheMessage {
     Query(BytesMut, Box<CacheableQuery>),
+    QueryParameterized(BytesMut, Box<CacheableQuery>, Vec<Option<Vec<u8>>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,22 +227,47 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                         let mut qcache = qcache.clone();
                         spawn_local(async move {
                             match src {
-                                StreamSource::Proxy(proxy_msg) => match proxy_msg.message {
-                                    CacheMessage::Query(data, cacheable_query) => {
-                                        let msg = QueryRequest {
-                                            data,
-                                            cacheable_query,
-                                            client_socket: proxy_msg.client_socket,
-                                            reply_tx: proxy_msg.reply_tx,
-                                        };
-                                        match qcache.query_dispatch(msg).await {
-                                            Ok(_) => (),
-                                            Err(e) => {
-                                                error!("query_dispatch error {e}");
-                                            }
+                                StreamSource::Proxy(proxy_msg) => {
+                                    // Extract query data and handle parameter replacement if needed
+                                    let result: Result<_, CacheError> = match proxy_msg.message {
+                                        CacheMessage::Query(data, cacheable_query) => {
+                                            trace!("query");
+                                            Ok((data, cacheable_query, QueryType::Simple))
                                         }
+                                        CacheMessage::QueryParameterized(
+                                            data,
+                                            mut cacheable_query,
+                                            parameters,
+                                        ) => {
+                                            trace!("parameterized query");
+                                            // Replace parameters in AST
+                                            cacheable_query
+                                                .parameters_replace(&parameters)
+                                                .map(|_| {
+                                                    (data, cacheable_query, QueryType::Extended)
+                                                })
+                                                .map_err(|e| e.into())
+                                        }
+                                    };
+
+                                    let dispatch_result =
+                                        result.map(|(data, cacheable_query, query_type)| {
+                                            QueryRequest {
+                                                query_type,
+                                                data,
+                                                cacheable_query,
+                                                client_socket: proxy_msg.client_socket,
+                                                reply_tx: proxy_msg.reply_tx,
+                                            }
+                                        });
+
+                                    if let Err(e) = match dispatch_result {
+                                        Ok(msg) => qcache.query_dispatch(msg).await,
+                                        Err(e) => Err(e),
+                                    } {
+                                        error!("query error {e}");
                                     }
-                                },
+                                }
                                 StreamSource::Cdc(msg) => match msg {
                                     CdcMessage::Register(table_metadata) => {
                                         let _ = qcache.cache_table_register(table_metadata).await;
