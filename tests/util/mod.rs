@@ -4,6 +4,7 @@ use std::{
     io::Error,
     io::Read,
     net::TcpListener,
+    ops::{Deref, DerefMut},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -14,6 +15,41 @@ use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, ToStatement};
 use tokio_util::bytes::{Buf, BytesMut};
 
+/// Guard structure that automatically kills and waits for the pgcache process on drop
+/// This ensures proper cleanup even if tests panic
+pub struct PgCacheProcess {
+    child: Child,
+}
+
+impl PgCacheProcess {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+}
+
+impl Drop for PgCacheProcess {
+    fn drop(&mut self) {
+        // Kill the process and wait for it to exit
+        // We ignore errors here because the process might already be dead
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Deref for PgCacheProcess {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl DerefMut for PgCacheProcess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
 fn find_available_port() -> Result<u16, Error> {
     // Bind to port 0 to let the OS assign an available port
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -23,7 +59,7 @@ fn find_available_port() -> Result<u16, Error> {
     Ok(port)
 }
 
-pub fn proxy_wait_for_ready(pgcache: &mut Child) -> Result<(), String> {
+pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), String> {
     const NEEDLE: &str = "Listening to";
     //wait to listening message from proxy before proceeding
     let mut buf = BytesMut::new();
@@ -100,12 +136,12 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
     ))
 }
 
-pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(Child, Client), Error> {
+pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, Client), Error> {
     // Find a random available port
     let listen_port = find_available_port()?;
     let listen_socket = format!("127.0.0.1:{}", listen_port);
 
-    let mut pgcache = Command::new(env!("CARGO_BIN_EXE_pgcache"))
+    let child = Command::new(env!("CARGO_BIN_EXE_pgcache"))
         .arg("--config")
         .arg("tests/data/default_config.toml")
         .arg("--origin_host")
@@ -131,6 +167,8 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(Child, Client), Error> {
         .spawn()
         .expect("run pgcache");
 
+    let mut pgcache = PgCacheProcess::new(child);
+
     //wait to listening message from proxy before proceeding
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
 
@@ -141,10 +179,7 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(Child, Client), Error> {
         .dbname("origin_test")
         .connect(NoTls)
         .await
-        .map_err(|e| {
-            pgcache.wait().expect("exit_status");
-            Error::other(e)
-        })?;
+        .map_err(Error::other)?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -156,7 +191,7 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(Child, Client), Error> {
 }
 
 pub async fn query<T>(
-    pgcache: &mut Child,
+    _pgcache: &mut PgCacheProcess,
     client: &Client,
     statement: &T,
     params: &[&(dyn ToSql + Sync)],
@@ -164,27 +199,18 @@ pub async fn query<T>(
 where
     T: ?Sized + ToStatement,
 {
-    let rv = client.query(statement, params).await.map_err(|e| {
-        pgcache.kill().expect("pgcache killed");
-        pgcache.wait().expect("exit_status");
-        Error::other(e)
-    })?;
-
-    Ok(rv)
+    client
+        .query(statement, params)
+        .await
+        .map_err(Error::other)
 }
 
 pub async fn simple_query(
-    pgcache: &mut Child,
+    _pgcache: &mut PgCacheProcess,
     client: &Client,
     query: &str,
 ) -> Result<Vec<SimpleQueryMessage>, Error> {
-    let rv = client.simple_query(query).await.map_err(|e| {
-        pgcache.kill().expect("pgcache killed");
-        pgcache.wait().expect("exit_status");
-        Error::other(e)
-    })?;
-
-    Ok(rv)
+    client.simple_query(query).await.map_err(Error::other)
 }
 
 /// Wait for CDC events to be processed by the cache system
@@ -243,7 +269,7 @@ pub fn assert_row_at(
 /// - test: (1, 'foo'), (2, 'bar'), (3, 'baz')
 /// - test_map: (1, 1, 'alpha'), (2, 1, 'beta'), (3, 2, 'gamma')
 pub async fn setup_constraint_test_tables(
-    pgcache: &mut Child,
+    pgcache: &mut PgCacheProcess,
     client: &Client,
 ) -> Result<(), Error> {
     query(

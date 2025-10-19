@@ -58,9 +58,6 @@ async fn test_insert_matching_constraint() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
     assert_row_at(&res, 3, &[("id", "4"), ("test_id", "1"), ("data", "delta")])?;
 
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
-
     Ok(())
 }
 
@@ -108,9 +105,6 @@ async fn test_insert_non_matching_constraint() -> Result<(), Error> {
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("id", "1"), ("test_id", "1"), ("data", "alpha")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
-
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
 
     Ok(())
 }
@@ -162,9 +156,6 @@ async fn test_update_entering_result_set() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
     assert_row_at(&res, 3, &[("id", "3"), ("test_id", "1"), ("data", "gamma")])?;
 
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
-
     Ok(())
 }
 
@@ -212,9 +203,6 @@ async fn test_update_leaving_result_set() -> Result<(), Error> {
     // RowDescription + 1 data row + CommandComplete = 3
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
-
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
 
     Ok(())
 }
@@ -268,9 +256,6 @@ async fn test_update_non_join_column() -> Result<(), Error> {
         &[("id", "1"), ("test_id", "1"), ("data", "alpha_updated")],
     )?;
     assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
-
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
 
     Ok(())
 }

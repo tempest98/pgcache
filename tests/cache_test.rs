@@ -68,9 +68,6 @@ async fn test_cache() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("data", "foo")])?;
 
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
-
     Ok(())
 }
 
@@ -212,9 +209,6 @@ async fn test_cache_join() -> Result<(), Error> {
             ("map_data", "baz"),
         ],
     )?;
-
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
 
     Ok(())
 }

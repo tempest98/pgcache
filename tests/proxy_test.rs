@@ -35,7 +35,5 @@ async fn test_proxy() -> Result<(), Error> {
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
 
-    pgcache.kill().expect("command killed");
-    pgcache.wait().expect("exit_status");
     Ok(())
 }
