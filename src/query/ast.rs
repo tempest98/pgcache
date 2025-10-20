@@ -8,7 +8,7 @@ use error_set::error_set;
 use ordered_float::NotNan;
 use pg_query::ParseResult;
 use pg_query::protobuf::{ColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum};
-use pg_query::protobuf::{JoinExpr, RangeSubselect};
+use pg_query::protobuf::{JoinExpr, RangeSubselect, SortByDir};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
@@ -494,6 +494,7 @@ impl SelectStatement {
         let where_nodes = self.where_clause.iter().flat_map(|w| w.nodes());
         let group_by_nodes = self.group_by.iter().flat_map(|c| c.nodes());
         let having_nodes = self.having.iter().flat_map(|h| h.nodes());
+        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
         let values_nodes = self
             .values
             .iter()
@@ -504,6 +505,7 @@ impl SelectStatement {
             .chain(where_nodes)
             .chain(group_by_nodes)
             .chain(having_nodes)
+            .chain(order_by_nodes)
             .chain(values_nodes)
     }
 
@@ -602,7 +604,14 @@ impl Deparse for SelectStatement {
             }
 
             if !self.order_by.is_empty() {
-                todo!();
+                buf.push_str(" ORDER BY");
+                let mut sep = "";
+                for order in &self.order_by {
+                    buf.push_str(sep);
+                    buf.push(' ');
+                    order.deparse(buf);
+                    sep = ",";
+                }
             }
 
             if let Some(_limit) = &self.limit {
@@ -1040,10 +1049,57 @@ pub struct OrderByClause {
     pub direction: OrderDirection,
 }
 
+impl OrderByClause {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.expr.nodes();
+        Box::new(current.chain(children))
+    }
+}
+
+impl Deparse for OrderByClause {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.expr.deparse(buf);
+        buf.push(' ');
+        self.direction.deparse(buf);
+        buf
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum OrderDirection {
     Asc,
     Desc,
+}
+
+impl OrderDirection {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    }
+}
+
+impl Deparse for OrderDirection {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            OrderDirection::Asc => buf.push_str("ASC"),
+            OrderDirection::Desc => buf.push_str("DESC"),
+        }
+        buf
+    }
+}
+
+impl TryFrom<SortByDir> for OrderDirection {
+    type Error = AstError;
+
+    fn try_from(dir: SortByDir) -> Result<Self, Self::Error> {
+        match dir {
+            SortByDir::SortbyAsc | SortByDir::SortbyDefault => Ok(OrderDirection::Asc),
+            SortByDir::SortbyDesc => Ok(OrderDirection::Desc),
+            SortByDir::Undefined | SortByDir::SortbyUsing => Err(AstError::UnsupportedFeature {
+                feature: format!("ORDER BY direction: {dir:?}"),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -1080,9 +1136,10 @@ fn select_statement_convert(select_stmt: &SelectStmt) -> Result<SelectStatement,
     let from = from_clause_convert(&select_stmt.from_clause)?;
     let where_clause = select_stmt_parse_where(select_stmt)?;
     let values = value_list_convert(&select_stmt.values_lists)?;
+    let order_by = order_by_clause_convert(&select_stmt.sort_clause)?;
 
     // For now, only convert the features we need for basic caching
-    // TODO: Add GROUP BY, HAVING, ORDER BY, LIMIT when needed
+    // TODO: Add GROUP BY, HAVING, LIMIT when needed
 
     Ok(SelectStatement {
         columns,
@@ -1090,8 +1147,8 @@ fn select_statement_convert(select_stmt: &SelectStmt) -> Result<SelectStatement,
         where_clause,
         group_by: vec![], // TODO: Convert group_clause
         having: None,     // TODO: Convert having_clause
-        order_by: vec![], // TODO: Convert sort_clause
-        limit: None,      // TODO: Convert limit_count/limit_offset
+        order_by,
+        limit: None, // TODO: Convert limit_count/limit_offset
         distinct: !select_stmt.distinct_clause.is_empty(),
         values,
     })
@@ -1370,6 +1427,64 @@ fn column_ref_convert(col_ref: &ColumnRef) -> Result<ColumnNode, AstError> {
 
     let column = column.ok_or(AstError::InvalidTableRef)?;
     Ok(ColumnNode { table, column })
+}
+
+fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
+    match node.node.as_ref() {
+        Some(NodeEnum::ColumnRef(col_ref)) => {
+            let column = column_ref_convert(col_ref)?;
+            Ok(ColumnExpr::Column(column))
+        }
+        Some(NodeEnum::AConst(const_val)) => {
+            let value = const_value_extract(const_val)?;
+            Ok(ColumnExpr::Literal(value))
+        }
+        Some(NodeEnum::SubLink(sub_link)) => {
+            match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
+                Some(NodeEnum::SelectStmt(select_stmt)) => {
+                    let statement = select_statement_convert(select_stmt)?;
+                    Ok(ColumnExpr::Subquery(statement))
+                }
+                other => Err(AstError::UnsupportedFeature {
+                    feature: format!("Sublink type: {other:?}"),
+                }),
+            }
+        }
+        // TODO: Add support for function calls
+        other => Err(AstError::UnsupportedFeature {
+            feature: format!("Column expression node: {other:?}"),
+        }),
+    }
+}
+
+fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, AstError> {
+    let mut order_by = Vec::new();
+
+    for sort_node in sort_clause {
+        if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
+            let expr_node = sort_by
+                .node
+                .as_ref()
+                .ok_or(AstError::UnsupportedFeature {
+                    feature: "ORDER BY without expression".to_string(),
+                })?;
+
+            let expr = node_convert_to_column_expr(expr_node)?;
+            let direction = OrderDirection::try_from(SortByDir::try_from(sort_by.sortby_dir).map_err(
+                |_| AstError::UnsupportedFeature {
+                    feature: format!("Invalid SortByDir value: {}", sort_by.sortby_dir),
+                },
+            )?)?;
+
+            order_by.push(OrderByClause { expr, direction });
+        } else {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("ORDER BY node type: {sort_node:?}"),
+            });
+        }
+    }
+
+    Ok(order_by)
 }
 
 /// Create a fingerprint hash for SQL query AST.
@@ -2397,5 +2512,184 @@ mod tests {
         let columns: Vec<&ColumnNode> = multi.nodes().collect();
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].column, "id");
+    }
+
+    #[test]
+    fn test_order_by_simple_asc() {
+        let sql = "SELECT * FROM users ORDER BY name ASC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
+
+        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+            assert_eq!(col.column, "name");
+            assert_eq!(col.table, None);
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_simple_desc() {
+        let sql = "SELECT * FROM users ORDER BY age DESC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(select.order_by[0].direction, OrderDirection::Desc);
+
+        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+            assert_eq!(col.column, "age");
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_default_direction() {
+        let sql = "SELECT * FROM users ORDER BY name";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.order_by.len(), 1);
+        // Default direction should be ASC
+        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
+    }
+
+    #[test]
+    fn test_order_by_multiple_columns() {
+        let sql = "SELECT * FROM users ORDER BY last_name ASC, first_name DESC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.order_by.len(), 2);
+
+        // First ORDER BY clause
+        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
+        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+            assert_eq!(col.column, "last_name");
+        } else {
+            panic!("Expected column expression");
+        }
+
+        // Second ORDER BY clause
+        assert_eq!(select.order_by[1].direction, OrderDirection::Desc);
+        if let ColumnExpr::Column(col) = &select.order_by[1].expr {
+            assert_eq!(col.column, "first_name");
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_qualified_column() {
+        let sql = "SELECT * FROM users u ORDER BY u.name ASC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.order_by.len(), 1);
+
+        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+            assert_eq!(col.table, Some("u".to_string()));
+            assert_eq!(col.column, "name");
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_with_where() {
+        let sql = "SELECT * FROM users WHERE active = true ORDER BY name ASC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(select.where_clause.is_some());
+        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
+    }
+
+    #[test]
+    fn test_order_by_deparse_asc() {
+        let sql = "SELECT * FROM users ORDER BY name ASC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_order_by_deparse_desc() {
+        let sql = "SELECT * FROM users ORDER BY age DESC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_order_by_deparse_multiple() {
+        let sql = "SELECT * FROM users ORDER BY last_name ASC, first_name DESC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_order_by_round_trip() {
+        let queries = vec![
+            "SELECT * FROM users ORDER BY name ASC",
+            "SELECT * FROM users ORDER BY age DESC",
+            "SELECT id, name FROM users WHERE active = true ORDER BY created_at DESC",
+            "SELECT * FROM users ORDER BY last_name ASC, first_name ASC, id DESC",
+        ];
+
+        for sql in queries {
+            // Parse original
+            let pg_ast1 = pg_query::parse(sql).unwrap();
+            let ast1 = sql_query_convert(&pg_ast1).unwrap();
+
+            // Deparse to string
+            let mut deparsed = String::with_capacity(1024);
+            ast1.deparse(&mut deparsed);
+
+            // Parse deparsed version
+            let pg_ast2 = pg_query::parse(&deparsed).unwrap();
+            let ast2 = sql_query_convert(&pg_ast2).unwrap();
+
+            // Should be equivalent
+            assert_eq!(ast1, ast2, "Round trip failed for: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_order_by_nodes_extraction() {
+        let sql = "SELECT * FROM users ORDER BY u.name ASC, age DESC";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        // Extract OrderByClause nodes
+        let order_clauses: Vec<&OrderByClause> = ast.nodes().collect();
+        assert_eq!(order_clauses.len(), 2);
+
+        // Extract ColumnNode from ORDER BY
+        let columns: Vec<&ColumnNode> = ast.nodes().collect();
+        // Should find columns in ORDER BY clause
+        assert!(columns.iter().any(|c| c.column == "name"));
+        assert!(columns.iter().any(|c| c.column == "age"));
     }
 }

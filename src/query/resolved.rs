@@ -506,6 +506,23 @@ fn select_columns_resolve(
     }
 }
 
+/// Resolve ORDER BY clauses
+fn order_by_resolve(
+    order_by: &[crate::query::ast::OrderByClause],
+    scope: &ResolutionScope,
+) -> Result<Vec<ResolvedOrderByClause>, ResolveError> {
+    order_by
+        .iter()
+        .map(|clause| {
+            let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
+            Ok(ResolvedOrderByClause {
+                expr: resolved_expr,
+                direction: clause.direction.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Resolve a SELECT statement
 pub fn select_statement_resolve(
     stmt: &SelectStatement,
@@ -530,15 +547,18 @@ pub fn select_statement_resolve(
         .map(|w| where_expr_resolve(w, &scope))
         .transpose()?;
 
-    // TODO: Resolve GROUP BY, HAVING, ORDER BY, LIMIT
+    // Resolve ORDER BY clause
+    let resolved_order_by = order_by_resolve(&stmt.order_by, &scope)?;
+
+    // TODO: Resolve GROUP BY, HAVING, LIMIT
     Ok(ResolvedSelectStatement {
         columns: resolved_columns,
         from: resolved_from,
         where_clause: resolved_where,
         group_by: Vec::new(), // TODO
         having: None,         // TODO
-        order_by: Vec::new(), // TODO
-        limit: None,          // TODO
+        order_by: resolved_order_by,
+        limit: None, // TODO
         distinct: stmt.distinct,
         values: stmt.values.clone(),
     })
@@ -1011,5 +1031,174 @@ mod tests {
         } else {
             panic!("Expected binary WHERE expression");
         }
+    }
+
+    #[test]
+    fn test_order_by_simple() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users ORDER BY name ASC";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+
+        // Check ORDER BY was resolved
+        assert_eq!(resolved.order_by.len(), 1);
+        assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
+
+        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+            assert_eq!(col.schema, "public");
+            assert_eq!(col.table, "users");
+            assert_eq!(col.column, "name");
+            assert_eq!(col.column_metadata.type_name, "text");
+        } else {
+            panic!("Expected column expression in ORDER BY");
+        }
+    }
+
+    #[test]
+    fn test_order_by_multiple_columns() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users ORDER BY name ASC, id DESC";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+
+        // Check ORDER BY was resolved
+        assert_eq!(resolved.order_by.len(), 2);
+
+        // First column: name ASC
+        assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
+        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+            assert_eq!(col.column, "name");
+            assert_eq!(col.table, "users");
+        } else {
+            panic!("Expected column expression");
+        }
+
+        // Second column: id DESC
+        assert_eq!(resolved.order_by[1].direction, OrderDirection::Desc);
+        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[1].expr {
+            assert_eq!(col.column, "id");
+            assert_eq!(col.table, "users");
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_qualified_column() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users u ORDER BY u.name DESC";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+
+        // Check ORDER BY was resolved with qualified column
+        assert_eq!(resolved.order_by.len(), 1);
+        assert_eq!(resolved.order_by[0].direction, OrderDirection::Desc);
+
+        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+            // Should resolve to actual table name, not alias
+            assert_eq!(col.table, "users");
+            assert_eq!(col.column, "name");
+            assert_eq!(col.schema, "public");
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_with_join() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+
+        // Check ORDER BY was resolved across joined tables
+        assert_eq!(resolved.order_by.len(), 2);
+
+        // First: u.name ASC
+        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+            assert_eq!(col.table, "users");
+            assert_eq!(col.column, "name");
+        } else {
+            panic!("Expected column expression");
+        }
+
+        // Second: o.id DESC
+        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[1].expr {
+            assert_eq!(col.table, "orders");
+            assert_eq!(col.column, "id");
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_unqualified_column() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users ORDER BY name";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+
+        // Check unqualified ORDER BY column was resolved
+        assert_eq!(resolved.order_by.len(), 1);
+        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+            assert_eq!(col.table, "users");
+            assert_eq!(col.column, "name");
+        } else {
+            panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_column_not_found() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users ORDER BY nonexistent_column ASC";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let result = select_statement_resolve(stmt, &tables);
+
+        // Should fail with column not found error
+        assert!(matches!(result, Err(ResolveError::ColumnNotFound { .. })));
     }
 }
