@@ -100,6 +100,7 @@ pub enum DataStreamState {
 
 #[derive(Debug)]
 pub enum CacheReply {
+    Complete(BytesMut),
     Forward(BytesMut),
     Error(BytesMut),
 }
@@ -301,7 +302,16 @@ fn worker_run(
                     spawn_local(async move {
                         debug!("cache worker task spawn");
                         match worker.handle_cached_query(&mut msg).await {
-                            Ok(_) => (),
+                            Ok(_) => {
+                                if msg
+                                    .reply_tx
+                                    .send(CacheReply::Complete(msg.data))
+                                    .await
+                                    .is_err()
+                                {
+                                    error!("no receiver");
+                                }
+                            }
                             Err(e) => {
                                 error!("handle_cached_query failed {e}");
                                 if msg

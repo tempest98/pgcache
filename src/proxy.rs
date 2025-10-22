@@ -26,10 +26,12 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host, tcp::WriteHalf},
     runtime::Builder,
-    sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel},
+    sync::mpsc::{
+        Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+    },
     task::{LocalSet, spawn_local},
 };
-use tokio_stream::{Stream, StreamExt, StreamMap, wrappers::ReceiverStream};
+use tokio_stream::{Stream, StreamExt};
 use tokio_util::{
     bytes::{Buf, BytesMut},
     codec::FramedRead,
@@ -233,6 +235,7 @@ pub fn connection_run(
 #[derive(Debug)]
 enum ProxyMode {
     Read,
+    CacheRead(Receiver<CacheReply>), //waiting for repsonse from the cache
     OriginWrite(PgFrontendMessage),
     ClientWrite(PgBackendMessage),
     CacheWrite(CacheMessage),
@@ -249,7 +252,6 @@ enum ProxyStatus {
 enum StreamSource {
     ClientRead(PgFrontendMessage),
     OriginRead(PgBackendMessage),
-    CacheRead(CacheReply),
 }
 
 type StreamSourceResult = Result<StreamSource, ProtocolError>;
@@ -321,6 +323,7 @@ impl ConnectionState {
     /// If cache indicates error or needs forwarding, send query to origin instead.
     fn handle_cache_reply(&mut self, reply: CacheReply) {
         match reply {
+            CacheReply::Complete(_) => self.proxy_mode = ProxyMode::Read,
             CacheReply::Error(buf) | CacheReply::Forward(buf) => {
                 debug!("forwarding to origin");
                 self.proxy_mode = ProxyMode::OriginWrite(PgFrontendMessage {
@@ -343,8 +346,9 @@ async fn origin_connect(addrs: &[SocketAddr]) -> Result<TcpStream, ConnectionErr
     Err(ConnectionError::NoConnection)
 }
 
-type ProxyStreamMap<'a> =
-    StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult> + 'a>>>;
+// type ProxyStreamMap<'a> =
+//     StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult> + 'a>>>;
+type ProxyStreamMap<'a> = Pin<Box<dyn Stream<Item = StreamSourceResult> + 'a>>;
 
 /// Set up the stream map for multiplexing client and origin messages.
 fn streams_setup<'a>(
@@ -360,13 +364,15 @@ fn streams_setup<'a>(
     let client_mapped = client_framed_read.map(|item| item.map(StreamSource::ClientRead));
     let origin_mapped = origin_framed_read.map(|item| item.map(StreamSource::OriginRead));
 
-    let mut streams_read: StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult>>>> =
-        StreamMap::new();
+    let streams_read = client_mapped.merge(origin_mapped);
 
-    streams_read.insert("client", Box::pin(client_mapped));
-    streams_read.insert("origin", Box::pin(origin_mapped));
+    // let mut streams_read: StreamMap<&'static str, Pin<Box<dyn Stream<Item = StreamSourceResult>>>> =
+    //     StreamMap::new();
 
-    (streams_read, origin_write, client_write)
+    // streams_read.insert("client", Box::pin(client_mapped));
+    // streams_read.insert("origin", Box::pin(origin_mapped));
+
+    (Box::pin(streams_read), origin_write, client_write)
 }
 
 // SAFETY: fd has to refer to a valid TcpStream
@@ -402,16 +408,13 @@ async fn handle_connection(
     loop {
         match state.proxy_mode {
             ProxyMode::Read => {
-                if let Some((_, res)) = streams_read.next().await {
+                if let Some(res) = streams_read.next().await {
                     match res {
                         Ok(StreamSource::ClientRead(msg)) => {
                             state.handle_client_message(msg).await;
                         }
                         Ok(StreamSource::OriginRead(msg)) => {
                             state.handle_origin_message(msg);
-                        }
-                        Ok(StreamSource::CacheRead(reply)) => {
-                            state.handle_cache_reply(reply);
                         }
                         Err(err) => {
                             debug!("read error [{}]", err);
@@ -420,6 +423,11 @@ async fn handle_connection(
                     }
                 } else {
                     break;
+                }
+            }
+            ProxyMode::CacheRead(ref mut reply_rx) => {
+                if let Some(reply) = reply_rx.recv().await {
+                    state.handle_cache_reply(reply);
                 }
             }
             ProxyMode::OriginWrite(ref mut msg) => {
@@ -451,12 +459,7 @@ async fn handle_connection(
                 match cache_tx.send(proxy_msg).await {
                     Ok(()) => {
                         // Cache accepted the message, wait for reply via stream
-                        let stream_rx = Box::pin(
-                            ReceiverStream::new(reply_rx)
-                                .map(|item| Ok(StreamSource::CacheRead(item))),
-                        );
-                        streams_read.insert("cache_reply", stream_rx);
-                        state.proxy_mode = ProxyMode::Read;
+                        state.proxy_mode = ProxyMode::CacheRead(reply_rx);
                     }
                     Err(e) => {
                         // Cache is unavailable, fall back to proxying directly to origin
