@@ -3,13 +3,13 @@ use std::rc::Rc;
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::bytes::{BufMut, BytesMut};
-use tracing::{debug, instrument};
+use tracing::{debug, error, instrument, trace};
 
 use crate::pg::protocol::encode::*;
 use crate::query::ast::Deparse;
 use crate::settings::Settings;
 
-use super::*;
+use super::{query_cache::{QueryRequest, QueryType}, CacheError};
 
 #[derive(Debug, Clone)]
 pub struct CacheWorker {

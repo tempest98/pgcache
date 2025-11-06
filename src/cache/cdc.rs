@@ -22,9 +22,15 @@ use tokio_postgres::{Client, Config, Error, NoTls};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
 
-use crate::catalog::{ColumnMetadata, TableMetadata};
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tracing::{debug, error};
 
-use super::*;
+use crate::{catalog::{ColumnMetadata, TableMetadata}, settings::Settings};
+
+use super::{
+    messages::{CdcMessage, CdcMessageUpdate},
+    CacheError,
+};
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
 /// Processes replication messages and synchronizes changes with the cache database.

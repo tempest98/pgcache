@@ -4,12 +4,13 @@ use std::rc::Rc;
 
 use iddqd::BiHashMap;
 use postgres_protocol::escape;
-use tokio::{net::TcpStream, sync::mpsc::UnboundedSender};
+use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::{net::TcpStream};
 
 use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
-use tracing::{info, instrument, trace};
+use tracing::{error, info, instrument, trace};
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
@@ -22,7 +23,12 @@ use crate::query::transform::{
 };
 use crate::settings::Settings;
 
-use super::*;
+use super::{
+    messages::CacheReply,
+    query::CacheableQuery,
+    types::{Cache, CachedQuery, CachedQueryState, UpdateQueries, UpdateQuery},
+    CacheError,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryType {
