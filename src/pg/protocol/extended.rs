@@ -3,13 +3,26 @@ use tokio_util::bytes::{Buf, BytesMut};
 use super::ProtocolError;
 use crate::cache::query::CacheableQuery;
 
+/// Classification of a prepared statement based on SQL analysis
+#[derive(Debug, Clone)]
+pub enum StatementType {
+    /// SELECT statement that can be cached
+    Cacheable(Box<CacheableQuery>),
+    /// Non-SELECT statement (INSERT, UPDATE, DELETE, DDL, etc.)
+    NonSelect,
+    /// SELECT statement that cannot be cached (complex features)
+    UncacheableSelect,
+    /// Failed to parse the SQL
+    ParseError,
+}
+
 /// Prepared statement stored in connection state
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     pub name: String,
     pub sql: String,
     pub parameter_count: usize,
-    pub cacheable_query: Option<Box<CacheableQuery>>,
+    pub sql_type: StatementType,
 }
 
 /// Portal (bound prepared statement) stored in connection state

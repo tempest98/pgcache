@@ -5,6 +5,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::{error::Error, thread};
 
+use pgcache_lib::metrics::Metrics;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use pgcache_lib::tracing_utils::SimpeFormatter;
@@ -20,6 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .build();
 
     let settings = Settings::from_args()?;
+    let metrics = Arc::new(Metrics::new());
 
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
@@ -28,12 +30,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let sigint = Arc::new(AtomicBool::new(false));
+    let sigusr1 = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))?;
+    signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&sigusr1))?;
 
     thread::scope(|scope| {
         let proxy_handle = thread::Builder::new()
             .name("proxy".to_owned())
-            .spawn_scoped(scope, || proxy_run(&settings))?;
+            .spawn_scoped(scope, || proxy_run(&settings, metrics.clone()))?;
 
         let sleep_duration = Duration::from_millis(500);
 
@@ -50,9 +54,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .map_err(|e| Box::new(e) as Box<dyn Error>);
                 break;
             }
+
+            if sigusr1.load(Ordering::Relaxed) {
+                sigusr1.store(false, Ordering::Relaxed);
+                let snapshot = metrics.snapshot();
+                info!("metrics: {}", snapshot);
+            }
+
             sleep(sleep_duration);
         }
         info!("process terminating {res:?}");
+
+        // Log final metrics
+        let snapshot = metrics.snapshot();
+        info!("Final metrics: {}", snapshot);
 
         // print the report.
         #[cfg(feature = "hotpath")]

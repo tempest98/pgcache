@@ -6,21 +6,23 @@ use std::{
     net::SocketAddr,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
+    sync::Arc,
     thread,
 };
 
 use crate::{
     cache::{CacheMessage, CacheReply, ProxyMessage, cache_run, query::CacheableQuery},
+    metrics::Metrics,
     pg::protocol::{
         ProtocolError,
         backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
         extended::{
-            ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, parse_bind_message,
-            parse_close_message, parse_execute_message, parse_parse_message,
+            ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, StatementType,
+            parse_bind_message, parse_close_message, parse_execute_message, parse_parse_message,
         },
         frontend::{PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType},
     },
-    query::ast::sql_query_convert,
+    query::ast::{AstError, sql_query_convert},
     settings::Settings,
 };
 
@@ -88,11 +90,12 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     cache_tx: SenderCacheType,
+    metrics: Arc<Metrics>,
 ) -> Result<Worker<'scope>, ConnectionError> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
-        .spawn_scoped(scope, || connection_run(settings, rx, cache_tx))?;
+        .spawn_scoped(scope, || connection_run(settings, rx, cache_tx, metrics))?;
 
     Ok((join, tx))
 }
@@ -109,9 +112,10 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     cache_tx: SenderCacheType,
+    metrics: Arc<Metrics>,
 ) -> Result<WorkerStatus, ConnectionError> {
     if workers[worker_index].0.is_finished() {
-        let new_worker = worker_create(worker_index, scope, settings, cache_tx)?;
+        let new_worker = worker_create(worker_index, scope, settings, cache_tx, metrics)?;
         let old_worker = mem::replace(&mut workers[worker_index], new_worker);
         match old_worker.0.join() {
             Ok(Err(ConnectionError::CacheDead)) => Ok(WorkerStatus::CacheDead),
@@ -143,12 +147,12 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
 
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
+pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), ConnectionError> {
     thread::scope(|scope| {
         let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
 
         let mut workers: Vec<_> = (0..settings.num_workers)
-            .map(|i| worker_create(i, scope, settings, cache_tx.clone()))
+            .map(|i| worker_create(i, scope, settings, cache_tx.clone(), metrics.clone()))
             .collect::<Result<Vec<_>, _>>()?;
 
         let rt = Builder::new_current_thread().enable_all().build()?;
@@ -177,6 +181,7 @@ pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
                     scope,
                     settings,
                     cache_tx.clone(),
+                    metrics.clone(),
                 )?;
 
                 if matches!(status, WorkerStatus::CacheDead) {
@@ -202,6 +207,7 @@ pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
     cache_tx: SenderCacheType,
+    metrics: Arc<Metrics>,
 ) -> Result<(), ConnectionError> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 
@@ -217,9 +223,10 @@ pub fn connection_run(
                 while let Some(mut socket) = rx.recv().await {
                     let addrs = addrs.clone();
                     let cache_tx = cache_tx.clone();
+                    let metrics = metrics.clone();
                     spawn_local(async move {
                         debug!("task spawn");
-                        match handle_connection(&mut socket, addrs, cache_tx).await {
+                        match handle_connection(&mut socket, addrs, cache_tx, metrics).await {
                             Err(ConnectionError::CacheDead) => {
                                 debug!("connection closed in degraded mode");
                                 return Err(Error::other("cache dead"));
@@ -265,7 +272,7 @@ struct ConnectionState {
     client_write_buf: VecDeque<BytesMut>,
 
     /// Cache of query fingerprints to cacheability decisions
-    fingerprint_cache: HashMap<u64, Option<Box<CacheableQuery>>>,
+    fingerprint_cache: HashMap<u64, Result<Box<CacheableQuery>, ForwardReason>>,
 
     /// Whether the connection is currently in a transaction
     in_transaction: bool,
@@ -284,10 +291,13 @@ struct ConnectionState {
 
     /// Extended protocol: portals (bound statements) by name
     portals: HashMap<String, Portal>,
+
+    /// Metrics collector for tracking query and cache performance
+    metrics: Arc<Metrics>,
 }
 
 impl ConnectionState {
-    fn new(client_fd_dup: OwnedFd) -> Self {
+    fn new(client_fd_dup: OwnedFd, metrics: Arc<Metrics>) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
             client_write_buf: VecDeque::new(),
@@ -298,6 +308,7 @@ impl ConnectionState {
             client_fd_dup,
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
+            metrics,
         }
     }
 
@@ -306,10 +317,21 @@ impl ConnectionState {
     async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
         match msg.message_type {
             PgFrontendMessageType::Query => {
+                self.metrics.query_increment();
+
                 if !self.in_transaction {
                     self.proxy_mode =
                         match handle_query(&msg.data, &mut self.fingerprint_cache).await {
-                            Ok(Action::Forward) => {
+                            Ok(Action::Forward(reason)) => {
+                                match reason {
+                                    ForwardReason::UnsupportedStatement => {
+                                        self.metrics.unsupported_increment()
+                                    }
+                                    ForwardReason::UncacheableSelect => {
+                                        self.metrics.uncacheable_increment()
+                                    }
+                                    ForwardReason::Invalid => self.metrics.invalid_increment(),
+                                }
                                 self.origin_write_buf.push_back(msg.data);
                                 ProxyMode::Read
                             }
@@ -317,12 +339,15 @@ impl ConnectionState {
                                 ProxyMode::CacheWrite(CacheMessage::Query(msg.data, ast))
                             }
                             Err(e) => {
+                                self.metrics.uncacheable_increment();
+                                self.metrics.invalid_increment();
                                 error!("handle_query {}", e);
                                 self.origin_write_buf.push_back(msg.data);
                                 ProxyMode::Read
                             }
                         };
                 } else {
+                    self.metrics.uncacheable_increment();
                     self.origin_write_buf.push_back(msg.data);
                 }
             }
@@ -378,8 +403,18 @@ impl ConnectionState {
     /// If cache indicates error or needs forwarding, send query to origin instead.
     fn handle_cache_reply(&mut self, reply: CacheReply) {
         match reply {
-            CacheReply::Complete(_) => self.proxy_mode = ProxyMode::Read,
-            CacheReply::Error(buf) | CacheReply::Forward(buf) => {
+            CacheReply::Complete(_) => {
+                self.metrics.cache_hit_increment();
+                self.proxy_mode = ProxyMode::Read;
+            }
+            CacheReply::Error(buf) => {
+                self.metrics.cache_error_increment();
+                debug!("forwarding to origin");
+                self.origin_write_buf.push_back(buf);
+                self.proxy_mode = ProxyMode::Read;
+            }
+            CacheReply::Forward(buf) => {
+                self.metrics.cache_miss_increment();
                 debug!("forwarding to origin");
                 self.origin_write_buf.push_back(buf);
                 self.proxy_mode = ProxyMode::Read;
@@ -390,14 +425,19 @@ impl ConnectionState {
     /// Handle Parse message - analyze cacheability, store prepared statement, and forward to origin.
     fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_parse_message(&msg.data) {
-            // Analyze cacheability (regardless of transaction state - deferred to Execute)
-            let cacheable_query = pg_query::parse(&parsed.sql)
-                .ok()
-                .and_then(|ast| sql_query_convert(&ast).ok())
-                .and_then(|query| CacheableQuery::try_from(&query).ok())
-                .map(Box::new);
+            // Analyze SQL type (regardless of transaction state - deferred to Execute)
+            let sql_type = match pg_query::parse(&parsed.sql) {
+                Ok(ast) => match sql_query_convert(&ast) {
+                    Ok(query) => match CacheableQuery::try_from(&query) {
+                        Ok(cacheable_query) => StatementType::Cacheable(Box::new(cacheable_query)),
+                        Err(_) => StatementType::UncacheableSelect,
+                    },
+                    Err(_) => StatementType::NonSelect,
+                },
+                Err(_) => StatementType::ParseError,
+            };
 
-            self.statement_store(parsed, cacheable_query);
+            self.statement_store(parsed, sql_type);
         }
         self.origin_write_buf.push_back(msg.data);
     }
@@ -412,9 +452,25 @@ impl ConnectionState {
 
     /// Handle Execute message - check cache for cacheable parameterized queries, otherwise forward to origin.
     fn handle_execute_message(&mut self, msg: PgFrontendMessage) {
+        self.metrics.query_increment();
+
         self.proxy_mode = match self.try_cache_execute(&msg) {
             Some(cache_msg) => ProxyMode::CacheWrite(cache_msg),
             None => {
+                self.metrics.uncacheable_increment();
+
+                // Track statement type for metrics
+                if let Ok(parsed) = parse_execute_message(&msg.data)
+                    && let Some(portal) = self.portals.get(&parsed.portal_name)
+                    && let Some(stmt) = self.prepared_statements.get(&portal.statement_name)
+                {
+                    match &stmt.sql_type {
+                        StatementType::NonSelect => self.metrics.unsupported_increment(),
+                        StatementType::ParseError => self.metrics.invalid_increment(),
+                        _ => {} // Cacheable or UncacheableSelect
+                    }
+                }
+
                 self.origin_write_buf.push_back(msg.data);
                 ProxyMode::Read
             }
@@ -444,8 +500,11 @@ impl ConnectionState {
         // Look up prepared statement
         let stmt = self.prepared_statements.get(&portal.statement_name)?;
 
-        // Check if cacheable
-        let cacheable_query = stmt.cacheable_query.as_ref()?.clone();
+        // Check if cacheable - extract CacheableQuery from StatementType
+        let cacheable_query = match &stmt.sql_type {
+            StatementType::Cacheable(query) => query.clone(),
+            _ => return None,
+        };
 
         // All checks passed - use cache
         Some(CacheMessage::QueryParameterized(
@@ -478,16 +537,12 @@ impl ConnectionState {
     }
 
     /// Store a prepared statement in connection state.
-    fn statement_store(
-        &mut self,
-        parsed: ParsedParseMessage,
-        cacheable_query: Option<Box<CacheableQuery>>,
-    ) {
+    fn statement_store(&mut self, parsed: ParsedParseMessage, sql_type: StatementType) {
         let stmt = PreparedStatement {
             name: parsed.statement_name.clone(),
             sql: parsed.sql,
             parameter_count: parsed.parameter_oids.len(),
-            cacheable_query,
+            sql_type,
         };
         debug!("parsed statement insert {}", parsed.statement_name);
         self.prepared_statements
@@ -690,6 +745,7 @@ async fn handle_connection(
     client_stream: &mut TcpStream,
     addrs: Vec<SocketAddr>,
     cache_tx: SenderCacheType,
+    metrics: Arc<Metrics>,
 ) -> Result<(), ConnectionError> {
     // Connect to origin database
     let mut origin_stream = origin_connect(&addrs).await?;
@@ -700,7 +756,7 @@ async fn handle_connection(
 
     // Initialize connection state
     let client_fd_dup = dup(&client_stream)?;
-    let mut state = ConnectionState::new(client_fd_dup);
+    let mut state = ConnectionState::new(client_fd_dup, metrics);
 
     // Set up streams
     let (origin_read, client_read, origin_write, client_write) =
@@ -741,6 +797,8 @@ async fn handle_connection(
                 }
             }
             ProxyMode::CacheWrite(msg) => {
+                state.metrics.cacheable_increment();
+
                 if matches!(msg, CacheMessage::QueryParameterized(_, _, _)) {
                     //send a flush to orgin
                     let data = BytesMut::from([b'H', 0, 0, 0, 4u8].as_ref());
@@ -787,15 +845,22 @@ async fn handle_connection(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ForwardReason {
+    UnsupportedStatement,
+    UncacheableSelect,
+    Invalid,
+}
+
 enum Action {
-    Forward,
+    Forward(ForwardReason),
     CacheCheck(Box<CacheableQuery>),
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_query(
     data: &BytesMut,
-    fp_cache: &mut HashMap<u64, Option<Box<CacheableQuery>>>,
+    fp_cache: &mut HashMap<u64, Result<Box<CacheableQuery>, ForwardReason>>,
 ) -> Result<Action, ParseError> {
     let msg_len = (&data[1..5]).get_u32() as usize;
     let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
@@ -805,25 +870,48 @@ async fn handle_query(
     let fingerprint = hasher.finish();
 
     match fp_cache.get(&fingerprint) {
-        Some(Some(cacheable_query)) => {
+        Some(Ok(cacheable_query)) => {
             trace!("cache hit: cacheable true");
             Ok(Action::CacheCheck(cacheable_query.clone()))
         }
-        Some(None) => {
+        Some(Err(reason)) => {
             trace!("cache hit: cacheable false");
-            Ok(Action::Forward)
+            Ok(Action::Forward(*reason))
         }
         None => {
             let ast = pg_query::parse(query)?;
 
-            if let Ok(query) = sql_query_convert(&ast)
-                && let Ok(cacheable_query) = CacheableQuery::try_from(&query)
-            {
-                fp_cache.insert(fingerprint, Some(Box::new(cacheable_query.clone())));
-                Ok(Action::CacheCheck(Box::new(cacheable_query)))
-            } else {
-                fp_cache.insert(fingerprint, None);
-                Ok(Action::Forward)
+            match sql_query_convert(&ast) {
+                Ok(query) => {
+                    // Successfully parsed as SELECT
+                    if let Ok(cacheable_query) = CacheableQuery::try_from(&query) {
+                        fp_cache.insert(fingerprint, Ok(Box::new(cacheable_query.clone())));
+                        Ok(Action::CacheCheck(Box::new(cacheable_query)))
+                    } else {
+                        let reason = ForwardReason::UncacheableSelect;
+                        fp_cache.insert(fingerprint, Err(reason));
+                        Ok(Action::Forward(reason))
+                    }
+                }
+                Err(ast_error) => {
+                    let reason = match ast_error {
+                        AstError::UnsupportedStatement { .. } => {
+                            // Not a SELECT statement (INSERT, UPDATE, DELETE, DDL, etc.)
+                            ForwardReason::UnsupportedStatement
+                        }
+                        AstError::UnsupportedSelectFeature { .. }
+                        | AstError::UnsupportedFeature { .. }
+                        | AstError::UnsupportedJoinType
+                        | AstError::WhereParseError(_) => ForwardReason::UncacheableSelect,
+                        AstError::MultipleStatements
+                        | AstError::MissingStatement
+                        | AstError::InvalidTableRef => ForwardReason::Invalid,
+                    };
+
+                    fp_cache.insert(fingerprint, Err(reason));
+
+                    Ok(Action::Forward(reason))
+                }
             }
         }
     }
