@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
-    io::Error,
-    io::Read,
+    io::{Error, Read, Write, stdout},
     net::TcpListener,
     ops::{Deref, DerefMut},
     process::{Child, Command, Stdio},
@@ -33,6 +32,9 @@ impl Drop for PgCacheProcess {
         // We ignore errors here because the process might already be dead
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        //drain stdout
+        let _ = std::io::copy(&mut self.stdout.as_mut().unwrap(), &mut stdout());
     }
 }
 
@@ -59,7 +61,7 @@ fn find_available_port() -> Result<u16, Error> {
     Ok(port)
 }
 
-pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), String> {
+pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
     const NEEDLE: &str = "Listening to";
     //wait to listening message from proxy before proceeding
     let mut buf = BytesMut::new();
@@ -72,8 +74,9 @@ pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), String> 
         }
         let cnt = stdout.read(&mut read_buf).unwrap_or_default();
         if cnt == 0 {
-            return Err("Unexpected end of stdout".to_owned());
+            return Err(Error::other("Unexpected end of stdout"));
         }
+        std::io::stdout().write_all(&read_buf[0..cnt])?;
         buf.extend_from_slice(&read_buf[0..cnt]);
     }
     pgcache.stdout = Some(stdout);
@@ -199,10 +202,7 @@ pub async fn query<T>(
 where
     T: ?Sized + ToStatement,
 {
-    client
-        .query(statement, params)
-        .await
-        .map_err(Error::other)
+    client.query(statement, params).await.map_err(Error::other)
 }
 
 pub async fn simple_query(
