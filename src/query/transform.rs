@@ -277,10 +277,14 @@ pub fn query_table_replace_with_values(
         }
         alias
     } else {
-        TableAlias {
+        let mut alias = TableAlias {
             name: table_metadata.name.clone(),
             columns: Vec::new(),
+        };
+        for name in column_names {
+            alias.columns.push(name.to_owned());
         }
+        alias
     };
 
     *source_node = TableSource::Subquery(TableSubqueryNode {

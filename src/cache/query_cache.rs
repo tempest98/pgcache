@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use iddqd::BiHashMap;
 use postgres_protocol::escape;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
-use tokio::{net::TcpStream};
 
 use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
@@ -24,10 +24,10 @@ use crate::query::transform::{
 use crate::settings::Settings;
 
 use super::{
+    CacheError,
     messages::CacheReply,
     query::CacheableQuery,
     types::{Cache, CachedQuery, CachedQueryState, UpdateQueries, UpdateQuery},
-    CacheError,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -789,6 +789,11 @@ impl QueryCache {
 
             // Check if this is an INSERT (row_changes is None)
             if row_changes.is_none() {
+                // If it is not a join then no need to invalidate
+                if update_query.query.is_single_table() {
+                    continue;
+                }
+
                 // For INSERTs: Check if new row matches all table constraints
                 // If it doesn't match, the row won't appear in results, no invalidation needed
                 if let Some(constraints) = cached_query

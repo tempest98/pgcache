@@ -3,13 +3,16 @@ use std::rc::Rc;
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::bytes::{BufMut, BytesMut};
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument};
 
 use crate::pg::protocol::encode::*;
 use crate::query::ast::Deparse;
 use crate::settings::Settings;
 
-use super::{query_cache::{QueryRequest, QueryType}, CacheError};
+use super::{
+    CacheError,
+    query_cache::{QueryRequest, QueryType},
+};
 
 #[derive(Debug, Clone)]
 pub struct CacheWorker {
@@ -58,7 +61,7 @@ impl CacheWorker {
 
         if msg.query_type == QueryType::Simple {
             row_description_encode(desc, &mut buf);
-            trace!("(w) client write {:?}", buf);
+            // trace!("(w) client write {:?}", buf);
             if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
                 error!("no client");
                 return Err(CacheError::Write);
@@ -86,13 +89,13 @@ impl CacheWorker {
             if buf.len() > BUFFER_SIZE_THRESHOLD
                 && msg.client_socket.write_all_buf(&mut buf).await.is_err()
             {
-                trace!("(w) client write data");
+                // trace!("(w) client write data");
 
                 error!("no client");
                 return Err(CacheError::Write);
             }
         }
-        trace!("(w) client write data");
+        // trace!("(w) client write data");
         if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
             return Err(CacheError::Write);
@@ -109,7 +112,7 @@ impl CacheWorker {
             ready_for_query_encode(&mut buf);
         }
 
-        trace!("(w) client write {:?}", buf);
+        // trace!("(w) client write {:?}", buf);
         if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
             return Err(CacheError::Write);

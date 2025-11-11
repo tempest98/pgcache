@@ -541,7 +541,7 @@ impl ConnectionState {
             Some(res) = client_read.next() => {
                 match res {
                     Ok(msg) => {
-                        trace!("client read {:?}", msg.data);
+                        // trace!("client read {:?}", msg.data);
                         self.handle_client_message(msg).await;
                     }
                     Err(err) => {
@@ -553,7 +553,7 @@ impl ConnectionState {
             Some(res) = origin_read.next() => {
                 match res {
                     Ok(msg) => {
-                        trace!("origin read {:?}", msg.data);
+                        // trace!("origin read {:?}", msg.data);
                         self.handle_origin_message(msg);
                     }
                     Err(err) => {
@@ -563,14 +563,14 @@ impl ConnectionState {
                 }
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
-                trace!("origin write {:?}", self.origin_write_buf[0]);
+                // trace!("origin write {:?}", self.origin_write_buf[0]);
                 origin_write.write_buf(&mut self.origin_write_buf[0]).await?;
                 if !self.origin_write_buf[0].has_remaining() {
                     self.origin_write_buf.pop_front();
                 }
             }
             _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
-                trace!("client write {:?}", self.client_write_buf[0]);
+                // trace!("client write {:?}", self.client_write_buf[0]);
                 client_write.write_buf(&mut self.client_write_buf[0]).await?;
                 if !self.client_write_buf[0].has_remaining() {
                     self.client_write_buf.pop_front();
@@ -600,7 +600,7 @@ impl ConnectionState {
             Some(res) = origin_read.next() => {
                 match res {
                     Ok(msg) => {
-                        trace!("origin read {:?}", msg.data);
+                        // trace!("origin read {:?}", msg.data);
                         self.handle_origin_message(msg);
                     }
                     Err(err) => {
@@ -614,14 +614,14 @@ impl ConnectionState {
                 self.handle_cache_reply(reply);
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
-                trace!("origin write {:?}", self.origin_write_buf[0]);
+                // trace!("origin write {:?}", self.origin_write_buf[0]);
                 origin_write.write_buf(&mut self.origin_write_buf[0]).await?;
                 if !self.origin_write_buf[0].has_remaining() {
                     self.origin_write_buf.pop_front();
                 }
             }
             _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
-                trace!("client write {:?}", self.client_write_buf[0]);
+                // trace!("client write {:?}", self.client_write_buf[0]);
                 client_write.write_buf(&mut self.client_write_buf[0]).await?;
                 if !self.client_write_buf[0].has_remaining() {
                     self.client_write_buf.pop_front();

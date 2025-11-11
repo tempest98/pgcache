@@ -220,6 +220,13 @@ pub async fn wait_for_cdc() {
     sleep(Duration::from_millis(250)).await;
 }
 
+/// Wait for queries to be loaded into cache
+/// Uses a short sleep to allow cache to load
+pub async fn wait_cache_load() {
+    // TODO: Replace with proper synchronization mechanism (polling, notification, etc.)
+    sleep(Duration::from_millis(250)).await;
+}
+
 /// Extract a row from SimpleQueryMessage results at the specified index
 /// Returns an error with context if the message at that index is not a Row
 pub fn extract_row(

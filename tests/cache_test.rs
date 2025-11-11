@@ -1,13 +1,14 @@
 use std::io::Error;
 
 use crate::util::{
-    assert_row_at, connect_pgcache, query, simple_query, start_databases, wait_for_cdc,
+    assert_row_at, connect_pgcache, query, simple_query, start_databases, wait_cache_load,
+    wait_for_cdc,
 };
 
 mod util;
 
 #[tokio::test]
-async fn test_cache() -> Result<(), Error> {
+async fn test_cache_simple() -> Result<(), Error> {
     let (dbs, origin) = start_databases().await?;
     let (mut pgcache, client) = connect_pgcache(&dbs).await?;
 
@@ -36,6 +37,8 @@ async fn test_cache() -> Result<(), Error> {
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
+
+    wait_cache_load().await;
 
     let res = simple_query(
         &mut pgcache,

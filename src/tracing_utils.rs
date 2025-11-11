@@ -27,13 +27,13 @@ where
 
         write!(
             &mut writer,
-            "[{}]\t{} {}: ",
+            "[{}]\t{} {} {}\t{}: ",
             metadata.level(),
             Style::new()
                 .bold()
                 .paint(thread::current().name().unwrap_or_default()),
-            // metadata.file().unwrap_or_default(),
-            // metadata.line().unwrap_or_default(),
+            metadata.file().unwrap_or_default(),
+            metadata.line().unwrap_or_default(),
             Color::Fixed(12).paint(span_name),
         )?;
 
