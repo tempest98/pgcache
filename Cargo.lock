@@ -744,15 +744,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "err_trail"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd07fd8b9b9a8ed762d905184c29d418a88296c2cff36d934004dd93569ae443"
-dependencies = [
- "tracing",
-]
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1656,7 +1647,6 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "criterion",
- "err_trail",
  "error_set",
  "hotpath",
  "iddqd",
@@ -1671,6 +1661,7 @@ dependencies = [
  "postgres-protocol 0.6.8",
  "postgres-replication",
  "postgres-types 0.2.9",
+ "regex-lite",
  "serde",
  "signal-hook",
  "strum",

@@ -25,11 +25,14 @@ use tokio_util::bytes::Bytes;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error};
 
-use crate::{catalog::{ColumnMetadata, TableMetadata}, settings::Settings};
+use crate::{
+    catalog::{ColumnMetadata, TableMetadata},
+    settings::Settings,
+};
 
 use super::{
-    messages::{CdcMessage, CdcMessageUpdate},
     CacheError,
+    messages::{CdcMessage, CdcMessageUpdate},
 };
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
@@ -314,6 +317,7 @@ impl CdcProcessor {
 
     /// Processes insert messages with query-aware filtering.
     async fn process_insert(&mut self, body: &InsertBody) -> Result<(), Error> {
+        debug!("-----------process_insert");
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table

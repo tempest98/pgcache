@@ -8,8 +8,14 @@ use std::{
     time::Duration,
 };
 
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+use pgcache_lib::metrics::MetricsSnapshot;
 use pgtemp::{PgTempDB, PgTempDBBuilder};
 use postgres_types::ToSql;
+use regex_lite::Regex;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, ToStatement};
 use tokio_util::bytes::{Buf, BytesMut};
@@ -63,7 +69,7 @@ fn find_available_port() -> Result<u16, Error> {
 
 pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
     const NEEDLE: &str = "Listening to";
-    //wait to listening message from proxy before proceeding
+    //wait for listening message from proxy before proceeding
     let mut buf = BytesMut::new();
     let mut read_buf = [0u8; 1024];
 
@@ -82,6 +88,82 @@ pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
     pgcache.stdout = Some(stdout);
 
     Ok(())
+}
+
+pub fn proxy_metrics_get(pgcache: &mut PgCacheProcess) -> Result<MetricsSnapshot, Error> {
+    kill(Pid::from_raw(pgcache.child.id() as i32), Signal::SIGUSR1).unwrap();
+
+    const NEEDLE: &str = "metrics:";
+    let mut buf = BytesMut::new();
+    let mut read_buf = [0u8; 1024];
+
+    let mut stdout = pgcache.stdout.take().unwrap();
+    while !String::from_utf8_lossy(&buf).contains(NEEDLE) {
+        if buf.len() > NEEDLE.len() {
+            buf.advance(buf.len() - NEEDLE.len());
+        }
+        let cnt = stdout.read(&mut read_buf).unwrap_or_default();
+        if cnt == 0 {
+            return Err(Error::other("Unexpected end of stdout"));
+        }
+        std::io::stdout().write_all(&read_buf[0..cnt])?;
+        buf.extend_from_slice(&read_buf[0..cnt]);
+    }
+
+    const END: &str = "metrics end";
+    while !String::from_utf8_lossy(&buf).contains(END) {
+        let cnt = stdout.read(&mut read_buf).unwrap_or_default();
+        if cnt == 0 {
+            return Err(Error::other("Unexpected end of stdout"));
+        }
+        std::io::stdout().write_all(&read_buf[0..cnt])?;
+        buf.extend_from_slice(&read_buf[0..cnt]);
+    }
+
+    let re = Regex::new(NEEDLE).unwrap();
+    let str = String::from_utf8_lossy(&buf);
+    let mat = re.find(&str).unwrap();
+    buf.advance(mat.end());
+
+    pgcache.stdout = Some(stdout);
+
+    let mut metrics = MetricsSnapshot {
+        queries_total: 0,
+        queries_cacheable: 0,
+        queries_uncacheable: 0,
+        queries_unsupported: 0,
+        queries_invalid: 0,
+        queries_cache_hit: 0,
+        queries_cache_miss: 0,
+        queries_cache_error: 0,
+        cache_hit_rate: 0.0,
+        cacheability_rate: 0.0,
+    };
+
+    let re = Regex::new(r"([a-z_]+)=([0-9.]+)").unwrap();
+    for (_, [name, value]) in re
+        .captures_iter(&String::from_utf8_lossy(&buf))
+        .map(|c| c.extract())
+    {
+        match name {
+            "queries_total" => metrics.queries_total = value.parse().unwrap(),
+            "queries_cacheable" => metrics.queries_cacheable = value.parse().unwrap(),
+            "queries_uncacheable" => metrics.queries_uncacheable = value.parse().unwrap(),
+            "queries_unsupported" => metrics.queries_unsupported = value.parse().unwrap(),
+            "queries_invalid" => metrics.queries_invalid = value.parse().unwrap(),
+            "queries_cache_hit" => metrics.queries_cache_hit = value.parse().unwrap(),
+            "queries_cache_miss" => metrics.queries_cache_miss = value.parse().unwrap(),
+            "queries_cache_error" => metrics.queries_cache_error = value.parse().unwrap(),
+            "cache_hit_rate" => metrics.cache_hit_rate = value.parse().unwrap(),
+            "cacheability_rate" => metrics.cacheability_rate = value.parse().unwrap(),
+            name => {
+                dbg!(name);
+                todo!();
+            }
+        }
+    }
+
+    Ok(metrics)
 }
 
 pub struct TempDBs {

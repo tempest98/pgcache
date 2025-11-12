@@ -1,8 +1,8 @@
 use std::io::Error;
 
 use crate::util::{
-    assert_row_at, connect_pgcache, query, simple_query, start_databases, wait_cache_load,
-    wait_for_cdc,
+    assert_row_at, connect_pgcache, proxy_metrics_get, query, simple_query, start_databases,
+    wait_cache_load, wait_for_cdc,
 };
 
 mod util;
@@ -71,6 +71,14 @@ async fn test_cache_simple() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("data", "foo")])?;
 
+    let metrics = proxy_metrics_get(&mut pgcache).map_err(Error::other)?;
+    assert_eq!(metrics.queries_total, 5);
+    assert_eq!(metrics.queries_cacheable, 3);
+    assert_eq!(metrics.queries_uncacheable, 2);
+    assert_eq!(metrics.queries_unsupported, 2);
+    assert_eq!(metrics.queries_cache_hit, 2);
+    assert_eq!(metrics.queries_cache_miss, 1);
+
     Ok(())
 }
 
@@ -117,12 +125,16 @@ async fn test_cache_join() -> Result<(), Error> {
     )
     .await?;
 
+    wait_for_cdc().await;
+
     let query_str = "select t.id, t.data as test_data, tm.test_id, tm.data as map_data \
         from test t join test_map tm on tm.test_id = t.id where t.id = 1
         order by tm.id;";
 
     // First query to populate cache
     let _ = simple_query(&mut pgcache, &client, query_str).await?;
+
+    wait_cache_load().await;
 
     // Second query should hit cache
     let res = simple_query(&mut pgcache, &client, query_str).await?;
@@ -180,7 +192,7 @@ async fn test_cache_join() -> Result<(), Error> {
 
     // Query after CDC should still return correct results
     let res = simple_query(&mut pgcache, &client, query_str).await?;
-
+    dbg!(&res);
     assert_eq!(res.len(), 5);
     assert_row_at(
         &res,
@@ -212,6 +224,15 @@ async fn test_cache_join() -> Result<(), Error> {
             ("map_data", "baz"),
         ],
     )?;
+
+    let metrics = proxy_metrics_get(&mut pgcache).map_err(Error::other)?;
+    assert_eq!(metrics.queries_total, 7);
+    assert_eq!(metrics.queries_cacheable, 3);
+    assert_eq!(metrics.queries_uncacheable, 4);
+    assert_eq!(metrics.queries_unsupported, 4);
+    assert_eq!(metrics.queries_invalid, 0);
+    assert_eq!(metrics.queries_cache_hit, 1);
+    assert_eq!(metrics.queries_cache_miss, 2);
 
     Ok(())
 }

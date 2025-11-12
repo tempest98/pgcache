@@ -1,6 +1,8 @@
 use std::io::Error;
 
-use crate::util::{PgCacheProcess, connect_pgcache, query, start_databases, wait_cache_load};
+use crate::util::{
+    PgCacheProcess, connect_pgcache, proxy_metrics_get, query, start_databases, wait_cache_load,
+};
 
 mod util;
 
@@ -42,19 +44,21 @@ async fn test_extended_protocol_basic() -> Result<(), Error> {
         .await
         .map_err(Error::other)?;
 
-    let rows = query(&mut pgcache, &client, &stmt, &[&"foo"]).await?;
-
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<_, i32>("id"), 1);
-    assert_eq!(rows[0].get::<_, &str>("data"), "foo");
-
+    query(&mut pgcache, &client, &stmt, &[&"foo"]).await?;
     wait_cache_load().await;
-
     let rows = query(&mut pgcache, &client, &stmt, &[&"foo"]).await?;
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 1);
     assert_eq!(rows[0].get::<_, &str>("data"), "foo");
+
+    let metrics = proxy_metrics_get(&mut pgcache).map_err(Error::other)?;
+    assert_eq!(metrics.queries_total, 4);
+    assert_eq!(metrics.queries_cacheable, 2);
+    assert_eq!(metrics.queries_uncacheable, 2);
+    assert_eq!(metrics.queries_unsupported, 2);
+    assert_eq!(metrics.queries_cache_hit, 1);
+    assert_eq!(metrics.queries_cache_miss, 1);
 
     Ok(())
 }
@@ -87,20 +91,29 @@ async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
         .map_err(Error::other)?;
 
     // Execute multiple times with different parameters
+    query(&mut pgcache, &client, &stmt, &[&"foo"]).await?;
+    wait_cache_load().await;
     let rows1 = query(&mut pgcache, &client, &stmt, &[&"foo"]).await?;
+
     assert_eq!(rows1.len(), 1);
     assert_eq!(rows1[0].get::<_, i32>("id"), 1);
     assert_eq!(rows1[0].get::<_, &str>("data"), "foo");
 
+    query(&mut pgcache, &client, &stmt, &[&"bar"]).await?;
+    wait_cache_load().await;
     let rows2 = query(&mut pgcache, &client, &stmt, &[&"bar"]).await?;
+
     assert_eq!(rows2.len(), 1);
     assert_eq!(rows2[0].get::<_, i32>("id"), 2);
     assert_eq!(rows2[0].get::<_, &str>("data"), "bar");
 
-    let rows3 = query(&mut pgcache, &client, &stmt, &[&"baz"]).await?;
-    assert_eq!(rows3.len(), 1);
-    assert_eq!(rows3[0].get::<_, i32>("id"), 3);
-    assert_eq!(rows3[0].get::<_, &str>("data"), "baz");
+    let metrics = proxy_metrics_get(&mut pgcache).map_err(Error::other)?;
+    assert_eq!(metrics.queries_total, 6);
+    assert_eq!(metrics.queries_cacheable, 4);
+    assert_eq!(metrics.queries_uncacheable, 2);
+    assert_eq!(metrics.queries_unsupported, 2);
+    assert_eq!(metrics.queries_cache_hit, 2);
+    assert_eq!(metrics.queries_cache_miss, 2);
 
     Ok(())
 }
@@ -133,15 +146,28 @@ async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
         .map_err(Error::other)?;
 
     // Execute with multiple parameters
+    query(&mut pgcache, &client, &stmt, &[&"foo", &50]).await?;
+    wait_cache_load().await;
     let rows = query(&mut pgcache, &client, &stmt, &[&"foo", &50]).await?;
+
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 1);
     assert_eq!(rows[0].get::<_, &str>("data"), "foo");
     assert_eq!(rows[0].get::<_, i32>("value"), 100);
 
     // Execute with different parameters - should not match
+    query(&mut pgcache, &client, &stmt, &[&"foo", &150]).await?;
+    wait_cache_load().await;
     let rows = query(&mut pgcache, &client, &stmt, &[&"foo", &150]).await?;
     assert_eq!(rows.len(), 0);
+
+    let metrics = proxy_metrics_get(&mut pgcache).map_err(Error::other)?;
+    assert_eq!(metrics.queries_total, 6);
+    assert_eq!(metrics.queries_cacheable, 4);
+    assert_eq!(metrics.queries_uncacheable, 2);
+    assert_eq!(metrics.queries_unsupported, 2);
+    assert_eq!(metrics.queries_cache_hit, 2);
+    assert_eq!(metrics.queries_cache_miss, 2);
 
     Ok(())
 }

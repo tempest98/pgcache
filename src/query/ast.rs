@@ -708,11 +708,12 @@ impl SelectColumn {
 impl Deparse for SelectColumn {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push(' ');
+        self.expr.deparse(buf);
         if let Some(alias) = &self.alias {
+            buf.push_str(" AS ");
             buf.push_str(alias);
-            buf.push('.');
         }
-        self.expr.deparse(buf)
+        buf
     }
 }
 
@@ -1462,19 +1463,17 @@ fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, A
 
     for sort_node in sort_clause {
         if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
-            let expr_node = sort_by
-                .node
-                .as_ref()
-                .ok_or(AstError::UnsupportedFeature {
-                    feature: "ORDER BY without expression".to_string(),
-                })?;
+            let expr_node = sort_by.node.as_ref().ok_or(AstError::UnsupportedFeature {
+                feature: "ORDER BY without expression".to_string(),
+            })?;
 
             let expr = node_convert_to_column_expr(expr_node)?;
-            let direction = OrderDirection::try_from(SortByDir::try_from(sort_by.sortby_dir).map_err(
-                |_| AstError::UnsupportedFeature {
-                    feature: format!("Invalid SortByDir value: {}", sort_by.sortby_dir),
-                },
-            )?)?;
+            let direction =
+                OrderDirection::try_from(SortByDir::try_from(sort_by.sortby_dir).map_err(
+                    |_| AstError::UnsupportedFeature {
+                        feature: format!("Invalid SortByDir value: {}", sort_by.sortby_dir),
+                    },
+                )?)?;
 
             order_by.push(OrderByClause { expr, direction });
         } else {
@@ -1917,6 +1916,36 @@ mod tests {
         }
         .deparse(&mut buf);
         assert_eq!(buf, "users.name");
+    }
+
+    #[test]
+    fn test_select_column_alias_deparse() {
+        let mut buf = String::new();
+
+        // Simple column
+        SelectColumn {
+            expr: ColumnExpr::Column(ColumnNode {
+                table: None,
+                column: "id".to_string(),
+            }),
+            alias: Some("alias".to_owned()),
+        }
+        .deparse(&mut buf);
+
+        assert_eq!(buf, " id AS alias");
+        buf.clear();
+
+        // Qualified column
+
+        SelectColumn {
+            expr: ColumnExpr::Column(ColumnNode {
+                table: Some("users".to_string()),
+                column: "name".to_string(),
+            }),
+            alias: Some("alias".to_owned()),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " users.name AS alias");
     }
 
     #[test]
