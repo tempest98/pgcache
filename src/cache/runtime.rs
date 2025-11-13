@@ -1,12 +1,15 @@
-use std::thread;
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, thread};
 
 use tokio::{
     runtime::Builder,
-    sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender},
+    sync::{
+        Semaphore,
+        mpsc::{Receiver, UnboundedReceiver, UnboundedSender},
+    },
     task::{LocalSet, spawn_local},
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, wrappers::UnboundedReceiverStream};
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, trace};
 
 use crate::{
     cache::{
@@ -120,21 +123,45 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 
         let mut stream = cache_rx_mapped.merge(cdc_rx_mapped);
 
+        let cdc_msg_queue = Rc::new(RefCell::new(VecDeque::new()));
+        let cdc_msg_queue_semaphore = Rc::new(Semaphore::new(0));
+
         debug!("cache loop");
         rt.block_on(async {
             let qcache = QueryCache::new(settings, cache, worker_tx).await?;
 
             LocalSet::new()
                 .run_until(async move {
+                    //task to process cdc messages
+                    {
+                        let mut qcache = qcache.clone();
+                        let sem = cdc_msg_queue_semaphore.clone();
+                        let msg_queue = cdc_msg_queue.clone();
+                        spawn_local(async move {
+                            while let Ok(permit) = sem.acquire().await {
+                                loop {
+                                    let Some(msg) = msg_queue.borrow_mut().pop_front() else {
+                                        break;
+                                    };
+                                    handle_cdc_message(&mut qcache, msg).await;
+                                }
+                                permit.forget();
+                            }
+                        });
+                    }
+
                     while let Some(src) = stream.next().await {
                         let mut qcache = qcache.clone();
+                        let cdc_msg_queue = cdc_msg_queue.clone();
+                        let cdc_msg_queue_semaphore = cdc_msg_queue_semaphore.clone();
                         spawn_local(async move {
                             match src {
                                 StreamSource::Proxy(proxy_msg) => {
                                     handle_proxy_message(&mut qcache, proxy_msg).await;
                                 }
                                 StreamSource::Cdc(msg) => {
-                                    handle_cdc_message(&mut qcache, msg).await;
+                                    cdc_msg_queue.borrow_mut().push_back(msg);
+                                    cdc_msg_queue_semaphore.add_permits(1);
                                 }
                             }
                         });

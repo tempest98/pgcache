@@ -2,7 +2,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_util::bytes::BytesMut;
 
-use super::{query::CacheableQuery, query_cache::QueryType, CacheError};
+use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
 
 /// Converted query data ready for processing
 pub struct QueryData {
@@ -57,6 +57,7 @@ pub enum CacheReply {
 }
 
 /// CDC update message containing both key and row data
+#[derive(Debug)]
 pub struct CdcMessageUpdate {
     pub relation_oid: u32,
     pub key_data: Vec<Option<String>>,
@@ -64,6 +65,7 @@ pub struct CdcMessageUpdate {
 }
 
 /// Messages for CDC (Change Data Capture) processing
+#[derive(Debug)]
 pub(crate) enum CdcMessage {
     Register(crate::catalog::TableMetadata),
     Insert(u32, Vec<Option<String>>),

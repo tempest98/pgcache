@@ -217,7 +217,7 @@ pub async fn simple_query(
 /// Uses a short sleep to allow logical replication changes to propagate
 pub async fn wait_for_cdc() {
     // TODO: Replace with proper synchronization mechanism (polling, notification, etc.)
-    sleep(Duration::from_millis(250)).await;
+    sleep(Duration::from_millis(500)).await;
 }
 
 /// Wait for queries to be loaded into cache
