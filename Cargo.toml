@@ -21,15 +21,13 @@ tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = "0.7.16"
 tokio-stream = "0.1.17"
 
-tokio-postgres = { path = "../rust-postgres/tokio-postgres", default-features = false }
-postgres-protocol = { path = "../rust-postgres/postgres-protocol" }
-postgres-replication = { path = "../rust-postgres/postgres-replication", default-features = false }
-postgres-types = { path = "../rust-postgres/postgres-types" }
-# pgwire = { git = "https://github.com/tempest98/pgwire", features = [
-pgwire = { path = "/Users/james/code/pgcache/pgwire", features = [
+tokio-postgres = { git = "https://github.com/tempest98/rust-postgres", default-features = false, branch = "compat" }
+postgres-protocol = {git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
+postgres-replication = { git = "https://github.com/tempest98/rust-postgres", default-features = false, branch = "compat" }
+postgres-types = { git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
+pgwire = { git = "https://github.com/tempest98/pgwire", features = [
     "client-api",
-    "server-api",
-    "scram",
+    "server-api-ring",
 ] }
 pg_query = "6.1.1"
 
