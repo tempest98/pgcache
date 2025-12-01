@@ -1,7 +1,10 @@
 use error_set::error_set;
+use ordered_float::NotNan;
+use postgres_protocol::types as pg_types;
+use postgres_types::Type as PgType;
 
 use crate::{
-    cache::query::CacheableQuery,
+    cache::{QueryParameter, QueryParameters, query::CacheableQuery},
     catalog::TableMetadata,
     query::ast::{
         ColumnExpr, LiteralValue, SelectColumn, SelectColumns, SelectStatement, TableAlias,
@@ -18,6 +21,10 @@ error_set! {
         InvalidParameterPlaceholder { placeholder: String },
         #[display("Invalid UTF-8 in parameter value")]
         InvalidUtf8,
+        #[display("Invalid parameter value: {message}")]
+        InvalidParameterValue { message: String },
+        #[display("Unsupported binary format for OID {oid}")]
+        UnsupportedBinaryFormat { oid: u32 },
     }
 }
 
@@ -40,7 +47,7 @@ error_set! {
 /// - Parameter value contains invalid UTF-8
 pub fn ast_parameters_replace(
     select_statement: &SelectStatement,
-    parameters: &[Option<Vec<u8>>],
+    parameters: &QueryParameters,
 ) -> Result<SelectStatement, AstTransformError> {
     let mut new_stmt = select_statement.clone();
 
@@ -65,7 +72,7 @@ pub fn ast_parameters_replace(
 /// Replace parameters in a TableSource (recursively handles JOINs)
 fn table_source_parameters_replace(
     table_source: &mut TableSource,
-    parameters: &[Option<Vec<u8>>],
+    parameters: &QueryParameters,
 ) -> Result<(), AstTransformError> {
     match table_source {
         TableSource::Join(join) => {
@@ -91,7 +98,7 @@ fn table_source_parameters_replace(
 /// Replace parameters in a WhereExpr tree (mutates in place)
 fn where_expr_parameters_replace(
     expr: &mut WhereExpr,
-    parameters: &[Option<Vec<u8>>],
+    parameters: &QueryParameters,
 ) -> Result<(), AstTransformError> {
     match expr {
         WhereExpr::Value(literal) => {
@@ -100,8 +107,8 @@ fn where_expr_parameters_replace(
                 // Parse parameter index from placeholder (e.g., "$1" -> 0)
                 let index = parameter_index_parse(placeholder)?;
 
-                // Get parameter value
-                let param_value =
+                // Get parameter
+                let param =
                     parameters
                         .get(index)
                         .ok_or(AstTransformError::ParameterOutOfBounds {
@@ -110,7 +117,7 @@ fn where_expr_parameters_replace(
                         })?;
 
                 // Replace the LiteralValue in place
-                *literal = parameter_to_literal(param_value)?;
+                *literal = parameter_to_literal(&param)?;
             }
         }
         WhereExpr::Column(_) => {
@@ -166,18 +173,191 @@ fn parameter_index_parse(placeholder: &str) -> Result<usize, AstTransformError> 
     Ok(param_num - 1) // Convert 1-indexed to 0-indexed
 }
 
-/// Convert a parameter value (bytes) to a LiteralValue
-fn parameter_to_literal(param: &Option<Vec<u8>>) -> Result<LiteralValue, AstTransformError> {
-    match param {
+/// Convert a parameter value (bytes) to a LiteralValue.
+///
+/// Handles both text format (format=0) and binary format (format=1) parameters
+/// from the PostgreSQL extended query protocol. Uses the OID to determine the
+/// appropriate type conversion.
+fn parameter_to_literal(param: &QueryParameter) -> Result<LiteralValue, AstTransformError> {
+    match &param.value {
         None => Ok(LiteralValue::Null),
         Some(bytes) => {
-            // Convert bytes to string
-            let s = String::from_utf8(bytes.clone()).map_err(|_| AstTransformError::InvalidUtf8)?;
-
-            // Try to infer type from the string value
-            // For now, use String type - could be enhanced with type hints later
-            Ok(LiteralValue::String(s))
+            if param.format == 0 {
+                text_parameter_to_literal(bytes, param.oid)
+            } else {
+                binary_parameter_to_literal(bytes, param.oid)
+            }
         }
+    }
+}
+
+/// Convert a text format parameter to a LiteralValue based on OID.
+fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, AstTransformError> {
+    let s = String::from_utf8(bytes.to_vec()).map_err(|_| AstTransformError::InvalidUtf8)?;
+
+    // Use postgres_types to identify the type from OID
+    let pg_type = PgType::from_oid(oid);
+
+    match pg_type {
+        Some(PgType::BOOL) => {
+            let value = matches!(s.as_str(), "t" | "true" | "TRUE" | "1");
+            Ok(LiteralValue::Boolean(value))
+        }
+        Some(PgType::INT2 | PgType::INT4 | PgType::INT8) => {
+            let value = s
+                .parse::<i64>()
+                .map_err(|e| AstTransformError::InvalidParameterValue {
+                    message: format!("invalid integer '{}': {}", s, e),
+                })?;
+            Ok(LiteralValue::Integer(value))
+        }
+        Some(PgType::FLOAT4 | PgType::FLOAT8) => {
+            let value = s
+                .parse::<f64>()
+                .map_err(|e| AstTransformError::InvalidParameterValue {
+                    message: format!("invalid float '{}': {}", s, e),
+                })?;
+            let value =
+                NotNan::new(value).map_err(|_| AstTransformError::InvalidParameterValue {
+                    message: format!("NaN is not a valid float value: {}", s),
+                })?;
+            Ok(LiteralValue::Float(value))
+        }
+        // String-like types
+        Some(
+            PgType::TEXT
+            | PgType::VARCHAR
+            | PgType::BPCHAR
+            | PgType::NAME
+            | PgType::CHAR
+            | PgType::UNKNOWN,
+        ) => Ok(LiteralValue::String(s)),
+        // Types that pass through as strings (UUID, temporal, numeric)
+        Some(
+            PgType::UUID
+            | PgType::TIMESTAMP
+            | PgType::TIMESTAMPTZ
+            | PgType::DATE
+            | PgType::TIME
+            | PgType::TIMETZ
+            | PgType::INTERVAL
+            | PgType::NUMERIC,
+        ) => Ok(LiteralValue::String(s)),
+        // Unknown OID or unhandled type - fallback to string
+        _ => Ok(LiteralValue::String(s)),
+    }
+}
+
+/// Convert a binary format parameter to a LiteralValue based on OID.
+fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, AstTransformError> {
+    let pg_type = PgType::from_oid(oid);
+
+    match pg_type {
+        Some(PgType::BOOL) => {
+            let value = pg_types::bool_from_sql(bytes).map_err(|e| {
+                AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary bool: {}", e),
+                }
+            })?;
+            Ok(LiteralValue::Boolean(value))
+        }
+        Some(PgType::INT2) => {
+            let value = pg_types::int2_from_sql(bytes).map_err(|e| {
+                AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary int2: {}", e),
+                }
+            })?;
+            Ok(LiteralValue::Integer(value as i64))
+        }
+        Some(PgType::INT4) => {
+            let value = pg_types::int4_from_sql(bytes).map_err(|e| {
+                AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary int4: {}", e),
+                }
+            })?;
+            Ok(LiteralValue::Integer(value as i64))
+        }
+        Some(PgType::INT8) => {
+            let value = pg_types::int8_from_sql(bytes).map_err(|e| {
+                AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary int8: {}", e),
+                }
+            })?;
+            Ok(LiteralValue::Integer(value))
+        }
+        Some(PgType::FLOAT4) => {
+            let value = pg_types::float4_from_sql(bytes).map_err(|e| {
+                AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary float4: {}", e),
+                }
+            })?;
+            let value = NotNan::new(value as f64).map_err(|_| {
+                AstTransformError::InvalidParameterValue {
+                    message: "NaN is not a valid float value".to_string(),
+                }
+            })?;
+            Ok(LiteralValue::Float(value))
+        }
+        Some(PgType::FLOAT8) => {
+            let value = pg_types::float8_from_sql(bytes).map_err(|e| {
+                AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary float8: {}", e),
+                }
+            })?;
+            let value =
+                NotNan::new(value).map_err(|_| AstTransformError::InvalidParameterValue {
+                    message: "NaN is not a valid float value".to_string(),
+                })?;
+            Ok(LiteralValue::Float(value))
+        }
+        Some(
+            PgType::TEXT
+            | PgType::VARCHAR
+            | PgType::BPCHAR
+            | PgType::NAME
+            | PgType::CHAR
+            | PgType::UNKNOWN,
+        ) => {
+            let value = pg_types::text_from_sql(bytes).map_err(|e| {
+                AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary text: {}", e),
+                }
+            })?;
+            Ok(LiteralValue::String(value.to_string()))
+        }
+        Some(PgType::UUID) => {
+            // UUID binary format is 16 bytes
+            if bytes.len() != 16 {
+                return Err(AstTransformError::InvalidParameterValue {
+                    message: format!(
+                        "invalid UUID length: expected 16 bytes, got {}",
+                        bytes.len()
+                    ),
+                });
+            }
+            let uuid_str = format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                bytes[4],
+                bytes[5],
+                bytes[6],
+                bytes[7],
+                bytes[8],
+                bytes[9],
+                bytes[10],
+                bytes[11],
+                bytes[12],
+                bytes[13],
+                bytes[14],
+                bytes[15]
+            );
+            Ok(LiteralValue::String(uuid_str))
+        }
+        Some(pg_type) => Err(AstTransformError::UnsupportedBinaryFormat { oid: pg_type.oid() }),
+        None => Err(AstTransformError::UnsupportedBinaryFormat { oid }),
     }
 }
 
@@ -305,6 +485,44 @@ mod tests {
 
     use super::*;
 
+    /// Helper to create QueryParameters for text format with TEXT OID
+    fn text_params(values: Vec<Option<&[u8]>>) -> QueryParameters {
+        let len = values.len();
+        QueryParameters {
+            values: values.into_iter().map(|v| v.map(|b| b.to_vec())).collect(),
+            formats: vec![0; len], // 0 = text format
+            oids: vec![PgType::TEXT.oid(); len],
+        }
+    }
+
+    /// Helper to create QueryParameters with specific OIDs (text format)
+    fn typed_text_params(values: Vec<(Option<&[u8]>, PgType)>) -> QueryParameters {
+        let len = values.len();
+        let (values, oids): (Vec<_>, Vec<_>) = values
+            .into_iter()
+            .map(|(v, t)| (v.map(|b| b.to_vec()), t.oid()))
+            .unzip();
+        QueryParameters {
+            values,
+            formats: vec![0; len], // 0 = text format
+            oids,
+        }
+    }
+
+    /// Helper to create QueryParameters with binary format
+    fn binary_params(values: Vec<(Option<&[u8]>, PgType)>) -> QueryParameters {
+        let len = values.len();
+        let (values, oids): (Vec<_>, Vec<_>) = values
+            .into_iter()
+            .map(|(v, t)| (v.map(|b| b.to_vec()), t.oid()))
+            .unzip();
+        QueryParameters {
+            values,
+            formats: vec![1; len], // 1 = binary format
+            oids,
+        }
+    }
+
     #[test]
     fn test_ast_parameters_replace_simple() {
         let query = "SELECT id FROM users WHERE id = $1";
@@ -314,7 +532,7 @@ mod tests {
         let Statement::Select(stmt) = &sql_query.statement;
 
         // Replace $1 with value "42"
-        let params = vec![Some(b"42".to_vec())];
+        let params = text_params(vec![Some(b"42")]);
         let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
 
         // Deparse to verify
@@ -333,7 +551,7 @@ mod tests {
         let Statement::Select(stmt) = &sql_query.statement;
 
         // Replace $1 with "42", $2 with "alice"
-        let params = vec![Some(b"42".to_vec()), Some(b"alice".to_vec())];
+        let params = text_params(vec![Some(b"42"), Some(b"alice")]);
         let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
 
         // Deparse to verify
@@ -355,7 +573,7 @@ mod tests {
         let Statement::Select(stmt) = &sql_query.statement;
 
         // Replace $1 with NULL
-        let params = vec![None];
+        let params = text_params(vec![None]);
         let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
 
         // Deparse to verify
@@ -374,7 +592,7 @@ mod tests {
         let Statement::Select(stmt) = &sql_query.statement;
 
         // Only provide 1 parameter, but query uses $2
-        let params = vec![Some(b"42".to_vec())];
+        let params = text_params(vec![Some(b"42")]);
         let result = ast_parameters_replace(stmt, &params);
 
         assert!(result.is_err());
@@ -396,7 +614,7 @@ mod tests {
         let Statement::Select(stmt) = &sql_query.statement;
 
         // Replace $1 with "100"
-        let params = vec![Some(b"100".to_vec())];
+        let params = text_params(vec![Some(b"100")]);
         let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
 
         // Deparse to verify
@@ -530,5 +748,280 @@ mod tests {
             update2,
             "SELECT true FROM users JOIN location ON location.user_id = users.user_id WHERE users.user_id = 1"
         );
+    }
+
+    // ==================== Text Format Parameter Tests ====================
+
+    #[test]
+    fn test_text_parameter_integer() {
+        let query = "SELECT id FROM users WHERE id = $1";
+        let ast = pg_query::parse(query).expect("to parse query");
+        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
+
+        let Statement::Select(stmt) = &sql_query.statement;
+
+        // Integer type should produce integer literal
+        let params = typed_text_params(vec![(Some(b"42"), PgType::INT4)]);
+        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        result.deparse(&mut buf);
+
+        // Integer literal renders without quotes
+        assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
+    }
+
+    #[test]
+    fn test_text_parameter_boolean() {
+        let query = "SELECT id FROM users WHERE active = $1";
+        let ast = pg_query::parse(query).expect("to parse query");
+        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
+
+        let Statement::Select(stmt) = &sql_query.statement;
+
+        // Boolean 't' -> true
+        let params = typed_text_params(vec![(Some(b"t"), PgType::BOOL)]);
+        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        result.deparse(&mut buf);
+
+        assert_eq!(buf, "SELECT id FROM users WHERE active = true");
+    }
+
+    #[test]
+    fn test_text_parameter_float() {
+        let query = "SELECT id FROM users WHERE score > $1";
+        let ast = pg_query::parse(query).expect("to parse query");
+        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
+
+        let Statement::Select(stmt) = &sql_query.statement;
+
+        let params = typed_text_params(vec![(Some(b"3.14"), PgType::FLOAT8)]);
+        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        result.deparse(&mut buf);
+
+        assert_eq!(buf, "SELECT id FROM users WHERE score > 3.14");
+    }
+
+    #[test]
+    fn test_text_parameter_invalid_integer() {
+        let param = QueryParameter {
+            value: Some(b"not_a_number".to_vec()),
+            format: 0,
+            oid: PgType::INT4.oid(),
+        };
+
+        let result = parameter_to_literal(&param);
+        assert!(matches!(
+            result,
+            Err(AstTransformError::InvalidParameterValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_text_parameter_uuid() {
+        let query = "SELECT id FROM users WHERE uuid = $1";
+        let ast = pg_query::parse(query).expect("to parse query");
+        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
+
+        let Statement::Select(stmt) = &sql_query.statement;
+
+        let params = typed_text_params(vec![(
+            Some(b"550e8400-e29b-41d4-a716-446655440000"),
+            PgType::UUID,
+        )]);
+        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        result.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT id FROM users WHERE uuid = '550e8400-e29b-41d4-a716-446655440000'"
+        );
+    }
+
+    // ==================== Binary Format Parameter Tests ====================
+
+    #[test]
+    fn test_binary_parameter_bool_true() {
+        let param = QueryParameter {
+            value: Some(vec![1]), // PostgreSQL binary bool: 1 = true
+            format: 1,
+            oid: PgType::BOOL.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(result, LiteralValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_binary_parameter_bool_false() {
+        let param = QueryParameter {
+            value: Some(vec![0]), // PostgreSQL binary bool: 0 = false
+            format: 1,
+            oid: PgType::BOOL.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(result, LiteralValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_binary_parameter_int2() {
+        let param = QueryParameter {
+            value: Some(vec![0x00, 0x2A]), // 42 in big-endian i16
+            format: 1,
+            oid: PgType::INT2.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(result, LiteralValue::Integer(42));
+    }
+
+    #[test]
+    fn test_binary_parameter_int4() {
+        let param = QueryParameter {
+            value: Some(vec![0x00, 0x00, 0x00, 0x2A]), // 42 in big-endian i32
+            format: 1,
+            oid: PgType::INT4.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(result, LiteralValue::Integer(42));
+    }
+
+    #[test]
+    fn test_binary_parameter_int8() {
+        let param = QueryParameter {
+            value: Some(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A]), // 42 in big-endian i64
+            format: 1,
+            oid: PgType::INT8.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(result, LiteralValue::Integer(42));
+    }
+
+    #[test]
+    fn test_binary_parameter_float4() {
+        // 3.14 as f32 in big-endian IEEE 754
+        let value: f32 = 2.73;
+        let bytes = value.to_be_bytes();
+
+        let param = QueryParameter {
+            value: Some(bytes.to_vec()),
+            format: 1,
+            oid: PgType::FLOAT4.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        match result {
+            LiteralValue::Float(f) => {
+                assert!((f.into_inner() - 2.73).abs() < 0.001);
+            }
+            _ => panic!("Expected Float literal"),
+        }
+    }
+
+    #[test]
+    fn test_binary_parameter_float8() {
+        let value: f64 = 2.73821;
+        let bytes = value.to_be_bytes();
+
+        let param = QueryParameter {
+            value: Some(bytes.to_vec()),
+            format: 1,
+            oid: PgType::FLOAT8.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        match result {
+            LiteralValue::Float(f) => {
+                assert!((f.into_inner() - 2.73821).abs() < 0.00001);
+            }
+            _ => panic!("Expected Float literal"),
+        }
+    }
+
+    #[test]
+    fn test_binary_parameter_text() {
+        let param = QueryParameter {
+            value: Some(b"hello world".to_vec()),
+            format: 1,
+            oid: PgType::TEXT.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(result, LiteralValue::String("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_binary_parameter_uuid() {
+        // UUID: 550e8400-e29b-41d4-a716-446655440000
+        let uuid_bytes: [u8; 16] = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+
+        let param = QueryParameter {
+            value: Some(uuid_bytes.to_vec()),
+            format: 1,
+            oid: PgType::UUID.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(
+            result,
+            LiteralValue::String("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_binary_parameter_unsupported_type() {
+        let param = QueryParameter {
+            value: Some(vec![0x00]),
+            format: 1,
+            oid: PgType::TIMESTAMP.oid(), // Timestamp not supported in binary
+        };
+
+        let result = parameter_to_literal(&param);
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_null() {
+        let param = QueryParameter {
+            value: None,
+            format: 1,
+            oid: PgType::INT4.oid(),
+        };
+
+        let result = parameter_to_literal(&param).expect("to convert parameter");
+        assert_eq!(result, LiteralValue::Null);
+    }
+
+    #[test]
+    fn test_binary_int4_in_query() {
+        let query = "SELECT id FROM users WHERE id = $1";
+        let ast = pg_query::parse(query).expect("to parse query");
+        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
+
+        let Statement::Select(stmt) = &sql_query.statement;
+
+        // Binary INT4: 42 in big-endian
+        let params = binary_params(vec![(Some(&[0x00, 0x00, 0x00, 0x2A]), PgType::INT4)]);
+        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        result.deparse(&mut buf);
+
+        assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
     }
 }

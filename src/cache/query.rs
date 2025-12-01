@@ -1,9 +1,13 @@
-use crate::query::{
-    ast::{
-        ExprOp, JoinNode, JoinType, SelectStatement, SqlQuery, Statement, TableSource, WhereExpr,
+use crate::{
+    cache::QueryParameters,
+    query::{
+        ast::{
+            ExprOp, JoinNode, JoinType, SelectStatement, SqlQuery, Statement, TableSource,
+            WhereExpr,
+        },
+        evaluate::is_simple_comparison,
+        transform::{AstTransformError, ast_parameters_replace},
     },
-    evaluate::is_simple_comparison,
-    transform::{AstTransformError, ast_parameters_replace},
 };
 use error_set::error_set;
 
@@ -40,7 +44,7 @@ impl CacheableQuery {
     /// Returns `CacheabilityError` if parameter replacement fails (e.g., invalid index, invalid UTF-8)
     pub fn parameters_replace(
         &mut self,
-        parameters: &[Option<Vec<u8>>],
+        parameters: &QueryParameters,
     ) -> Result<(), AstTransformError> {
         self.statement = ast_parameters_replace(&self.statement, parameters)?;
         Ok(())

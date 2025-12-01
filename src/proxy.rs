@@ -11,14 +11,17 @@ use std::{
 };
 
 use crate::{
-    cache::{CacheMessage, CacheReply, ProxyMessage, cache_run, query::CacheableQuery},
+    cache::{
+        CacheMessage, CacheReply, ProxyMessage, QueryParameters, cache_run, query::CacheableQuery,
+    },
     metrics::Metrics,
     pg::protocol::{
         ProtocolError,
         backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
         extended::{
             ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, StatementType,
-            parse_bind_message, parse_close_message, parse_execute_message, parse_parse_message,
+            parse_bind_message, parse_close_message, parse_describe_message, parse_execute_message,
+            parse_parameter_description, parse_parse_message,
         },
         frontend::{PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType},
     },
@@ -292,6 +295,9 @@ struct ConnectionState {
     /// Extended protocol: portals (bound statements) by name
     portals: HashMap<String, Portal>,
 
+    /// Extended protocol: name of statement most recently described (awaiting ParameterDescription)
+    pending_describe_statement: Option<String>,
+
     /// Metrics collector for tracking query and cache performance
     metrics: Arc<Metrics>,
 }
@@ -308,6 +314,7 @@ impl ConnectionState {
             client_fd_dup,
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
+            pending_describe_statement: None,
             metrics,
         }
     }
@@ -381,19 +388,36 @@ impl ConnectionState {
     }
 
     /// Handle a message from the origin database (backend).
-    /// Updates transaction state and forwards to client.
+    /// Updates transaction state, captures parameter OIDs, and forwards to client.
     fn handle_origin_message(&mut self, msg: PgBackendMessage) {
-        if msg.message_type == PgBackendMessageType::ReadyForQuery {
-            // ReadyForQuery message contains transaction status at byte 5
-            // 'I' = idle (not in transaction)
-            // 'T' = in transaction block
-            // 'E' = in failed transaction block
-            self.in_transaction = msg.data[5] == b'T' || msg.data[5] == b'E';
-
-            // Clean up unnamed portals when transaction ends
-            if !self.in_transaction {
-                self.portals.retain(|name, _| !name.is_empty());
+        match msg.message_type {
+            PgBackendMessageType::ParameterDescription => {
+                // Update the pending statement's parameter OIDs from the server response
+                if let Some(stmt_name) = self.pending_describe_statement.take() {
+                    if let Ok(parsed) = parse_parameter_description(&msg.data) {
+                        if let Some(stmt) = self.prepared_statements.get_mut(&stmt_name) {
+                            debug!(
+                                "updated statement '{}' with parameter OIDs {:?}",
+                                stmt_name, parsed.parameter_oids
+                            );
+                            stmt.parameter_oids = parsed.parameter_oids;
+                        }
+                    }
+                }
             }
+            PgBackendMessageType::ReadyForQuery => {
+                // ReadyForQuery message contains transaction status at byte 5
+                // 'I' = idle (not in transaction)
+                // 'T' = in transaction block
+                // 'E' = in failed transaction block
+                self.in_transaction = msg.data[5] == b'T' || msg.data[5] == b'E';
+
+                // Clean up unnamed portals when transaction ends
+                if !self.in_transaction {
+                    self.portals.retain(|name, _| !name.is_empty());
+                }
+            }
+            _ => {}
         }
 
         self.client_write_buf.push_back(msg.data);
@@ -491,12 +515,6 @@ impl ConnectionState {
         // Look up portal
         let portal = self.portals.get(&parsed.portal_name)?;
 
-        // Reject binary format (not supported yet)
-        if portal.has_binary_parameters() {
-            debug!("has binary parameteres");
-            return None;
-        }
-
         // Look up prepared statement
         let stmt = self.prepared_statements.get(&portal.statement_name)?;
 
@@ -510,12 +528,22 @@ impl ConnectionState {
         Some(CacheMessage::QueryParameterized(
             msg.data.clone(),
             cacheable_query,
-            portal.parameter_values.clone(),
+            QueryParameters {
+                values: portal.parameter_values.clone(),
+                formats: portal.parameter_formats.clone(),
+                oids: stmt.parameter_oids.clone(),
+            },
         ))
     }
 
-    /// Handle Describe message - forward to origin.
+    /// Handle Describe message - track statement name for ParameterDescription and forward to origin.
     fn handle_describe_message(&mut self, msg: PgFrontendMessage) {
+        if let Ok(parsed) = parse_describe_message(&msg.data) {
+            // Track statement describes so we can update OIDs when ParameterDescription arrives
+            if parsed.describe_type == b'S' {
+                self.pending_describe_statement = Some(parsed.name);
+            }
+        }
         self.origin_write_buf.push_back(msg.data);
     }
 
@@ -541,7 +569,7 @@ impl ConnectionState {
         let stmt = PreparedStatement {
             name: parsed.statement_name.clone(),
             sql: parsed.sql,
-            parameter_count: parsed.parameter_oids.len(),
+            parameter_oids: parsed.parameter_oids,
             sql_type,
         };
         debug!("parsed statement insert {}", parsed.statement_name);

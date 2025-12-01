@@ -11,17 +11,55 @@ pub struct QueryData {
     pub query_type: QueryType,
 }
 
+/// Parameters passed into an extended query
+#[derive(Debug)]
+pub struct QueryParameters {
+    pub values: Vec<Option<Vec<u8>>>,
+    pub formats: Vec<i16>,
+    pub oids: Vec<u32>,
+}
+
+impl QueryParameters {
+    pub fn get(&self, index: usize) -> Option<QueryParameter> {
+        if let Some(value) = self.values.get(index)
+            && let Some(&format) = self.formats.get(index)
+            && let Some(&oid) = self.oids.get(index)
+        {
+            Some(QueryParameter {
+                value: value.clone(),
+                format,
+                oid,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryParameter {
+    pub value: Option<Vec<u8>>,
+    pub format: i16,
+    pub oid: u32,
+}
+
 /// Message types for communication between proxy and cache
 #[derive(Debug)]
 pub enum CacheMessage {
     Query(BytesMut, Box<CacheableQuery>),
-    QueryParameterized(BytesMut, Box<CacheableQuery>, Vec<Option<Vec<u8>>>),
+    QueryParameterized(BytesMut, Box<CacheableQuery>, QueryParameters),
 }
 
 impl CacheMessage {
     /// Converts the cache message into query data ready for processing.
     /// For parameterized queries, this performs parameter replacement in the AST.
-    pub fn into_query_data(self) -> Result<QueryData, CacheError> {
+    ///
+    /// On error, returns the original data buffer so it can be forwarded to the origin.
+    pub fn into_query_data(self) -> Result<QueryData, (CacheError, BytesMut)> {
         match self {
             CacheMessage::Query(data, cacheable_query) => Ok(QueryData {
                 data,
@@ -30,7 +68,9 @@ impl CacheMessage {
             }),
             CacheMessage::QueryParameterized(data, mut cacheable_query, parameters) => {
                 // Replace parameters in AST
-                cacheable_query.parameters_replace(&parameters)?;
+                if let Err(e) = cacheable_query.parameters_replace(&parameters) {
+                    return Err((e.into(), data));
+                }
                 Ok(QueryData {
                     data,
                     cacheable_query,

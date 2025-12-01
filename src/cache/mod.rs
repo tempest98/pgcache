@@ -15,7 +15,9 @@ mod types;
 mod worker;
 
 // Re-export public types
-pub use messages::{CacheMessage, CacheReply, DataStreamState, ProxyMessage};
+pub use messages::{
+    CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
+};
 pub use runtime::cache_run;
 pub use types::{Cache, CachedQuery, CachedQueryState, UpdateQueries, UpdateQuery};
 

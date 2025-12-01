@@ -21,7 +21,7 @@ pub enum StatementType {
 pub struct PreparedStatement {
     pub name: String,
     pub sql: String,
-    pub parameter_count: usize,
+    pub parameter_oids: Vec<u32>,
     pub sql_type: StatementType,
 }
 
@@ -73,6 +73,12 @@ pub struct ParsedExecuteMessage {
 pub struct ParsedDescribeMessage {
     pub describe_type: u8, // b'S' for statement, b'P' for portal
     pub name: String,
+}
+
+/// Parsed ParameterDescription message data (backend response)
+#[derive(Debug, Clone)]
+pub struct ParsedParameterDescription {
+    pub parameter_oids: Vec<u32>,
 }
 
 /// Parsed Close message data
@@ -349,6 +355,40 @@ pub fn parse_close_message(data: &BytesMut) -> Result<ParsedCloseMessage, Protoc
     let name = read_cstring(&mut buf)?.to_owned();
 
     Ok(ParsedCloseMessage { close_type, name })
+}
+
+/// Parse a ParameterDescription message ('t') from backend
+///
+/// Format:
+/// Byte1('t')
+/// Int32 - message length
+/// Int16 - number of parameters
+/// For each parameter:
+///     Int32 - OID of parameter data type
+pub fn parse_parameter_description(data: &BytesMut) -> Result<ParsedParameterDescription, ProtocolError> {
+    if data.len() < 7 {
+        return Err(ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "ParameterDescription message too short",
+        )));
+    }
+
+    let mut buf = &data[5..]; // Skip message tag and length
+
+    let param_count = buf.get_i16() as usize;
+    let mut parameter_oids = Vec::with_capacity(param_count);
+
+    for _ in 0..param_count {
+        if buf.len() < 4 {
+            return Err(ProtocolError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "missing parameter OID in ParameterDescription",
+            )));
+        }
+        parameter_oids.push(buf.get_u32());
+    }
+
+    Ok(ParsedParameterDescription { parameter_oids })
 }
 
 #[cfg(test)]

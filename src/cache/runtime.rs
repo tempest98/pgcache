@@ -38,8 +38,10 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
                 error!("query dispatch failed: {e}");
             }
         }
-        Err(e) => {
-            error!("failed to convert query: {e}");
+        Err((e, data)) => {
+            debug!("forwarding to origin due to parameter conversion error: {e}");
+            // Forward to origin when parameter conversion fails
+            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(data)).await;
         }
     }
 }
