@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use crate::util::{connect_pgcache, query, start_databases, PgCacheProcess};
+use crate::util::{PgCacheProcess, connect_pgcache, query, start_databases, wait_cache_load};
 
 mod util;
 
@@ -41,6 +41,14 @@ async fn test_extended_protocol_basic() -> Result<(), Error> {
         .prepare("select id, data from test where data = $1")
         .await
         .map_err(Error::other)?;
+
+    let rows = query(&mut pgcache, &client, &stmt, &[&"foo"]).await?;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("id"), 1);
+    assert_eq!(rows[0].get::<_, &str>("data"), "foo");
+
+    wait_cache_load().await;
 
     let rows = query(&mut pgcache, &client, &stmt, &[&"foo"]).await?;
 

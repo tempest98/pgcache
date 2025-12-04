@@ -393,16 +393,15 @@ impl ConnectionState {
         match msg.message_type {
             PgBackendMessageType::ParameterDescription => {
                 // Update the pending statement's parameter OIDs from the server response
-                if let Some(stmt_name) = self.pending_describe_statement.take() {
-                    if let Ok(parsed) = parse_parameter_description(&msg.data) {
-                        if let Some(stmt) = self.prepared_statements.get_mut(&stmt_name) {
-                            debug!(
-                                "updated statement '{}' with parameter OIDs {:?}",
-                                stmt_name, parsed.parameter_oids
-                            );
-                            stmt.parameter_oids = parsed.parameter_oids;
-                        }
-                    }
+                if let Some(stmt_name) = self.pending_describe_statement.take()
+                    && let Ok(parsed) = parse_parameter_description(&msg.data)
+                    && let Some(stmt) = self.prepared_statements.get_mut(&stmt_name)
+                {
+                    debug!(
+                        "updated statement '{}' with parameter OIDs {:?}",
+                        stmt_name, parsed.parameter_oids
+                    );
+                    stmt.parameter_oids = parsed.parameter_oids;
                 }
             }
             PgBackendMessageType::ReadyForQuery => {
@@ -515,6 +514,12 @@ impl ConnectionState {
         // Look up portal
         let portal = self.portals.get(&parsed.portal_name)?;
 
+        // Only handle implicit or uniform result formats
+        if portal.result_formats.len() > 1 && portal.result_formats.windows(2).all(|w| w[0] == w[1])
+        {
+            return None;
+        }
+
         // Look up prepared statement
         let stmt = self.prepared_statements.get(&portal.statement_name)?;
 
@@ -533,6 +538,7 @@ impl ConnectionState {
                 formats: portal.parameter_formats.clone(),
                 oids: stmt.parameter_oids.clone(),
             },
+            portal.result_formats.clone(),
         ))
     }
 
@@ -604,11 +610,13 @@ impl ConnectionState {
     }
 
     /// Clear all prepared statements from connection state.
+    #[expect(unused)]
     fn statements_clear(&mut self) {
         self.prepared_statements.clear();
     }
 
     /// Clear all portals from connection state.
+    #[expect(unused)]
     fn portals_clear(&mut self) {
         self.portals.clear();
     }
@@ -827,7 +835,7 @@ async fn handle_connection(
             ProxyMode::CacheWrite(msg) => {
                 state.metrics.cacheable_increment();
 
-                if matches!(msg, CacheMessage::QueryParameterized(_, _, _)) {
+                if matches!(msg, CacheMessage::QueryParameterized(_, _, _, _)) {
                     //send a flush to orgin
                     let data = BytesMut::from([b'H', 0, 0, 0, 4u8].as_ref());
                     state.origin_write_buf.push_back(data);
@@ -856,7 +864,7 @@ async fn handle_connection(
                         state.proxy_status = ProxyStatus::Degraded;
                         let data = match e.0.message {
                             CacheMessage::Query(data, _) => data,
-                            CacheMessage::QueryParameterized(data, _, _) => data,
+                            CacheMessage::QueryParameterized(data, _, _, _) => data,
                         };
 
                         state.origin_write_buf.push_back(data);

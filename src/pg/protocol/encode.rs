@@ -10,21 +10,21 @@ use crate::pg::protocol::backend::{
 
 #[instrument(skip_all)]
 pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
-    let cnt = desc.len() as i16;
+    let field_cnt = desc.len() as i16;
     let string_len = desc.iter().fold(0, |acc, col| acc + col.name().len() + 1);
 
     buf.put_u8(ROW_DESCRIPTION_TAG);
-    buf.put_i32(6 + (18 * cnt as i32) + string_len as i32);
-    buf.put_i16(cnt);
+    buf.put_i32(6 + (18 * field_cnt as i32) + string_len as i32);
+    buf.put_i16(field_cnt);
     for col in desc.iter() {
         buf.put_slice(col.name().as_bytes());
-        buf.put_u8(0);
-        buf.put_i32(0);
-        buf.put_i16(0);
-        buf.put_i32(0);
-        buf.put_i16(-1);
-        buf.put_i32(-1);
-        buf.put_i16(0);
+        buf.put_u8(0); // string terminator
+        buf.put_i32(0); // table oid
+        buf.put_i16(0); // column num
+        buf.put_u32(col.type_oid());
+        buf.put_i16(col.type_size());
+        buf.put_i32(col.type_modifier());
+        buf.put_i16(0); // format code
     }
 }
 

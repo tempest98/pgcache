@@ -14,6 +14,8 @@ use super::{
     query_cache::{QueryRequest, QueryType},
 };
 
+const BUFFER_SIZE_THRESHOLD: usize = 64 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct CacheWorker {
     db_cache: Rc<Client>,
@@ -44,8 +46,18 @@ impl CacheWorker {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_cached_query(&self, msg: &mut QueryRequest) -> Result<(), CacheError> {
-        const BUFFER_SIZE_THRESHOLD: usize = 64 * 1024;
+        let rv = if msg.result_formats.is_empty() || msg.result_formats[0] == 0 {
+            self.handle_cached_query_text(msg).await
+        } else {
+            self.handle_cached_query_binary(msg).await
+        };
 
+        debug!("cache hit");
+        rv
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn handle_cached_query_text(&self, msg: &mut QueryRequest) -> Result<(), CacheError> {
         // Generate SQL query from AST (parameters are already replaced if present)
         let mut sql = String::new();
         msg.cacheable_query.statement().deparse(&mut sql);
@@ -118,7 +130,58 @@ impl CacheWorker {
             return Err(CacheError::Write);
         }
 
-        debug!("cache hit");
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn handle_cached_query_binary(
+        &self,
+        msg: &mut QueryRequest,
+    ) -> Result<(), CacheError> {
+        // Generate SQL query from AST (parameters are already replaced if present)
+        let mut sql = String::new();
+        msg.cacheable_query.statement().deparse(&mut sql);
+
+        // Execute query against cache database
+        let res = self.db_cache.query(&sql, &[]).await?;
+
+        let mut buf = BytesMut::new();
+        for row in &res[0..res.len()] {
+            // Use raw buffer directly to avoid decode/encode overhead
+            // The raw buffer contains field data but not the field count
+            let raw_data = row.raw_buffer_bytes();
+            let field_count = row.len() as u16;
+
+            buf.put_u8(b'D'); // DATA_ROW_TAG
+            buf.put_i32(4 + 2 + raw_data.len() as i32); // 4 (length field) + 2 (field count) + data
+            buf.put_u16(field_count);
+            buf.put_slice(raw_data);
+
+            //send data if more than 64kB have been accumulated
+            if buf.len() > BUFFER_SIZE_THRESHOLD
+                && msg.client_socket.write_all_buf(&mut buf).await.is_err()
+            {
+                // trace!("(w) client write data");
+
+                error!("no client");
+                return Err(CacheError::Write);
+            }
+        }
+        // trace!("(w) client write data [{:?}]", buf);
+        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+            error!("no client");
+            return Err(CacheError::Write);
+        }
+
+        let mut buf = BytesMut::new();
+        command_complete_encode(res.len() as u64, &mut buf);
+
+        // trace!("(w) client write {:?}", buf);
+        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+            error!("no client");
+            return Err(CacheError::Write);
+        }
+
         Ok(())
     }
 }

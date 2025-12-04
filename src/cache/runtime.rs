@@ -9,7 +9,7 @@ use tokio::{
     task::{LocalSet, spawn_local},
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, wrappers::UnboundedReceiverStream};
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument};
 
 use crate::{
     cache::{
@@ -31,6 +31,7 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
                 query_type: query_data.query_type,
                 data: query_data.data,
                 cacheable_query: query_data.cacheable_query,
+                result_formats: query_data.result_formats,
                 client_socket: proxy_msg.client_socket,
                 reply_tx: proxy_msg.reply_tx,
             };

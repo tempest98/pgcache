@@ -9,6 +9,7 @@ pub struct QueryData {
     pub data: BytesMut,
     pub cacheable_query: Box<CacheableQuery>,
     pub query_type: QueryType,
+    pub result_formats: Vec<i16>,
 }
 
 /// Parameters passed into an extended query
@@ -51,7 +52,7 @@ pub struct QueryParameter {
 #[derive(Debug)]
 pub enum CacheMessage {
     Query(BytesMut, Box<CacheableQuery>),
-    QueryParameterized(BytesMut, Box<CacheableQuery>, QueryParameters),
+    QueryParameterized(BytesMut, Box<CacheableQuery>, QueryParameters, Vec<i16>),
 }
 
 impl CacheMessage {
@@ -65,8 +66,14 @@ impl CacheMessage {
                 data,
                 cacheable_query,
                 query_type: QueryType::Simple,
+                result_formats: Vec::new(),
             }),
-            CacheMessage::QueryParameterized(data, mut cacheable_query, parameters) => {
+            CacheMessage::QueryParameterized(
+                data,
+                mut cacheable_query,
+                parameters,
+                result_formats,
+            ) => {
                 // Replace parameters in AST
                 if let Err(e) = cacheable_query.parameters_replace(&parameters) {
                     return Err((e.into(), data));
@@ -75,6 +82,7 @@ impl CacheMessage {
                     data,
                     cacheable_query,
                     query_type: QueryType::Extended,
+                    result_formats,
                 })
             }
         }

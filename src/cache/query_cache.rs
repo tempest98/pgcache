@@ -41,6 +41,7 @@ pub struct QueryRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
     pub cacheable_query: Box<CacheableQuery>,
+    pub result_formats: Vec<i16>,
     pub client_socket: TcpStream,
     pub reply_tx: Sender<CacheReply>,
 }
