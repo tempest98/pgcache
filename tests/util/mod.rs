@@ -17,7 +17,7 @@ use pgtemp::{PgTempDB, PgTempDBBuilder};
 use postgres_types::ToSql;
 use regex_lite::Regex;
 use tokio::time::sleep;
-use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, ToStatement};
+use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, Statement, ToStatement};
 use tokio_util::bytes::{Buf, BytesMut};
 
 /// Guard structure that automatically kills and waits for the pgcache process on drop
@@ -167,8 +167,81 @@ pub fn proxy_metrics_get(pgcache: &mut PgCacheProcess) -> Result<MetricsSnapshot
 }
 
 pub struct TempDBs {
-    origin: PgTempDB,
-    cache: PgTempDB,
+    pub origin: PgTempDB,
+    pub cache: PgTempDB,
+}
+
+/// Test context combining all resources needed for integration tests.
+/// Provides convenient methods for executing queries and checking metrics.
+pub struct TestContext {
+    pub dbs: TempDBs,
+    pub pgcache: PgCacheProcess,
+    pub cache: Client,   // connected through pgcache proxy
+    pub origin: Client,  // direct connection to origin database
+}
+
+impl TestContext {
+    pub async fn setup() -> Result<Self, Error> {
+        let (dbs, origin) = start_databases().await?;
+        let (pgcache, cache) = connect_pgcache(&dbs).await?;
+        Ok(Self {
+            dbs,
+            pgcache,
+            cache,
+            origin,
+        })
+    }
+
+    /// Execute query through pgcache proxy
+    pub async fn query<T>(
+        &mut self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.cache.query(statement, params).await.map_err(Error::other)
+    }
+
+    /// Execute query directly on origin (bypassing pgcache)
+    pub async fn origin_query<T>(
+        &mut self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.origin.query(statement, params).await.map_err(Error::other)
+    }
+
+    /// Execute simple query through pgcache proxy
+    pub async fn simple_query(&mut self, query: &str) -> Result<Vec<SimpleQueryMessage>, Error> {
+        self.cache.simple_query(query).await.map_err(Error::other)
+    }
+
+    /// Get metrics from pgcache process
+    pub fn metrics(&mut self) -> Result<MetricsSnapshot, Error> {
+        proxy_metrics_get(&mut self.pgcache)
+    }
+
+    /// Prepare a statement through pgcache proxy
+    pub async fn prepare(&self, query: &str) -> Result<Statement, Error> {
+        self.cache.prepare(query).await.map_err(Error::other)
+    }
+
+    /// Execute query_one through pgcache proxy
+    pub async fn query_one<T>(
+        &self,
+        statement: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row, Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        self.cache.query_one(statement, params).await.map_err(Error::other)
+    }
 }
 
 pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
@@ -357,37 +430,26 @@ pub fn assert_row_at(
 /// Creates tables and inserts base data:
 /// - test: (1, 'foo'), (2, 'bar'), (3, 'baz')
 /// - test_map: (1, 1, 'alpha'), (2, 1, 'beta'), (3, 2, 'gamma')
-pub async fn setup_constraint_test_tables(
-    pgcache: &mut PgCacheProcess,
-    client: &Client,
-) -> Result<(), Error> {
-    query(
-        pgcache,
-        client,
+pub async fn setup_constraint_test_tables(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
         "create table test (id integer primary key, data text)",
         &[],
     )
     .await?;
 
-    query(
-        pgcache,
-        client,
+    ctx.query(
         "create table test_map (id serial primary key, test_id integer, data text)",
         &[],
     )
     .await?;
 
-    query(
-        pgcache,
-        client,
+    ctx.query(
         "insert into test (id, data) values (1, 'foo'), (2, 'bar'), (3, 'baz')",
         &[],
     )
     .await?;
 
-    query(
-        pgcache,
-        client,
+    ctx.query(
         "insert into test_map (test_id, data) values (1, 'alpha'), (1, 'beta'), (2, 'gamma')",
         &[],
     )
