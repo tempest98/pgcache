@@ -41,8 +41,8 @@ use crate::{
     settings::Settings,
 };
 
-use super::{ConnectionError, ProxyMode, ProxyStatus, ReadError};
 use super::query::{Action, ForwardReason, handle_query};
+use super::{ConnectionError, ProxyMode, ProxyStatus, ReadError};
 
 type SenderCacheType = Sender<ProxyMessage>;
 
@@ -102,6 +102,7 @@ impl ConnectionState {
 
     /// Handle a message from the client (frontend).
     /// Determines whether to forward to origin, check cache, or take other action.
+    #[expect(clippy::wildcard_enum_match_arm)]
     async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
         match msg.message_type {
             PgFrontendMessageType::Query => {
@@ -170,6 +171,7 @@ impl ConnectionState {
 
     /// Handle a message from the origin database (backend).
     /// Updates transaction state, captures parameter OIDs, and forwards to client.
+    #[expect(clippy::wildcard_enum_match_arm)]
     fn handle_origin_message(&mut self, msg: PgBackendMessage) {
         match msg.message_type {
             PgBackendMessageType::ParameterDescription => {
@@ -190,7 +192,7 @@ impl ConnectionState {
                 // 'I' = idle (not in transaction)
                 // 'T' = in transaction block
                 // 'E' = in failed transaction block
-                self.in_transaction = msg.data[5] == b'T' || msg.data[5] == b'E';
+                self.in_transaction = msg.data.get(5).is_some_and(|&b| b == b'T' || b == b'E');
 
                 // Clean up unnamed portals when transaction ends
                 if !self.in_transaction {
@@ -271,7 +273,7 @@ impl ConnectionState {
                     match &stmt.sql_type {
                         StatementType::NonSelect => self.metrics.unsupported_increment(),
                         StatementType::ParseError => self.metrics.invalid_increment(),
-                        _ => {} // Cacheable or UncacheableSelect
+                        StatementType::Cacheable(_) | StatementType::UncacheableSelect => {}
                     }
                 }
 
@@ -298,7 +300,11 @@ impl ConnectionState {
         let portal = self.portals.get(&parsed.portal_name)?;
 
         // Only handle implicit or uniform result formats
-        if portal.result_formats.len() > 1 && portal.result_formats.windows(2).all(|w| w[0] == w[1])
+        if portal.result_formats.len() > 1
+            && portal
+                .result_formats
+                .windows(2)
+                .all(|w| matches!(w, [a, b] if a == b))
         {
             return None;
         }
@@ -309,7 +315,9 @@ impl ConnectionState {
         // Check if cacheable - extract CacheableQuery from StatementType
         let cacheable_query = match &stmt.sql_type {
             StatementType::Cacheable(query) => query.clone(),
-            _ => return None,
+            StatementType::NonSelect
+            | StatementType::UncacheableSelect
+            | StatementType::ParseError => return None,
         };
 
         // All checks passed - use cache
@@ -404,6 +412,10 @@ impl ConnectionState {
         self.portals.clear();
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "VecDeque access guarded by !is_empty()"
+    )]
     async fn connection_select(
         &mut self,
         origin_read: &mut Pin<&mut FramedOrigin<'_>>,
@@ -451,6 +463,10 @@ impl ConnectionState {
         Ok(())
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "VecDeque access guarded by !is_empty()"
+    )]
     async fn connection_select_with_cache(
         &mut self,
         origin_read: &mut Pin<&mut FramedOrigin<'_>>,
@@ -673,7 +689,7 @@ pub fn connection_run(
                 while let Some(mut socket) = rx.recv().await {
                     let addrs = addrs.clone();
                     let cache_tx = cache_tx.clone();
-                    let metrics = metrics.clone();
+                    let metrics = Arc::clone(&metrics);
                     spawn_local(async move {
                         debug!("task spawn");
                         match handle_connection(&mut socket, addrs, cache_tx, metrics).await {

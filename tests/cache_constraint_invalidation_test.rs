@@ -1,6 +1,9 @@
+#![allow(clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used)]
+
 use std::io::Error;
 
-use crate::util::{assert_row_at, setup_constraint_test_tables, wait_for_cdc, TestContext};
+use crate::util::{TestContext, assert_row_at, setup_constraint_test_tables, wait_for_cdc};
 
 mod util;
 
@@ -115,11 +118,8 @@ async fn test_update_entering_result_set() -> Result<(), Error> {
         .await?;
 
     // UPDATE: Change gamma's test_id from 2 to 1 (entering result set)
-    ctx.origin_query(
-        "update test_map set test_id = 1 where data = 'gamma'",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("update test_map set test_id = 1 where data = 'gamma'", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -160,11 +160,8 @@ async fn test_update_leaving_result_set() -> Result<(), Error> {
 
     // UPDATE: Change alpha's test_id from 1 to 5 (leaving result set)
     // Optimization: no invalidation, UPDATE mechanism removes row from cache
-    ctx.origin_query(
-        "update test_map set test_id = 5 where data = 'alpha'",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("update test_map set test_id = 5 where data = 'alpha'", &[])
+        .await?;
 
     wait_for_cdc().await;
 

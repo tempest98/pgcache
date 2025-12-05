@@ -3,9 +3,7 @@ use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
 use crate::{
     catalog::TableMetadata,
     query::{
-        ast::SelectStatement,
-        constraints::QueryConstraints,
-        resolved::ResolvedSelectStatement,
+        ast::SelectStatement, constraints::QueryConstraints, resolved::ResolvedSelectStatement,
     },
 };
 

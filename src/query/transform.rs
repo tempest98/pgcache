@@ -152,7 +152,7 @@ fn where_expr_parameters_replace(
 fn parameter_index_parse(placeholder: &str) -> Result<usize, AstTransformError> {
     if !placeholder.starts_with('$') {
         return Err(AstTransformError::InvalidParameterPlaceholder {
-            placeholder: placeholder.to_string(),
+            placeholder: placeholder.to_owned(),
         });
     }
 
@@ -161,12 +161,12 @@ fn parameter_index_parse(placeholder: &str) -> Result<usize, AstTransformError> 
         index_str
             .parse::<usize>()
             .map_err(|_| AstTransformError::InvalidParameterPlaceholder {
-                placeholder: placeholder.to_string(),
+                placeholder: placeholder.to_owned(),
             })?;
 
     if param_num == 0 {
         return Err(AstTransformError::InvalidParameterPlaceholder {
-            placeholder: placeholder.to_string(),
+            placeholder: placeholder.to_owned(),
         });
     }
 
@@ -293,7 +293,7 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, A
             })?;
             let value = NotNan::new(value as f64).map_err(|_| {
                 AstTransformError::InvalidParameterValue {
-                    message: "NaN is not a valid float value".to_string(),
+                    message: "NaN is not a valid float value".to_owned(),
                 }
             })?;
             Ok(LiteralValue::Float(value))
@@ -306,7 +306,7 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, A
             })?;
             let value =
                 NotNan::new(value).map_err(|_| AstTransformError::InvalidParameterValue {
-                    message: "NaN is not a valid float value".to_string(),
+                    message: "NaN is not a valid float value".to_owned(),
                 })?;
             Ok(LiteralValue::Float(value))
         }
@@ -323,18 +323,19 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, A
                     message: format!("invalid binary text: {}", e),
                 }
             })?;
-            Ok(LiteralValue::String(value.to_string()))
+            Ok(LiteralValue::String(value.to_owned()))
         }
         Some(PgType::UUID) => {
             // UUID binary format is 16 bytes
-            if bytes.len() != 16 {
-                return Err(AstTransformError::InvalidParameterValue {
-                    message: format!(
-                        "invalid UUID length: expected 16 bytes, got {}",
-                        bytes.len()
-                    ),
-                });
-            }
+            let bytes: &[u8; 16] =
+                bytes
+                    .try_into()
+                    .map_err(|_| AstTransformError::InvalidParameterValue {
+                        message: format!(
+                            "invalid UUID length: expected 16 bytes, got {}",
+                            bytes.len()
+                        ),
+                    })?;
             let uuid_str = format!(
                 "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                 bytes[0],
@@ -386,12 +387,16 @@ pub fn query_table_update_queries(
     let select_list = SelectColumns::Columns(vec![column]);
 
     let mut queries = Vec::new();
-    if tables.len() == 1 {
-        queries.push((tables[0], query_select_replace(select, select_list)));
-    } else if tables.len() == 2 {
-        //can use same query for both tables (CacheableQuery guarantees is_supported_from)
-        queries.push((tables[0], query_select_replace(select, select_list.clone())));
-        queries.push((tables[1], query_select_replace(select, select_list)));
+    match tables.as_slice() {
+        [table] => {
+            queries.push((*table, query_select_replace(select, select_list)));
+        }
+        [table1, table2] => {
+            //can use same query for both tables (CacheableQuery guarantees is_supported_from)
+            queries.push((*table1, query_select_replace(select, select_list.clone())));
+            queries.push((*table2, query_select_replace(select, select_list)));
+        }
+        _ => {}
     }
 
     queries
@@ -405,7 +410,10 @@ pub fn query_table_replace_with_values(
     let mut select_new = select.clone();
 
     //find first matching table source
-    let mut frontier = vec![&mut select_new.from[0]];
+    let Some(first_from) = select_new.from.first_mut() else {
+        return Err(AstTransformError::MissingTable);
+    };
+    let mut frontier = vec![first_from];
     let mut source_node: Option<&mut TableSource> = None;
     while let Some(cur) = frontier.pop() {
         match cur {
@@ -435,13 +443,11 @@ pub fn query_table_replace_with_values(
 
     for column_meta in &table_metadata.columns {
         let position = column_meta.position as usize - 1;
-        if position < row_data.len() {
-            let value = row_data[position]
-                .as_deref()
-                .map_or(LiteralValue::Null, |v| {
-                    //some ugly casting
-                    LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone())
-                });
+        if let Some(row_value) = row_data.get(position) {
+            let value = row_value.as_deref().map_or(LiteralValue::Null, |v| {
+                //some ugly casting
+                LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone())
+            });
 
             column_names.push(column_meta.name.as_str());
             values.push(value);
@@ -481,6 +487,9 @@ pub fn query_table_replace_with_values(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::wildcard_enum_match_arm)]
+
     use crate::query::ast::{Deparse, Statement, sql_query_convert};
 
     use super::*;
@@ -943,7 +952,10 @@ mod tests {
             LiteralValue::Float(f) => {
                 assert!((f.into_inner() - 2.73821).abs() < 0.00001);
             }
-            _ => panic!("Expected Float literal"),
+            _ => panic!(
+                "Expected F
+           loat literal"
+            ),
         }
     }
 
@@ -956,7 +968,7 @@ mod tests {
         };
 
         let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::String("hello world".to_string()));
+        assert_eq!(result, LiteralValue::String("hello world".to_owned()));
     }
 
     #[test]
@@ -976,7 +988,7 @@ mod tests {
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(
             result,
-            LiteralValue::String("550e8400-e29b-41d4-a716-446655440000".to_string())
+            LiteralValue::String("550e8400-e29b-41d4-a716-446655440000".to_owned())
         );
     }
 

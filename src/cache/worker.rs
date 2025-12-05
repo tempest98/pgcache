@@ -46,7 +46,7 @@ impl CacheWorker {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_cached_query(&self, msg: &mut QueryRequest) -> Result<(), CacheError> {
-        let rv = if msg.result_formats.is_empty() || msg.result_formats[0] == 0 {
+        let rv = if msg.result_formats.first().is_none_or(|&f| f == 0) {
             self.handle_cached_query_text(msg).await
         } else {
             self.handle_cached_query_binary(msg).await
@@ -65,7 +65,12 @@ impl CacheWorker {
         // Execute query against cache database
         let res = self.db_cache.simple_query(&sql).await?;
 
-        let SimpleQueryMessage::RowDescription(desc) = &res[0] else {
+        let [
+            SimpleQueryMessage::RowDescription(desc),
+            data_rows @ ..,
+            SimpleQueryMessage::CommandComplete(cnt),
+        ] = res.as_slice()
+        else {
             return Err(CacheError::InvalidMessage);
         };
 
@@ -81,21 +86,19 @@ impl CacheWorker {
         }
 
         buf.clear();
-        for query_msg in &res[1..(res.len() - 1)] {
-            match query_msg {
-                SimpleQueryMessage::Row(row) => {
-                    // Use raw buffer directly to avoid decode/encode overhead
-                    // The raw buffer contains field data but not the field count
-                    let raw_data = row.raw_buffer_bytes();
-                    let field_count = row.len() as u16;
+        for query_msg in data_rows {
+            let SimpleQueryMessage::Row(row) = query_msg else {
+                return Err(CacheError::InvalidMessage);
+            };
+            // Use raw buffer directly to avoid decode/encode overhead
+            // The raw buffer contains field data but not the field count
+            let raw_data = row.raw_buffer_bytes();
+            let field_count = row.len() as u16;
 
-                    buf.put_u8(b'D'); // DATA_ROW_TAG
-                    buf.put_i32(4 + 2 + raw_data.len() as i32); // 4 (length field) + 2 (field count) + data
-                    buf.put_u16(field_count);
-                    buf.put_slice(raw_data);
-                }
-                _ => return Err(CacheError::InvalidMessage),
-            }
+            buf.put_u8(b'D'); // DATA_ROW_TAG
+            buf.put_i32(4 + 2 + raw_data.len() as i32); // 4 (length field) + 2 (field count) + data
+            buf.put_u16(field_count);
+            buf.put_slice(raw_data);
 
             //send data if more than 64kB have been accumulated
             if buf.len() > BUFFER_SIZE_THRESHOLD
@@ -112,10 +115,6 @@ impl CacheWorker {
             error!("no client");
             return Err(CacheError::Write);
         }
-
-        let SimpleQueryMessage::CommandComplete(cnt) = &res[res.len() - 1] else {
-            return Err(CacheError::InvalidMessage);
-        };
 
         let mut buf = BytesMut::new();
         command_complete_encode(*cnt, &mut buf);
@@ -146,7 +145,7 @@ impl CacheWorker {
         let res = self.db_cache.query(&sql, &[]).await?;
 
         let mut buf = BytesMut::new();
-        for row in &res[0..res.len()] {
+        for row in &res {
             // Use raw buffer directly to avoid decode/encode overhead
             // The raw buffer contains field data but not the field count
             let raw_data = row.raw_buffer_bytes();

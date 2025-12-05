@@ -355,8 +355,8 @@ impl WhereExpr {
             WhereExpr::Unary(unary) => unary.expr.has_sublink(),
             WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_sublink()),
             WhereExpr::Function { args, .. } => args.iter().any(|e| e.has_sublink()),
-            WhereExpr::Subquery { .. } => true, // Found a subquery!
-            _ => false,                         // Value and Column don't contain sublinks
+            WhereExpr::Subquery { .. } => true,
+            WhereExpr::Value(_) | WhereExpr::Column(_) => false,
         }
     }
 }
@@ -511,7 +511,7 @@ impl SelectStatement {
 
     /// Check if this SELECT statement references only a single table
     pub fn is_single_table(&self) -> bool {
-        self.from.len() == 1 && matches!(self.from[0], TableSource::Table(_))
+        matches!(self.from.as_slice(), [TableSource::Table(_)])
     }
 
     /// Check if this SELECT statement contains sublinks/subqueries
@@ -549,7 +549,7 @@ impl SelectStatement {
                 .args
                 .iter()
                 .any(|arg| self.column_expr_has_sublink(arg)),
-            _ => false, // Column references and literals don't contain sublinks
+            ColumnExpr::Column(_) | ColumnExpr::Literal(_) | ColumnExpr::Subquery(_) => false,
         }
     }
 }
@@ -722,7 +722,7 @@ pub enum ColumnExpr {
     Column(ColumnNode),     // column_name, table.column_name
     Function(FunctionCall), // COUNT(*), SUM(col), etc.
     Literal(LiteralValue),  // Constant values
-    Subquery(SelectStatement),
+    Subquery(Box<SelectStatement>),
 }
 
 impl ColumnExpr {
@@ -1111,11 +1111,10 @@ pub struct LimitClause {
 
 /// Convert a pg_query ParseResult into our simplified AST
 pub fn sql_query_convert(ast: &ParseResult) -> Result<SqlQuery, AstError> {
-    if ast.protobuf.stmts.len() != 1 {
+    let [raw_stmt] = ast.protobuf.stmts.as_slice() else {
         return Err(AstError::MultipleStatements);
-    }
+    };
 
-    let raw_stmt = &ast.protobuf.stmts[0];
     let stmt_node = raw_stmt.stmt.as_ref().ok_or(AstError::MissingStatement)?;
 
     match stmt_node.node.as_ref() {
@@ -1204,8 +1203,8 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
             match val_node.node.as_ref() {
                 Some(NodeEnum::ColumnRef(col_ref)) => {
                     // Check if this is SELECT *
-                    if col_ref.fields.len() == 1
-                        && let Some(NodeEnum::AStar(_)) = &col_ref.fields[0].node
+                    if let [field] = col_ref.fields.as_slice()
+                        && let Some(NodeEnum::AStar(_)) = &field.node
                     {
                         has_star = true;
                         continue;
@@ -1224,7 +1223,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                         Some(NodeEnum::SelectStmt(select_stmt)) => {
                             let statement = select_statement_convert(select_stmt)?;
                             columns.push(SelectColumn {
-                                expr: ColumnExpr::Subquery(statement),
+                                expr: ColumnExpr::Subquery(Box::new(statement)),
                                 alias,
                             });
                         }
@@ -1255,7 +1254,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
         Ok(SelectColumns::Columns(columns))
     } else {
         Err(AstError::UnsupportedSelectFeature {
-            feature: "Mixed * and column list".to_string(),
+            feature: "Mixed * and column list".to_owned(),
         })
     }
 }
@@ -1310,7 +1309,7 @@ fn join_expr_convert(join_expr: &JoinExpr) -> Result<TableSource, AstError> {
         join_arg_convert(larg_node, "left")?
     } else {
         return Err(AstError::UnsupportedSelectFeature {
-            feature: "join missing left argument".to_string(),
+            feature: "join missing left argument".to_owned(),
         });
     };
 
@@ -1319,7 +1318,7 @@ fn join_expr_convert(join_expr: &JoinExpr) -> Result<TableSource, AstError> {
         join_arg_convert(rarg_node, "right")?
     } else {
         return Err(AstError::UnsupportedSelectFeature {
-            feature: "join missing right argument".to_string(),
+            feature: "join missing right argument".to_owned(),
         });
     };
 
@@ -1444,7 +1443,7 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
             match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
                 Some(NodeEnum::SelectStmt(select_stmt)) => {
                     let statement = select_statement_convert(select_stmt)?;
-                    Ok(ColumnExpr::Subquery(statement))
+                    Ok(ColumnExpr::Subquery(Box::new(statement)))
                 }
                 other => Err(AstError::UnsupportedFeature {
                     feature: format!("Sublink type: {other:?}"),
@@ -1464,7 +1463,7 @@ fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, A
     for sort_node in sort_clause {
         if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
             let expr_node = sort_by.node.as_ref().ok_or(AstError::UnsupportedFeature {
-                feature: "ORDER BY without expression".to_string(),
+                feature: "ORDER BY without expression".to_owned(),
             })?;
 
             let expr = node_convert_to_column_expr(expr_node)?;
@@ -1495,6 +1494,9 @@ pub fn ast_query_fingerprint(select_statement: &SelectStatement) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used)]
+
     use std::{collections::HashSet, panic};
 
     use super::*;
@@ -1607,13 +1609,13 @@ mod tests {
 
             // First column: u.id
             if let ColumnExpr::Column(col_ref) = &columns[0].expr {
-                assert_eq!(col_ref.table, Some("u".to_string()));
+                assert_eq!(col_ref.table, Some("u".to_owned()));
                 assert_eq!(col_ref.column, "id");
             }
 
             // Second column: u.name
             if let ColumnExpr::Column(col_ref) = &columns[1].expr {
-                assert_eq!(col_ref.table, Some("u".to_string()));
+                assert_eq!(col_ref.table, Some("u".to_owned()));
                 assert_eq!(col_ref.column, "name");
             }
         }
@@ -1630,13 +1632,13 @@ mod tests {
             assert_eq!(columns.len(), 2);
 
             // First column: id as user_id
-            assert_eq!(columns[0].alias, Some("user_id".to_string()));
+            assert_eq!(columns[0].alias, Some("user_id".to_owned()));
             if let ColumnExpr::Column(col_ref) = &columns[0].expr {
                 assert_eq!(col_ref.column, "id");
             }
 
             // Second column: name as full_name
-            assert_eq!(columns[1].alias, Some("full_name".to_string()));
+            assert_eq!(columns[1].alias, Some("full_name".to_owned()));
             if let ColumnExpr::Column(col_ref) = &columns[1].expr {
                 assert_eq!(col_ref.column, "name");
             }
@@ -1863,7 +1865,7 @@ mod tests {
         let mut buf = String::new();
 
         // String literal
-        LiteralValue::String("hello".to_string()).deparse(&mut buf);
+        LiteralValue::String("hello".to_owned()).deparse(&mut buf);
         assert_eq!(buf, "'hello'");
         buf.clear();
 
@@ -1892,7 +1894,7 @@ mod tests {
         buf.clear();
 
         // Parameter
-        LiteralValue::Parameter("$1".to_string()).deparse(&mut buf);
+        LiteralValue::Parameter("$1".to_owned()).deparse(&mut buf);
         assert_eq!(buf, "$1");
     }
 
@@ -1903,7 +1905,7 @@ mod tests {
         // Simple column
         ColumnNode {
             table: None,
-            column: "id".to_string(),
+            column: "id".to_owned(),
         }
         .deparse(&mut buf);
         assert_eq!(buf, "id");
@@ -1911,8 +1913,8 @@ mod tests {
 
         // Qualified column
         ColumnNode {
-            table: Some("users".to_string()),
-            column: "name".to_string(),
+            table: Some("users".to_owned()),
+            column: "name".to_owned(),
         }
         .deparse(&mut buf);
         assert_eq!(buf, "users.name");
@@ -1926,7 +1928,7 @@ mod tests {
         SelectColumn {
             expr: ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             }),
             alias: Some("alias".to_owned()),
         }
@@ -1939,8 +1941,8 @@ mod tests {
 
         SelectColumn {
             expr: ColumnExpr::Column(ColumnNode {
-                table: Some("users".to_string()),
-                column: "name".to_string(),
+                table: Some("users".to_owned()),
+                column: "name".to_owned(),
             }),
             alias: Some("alias".to_owned()),
         }
@@ -2005,7 +2007,7 @@ mod tests {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(1))),
         };
@@ -2018,10 +2020,10 @@ mod tests {
         let expr = BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
-                table: Some("users".to_string()),
-                column: "name".to_string(),
+                table: Some("users".to_owned()),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
         };
 
         expr.deparse(&mut buf);
@@ -2037,7 +2039,7 @@ mod tests {
             op: ExprOp::Not,
             expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "active".to_string(),
+                column: "active".to_owned(),
             })),
         };
 
@@ -2157,7 +2159,7 @@ mod tests {
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
         assert_eq!(literals.len(), 1);
-        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_string()));
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_owned()));
 
         // Test deparsing
         let mut deparsed = String::with_capacity(1024);
@@ -2175,8 +2177,8 @@ mod tests {
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
         assert_eq!(literals.len(), 2);
-        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_string()));
-        assert_eq!(literals[1], &LiteralValue::Parameter("$2".to_string()));
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_owned()));
+        assert_eq!(literals[1], &LiteralValue::Parameter("$2".to_owned()));
 
         // Test deparsing
         let mut deparsed = String::with_capacity(1024);
@@ -2194,7 +2196,7 @@ mod tests {
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
         assert_eq!(literals.len(), 2);
-        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_string()));
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_owned()));
         assert_eq!(literals[1], &LiteralValue::Boolean(true));
 
         // Test deparsing
@@ -2206,14 +2208,14 @@ mod tests {
     #[test]
     fn test_literal_empty_string() {
         let mut buf = String::new();
-        LiteralValue::String("".to_string()).deparse(&mut buf);
+        LiteralValue::String("".to_owned()).deparse(&mut buf);
         assert_eq!(buf, "''");
     }
 
     #[test]
     fn test_literal_string_with_quotes() {
         let mut buf = String::new();
-        LiteralValue::String("test'quote".to_string()).deparse(&mut buf);
+        LiteralValue::String("test'quote".to_owned()).deparse(&mut buf);
         // postgres-protocol should properly escape the quote
         assert_eq!(buf, "'test''quote'");
     }
@@ -2221,7 +2223,7 @@ mod tests {
     #[test]
     fn test_literal_string_with_backslashes() {
         let mut buf = String::new();
-        LiteralValue::String("test\\path".to_string()).deparse(&mut buf);
+        LiteralValue::String("test\\path".to_owned()).deparse(&mut buf);
         // postgres-protocol should use E'' syntax for backslashes
         assert_eq!(buf, "E'test\\\\path'");
     }
@@ -2335,7 +2337,7 @@ mod tests {
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
 
         assert_eq!(literals.len(), 3);
-        assert_eq!(literals[0], &LiteralValue::String("john".to_string()));
+        assert_eq!(literals[0], &LiteralValue::String("john".to_owned()));
         assert_eq!(literals[1], &LiteralValue::Integer(25));
         assert_eq!(literals[2], &LiteralValue::Boolean(true));
     }
@@ -2404,9 +2406,9 @@ mod tests {
         assert_eq!(columns.len(), 2);
 
         // Verify the condition columns
-        assert_eq!(columns[0].table, Some("u".to_string()));
+        assert_eq!(columns[0].table, Some("u".to_owned()));
         assert_eq!(columns[0].column, "id");
-        assert_eq!(columns[1].table, Some("o".to_string()));
+        assert_eq!(columns[1].table, Some("o".to_owned()));
         assert_eq!(columns[1].column, "user_id");
     }
 
@@ -2454,10 +2456,10 @@ mod tests {
         // Note: FunctionCall support is limited in the current parser
         // This test verifies the nodes() implementation works for the structure
         let func = FunctionCall {
-            name: "COUNT".to_string(),
+            name: "COUNT".to_owned(),
             args: vec![ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })],
         };
 
@@ -2476,7 +2478,7 @@ mod tests {
         // Test that TableNode::nodes() returns itself as a leaf node
         let tables: Vec<&TableNode> = ast.nodes().collect();
         assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].schema, Some("public".to_string()));
+        assert_eq!(tables[0].schema, Some("public".to_owned()));
         assert_eq!(tables[0].name, "users");
     }
 
@@ -2525,7 +2527,7 @@ mod tests {
             exprs: vec![
                 WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_string(),
+                    column: "id".to_owned(),
                 }),
                 WhereExpr::Value(LiteralValue::Integer(1)),
                 WhereExpr::Value(LiteralValue::Integer(2)),
@@ -2626,7 +2628,7 @@ mod tests {
         assert_eq!(select.order_by.len(), 1);
 
         if let ColumnExpr::Column(col) = &select.order_by[0].expr {
-            assert_eq!(col.table, Some("u".to_string()));
+            assert_eq!(col.table, Some("u".to_owned()));
             assert_eq!(col.column, "name");
         } else {
             panic!("Expected column expression");

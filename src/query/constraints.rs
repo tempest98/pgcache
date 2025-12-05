@@ -80,7 +80,13 @@ fn analyze_equality_expr(
         }
 
         // OR, other operators: cannot propagate
-        _ => {}
+        ResolvedWhereExpr::Value(_)
+        | ResolvedWhereExpr::Column(_)
+        | ResolvedWhereExpr::Unary(_)
+        | ResolvedWhereExpr::Binary(_)
+        | ResolvedWhereExpr::Multi(_)
+        | ResolvedWhereExpr::Function { .. }
+        | ResolvedWhereExpr::Subquery { .. } => {}
     }
 }
 
@@ -190,6 +196,9 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectStatement) -> QueryCon
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used)]
+
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 

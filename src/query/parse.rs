@@ -19,9 +19,9 @@ error_set! {
     WhereParseError := {
         #[display("Unsupported WHERE clause pattern")]
         UnsupportedPattern,
-        #[display("Unsupported A expression")]
+        #[display("Unsupported A expression: {expr}")]
         UnsupportedAExpr { expr: String },
-        #[display("Unsupported operator")]
+        #[display("Unsupported operator: {operator}")]
         UnsupportedOperator { operator: String },
         #[display("Invalid column reference")]
         InvalidColumnRef,
@@ -31,6 +31,7 @@ error_set! {
         ComplexExpression { expr: String },
         #[display("Missing expression")]
         MissingExpression,
+        #[display("{error}")]
         Other { error: String }
     }
 
@@ -69,7 +70,8 @@ pub fn _query_select_columns(ast: &ParseResult) -> HashSet<String> {
         if let Some(node) = &target.node {
             node.nodes().iter().for_each(|&(node_ref, _, _, _)| {
                 if let NodeRef::ColumnRef(column_ref) = node_ref
-                    && let Some(NodeEnum::String(column)) = &column_ref.fields[0].node
+                    && let Some(field) = column_ref.fields.first()
+                    && let Some(NodeEnum::String(column)) = &field.node
                 {
                     columns.insert(column.sval.clone());
                 }
@@ -90,7 +92,7 @@ fn query_select_statement(ast: &ParseResult) -> &SelectStmt {
         todo!("support multiple statements in query");
     }
 
-    let raw_stmt = &ast.protobuf.stmts[0];
+    let raw_stmt = ast.protobuf.stmts.first().expect("statement in query");
 
     if let Some(NodeEnum::SelectStmt(select_stmt)) =
         raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref())
@@ -199,6 +201,7 @@ fn param_ref_extract(param_ref: &ParamRef) -> LiteralValue {
 }
 
 /// Convert PostgreSQL A_Expr (expressions like col = value)
+#[expect(clippy::wildcard_enum_match_arm)]
 fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
     match expr.kind() {
         AExprKind::AexprOp => {
@@ -231,13 +234,13 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
 
 /// Extract operator from pg_query operator name nodes
 fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<ExprOp, WhereParseError> {
-    if name_nodes.len() != 1 {
+    let [name_node] = name_nodes else {
         return Err(WhereParseError::Other {
-            error: "Multi-part operator names not supported".to_string(),
+            error: "Multi-part operator names not supported".to_owned(),
         });
-    }
+    };
 
-    match name_nodes[0].node.as_ref() {
+    match name_node.node.as_ref() {
         Some(NodeEnum::String(s)) => match s.sval.as_str() {
             "=" => Ok(ExprOp::Equal),
             "!=" | "<>" => Ok(ExprOp::NotEqual),
@@ -249,14 +252,14 @@ fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<ExprOp, WhereParseE
             op => {
                 dbg!(op);
                 Err(WhereParseError::UnsupportedOperator {
-                    operator: op.to_string(),
+                    operator: op.to_owned(),
                 })
             }
         },
         unsupported => {
             dbg!(unsupported);
             Err(WhereParseError::Other {
-                error: "Invalid operator name format".to_string(),
+                error: "Invalid operator name format".to_owned(),
             })
         }
     }
@@ -266,22 +269,22 @@ fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<ExprOp, WhereParseE
 fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
     match expr.boolop() {
         BoolExprType::AndExpr => {
-            if expr.args.len() < 2 {
+            let [first, second, rest @ ..] = expr.args.as_slice() else {
                 return Err(WhereParseError::Other {
-                    error: "AND with < 2 arguments not supported".to_string(),
+                    error: "AND with < 2 arguments not supported".to_owned(),
                 });
-            }
+            };
 
             // For chained AND expressions (a AND b AND c), build a left-associative tree:
             // ((a AND b) AND c)
             let mut result = WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::And,
-                lexpr: Box::new(node_convert_to_expr(&expr.args[0])?),
-                rexpr: Box::new(node_convert_to_expr(&expr.args[1])?),
+                lexpr: Box::new(node_convert_to_expr(first)?),
+                rexpr: Box::new(node_convert_to_expr(second)?),
             });
 
             // Chain additional arguments
-            for arg in &expr.args[2..] {
+            for arg in rest {
                 result = WhereExpr::Binary(BinaryExpr {
                     op: ExprOp::And,
                     lexpr: Box::new(result),
@@ -292,22 +295,22 @@ fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
             Ok(result)
         }
         BoolExprType::OrExpr => {
-            if expr.args.len() < 2 {
+            let [first, second, rest @ ..] = expr.args.as_slice() else {
                 return Err(WhereParseError::Other {
-                    error: "OR with < 2 arguments not supported".to_string(),
+                    error: "OR with < 2 arguments not supported".to_owned(),
                 });
-            }
+            };
 
             // For chained OR expressions (a OR b OR c), build a left-associative tree:
             // ((a OR b) OR c)
             let mut result = WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Or,
-                lexpr: Box::new(node_convert_to_expr(&expr.args[0])?),
-                rexpr: Box::new(node_convert_to_expr(&expr.args[1])?),
+                lexpr: Box::new(node_convert_to_expr(first)?),
+                rexpr: Box::new(node_convert_to_expr(second)?),
             });
 
             // Chain additional arguments
-            for arg in &expr.args[2..] {
+            for arg in rest {
                 result = WhereExpr::Binary(BinaryExpr {
                     op: ExprOp::Or,
                     lexpr: Box::new(result),
@@ -318,25 +321,29 @@ fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
             Ok(result)
         }
         BoolExprType::NotExpr => {
-            if expr.args.len() != 1 {
+            let [arg] = expr.args.as_slice() else {
                 return Err(WhereParseError::Other {
-                    error: "NOT with != 1 argument not supported".to_string(),
+                    error: "NOT with != 1 argument not supported".to_owned(),
                 });
-            }
+            };
 
             Ok(WhereExpr::Unary(UnaryExpr {
                 op: ExprOp::Not,
-                expr: Box::new(node_convert_to_expr(&expr.args[0])?),
+                expr: Box::new(node_convert_to_expr(arg)?),
             }))
         }
         BoolExprType::Undefined => Err(WhereParseError::Other {
-            error: "Undefined boolean expression type".to_string(),
+            error: "Undefined boolean expression type".to_owned(),
         }),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::wildcard_enum_match_arm)]
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -358,17 +365,17 @@ mod tests {
         let cols = _query_select_columns(
             &pg_query::parse("select id, str from test where str = 'hello'").unwrap(),
         );
-        assert_eq!(cols, HashSet::from(["id".to_string(), "str".to_string()]));
+        assert_eq!(cols, HashSet::from(["id".to_owned(), "str".to_owned()]));
 
         let cols = _query_select_columns(
             &pg_query::parse("select count(id), str from test where str = 'hihi'").unwrap(),
         );
-        assert_eq!(cols, HashSet::from(["id".to_string(), "str".to_string()]));
+        assert_eq!(cols, HashSet::from(["id".to_owned(), "str".to_owned()]));
 
         // let cols = _query_select_columns(
         //     &pg_query::parse("select *, count(*) from test where str = 'hihi'").unwrap(),
         // );
-        // assert_eq!(cols, HashSet::from(["id".to_string(), "str".to_string()]));
+        // assert_eq!(cols, HashSet::from(["id".to_owned(), "str".to_owned()]));
     }
 
     #[test]
@@ -384,9 +391,9 @@ mod tests {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "str".to_string(),
+                column: "str".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
         }));
 
         assert_eq!(where_clause, expected);
@@ -405,7 +412,7 @@ mod tests {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -425,7 +432,7 @@ mod tests {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "active".to_string(),
+                column: "active".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
         }));
@@ -445,7 +452,7 @@ mod tests {
             op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "cnt".to_string(),
+                column: "cnt".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(0))),
         }));
@@ -467,15 +474,15 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_string(),
+                    column: "str".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_string(),
+                    column: "id".to_owned(),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
             })),
@@ -498,17 +505,17 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_string(),
+                    column: "str".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_string(),
+                    column: "str".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("world".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("world".to_owned()))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -529,9 +536,9 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_string(),
+                    column: "str".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -549,10 +556,10 @@ mod tests {
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
-                table: Some("test".to_string()),
-                column: "str".to_string(),
+                table: Some("test".to_owned()),
+                column: "str".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -570,7 +577,7 @@ mod tests {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "data".to_string(),
+                column: "data".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
         }));
@@ -601,7 +608,7 @@ mod tests {
             op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -621,7 +628,7 @@ mod tests {
             op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -641,7 +648,7 @@ mod tests {
             op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -661,7 +668,7 @@ mod tests {
             op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -681,7 +688,7 @@ mod tests {
             op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -725,15 +732,15 @@ mod tests {
                     op: ExprOp::Equal,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "name".to_string(),
+                        column: "name".to_owned(),
                     })),
-                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
                 })),
                 rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                     op: ExprOp::GreaterThan,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "age".to_string(),
+                        column: "age".to_owned(),
                     })),
                     rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(25))),
                 })),
@@ -742,7 +749,7 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "active".to_string(),
+                    column: "active".to_owned(),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
             })),
@@ -772,26 +779,26 @@ mod tests {
                     op: ExprOp::Equal,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "name".to_string(),
+                        column: "name".to_owned(),
                     })),
-                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
                 })),
                 rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                     op: ExprOp::Equal,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "name".to_string(),
+                        column: "name".to_owned(),
                     })),
-                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))),
+                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_owned()))),
                 })),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_string(),
+                    column: "name".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("bob".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("bob".to_owned()))),
             })),
         }));
 
@@ -811,9 +818,9 @@ mod tests {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -833,17 +840,17 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_string(),
+                    column: "name".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::GreaterThan,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "age".to_string(),
+                    column: "age".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$2".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$2".to_owned()))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -864,15 +871,15 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_string(),
+                    column: "name".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "active".to_string(),
+                    column: "active".to_owned(),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
             })),

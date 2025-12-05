@@ -138,8 +138,8 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                     //task to process cdc messages
                     {
                         let mut qcache = qcache.clone();
-                        let sem = cdc_msg_queue_semaphore.clone();
-                        let msg_queue = cdc_msg_queue.clone();
+                        let sem = Rc::clone(&cdc_msg_queue_semaphore);
+                        let msg_queue = Rc::clone(&cdc_msg_queue);
                         spawn_local(async move {
                             while let Ok(permit) = sem.acquire().await {
                                 loop {
@@ -155,8 +155,8 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 
                     while let Some(src) = stream.next().await {
                         let mut qcache = qcache.clone();
-                        let cdc_msg_queue = cdc_msg_queue.clone();
-                        let cdc_msg_queue_semaphore = cdc_msg_queue_semaphore.clone();
+                        let cdc_msg_queue = Rc::clone(&cdc_msg_queue);
+                        let cdc_msg_queue_semaphore = Rc::clone(&cdc_msg_queue_semaphore);
                         spawn_local(async move {
                             match src {
                                 StreamSource::Proxy(proxy_msg) => {

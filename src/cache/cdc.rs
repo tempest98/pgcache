@@ -401,8 +401,8 @@ impl CdcProcessor {
     /// Parse RelationBody into TableMetadata for cache registration.
     fn parse_relation_to_table_metadata(&self, relation_body: &RelationBody) -> TableMetadata {
         let relation_oid = relation_body.rel_id();
-        let table_name = relation_body.name().unwrap_or("unknown_table").to_string();
-        let schema_name = relation_body.namespace().unwrap_or("public").to_string();
+        let table_name = relation_body.name().unwrap_or("unknown_table").to_owned();
+        let schema_name = relation_body.namespace().unwrap_or("public").to_owned();
 
         // Build column metadata from relation body
         let mut columns = BiHashMap::new();
@@ -415,10 +415,10 @@ impl CdcProcessor {
             let data_type = tokio_postgres::types::Type::from_oid(type_oid)
                 .unwrap_or(tokio_postgres::types::Type::TEXT); // Fallback for unknown types
 
-            let type_name = data_type.name().to_string(); // Get the type name from tokio_postgres Type
+            let type_name = data_type.name().to_owned(); // Get the type name from tokio_postgres Type
 
             let column_metadata = ColumnMetadata {
-                name: column.name().unwrap_or("unknown_column").to_string(),
+                name: column.name().unwrap_or("unknown_column").to_owned(),
                 position: (idx + 1) as i16, // PostgreSQL columns are 1-indexed
                 type_oid,
                 data_type,
@@ -427,7 +427,7 @@ impl CdcProcessor {
             };
 
             if is_primary_key {
-                primary_key_columns.push(column.name().unwrap_or("unknown_column").to_string());
+                primary_key_columns.push(column.name().unwrap_or("unknown_column").to_owned());
             }
 
             columns.insert_overwrite(column_metadata);

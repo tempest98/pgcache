@@ -1,6 +1,9 @@
+#![allow(clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used)]
+
 use std::io::Error;
 
-use crate::util::{assert_row_at, wait_cache_load, wait_for_cdc, TestContext};
+use crate::util::{TestContext, assert_row_at, wait_cache_load, wait_for_cdc};
 
 mod util;
 
@@ -8,11 +11,8 @@ mod util;
 async fn test_cache_simple() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    ctx.query(
-        "create table test (id integer primary key, data text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
 
     ctx.query(
         "insert into test (id, data) values (1, 'foo'), (2, 'bar')",
@@ -67,11 +67,8 @@ async fn test_cache_simple() -> Result<(), Error> {
 async fn test_cache_join() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    ctx.query(
-        "create table test (id integer primary key, data text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
 
     ctx.query(
         "create table test_map (id serial primary key, test_id integer, data text)",

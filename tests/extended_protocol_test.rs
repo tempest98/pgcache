@@ -1,16 +1,16 @@
+#![allow(clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used)]
+
 use std::io::Error;
 
-use crate::util::{wait_cache_load, wait_for_cdc, TestContext};
+use crate::util::{TestContext, wait_cache_load, wait_for_cdc};
 
 mod util;
 
 /// Setup basic test table with id and data columns
 async fn setup_basic_test_table(ctx: &mut TestContext) -> Result<(), Error> {
-    ctx.query(
-        "create table test (id integer primary key, data text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
 
     ctx.query(
         "insert into test (id, data) values (1, 'foo'), (2, 'bar')",
@@ -29,7 +29,9 @@ async fn test_extended_protocol_basic() -> Result<(), Error> {
 
     // Use extended protocol with parameterized query
     // tokio-postgres uses extended protocol by default for prepared statements
-    let stmt = ctx.prepare("select id, data from test where data = $1").await?;
+    let stmt = ctx
+        .prepare("select id, data from test where data = $1")
+        .await?;
 
     ctx.query(&stmt, &[&"foo"]).await?;
     wait_cache_load().await;
@@ -54,11 +56,8 @@ async fn test_extended_protocol_basic() -> Result<(), Error> {
 async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    ctx.query(
-        "create table test (id integer primary key, data text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
 
     ctx.query(
         "insert into test (id, data) values (1, 'foo'), (2, 'bar'), (3, 'baz')",
@@ -67,7 +66,9 @@ async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
     .await?;
 
     // Prepare statement once
-    let stmt = ctx.prepare("select id, data from test where data = $1").await?;
+    let stmt = ctx
+        .prepare("select id, data from test where data = $1")
+        .await?;
 
     // Execute multiple times with different parameters
     ctx.query(&stmt, &[&"foo"]).await?;
@@ -149,11 +150,8 @@ async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
 async fn test_extended_protocol_null_parameter() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    ctx.query(
-        "create table test (id integer primary key, data text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
 
     // Insert test data with NULL
     ctx.query(
@@ -185,10 +183,14 @@ async fn test_extended_protocol_unnamed_statement() -> Result<(), Error> {
 
     // Use query_one which creates unnamed statements
     // Each execution replaces the previous unnamed statement
-    let row = ctx.query_one("select data from test where id = $1", &[&1]).await?;
+    let row = ctx
+        .query_one("select data from test where id = $1", &[&1])
+        .await?;
     assert_eq!(row.get::<_, &str>("data"), "foo");
 
-    let row = ctx.query_one("select data from test where id = $1", &[&2]).await?;
+    let row = ctx
+        .query_one("select data from test where id = $1", &[&2])
+        .await?;
     assert_eq!(row.get::<_, &str>("data"), "bar");
 
     Ok(())
@@ -198,11 +200,8 @@ async fn test_extended_protocol_unnamed_statement() -> Result<(), Error> {
 async fn test_extended_protocol_insert_returning() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    ctx.query(
-        "create table test (id serial primary key, data text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table test (id serial primary key, data text)", &[])
+        .await?;
 
     // Prepare INSERT RETURNING statement
     let stmt = ctx
@@ -273,7 +272,7 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
     assert_eq!(metrics.queries_total, 7);
     assert_eq!(metrics.queries_cacheable, 5);
     assert_eq!(metrics.queries_cache_miss, 2); // foo (initial), bar (initial)
-    assert_eq!(metrics.queries_cache_hit, 3);  // foo (second), foo (after CDC), bar (second)
+    assert_eq!(metrics.queries_cache_hit, 3); // foo (second), foo (after CDC), bar (second)
 
     Ok(())
 }

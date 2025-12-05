@@ -3,10 +3,13 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
 };
 
-use tokio_util::bytes::{Buf, BytesMut};
+use tokio_util::bytes::BytesMut;
 use tracing::trace;
 
-use crate::{cache::query::CacheableQuery, query::ast::{AstError, sql_query_convert}};
+use crate::{
+    cache::query::CacheableQuery,
+    query::ast::{AstError, sql_query_convert},
+};
 
 use super::ParseError;
 
@@ -27,8 +30,15 @@ pub(super) async fn handle_query(
     data: &BytesMut,
     fp_cache: &mut HashMap<u64, Result<Box<CacheableQuery>, ForwardReason>>,
 ) -> Result<Action, ParseError> {
-    let msg_len = (&data[1..5]).get_u32() as usize;
-    let query = str::from_utf8(&data[5..msg_len]).map_err(|_| ParseError::InvalidUtf8)?;
+    let len_bytes: [u8; 4] = data
+        .get(1..5)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(ParseError::InvalidUtf8)?;
+    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+    let query = data
+        .get(5..msg_len)
+        .and_then(|b| str::from_utf8(b).ok())
+        .ok_or(ParseError::InvalidUtf8)?;
 
     let mut hasher = DefaultHasher::new();
     query.hash(&mut hasher);

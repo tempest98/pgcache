@@ -116,12 +116,14 @@ impl PgBackendMessageCodec {
             return Ok(None);
         }
 
-        let msg_len = (&buf[1..5]).get_i32() as usize + 1;
+        let (_, mut rest) = buf.split_at(1);
+        let msg_len = rest.get_i32() as usize + 1;
         if buf.remaining() < msg_len {
             return Ok(None);
         }
 
-        self.state = if (&buf[5..9]).get_i32() == AUTHENTICATION_OK {
+        let (_, mut auth_code_slice) = buf.split_at(5);
+        self.state = if auth_code_slice.get_i32() == AUTHENTICATION_OK {
             PgConnectionState::Query
         } else {
             PgConnectionState::Authentication
@@ -145,13 +147,11 @@ impl Decoder for PgBackendMessageCodec {
 
         match self.state {
             PgConnectionState::Startup => {
-                const MIN_MESSAGE_LEN: usize = 1;
-
-                if buf.remaining() < MIN_MESSAGE_LEN {
+                let Some(&first_byte) = buf.first() else {
                     return Ok(None);
-                }
+                };
 
-                match buf[0] {
+                match first_byte {
                     b'S' | b'N' => Ok(Some(PgBackendMessage {
                         message_type: PgBackendMessageType::SslRequestResponse,
                         data: buf.split_to(1),
@@ -162,67 +162,74 @@ impl Decoder for PgBackendMessageCodec {
             }
             PgConnectionState::Authentication => self.handle_authentication_message(buf),
             _ => {
-                if let Some(msg_type) = BACKEND_MESSAGE_TYPE_MAP.get(&buf[0]) {
-                    const MIN_MESSAGE_LEN: usize = 5;
-                    if buf.remaining() < MIN_MESSAGE_LEN {
-                        return Ok(None);
-                    }
+                let Some(&first_byte) = buf.first() else {
+                    return Ok(None);
+                };
 
-                    let msg_len = (&buf[1..5]).get_i32() as usize + 1;
-                    if buf.remaining() < msg_len {
-                        return Ok(None);
-                    }
+                let Some(msg_type) = BACKEND_MESSAGE_TYPE_MAP.get(&first_byte) else {
+                    return Err(ProtocolError::UnrecognizedMessageType {
+                        tag: first_byte.escape_ascii().to_string(),
+                    });
+                };
 
-                    if *msg_type == PgBackendMessageType::DataRows {
-                        const MAX_BATCH_SIZE: usize = 64 * 1024;
+                const MIN_MESSAGE_LEN: usize = 5;
+                if buf.remaining() < MIN_MESSAGE_LEN {
+                    return Ok(None);
+                }
 
-                        // Start with the first DataRow message
-                        let mut total_bytes = msg_len;
-                        let mut position = msg_len;
+                let (_, mut len_slice) = buf.split_at(1);
+                let msg_len = len_slice.get_i32() as usize + 1;
+                if buf.remaining() < msg_len {
+                    return Ok(None);
+                }
 
-                        // Look ahead for more consecutive DataRow messages
-                        while position + 5 <= buf.remaining() {
-                            let next_tag = buf[position];
+                if *msg_type == PgBackendMessageType::DataRows {
+                    const MAX_BATCH_SIZE: usize = 64 * 1024;
 
-                            // Stop if not a DataRow message
-                            if next_tag != DATA_ROW_TAG {
-                                break;
-                            }
+                    // Start with the first DataRow message
+                    let mut total_bytes = msg_len;
+                    let mut position = msg_len;
 
-                            // Read the next message length
-                            let next_msg_len =
-                                (&buf[position + 1..position + 5]).get_i32() as usize + 1;
+                    // Look ahead for more consecutive DataRow messages
+                    while position + 5 <= buf.remaining() {
+                        let Some(&next_tag) = buf.get(position) else {
+                            break;
+                        };
 
-                            // Stop if message is incomplete in buffer
-                            if position + next_msg_len > buf.remaining() {
-                                break;
-                            }
-
-                            // Stop if we would exceed the 64KB limit
-                            if total_bytes + next_msg_len > MAX_BATCH_SIZE {
-                                break;
-                            }
-
-                            // Accumulate this message
-                            total_bytes += next_msg_len;
-                            position += next_msg_len;
+                        // Stop if not a DataRow message
+                        if next_tag != DATA_ROW_TAG {
+                            break;
                         }
 
-                        // Return all accumulated DataRow messages
-                        Ok(Some(PgBackendMessage {
-                            message_type: PgBackendMessageType::DataRows,
-                            data: buf.split_to(total_bytes),
-                        }))
-                    } else {
-                        Ok(Some(PgBackendMessage {
-                            message_type: *msg_type,
-                            data: buf.split_to(msg_len),
-                        }))
+                        // Read the next message length
+                        let (_, mut next_len_slice) = buf.split_at(position + 1);
+                        let next_msg_len = next_len_slice.get_i32() as usize + 1;
+
+                        // Stop if message is incomplete in buffer
+                        if position + next_msg_len > buf.remaining() {
+                            break;
+                        }
+
+                        // Stop if we would exceed the 64KB limit
+                        if total_bytes + next_msg_len > MAX_BATCH_SIZE {
+                            break;
+                        }
+
+                        // Accumulate this message
+                        total_bytes += next_msg_len;
+                        position += next_msg_len;
                     }
+
+                    // Return all accumulated DataRow messages
+                    Ok(Some(PgBackendMessage {
+                        message_type: PgBackendMessageType::DataRows,
+                        data: buf.split_to(total_bytes),
+                    }))
                 } else {
-                    Err(ProtocolError::UnrecognizedMessageType {
-                        tag: buf[0].escape_ascii().to_string(),
-                    })
+                    Ok(Some(PgBackendMessage {
+                        message_type: *msg_type,
+                        data: buf.split_to(msg_len),
+                    }))
                 }
             }
         }

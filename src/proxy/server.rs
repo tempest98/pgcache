@@ -51,9 +51,15 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     cache_tx: SenderCacheType,
     metrics: Arc<Metrics>,
 ) -> Result<WorkerStatus, ConnectionError> {
-    if workers[worker_index].0.is_finished() {
+    let Some(worker) = workers.get_mut(worker_index) else {
+        return Err(ConnectionError::IoError(std::io::Error::other(
+            "worker index out of bounds",
+        )));
+    };
+
+    if worker.0.is_finished() {
         let new_worker = worker_create(worker_index, scope, settings, cache_tx, metrics)?;
-        let old_worker = mem::replace(&mut workers[worker_index], new_worker);
+        let old_worker = mem::replace(worker, new_worker);
         match old_worker.0.join() {
             Ok(Err(ConnectionError::CacheDead)) => Ok(WorkerStatus::CacheDead),
             _ => Ok(WorkerStatus::Exited),
@@ -89,7 +95,7 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
         let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
 
         let mut workers: Vec<_> = (0..settings.num_workers)
-            .map(|i| worker_create(i, scope, settings, cache_tx.clone(), metrics.clone()))
+            .map(|i| worker_create(i, scope, settings, cache_tx.clone(), Arc::clone(&metrics)))
             .collect::<Result<Vec<_>, _>>()?;
 
         let rt = Builder::new_current_thread().enable_all().build()?;
@@ -110,7 +116,9 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
             while let Ok((socket, _)) = listener.accept().await {
                 debug!("socket accepted");
 
-                let _ = workers[cur_worker].1.send(socket);
+                if let Some(worker) = workers.get(cur_worker) {
+                    let _ = worker.1.send(socket);
+                }
 
                 let status = worker_ensure_alive(
                     &mut workers,
@@ -118,7 +126,7 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
                     scope,
                     settings,
                     cache_tx.clone(),
-                    metrics.clone(),
+                    Arc::clone(&metrics),
                 )?;
 
                 if matches!(status, WorkerStatus::CacheDead) {

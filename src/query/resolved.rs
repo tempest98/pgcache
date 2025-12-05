@@ -315,20 +315,17 @@ fn column_resolve<'a>(
         }
     }
 
-    match matches.len() {
-        0 => Err(ResolveError::ColumnNotFound {
+    match matches.as_slice() {
+        [] => Err(ResolveError::ColumnNotFound {
             table: "<unknown>".to_owned(),
             column: column_name.clone(),
         }),
-        1 => {
-            let (table_metadata, column_metadata) = matches[0];
-            Ok(ResolvedColumnNode {
-                schema: table_metadata.schema.clone(),
-                table: table_metadata.name.clone(),
-                column: column_metadata.name.clone(),
-                column_metadata: column_metadata.clone(),
-            })
-        }
+        [(table_metadata, column_metadata)] => Ok(ResolvedColumnNode {
+            schema: table_metadata.schema.clone(),
+            table: table_metadata.name.clone(),
+            column: column_metadata.name.clone(),
+            column_metadata: (*column_metadata).clone(),
+        }),
         _ => Err(ResolveError::AmbiguousColumn {
             column: column_name.clone(),
         }),
@@ -566,6 +563,9 @@ pub fn select_statement_resolve(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used)]
+
     use tokio_postgres::types::Type;
 
     use super::*;
@@ -1133,7 +1133,8 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC";
+        let sql =
+            "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC";
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
 

@@ -276,10 +276,16 @@ impl QueryCache {
         table_oid: u32,
         response: &[SimpleQueryMessage],
     ) -> Result<(), CacheError> {
-        if response.len() < 3 {
+        let [
+            SimpleQueryMessage::RowDescription(row_description),
+            data_rows @ ..,
+            _command_complete,
+        ] = response
+        else {
             //no results to store
             return Ok(());
-        }
+        };
+
         let sql_list = {
             let cache = self.cache.borrow();
             let table = cache
@@ -293,7 +299,7 @@ impl QueryCache {
             let pkey_columns = &table.primary_key_columns;
             let table_name = table.name.as_str();
 
-            let rows = response
+            let rows = data_rows
                 .iter()
                 .filter_map(|msg| {
                     if let SimpleQueryMessage::Row(row) = msg {
@@ -305,7 +311,7 @@ impl QueryCache {
                 .collect::<Vec<_>>();
 
             let mut sql_list = Vec::new();
-            let columns: Vec<&str> = Vec::from_iter(rows[0].columns().iter().map(|c| c.name()));
+            let columns: Vec<&str> = Vec::from_iter(row_description.iter().map(|c| c.name()));
             for &row in &rows {
                 let mut values: Vec<String> = Vec::new();
                 for idx in 0..row.columns().len() {
@@ -378,7 +384,7 @@ impl QueryCache {
 
             let type_oid = row.get("type_oid");
             let data_type = Type::from_oid(type_oid).expect("valid type");
-            let type_name = data_type.name().to_string(); // Get the type name from tokio_postgres Type
+            let type_name = data_type.name().to_owned(); // Get the type name from tokio_postgres Type
             let pg_position: i64 = row.get("position");
 
             let column = ColumnMetadata {
@@ -512,10 +518,10 @@ impl QueryCache {
             for pk_column in &table_metadata.primary_key_columns {
                 if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
                     let position = column_meta.position as usize - 1;
-                    if position < row_data.len() {
-                        let value = row_data[position]
+                    if let Some(row_value) = row_data.get(position) {
+                        let value = row_value
                             .as_deref()
-                            .map_or("NULL".to_string(), escape::escape_literal);
+                            .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
                         where_conditions.push(format!("{pk_column} = {value}"));
                     }
                 }
@@ -529,10 +535,10 @@ impl QueryCache {
             let mut comparison_columns = Vec::new();
             for column_meta in &table_metadata.columns {
                 let position = column_meta.position as usize - 1;
-                if position < row_data.len() {
-                    let value = row_data[position]
+                if let Some(row_value) = row_data.get(position) {
+                    let value = row_value
                         .as_deref()
-                        .map_or("NULL".to_string(), escape::escape_literal);
+                        .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
                     comparison_columns.push(format!(
                         "{} IS DISTINCT FROM {} AS {}",
                         column_meta.name, value, column_meta.name
@@ -670,10 +676,10 @@ impl QueryCache {
 
         for column_meta in &table_metadata.columns {
             let position = column_meta.position as usize - 1;
-            if position < row_data.len() {
-                let value = row_data[position]
+            if let Some(row_value) = row_data.get(position) {
+                let value = row_value
                     .as_deref()
-                    .map_or("NULL".to_string(), escape::escape_literal);
+                    .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
 
                 column_names.push(column_meta.name.as_str());
                 values.push(value);
@@ -685,8 +691,8 @@ impl QueryCache {
         value_select.deparse(&mut select);
 
         let table_name = &table_metadata.name;
-        let column_list = column_names.to_vec().join(", ");
-        let value_list = values.to_vec().join(", ");
+        let column_list = column_names.join(", ");
+        let value_list = values.join(", ");
         let pk_column_list = table_metadata.primary_key_columns.join(", ");
         let update_list = column_names
             .iter()
@@ -807,8 +813,8 @@ impl QueryCache {
                         if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str())
                         {
                             let position = column_meta.position as usize - 1;
-                            if position < row_data.len()
-                                && !constraint_value.matches(&row_data[position])
+                            if let Some(row_value) = row_data.get(position)
+                                && !constraint_value.matches(row_value)
                             {
                                 all_match = false;
                                 break;
@@ -878,8 +884,8 @@ impl QueryCache {
                                 table_metadata.columns.get1(constraint_column.as_str())
                             {
                                 let position = column_meta.position as usize - 1;
-                                if position < row_data.len()
-                                    && !constraint_value.matches(&row_data[position])
+                                if let Some(row_value) = row_data.get(position)
+                                    && !constraint_value.matches(row_value)
                                 {
                                     all_constraints_match = false;
                                     break;
@@ -1081,10 +1087,10 @@ impl QueryCache {
         for pk_column in &table_metadata.primary_key_columns {
             if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
-                if position < row_data.len() {
-                    let value = row_data[position]
+                if let Some(row_value) = row_data.get(position) {
+                    let value = row_value
                         .as_deref()
-                        .map_or("NULL".to_string(), escape::escape_literal);
+                        .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
                     where_conditions.push(format!("{pk_column} = {value}"));
                 }
             }

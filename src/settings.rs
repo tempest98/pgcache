@@ -96,7 +96,9 @@ impl Settings {
                 Long("help") => {
                     Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
                 }
-                _ => return Err(ConfigError::ArgumentError(Box::new(arg.unexpected()))),
+                Short(_) | Long(_) | Value(_) => {
+                    return Err(ConfigError::ArgumentError(Box::new(arg.unexpected())));
+                }
             }
         }
 

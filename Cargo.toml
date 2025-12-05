@@ -18,6 +18,13 @@ fallible_impl_from = "warn"
 wildcard_enum_match_arm = "warn"
 unneeded_field_pattern = "warn"
 fn_params_excessive_bools = "deny"
+unwrap_used = "warn"
+large_futures = "warn"
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+str_to_string = "warn"
+implicit_clone = "warn"
+# unnecessary_wraps = "warn"
 # must_use_candidate = "deny"
 
 [profile.profiling]

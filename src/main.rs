@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     thread::scope(|scope| {
         let proxy_handle = thread::Builder::new()
             .name("proxy".to_owned())
-            .spawn_scoped(scope, || proxy_run(&settings, metrics.clone()))?;
+            .spawn_scoped(scope, || proxy_run(&settings, Arc::clone(&metrics)))?;
 
         let sleep_duration = Duration::from_millis(500);
 

@@ -176,8 +176,8 @@ pub struct TempDBs {
 pub struct TestContext {
     pub dbs: TempDBs,
     pub pgcache: PgCacheProcess,
-    pub cache: Client,   // connected through pgcache proxy
-    pub origin: Client,  // direct connection to origin database
+    pub cache: Client,  // connected through pgcache proxy
+    pub origin: Client, // direct connection to origin database
 }
 
 impl TestContext {
@@ -201,7 +201,10 @@ impl TestContext {
     where
         T: ?Sized + ToStatement,
     {
-        self.cache.query(statement, params).await.map_err(Error::other)
+        self.cache
+            .query(statement, params)
+            .await
+            .map_err(Error::other)
     }
 
     /// Execute query directly on origin (bypassing pgcache)
@@ -213,7 +216,10 @@ impl TestContext {
     where
         T: ?Sized + ToStatement,
     {
-        self.origin.query(statement, params).await.map_err(Error::other)
+        self.origin
+            .query(statement, params)
+            .await
+            .map_err(Error::other)
     }
 
     /// Execute simple query through pgcache proxy
@@ -240,7 +246,10 @@ impl TestContext {
     where
         T: ?Sized + ToStatement,
     {
-        self.cache.query_one(statement, params).await.map_err(Error::other)
+        self.cache
+            .query_one(statement, params)
+            .await
+            .map_err(Error::other)
     }
 }
 
@@ -431,11 +440,8 @@ pub fn assert_row_at(
 /// - test: (1, 'foo'), (2, 'bar'), (3, 'baz')
 /// - test_map: (1, 1, 'alpha'), (2, 1, 'beta'), (3, 2, 'gamma')
 pub async fn setup_constraint_test_tables(ctx: &mut TestContext) -> Result<(), Error> {
-    ctx.query(
-        "create table test (id integer primary key, data text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
 
     ctx.query(
         "create table test_map (id serial primary key, test_id integer, data text)",

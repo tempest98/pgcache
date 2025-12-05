@@ -98,7 +98,7 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> Result<&'a str, ProtocolError> {
             "missing null terminator",
         )))?;
 
-    let bytes = &buf[..null_pos];
+    let (bytes, rest) = buf.split_at(null_pos);
     let s = std::str::from_utf8(bytes).map_err(|_| {
         ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -106,7 +106,8 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> Result<&'a str, ProtocolError> {
         ))
     })?;
 
-    buf.advance(null_pos + 1);
+    // Skip past the null terminator
+    *buf = rest.get(1..).unwrap_or_default();
     Ok(s)
 }
 
@@ -121,14 +122,14 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> Result<&'a str, ProtocolError> {
 /// For each parameter:
 ///     Int32 - OID of parameter data type (0 = unspecified)
 pub fn parse_parse_message(data: &BytesMut) -> Result<ParsedParseMessage, ProtocolError> {
-    if data.len() < 5 {
+    let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Parse message too short",
         )));
-    }
+    };
 
-    let mut buf = &data[5..]; // Skip message tag (1 byte) and length (4 bytes)
+    let mut buf = buf; // Skip message tag (1 byte) and length (4 bytes)
 
     let statement_name = read_cstring(&mut buf)?.to_owned();
     let sql = read_cstring(&mut buf)?.to_owned();
@@ -178,14 +179,14 @@ pub fn parse_parse_message(data: &BytesMut) -> Result<ParsedParseMessage, Protoc
 /// For each format code:
 ///     Int16 - format code (0=text, 1=binary)
 pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, ProtocolError> {
-    if data.len() < 5 {
+    let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Bind message too short",
         )));
-    }
+    };
 
-    let mut buf = &data[5..]; // Skip message tag and length
+    let mut buf = buf; // Skip message tag and length
 
     let portal_name = read_cstring(&mut buf)?.to_owned();
     let statement_name = read_cstring(&mut buf)?.to_owned();
@@ -234,13 +235,13 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
             parameter_values.push(None);
         } else {
             let param_len = param_len as usize;
-            if buf.len() < param_len {
+            let Some(value_bytes) = buf.get(..param_len) else {
                 return Err(ProtocolError::IoError(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "parameter value truncated",
                 )));
-            }
-            let value = buf[..param_len].to_vec();
+            };
+            let value = value_bytes.to_vec();
             buf.advance(param_len);
             parameter_values.push(Some(value));
         }
@@ -283,14 +284,14 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
 /// String - portal name (empty string for unnamed)
 /// Int32 - maximum number of rows to return (0 = unlimited)
 pub fn parse_execute_message(data: &BytesMut) -> Result<ParsedExecuteMessage, ProtocolError> {
-    if data.len() < 5 {
+    let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Execute message too short",
         )));
-    }
+    };
 
-    let mut buf = &data[5..]; // Skip message tag and length
+    let mut buf = buf; // Skip message tag and length
 
     let portal_name = read_cstring(&mut buf)?.to_owned();
 
@@ -316,14 +317,22 @@ pub fn parse_execute_message(data: &BytesMut) -> Result<ParsedExecuteMessage, Pr
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
 pub fn parse_describe_message(data: &BytesMut) -> Result<ParsedDescribeMessage, ProtocolError> {
-    if data.len() < 6 {
+    let Some(buf) = data.get(5..) else {
+        return Err(ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Describe message too short",
+        )));
+    };
+
+    // Need at least 1 byte for describe_type
+    if buf.is_empty() {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Describe message too short",
         )));
     }
 
-    let mut buf = &data[5..]; // Skip message tag and length
+    let mut buf = buf; // Skip message tag and length
 
     let describe_type = buf.get_u8();
     let name = read_cstring(&mut buf)?.to_owned();
@@ -342,14 +351,22 @@ pub fn parse_describe_message(data: &BytesMut) -> Result<ParsedDescribeMessage, 
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
 pub fn parse_close_message(data: &BytesMut) -> Result<ParsedCloseMessage, ProtocolError> {
-    if data.len() < 6 {
+    let Some(buf) = data.get(5..) else {
+        return Err(ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Close message too short",
+        )));
+    };
+
+    // Need at least 1 byte for close_type
+    if buf.is_empty() {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Close message too short",
         )));
     }
 
-    let mut buf = &data[5..]; // Skip message tag and length
+    let mut buf = buf; // Skip message tag and length
 
     let close_type = buf.get_u8();
     let name = read_cstring(&mut buf)?.to_owned();
@@ -365,15 +382,25 @@ pub fn parse_close_message(data: &BytesMut) -> Result<ParsedCloseMessage, Protoc
 /// Int16 - number of parameters
 /// For each parameter:
 ///     Int32 - OID of parameter data type
-pub fn parse_parameter_description(data: &BytesMut) -> Result<ParsedParameterDescription, ProtocolError> {
-    if data.len() < 7 {
+pub fn parse_parameter_description(
+    data: &BytesMut,
+) -> Result<ParsedParameterDescription, ProtocolError> {
+    // Need at least 7 bytes: tag(1) + length(4) + param_count(2)
+    let Some(buf) = data.get(5..) else {
+        return Err(ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "ParameterDescription message too short",
+        )));
+    };
+
+    if buf.len() < 2 {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "ParameterDescription message too short",
         )));
     }
 
-    let mut buf = &data[5..]; // Skip message tag and length
+    let mut buf = buf; // Skip message tag and length
 
     let param_count = buf.get_i16() as usize;
     let mut parameter_oids = Vec::with_capacity(param_count);
@@ -393,6 +420,9 @@ pub fn parse_parameter_description(data: &BytesMut) -> Result<ParsedParameterDes
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -654,8 +684,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_all_text() {
         let portal = Portal {
-            name: "p1".to_string(),
-            statement_name: "s1".to_string(),
+            name: "p1".to_owned(),
+            statement_name: "s1".to_owned(),
             parameter_values: vec![Some(b"42".to_vec())],
             parameter_formats: vec![0], // text format
             result_formats: vec![0],
@@ -670,8 +700,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_with_binary() {
         let portal = Portal {
-            name: "p1".to_string(),
-            statement_name: "s1".to_string(),
+            name: "p1".to_owned(),
+            statement_name: "s1".to_owned(),
             parameter_values: vec![Some(vec![0, 0, 0, 42])],
             parameter_formats: vec![1], // binary format
             result_formats: vec![0],
@@ -686,8 +716,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_mixed() {
         let portal = Portal {
-            name: "p1".to_string(),
-            statement_name: "s1".to_string(),
+            name: "p1".to_owned(),
+            statement_name: "s1".to_owned(),
             parameter_values: vec![Some(b"text".to_vec()), Some(vec![0, 0, 0, 42])],
             parameter_formats: vec![0, 1], // text, then binary
             result_formats: vec![0],
@@ -702,8 +732,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_empty() {
         let portal = Portal {
-            name: "p1".to_string(),
-            statement_name: "s1".to_string(),
+            name: "p1".to_owned(),
+            statement_name: "s1".to_owned(),
             parameter_values: vec![],
             parameter_formats: vec![],
             result_formats: vec![],

@@ -75,14 +75,10 @@ impl TryFrom<&SqlQuery> for CacheableQuery {
 }
 
 fn is_supported_from(select: &SelectStatement) -> bool {
-    if select.from.len() == 1 {
-        if let TableSource::Join(join) = &select.from[0] {
-            is_supported_join(join)
-        } else {
-            true
-        }
-    } else {
-        false
+    match select.from.as_slice() {
+        [TableSource::Join(join)] => is_supported_join(join),
+        [_] => true,
+        _ => false,
     }
 }
 
@@ -91,12 +87,18 @@ fn is_supported_join(join: &JoinNode) -> bool {
         return false;
     }
     match &join.condition {
-        Some(where_expr) => match where_expr {
-            WhereExpr::Binary(binary_expr) => {
-                binary_expr.op == ExprOp::Equal && !where_expr.has_sublink()
-            }
-            _ => false,
-        },
+        Some(WhereExpr::Binary(binary_expr)) => {
+            binary_expr.op == ExprOp::Equal
+                && !join.condition.as_ref().is_some_and(|e| e.has_sublink())
+        }
+        Some(
+            WhereExpr::Value(_)
+            | WhereExpr::Column(_)
+            | WhereExpr::Unary(_)
+            | WhereExpr::Multi(_)
+            | WhereExpr::Function { .. }
+            | WhereExpr::Subquery { .. },
+        ) => false,
         None => true,
     }
 }
@@ -133,9 +135,28 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
                     // OR: both sides must be cacheable
                     is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
                 }
-                _ => false, // Other operators not supported yet
+                ExprOp::Not
+                | ExprOp::Like
+                | ExprOp::ILike
+                | ExprOp::NotLike
+                | ExprOp::NotILike
+                | ExprOp::In
+                | ExprOp::NotIn
+                | ExprOp::Between
+                | ExprOp::NotBetween
+                | ExprOp::IsNull
+                | ExprOp::IsNotNull
+                | ExprOp::Any
+                | ExprOp::All
+                | ExprOp::Exists
+                | ExprOp::NotExists => false,
             }
         }
-        _ => false, // Other expression types not supported yet
+        WhereExpr::Value(_)
+        | WhereExpr::Column(_)
+        | WhereExpr::Unary(_)
+        | WhereExpr::Multi(_)
+        | WhereExpr::Function { .. }
+        | WhereExpr::Subquery { .. } => false,
     }
 }

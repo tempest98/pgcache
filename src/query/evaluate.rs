@@ -1,3 +1,5 @@
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::catalog::TableMetadata;
 
 use super::ast::{BinaryExpr, ExprOp, LiteralValue, WhereExpr};
@@ -30,7 +32,21 @@ pub fn where_expr_evaluate(
                     where_expr_evaluate(&binary_expr.lexpr, row_data, table_metadata)
                         || where_expr_evaluate(&binary_expr.rexpr, row_data, table_metadata)
                 }
-                _ => {
+                ExprOp::Not
+                | ExprOp::Like
+                | ExprOp::ILike
+                | ExprOp::NotLike
+                | ExprOp::NotILike
+                | ExprOp::In
+                | ExprOp::NotIn
+                | ExprOp::Between
+                | ExprOp::NotBetween
+                | ExprOp::IsNull
+                | ExprOp::IsNotNull
+                | ExprOp::Any
+                | ExprOp::All
+                | ExprOp::Exists
+                | ExprOp::NotExists => {
                     // Unsupported operator - should not reach here if is_cacheable_expr works correctly
                     false
                 }
@@ -173,6 +189,9 @@ pub fn is_simple_comparison(binary_expr: &BinaryExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use crate::catalog::ColumnMetadata;
     use crate::query::ast::ColumnNode;
@@ -183,7 +202,7 @@ mod tests {
     // Tests for where_value_compare_string function
     #[test]
     fn where_value_compare_string_string_match() {
-        let filter_value = LiteralValue::String("hello".to_string());
+        let filter_value = LiteralValue::String("hello".to_owned());
         assert!(where_value_compare_string(
             &filter_value,
             "hello",
@@ -321,7 +340,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_parameter_never_matches() {
-        let filter_value = LiteralValue::Parameter("$1".to_string());
+        let filter_value = LiteralValue::Parameter("$1".to_owned());
         assert!(!where_value_compare_string(
             &filter_value,
             "$1",
@@ -339,37 +358,37 @@ mod tests {
         let mut columns = BiHashMap::new();
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "id".to_string(),
+            name: "id".to_owned(),
             position: 1,
             type_oid: 23, // INT4
             data_type: Type::INT4,
-            type_name: "integer".to_string(),
+            type_name: "integer".to_owned(),
             is_primary_key: true,
         });
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "name".to_string(),
+            name: "name".to_owned(),
             position: 2,
             type_oid: 25, // TEXT
             data_type: Type::TEXT,
-            type_name: "text".to_string(),
+            type_name: "text".to_owned(),
             is_primary_key: false,
         });
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "active".to_string(),
+            name: "active".to_owned(),
             position: 3,
             type_oid: 16, // BOOL
             data_type: Type::BOOL,
-            type_name: "boolean".to_string(),
+            type_name: "boolean".to_owned(),
             is_primary_key: false,
         });
 
         TableMetadata {
-            name: "test_table".to_string(),
-            schema: "public".to_string(),
+            name: "test_table".to_owned(),
+            schema: "public".to_owned(),
             relation_oid: 12345,
-            primary_key_columns: vec!["id".to_string()],
+            primary_key_columns: vec!["id".to_owned()],
             columns,
         }
     }
@@ -379,18 +398,18 @@ mod tests {
     fn expr_comparison_evaluate_string_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -404,18 +423,18 @@ mod tests {
     fn expr_comparison_evaluate_string_no_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_owned()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -429,16 +448,16 @@ mod tests {
     fn expr_comparison_evaluate_integer_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("123".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("123".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         };
@@ -453,13 +472,13 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_null_value() {
         let table_metadata = create_test_table_metadata();
-        let row_data = vec![Some("1".to_string()), None, Some("true".to_string())];
+        let row_data = vec![Some("1".to_owned()), None, Some("true".to_owned())];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
         };
@@ -475,18 +494,18 @@ mod tests {
     fn expr_comparison_evaluate_reverse_order() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         // Test value = column (reverse order)
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
-            lexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+            lexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
             rexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
         };
 
@@ -501,18 +520,18 @@ mod tests {
     fn expr_comparison_evaluate_invalid_column() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "nonexistent".to_string(),
+                column: "nonexistent".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("test".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("test".to_owned()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -527,18 +546,18 @@ mod tests {
     fn where_expr_evaluate_simple_equality() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
         });
 
         assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
@@ -548,9 +567,9 @@ mod tests {
     fn where_expr_evaluate_and_operation_both_true() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("123".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("123".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
@@ -559,7 +578,7 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_string(),
+                    column: "id".to_owned(),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
             })),
@@ -567,9 +586,9 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_string(),
+                    column: "name".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
             })),
         });
 
@@ -580,9 +599,9 @@ mod tests {
     fn where_expr_evaluate_and_operation_one_false() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("123".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("123".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
@@ -591,7 +610,7 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_string(),
+                    column: "id".to_owned(),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // Different value
             })),
@@ -599,9 +618,9 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_string(),
+                    column: "name".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
             })),
         });
 
@@ -612,9 +631,9 @@ mod tests {
     fn where_expr_evaluate_or_operation_one_true() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("123".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("123".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
@@ -623,7 +642,7 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_string(),
+                    column: "id".to_owned(),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // False condition
             })),
@@ -631,9 +650,9 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_string(),
+                    column: "name".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))), // True condition
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))), // True condition
             })),
         });
 
@@ -644,9 +663,9 @@ mod tests {
     fn where_expr_evaluate_or_operation_both_false() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("123".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("123".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
@@ -655,7 +674,7 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_string(),
+                    column: "id".to_owned(),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(999))), // False condition
             })),
@@ -663,9 +682,9 @@ mod tests {
                 op: ExprOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_string(),
+                    column: "name".to_owned(),
                 })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))), // False condition
+                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_owned()))), // False condition
             })),
         });
 
@@ -676,16 +695,16 @@ mod tests {
     fn where_expr_evaluate_greater_than() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("123".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("123".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let expr = WhereExpr::Binary(BinaryExpr {
             op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         });
@@ -698,13 +717,13 @@ mod tests {
     fn where_expr_evaluate_unsupported_expression_type() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("123".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("123".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let expr = WhereExpr::Function {
-            name: "upper".to_string(),
+            name: "upper".to_owned(),
             args: vec![],
         };
 
@@ -716,18 +735,18 @@ mod tests {
     fn expr_not_equal_evaluate_string_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_owned()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -741,18 +760,18 @@ mod tests {
     fn expr_not_equal_evaluate_string_no_match() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -767,16 +786,16 @@ mod tests {
     fn expr_less_than_evaluate_integer_true() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("50".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("50".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -792,16 +811,16 @@ mod tests {
     fn expr_less_than_evaluate_integer_false() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("150".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("150".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -818,16 +837,16 @@ mod tests {
     fn expr_less_than_or_equal_evaluate_integer_equal() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("100".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("100".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -843,16 +862,16 @@ mod tests {
     fn expr_less_than_or_equal_evaluate_integer_less() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("50".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("50".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -868,16 +887,16 @@ mod tests {
     fn expr_less_than_or_equal_evaluate_integer_false() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("150".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("150".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -894,16 +913,16 @@ mod tests {
     fn expr_greater_than_evaluate_integer_true() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("150".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("150".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -919,16 +938,16 @@ mod tests {
     fn expr_greater_than_evaluate_integer_false() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("50".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("50".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -945,16 +964,16 @@ mod tests {
     fn expr_greater_than_or_equal_evaluate_integer_equal() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("100".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("100".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -970,16 +989,16 @@ mod tests {
     fn expr_greater_than_or_equal_evaluate_integer_greater() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("150".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("150".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -995,16 +1014,16 @@ mod tests {
     fn expr_greater_than_or_equal_evaluate_integer_false() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("50".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("50".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_string(),
+                column: "id".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(100))),
         };
@@ -1024,29 +1043,29 @@ mod tests {
         // Add a float column to metadata for testing
         let mut columns = BiHashMap::new();
         columns.insert_overwrite(ColumnMetadata {
-            name: "price".to_string(),
+            name: "price".to_owned(),
             position: 4,
             type_oid: 701, // FLOAT8
             data_type: Type::FLOAT8,
-            type_name: "double precision".to_string(),
+            type_name: "double precision".to_owned(),
             is_primary_key: false,
         });
 
         let mut table_metadata = table_metadata;
         table_metadata.columns.insert_overwrite(ColumnMetadata {
-            name: "price".to_string(),
+            name: "price".to_owned(),
             position: 4,
             type_oid: 701,
             data_type: Type::FLOAT8,
-            type_name: "double precision".to_string(),
+            type_name: "double precision".to_owned(),
             is_primary_key: false,
         });
 
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
-            Some("99.50".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+            Some("99.50".to_owned()),
         ];
 
         // Test less than
@@ -1054,7 +1073,7 @@ mod tests {
             op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "price".to_string(),
+                column: "price".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(
                 NotNan::new(100.0).unwrap(),
@@ -1072,7 +1091,7 @@ mod tests {
             op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "price".to_string(),
+                column: "price".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Float(
                 NotNan::new(50.0).unwrap(),
@@ -1091,9 +1110,9 @@ mod tests {
     fn expr_comparison_evaluate_string_operations() {
         let table_metadata = create_test_table_metadata();
         let row_data = vec![
-            Some("1".to_string()),
-            Some("john".to_string()),
-            Some("true".to_string()),
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
         ];
 
         // Test string less than (lexicographic)
@@ -1101,9 +1120,9 @@ mod tests {
             op: ExprOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("zebra".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("zebra".to_owned()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1117,9 +1136,9 @@ mod tests {
             op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("alice".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("alice".to_owned()))),
         };
 
         assert!(expr_comparison_evaluate(
@@ -1133,16 +1152,16 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_null_handling() {
         let table_metadata = create_test_table_metadata();
-        let row_data = vec![Some("1".to_string()), None, Some("true".to_string())];
+        let row_data = vec![Some("1".to_owned()), None, Some("true".to_owned())];
 
         // NULL comparisons should return false (except equality with NULL)
         let binary_expr = BinaryExpr {
             op: ExprOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("test".to_string()))),
+            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("test".to_owned()))),
         };
 
         assert!(!expr_comparison_evaluate(
@@ -1156,7 +1175,7 @@ mod tests {
             op: ExprOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_string(),
+                column: "name".to_owned(),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
         };
