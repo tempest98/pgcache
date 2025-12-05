@@ -652,6 +652,7 @@ mod tests {
             schema: "public".to_owned(),
             primary_key_columns: vec!["id".to_owned()],
             columns,
+            indexes: Vec::new(),
         }
     }
 

@@ -12,7 +12,7 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tokio_util::bytes::BytesMut;
 use tracing::{error, info, instrument, trace};
 
-use crate::catalog::{ColumnMetadata, TableMetadata};
+use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata};
 use crate::query::ast::{
     ColumnNode, Deparse, JoinNode, SelectStatement, TableNode, ast_query_fingerprint,
 };
@@ -414,12 +414,15 @@ impl QueryCache {
             return Err(CacheError::UnknownSchema);
         };
 
+        let indexes = self.query_table_indexes_get(relation_oid).await?;
+
         let table = TableMetadata {
             name: table.to_owned(),
             schema: schema.to_owned(),
             relation_oid,
             primary_key_columns,
             columns,
+            indexes,
         };
 
         Ok(table)
@@ -497,6 +500,52 @@ impl QueryCache {
         Ok(rows)
     }
 
+    /// Query index metadata for a table from the origin database.
+    ///
+    /// Returns non-primary-key indexes, excluding expression and partial indexes.
+    /// Primary key indexes are excluded since the PRIMARY KEY constraint creates them.
+    #[instrument(skip_all)]
+    async fn query_table_indexes_get(
+        &self,
+        relation_oid: u32,
+    ) -> Result<Vec<IndexMetadata>, CacheError> {
+        let sql = r"
+            SELECT
+                i.relname AS index_name,
+                ix.indisunique AS is_unique,
+                am.amname AS method,
+                array_agg(a.attname ORDER BY array_position(ix.indkey::int[], a.attnum::int)) AS columns
+            FROM pg_index ix
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_am am ON am.oid = i.relam
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+            WHERE t.oid = $1
+              AND NOT ix.indisprimary
+              AND ix.indexprs IS NULL
+              AND ix.indpred IS NULL
+            GROUP BY i.relname, ix.indisunique, am.amname, ix.indkey
+            ORDER BY i.relname;
+        ";
+
+        let rows = self.db_origin.query(sql, &[&relation_oid]).await?;
+
+        let indexes = rows
+            .iter()
+            .map(|row| {
+                let columns: Vec<String> = row.get("columns");
+                IndexMetadata {
+                    name: row.get("index_name"),
+                    is_unique: row.get("is_unique"),
+                    method: row.get("method"),
+                    columns,
+                }
+            })
+            .collect();
+
+        Ok(indexes)
+    }
+
     async fn query_row_changes(
         &self,
         relation_oid: u32,
@@ -565,39 +614,52 @@ impl QueryCache {
         &self,
         table_metadata: &TableMetadata,
     ) -> Result<(), CacheError> {
-        let mut columns = Vec::new();
-        for column in &table_metadata.columns {
-            let column_sql = format!("    {} {}", column.name, column.type_name,);
-            columns.push(column_sql);
-        }
+        let table_name = &table_metadata.name;
 
-        let drop_sql = format!("DROP TABLE IF EXISTS {}", table_metadata.name);
+        let column_defs: Vec<String> = table_metadata
+            .columns
+            .iter()
+            .map(|c| format!("    {} {}", c.name, c.type_name))
+            .collect();
+        let column_defs = column_defs.join(",\n");
 
-        let sql = format!(
-            "CREATE TABLE {} (\n{},\n\tPRIMARY KEY({})\n)",
-            table_metadata.name,
-            columns.join(",\n"),
-            table_metadata.primary_key_columns.join(", "),
-        );
+        let primary_key = table_metadata.primary_key_columns.join(", ");
+
+        let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
+        let create_sql =
+            format!("CREATE TABLE {table_name} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)");
 
         self.db_cache.execute(&drop_sql, &[]).await?;
-        self.db_cache.execute(&sql, &[]).await?;
+        self.db_cache.execute(&create_sql, &[]).await?;
+
+        // Create indexes
+        for index in &table_metadata.indexes {
+            let unique = if index.is_unique { "UNIQUE " } else { "" };
+            let method = &index.method;
+            let columns = index.columns.join(", ");
+            let index_sql =
+                format!("CREATE {unique}INDEX ON {table_name} USING {method} ({columns})");
+            self.db_cache.execute(&index_sql, &[]).await?;
+        }
 
         Ok(())
     }
 
     /// Register table metadata from CDC processing.
+    ///
+    /// CDC RelationBody doesn't include index information, so indexes are
+    /// queried from the origin database when table_metadata.indexes is empty.
     #[instrument(skip_all)]
     pub async fn cache_table_register(
         &mut self,
-        table_metadata: TableMetadata,
+        mut table_metadata: TableMetadata,
     ) -> Result<(), CacheError> {
         let relation_oid = table_metadata.relation_oid;
 
         let table_exists = self.cache.borrow().tables.contains_key1(&relation_oid);
         if table_exists {
             if let Some(current_table) = self.cache.borrow().tables.get1(&relation_oid)
-                && current_table == &table_metadata
+                && current_table.schema_eq(&table_metadata)
             {
                 return Ok(());
             }
@@ -609,6 +671,11 @@ impl QueryCache {
             );
 
             self.cache_table_invalidate(relation_oid);
+        }
+
+        // CDC RelationBody doesn't include indexes, so query them from origin
+        if table_metadata.indexes.is_empty() {
+            table_metadata.indexes = self.query_table_indexes_get(relation_oid).await?;
         }
 
         self.cache_table_create_from_metadata(&table_metadata)

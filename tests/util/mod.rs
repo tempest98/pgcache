@@ -435,6 +435,27 @@ pub fn assert_row_at(
     Ok(())
 }
 
+/// Connect directly to the cache database (bypassing pgcache proxy)
+/// Useful for verifying internal cache state like indexes
+pub async fn connect_cache_db(dbs: &TempDBs) -> Result<Client, Error> {
+    let (client, connection) = Config::new()
+        .host("localhost")
+        .port(dbs.cache.db_port())
+        .user(dbs.cache.db_user())
+        .dbname(dbs.cache.db_name())
+        .connect(NoTls)
+        .await
+        .map_err(Error::other)?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("cache db connection error: {e}");
+        }
+    });
+
+    Ok(client)
+}
+
 /// Setup test and test_map tables with base data for constraint invalidation tests
 /// Creates tables and inserts base data:
 /// - test: (1, 'foo'), (2, 'bar'), (3, 'baz')

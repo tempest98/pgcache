@@ -14,7 +14,7 @@ use crate::query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectColumns, Tab
 /// Contains schema information, column definitions, and primary key metadata
 /// for a PostgreSQL table. This information is fetched from the database
 /// information_schema and pg_catalog.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TableMetadata {
     /// PostgreSQL relation OID
     pub relation_oid: u32,
@@ -26,9 +26,23 @@ pub struct TableMetadata {
     pub primary_key_columns: Vec<String>,
     /// Column metadata indexed by name and position
     pub columns: BiHashMap<ColumnMetadata>,
+    /// Index metadata for non-primary-key indexes
+    pub indexes: Vec<IndexMetadata>,
 }
 
 impl TableMetadata {
+    /// Compare table schema (columns, primary key) without comparing indexes.
+    ///
+    /// Used to determine if a table needs recreation. Index changes don't
+    /// require table recreation.
+    pub fn schema_eq(&self, other: &TableMetadata) -> bool {
+        self.relation_oid == other.relation_oid
+            && self.name == other.name
+            && self.schema == other.schema
+            && self.primary_key_columns == other.primary_key_columns
+            && self.columns == other.columns
+    }
+
     /// Generate SELECT columns for all columns in this table.
     ///
     /// If an alias is provided, column references will use the alias name
@@ -122,4 +136,21 @@ impl BiHashItem for ColumnMetadata {
     }
 
     bi_upcast!();
+}
+
+/// Metadata about a table index.
+///
+/// Contains index definition information for recreating indexes
+/// on cached tables. Expression indexes and partial indexes are not supported.
+/// Primary key indexes are excluded since they are created by the PRIMARY KEY constraint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexMetadata {
+    /// Index name (for reference/logging, not used in CREATE INDEX)
+    pub name: String,
+    /// Whether this is a unique index
+    pub is_unique: bool,
+    /// Index method (btree, hash, gist, gin, etc.)
+    pub method: String,
+    /// Ordered list of column names in the index
+    pub columns: Vec<String>,
 }

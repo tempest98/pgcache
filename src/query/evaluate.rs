@@ -390,6 +390,7 @@ mod tests {
             relation_oid: 12345,
             primary_key_columns: vec!["id".to_owned()],
             columns,
+            indexes: Vec::new(),
         }
     }
 

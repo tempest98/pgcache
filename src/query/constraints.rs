@@ -236,6 +236,7 @@ mod tests {
             schema: "public".to_owned(),
             primary_key_columns: vec!["id".to_owned()],
             columns,
+            indexes: Vec::new(),
         }
     }
 
@@ -318,6 +319,7 @@ mod tests {
             schema: "public".to_owned(),
             primary_key_columns: vec!["id".to_owned()],
             columns: c_columns,
+            indexes: Vec::new(),
         });
 
         // Use parentheses to avoid parser issues with nested JOINs

@@ -439,6 +439,7 @@ impl CdcProcessor {
             relation_oid,
             primary_key_columns,
             columns,
+            indexes: Vec::new(), // Indexes are queried separately in cache_table_register
         }
     }
 
