@@ -157,16 +157,26 @@ impl QueryCache {
                 let (table_oids, resolved) = self
                     .query_register(fingerprint, &msg.cacheable_query, &search_path_refs)
                     .await?;
+                let mut total_bytes: usize = 0;
                 for table_oid in table_oids {
                     let rows = self.query_cache_fetch(table_oid, &resolved).await?;
-                    self.query_cache_results(table_oid, &rows).await?;
+                    let bytes = self.query_cache_results(table_oid, &rows).await?;
+                    total_bytes += bytes;
                     self.cache
                         .borrow_mut()
                         .cached_queries
                         .entry(fingerprint)
                         .and_modify(|mut query| query.state = CachedQueryState::Ready);
                 }
-                trace!("cached query ready");
+                self.cache
+                    .borrow_mut()
+                    .cached_queries
+                    .entry(fingerprint)
+                    .and_modify(|mut query| {
+                        query.state = CachedQueryState::Ready;
+                        query.cached_bytes = total_bytes;
+                    });
+                trace!("cached query ready, cached_bytes={total_bytes}");
             };
 
             Ok(())
@@ -273,11 +283,8 @@ impl QueryCache {
                 .relation_oid;
 
             // Resolve the update query
-            let update_resolved = select_statement_resolve(
-                &update_select,
-                &self.cache.borrow().tables,
-                search_path,
-            )?;
+            let update_resolved =
+                select_statement_resolve(&update_select, &self.cache.borrow().tables, search_path)?;
 
             let update_query = UpdateQuery {
                 fingerprint,
@@ -305,6 +312,7 @@ impl QueryCache {
             select_statement: select_statement.clone(),
             resolved: resolved.clone(),
             constraints: query_constraints,
+            cached_bytes: 0,
         };
 
         // Store cached query metadata
@@ -327,12 +335,13 @@ impl QueryCache {
     }
 
     /// Stores query results in the cache for faster retrieval.
+    /// Returns the number of bytes cached (sum of raw value sizes).
     #[instrument(skip_all)]
     pub async fn query_cache_results(
         &self,
         table_oid: u32,
         response: &[SimpleQueryMessage],
-    ) -> Result<(), CacheError> {
+    ) -> Result<usize, CacheError> {
         let [
             SimpleQueryMessage::RowDescription(row_description),
             data_rows @ ..,
@@ -340,8 +349,10 @@ impl QueryCache {
         ] = response
         else {
             //no results to store
-            return Ok(());
+            return Ok(0);
         };
+
+        let mut cached_bytes: usize = 0;
 
         let sql_list = {
             let cache = self.cache.borrow();
@@ -373,8 +384,10 @@ impl QueryCache {
             for &row in &rows {
                 let mut values: Vec<String> = Vec::new();
                 for idx in 0..row.columns().len() {
+                    let value = row.get(idx);
+                    cached_bytes += value.map_or(0, |v| v.len());
                     values.push(
-                        row.get(idx)
+                        value
                             .map(escape::escape_literal)
                             .unwrap_or("NULL".to_owned()),
                     );
@@ -386,8 +399,10 @@ impl QueryCache {
                     .map(|&c| format!("{c} = EXCLUDED.{c}"))
                     .collect::<Vec<_>>();
 
-                let mut insert_table =
-                    format!("insert into {schema}.{table_name}({}) values (", columns.join(","));
+                let mut insert_table = format!(
+                    "insert into {schema}.{table_name}({}) values (",
+                    columns.join(",")
+                );
                 insert_table.push_str(&values.join(","));
                 insert_table.push_str(") on conflict (");
                 insert_table.push_str(&pkey_columns.join(","));
@@ -403,7 +418,7 @@ impl QueryCache {
             .simple_query(sql_list.join(";").as_str())
             .await?;
 
-        Ok(())
+        Ok(cached_bytes)
     }
 
     #[instrument(skip_all)]
@@ -736,8 +751,9 @@ impl QueryCache {
         // Create schema if it doesn't exist, then create table with qualified name
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
         let drop_sql = format!("DROP TABLE IF EXISTS {schema}.{table}");
-        let create_sql =
-            format!("CREATE TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)");
+        let create_sql = format!(
+            "CREATE TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
+        );
 
         self.db_cache.execute(&create_schema_sql, &[]).await?;
         self.db_cache.execute(&drop_sql, &[]).await?;
@@ -1022,9 +1038,7 @@ impl QueryCache {
                     ]
                 })
                 .collect::<HashMap<_, _>>();
-            let joins = resolved
-                .nodes::<ResolvedJoinNode>()
-                .collect::<Vec<_>>();
+            let joins = resolved.nodes::<ResolvedJoinNode>().collect::<Vec<_>>();
 
             // Check if we need to invalidate based on constraint analysis
             let mut needs_invalidation = false;

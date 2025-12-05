@@ -21,6 +21,8 @@ pub struct CachedQuery {
     pub select_statement: SelectStatement,
     pub resolved: ResolvedSelectStatement,
     pub constraints: QueryConstraints,
+    /// Estimated size of cached data in bytes (sum of raw value bytes)
+    pub cached_bytes: usize,
 }
 
 impl IdHashItem for CachedQuery {
