@@ -30,7 +30,10 @@ use crate::{
     cache::{CacheMessage, CacheReply, ProxyMessage, query::CacheableQuery},
     metrics::Metrics,
     pg::protocol::{
-        backend::{PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType},
+        backend::{
+            PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType, data_row_first_column,
+            parameter_status_parse,
+        },
         extended::{
             ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, StatementType,
             parse_bind_message, parse_close_message, parse_describe_message, parse_execute_message,
@@ -38,13 +41,14 @@ use crate::{
         },
         frontend::{
             PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType,
-            startup_message_parameter,
+            simple_query_message_build, startup_message_parameter,
         },
     },
     settings::Settings,
 };
 
 use super::query::{Action, ForwardReason, handle_query};
+use super::search_path::SearchPath;
 use super::{ConnectionError, ProxyMode, ProxyStatus, ReadError};
 
 type SenderCacheType = Sender<ProxyMessage>;
@@ -88,6 +92,15 @@ pub(super) struct ConnectionState {
     /// PostgreSQL session user from startup message
     /// TODO: Track SET ROLE queries to update effective user for permission checks
     session_user: Option<String>,
+
+    /// Parsed search_path for this connection (from ParameterStatus or SHOW query)
+    search_path: Option<SearchPath>,
+
+    /// Whether we're waiting for SHOW search_path response (pre-18 fallback)
+    search_path_query_pending: bool,
+
+    /// Whether this is the first ReadyForQuery after authentication
+    first_ready_for_query: bool,
 }
 
 impl ConnectionState {
@@ -105,6 +118,9 @@ impl ConnectionState {
             pending_describe_statement: None,
             metrics,
             session_user: None,
+            search_path: None,
+            search_path_query_pending: false,
+            first_ready_for_query: true,
         }
     }
 
@@ -186,7 +202,37 @@ impl ConnectionState {
     /// Updates transaction state, captures parameter OIDs, and forwards to client.
     #[expect(clippy::wildcard_enum_match_arm)]
     fn handle_origin_message(&mut self, msg: PgBackendMessage) {
+        // Intercept SHOW search_path response (don't forward to client)
+        if self.search_path_query_pending {
+            match msg.message_type {
+                PgBackendMessageType::DataRows => {
+                    // Extract search_path value from the DataRow
+                    if let Some(value) = data_row_first_column(&msg.data) {
+                        debug!("received search_path from SHOW query: {}", value);
+                        self.search_path = Some(SearchPath::parse(value));
+                    }
+                }
+                PgBackendMessageType::ReadyForQuery => {
+                    // SHOW query complete, resume normal operation
+                    debug!("search_path query complete");
+                    self.search_path_query_pending = false;
+                }
+                _ => {
+                    // Ignore RowDescription, CommandComplete, etc.
+                }
+            }
+            // Don't forward any of these messages to client
+            return;
+        }
+
         match msg.message_type {
+            PgBackendMessageType::ParameterStatus => {
+                // Check for search_path parameter (PG 18+ sends this during startup)
+                if let Some(("search_path", value)) = parameter_status_parse(&msg.data) {
+                    debug!("received search_path from ParameterStatus: {}", value);
+                    self.search_path = Some(SearchPath::parse(value));
+                }
+            }
             PgBackendMessageType::ParameterDescription => {
                 // Update the pending statement's parameter OIDs from the server response
                 if let Some(stmt_name) = self.pending_describe_statement.take()
@@ -210,6 +256,20 @@ impl ConnectionState {
                 // Clean up unnamed portals when transaction ends
                 if !self.in_transaction {
                     self.portals.retain(|name, _| !name.is_empty());
+                }
+
+                // On first ReadyForQuery, check if we need to query search_path (pre-18 fallback)
+                if self.first_ready_for_query {
+                    self.first_ready_for_query = false;
+
+                    if self.search_path.is_none() && !self.search_path_query_pending {
+                        // PG < 18 doesn't send search_path in ParameterStatus
+                        // Send SHOW search_path query to origin
+                        debug!("search_path not received, sending SHOW search_path query");
+                        self.search_path_query_pending = true;
+                        let query_msg = simple_query_message_build("SHOW search_path;");
+                        self.origin_write_buf.push_back(query_msg);
+                    }
                 }
             }
             _ => {}
@@ -633,6 +693,25 @@ async fn handle_connection(
                 }
             }
             ProxyMode::CacheWrite(msg) => {
+                // Resolve search_path for this connection (expand $user to session_user)
+                // If search_path is unknown, forward to origin instead of caching
+                let Some(resolved_search_path) = state.search_path.as_ref().map(|sp| {
+                    sp.resolve(state.session_user.as_deref())
+                        .into_iter()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                }) else {
+                    debug!("search_path unknown, forwarding to origin");
+                    state.metrics.uncacheable_increment();
+                    let data = match msg {
+                        CacheMessage::Query(data, _) => data,
+                        CacheMessage::QueryParameterized(data, _, _, _) => data,
+                    };
+                    state.origin_write_buf.push_back(data);
+                    state.proxy_mode = ProxyMode::Read;
+                    continue;
+                };
+
                 state.metrics.cacheable_increment();
 
                 if matches!(msg, CacheMessage::QueryParameterized(_, _, _, _)) {
@@ -652,6 +731,7 @@ async fn handle_connection(
                     message: msg,
                     client_socket: client_socket_dup,
                     reply_tx,
+                    search_path: resolved_search_path,
                 };
 
                 match cache_tx.send(proxy_msg).await {

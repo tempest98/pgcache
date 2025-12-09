@@ -249,7 +249,7 @@ mod tests {
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -272,7 +272,7 @@ mod tests {
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -327,7 +327,7 @@ mod tests {
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -357,7 +357,7 @@ mod tests {
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -388,7 +388,7 @@ mod tests {
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -413,7 +413,7 @@ mod tests {
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -431,7 +431,7 @@ mod tests {
         let ast = pg_query::parse(sql).unwrap();
         let sql_query = sql_query_convert(&ast).unwrap();
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         let constraints = analyze_query_constraints(&resolved);
 

@@ -1,5 +1,6 @@
 mod connection;
 mod query;
+pub mod search_path;
 mod server;
 
 use std::io;

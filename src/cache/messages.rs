@@ -132,6 +132,8 @@ pub struct ProxyMessage {
     pub message: CacheMessage,
     pub client_socket: TcpStream,
     pub reply_tx: Sender<CacheReply>,
+    /// Resolved search_path for this connection (with $user expanded to session_user)
+    pub search_path: Vec<String>,
 }
 
 /// Unified stream source for multiplexing proxy and CDC messages

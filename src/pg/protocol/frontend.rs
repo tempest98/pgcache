@@ -86,6 +86,21 @@ pub fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option<&'a st
     }
 }
 
+/// Build a simple query message for sending to the backend.
+///
+/// Message format: 'Q' | int32 len | string query (null-terminated)
+pub fn simple_query_message_build(query: &str) -> BytesMut {
+    let query_bytes = query.as_bytes();
+    // Length includes: 4 bytes for length field + query bytes + 1 null terminator
+    let len = (4 + query_bytes.len() + 1) as i32;
+    let mut buf = BytesMut::with_capacity(1 + 4 + query_bytes.len() + 1);
+    buf.extend_from_slice(b"Q");
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(query_bytes);
+    buf.extend_from_slice(&[0]);
+    buf
+}
+
 impl Decoder for PgFrontendMessageCodec {
     type Item = PgFrontendMessage;
     type Error = ProtocolError;

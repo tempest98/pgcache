@@ -44,6 +44,8 @@ pub struct QueryRequest {
     pub result_formats: Vec<i16>,
     pub client_socket: TcpStream,
     pub reply_tx: Sender<CacheReply>,
+    /// Resolved search_path for schema resolution
+    pub search_path: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,8 +129,10 @@ impl QueryCache {
                 .map_err(|_| CacheError::Reply)?;
 
             if cached_query_state.is_none() {
+                let search_path_refs: Vec<&str> =
+                    msg.search_path.iter().map(String::as_str).collect();
                 let table_oids = self
-                    .query_register(fingerprint, &msg.cacheable_query)
+                    .query_register(fingerprint, &msg.cacheable_query, &search_path_refs)
                     .await?;
                 for table_oid in table_oids {
                     let rows = self.query_cache_fetch(table_oid, stmt).await?;
@@ -189,23 +193,38 @@ impl QueryCache {
         &mut self,
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
+        search_path: &[&str],
     ) -> Result<Vec<u32>, CacheError> {
         let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
 
         // Ensure all tables are registered in the cache
+        // First, resolve each table using the search_path to find the correct schema
         for table_node in select_statement.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
-            let schema = table_node.schema.as_deref().unwrap_or("public");
 
-            if !self.cache.borrow().tables.contains_key2(&(schema, table_name)) {
-                let table = self.cache_table_create(Some(schema), table_name).await?;
+            // Determine schema: explicit or search through search_path
+            let schema = if let Some(schema) = table_node.schema.as_deref() {
+                schema.to_owned()
+            } else {
+                // Search through search_path to find which schema the table is in
+                self.schema_for_table_find(table_name, search_path).await?
+            };
+
+            if !self
+                .cache
+                .borrow()
+                .tables
+                .contains_key2(&(schema.as_str(), table_name))
+            {
+                let table = self.cache_table_create(Some(&schema), table_name).await?;
                 self.cache.borrow_mut().tables.insert_overwrite(table);
             }
         }
 
         // Resolve the query using catalog metadata
-        let resolved = select_statement_resolve(select_statement, &self.cache.borrow().tables)?;
+        let resolved =
+            select_statement_resolve(select_statement, &self.cache.borrow().tables, search_path)?;
 
         // Analyze constraints from the resolved query
         let query_constraints = analyze_query_constraints(&resolved);
@@ -216,12 +235,18 @@ impl QueryCache {
                 query: update_select,
             };
 
-            let schema = table_node.schema.as_deref().unwrap_or("public");
+            // Resolve schema using explicit schema or search_path
+            let schema = if let Some(schema) = table_node.schema.as_deref() {
+                schema.to_owned()
+            } else {
+                self.schema_for_table_find(table_node.name.as_str(), search_path)
+                    .await?
+            };
             let relation_oid = self
                 .cache
                 .borrow()
                 .tables
-                .get2(&(schema, table_node.name.as_str()))
+                .get2(&(schema.as_str(), table_node.name.as_str()))
                 .ok_or(CacheError::UnknownTable {
                     oid: None,
                     name: Some(table_node.name.clone()),
@@ -545,6 +570,54 @@ impl QueryCache {
             .collect();
 
         Ok(indexes)
+    }
+
+    /// Find which schema a table belongs to by searching through the search_path.
+    ///
+    /// Queries the database to find the first schema in search_path that contains
+    /// the given table name.
+    #[instrument(skip_all)]
+    async fn schema_for_table_find(
+        &self,
+        table_name: &str,
+        search_path: &[&str],
+    ) -> Result<String, CacheError> {
+        // First check if the table is already in our cache
+        for schema in search_path {
+            if self
+                .cache
+                .borrow()
+                .tables
+                .get2(&(*schema, table_name))
+                .is_some()
+            {
+                return Ok((*schema).to_owned());
+            }
+        }
+
+        // Query the database to find which schema contains the table
+        let sql = r"
+            SELECT n.nspname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = $1
+            AND c.relkind = 'r'
+            AND n.nspname = any($2)
+            ORDER BY array_position($2::text[], n.nspname::text)
+            LIMIT 1;
+        ";
+
+        let rows = self
+            .db_origin
+            .query(sql, &[&table_name, &search_path])
+            .await?;
+
+        rows.first()
+            .map(|row| row.get::<_, String>(0))
+            .ok_or_else(|| CacheError::UnknownTable {
+                oid: None,
+                name: Some(table_name.to_owned()),
+            })
     }
 
     async fn query_row_changes(

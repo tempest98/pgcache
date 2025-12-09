@@ -34,6 +34,7 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
                 result_formats: query_data.result_formats,
                 client_socket: proxy_msg.client_socket,
                 reply_tx: proxy_msg.reply_tx,
+                search_path: proxy_msg.search_path,
             };
             if let Err(e) = qcache.query_dispatch(request).await {
                 error!("query dispatch failed: {e}");

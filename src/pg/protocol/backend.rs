@@ -136,6 +136,43 @@ impl PgBackendMessageCodec {
     }
 }
 
+/// Parse a ParameterStatus message to extract name and value.
+///
+/// Message format: 'S' | int32 len | string name (null-terminated) | string value (null-terminated)
+///
+/// Returns `None` if the message is malformed.
+pub fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
+    // Skip tag ('S') and length (4 bytes)
+    let payload = data.get(5..)?;
+
+    // Split on null bytes: [name, value, ""]
+    let mut parts = payload.split(|&b| b == 0);
+
+    let name = std::str::from_utf8(parts.next()?).ok()?;
+    let value = std::str::from_utf8(parts.next()?).ok()?;
+
+    Some((name, value))
+}
+
+/// Extract the first column value from a DataRow message as a string.
+///
+/// Message format: 'D' | int32 len | int16 column_count | (int32 col_len | bytes col_data)*
+///
+/// Returns `None` if the message is malformed or the column is NULL.
+pub fn data_row_first_column(data: &[u8]) -> Option<&str> {
+    // Skip tag ('D') and length (4 bytes) and column count (2 bytes)
+    let payload = data.get(7..)?;
+
+    // First 4 bytes are the column length (-1 means NULL)
+    let col_len = i32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
+    if col_len < 0 {
+        return None; // NULL value
+    }
+
+    let col_data = payload.get(4..4 + col_len as usize)?;
+    std::str::from_utf8(col_data).ok()
+}
+
 impl Decoder for PgBackendMessageCodec {
     type Item = PgMessage<PgBackendMessageType>;
     type Error = ProtocolError;

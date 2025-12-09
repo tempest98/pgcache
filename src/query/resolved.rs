@@ -244,28 +244,31 @@ impl<'a> ResolutionScope<'a> {
     }
 }
 
-/// Resolve a table reference to a resolved table node
-fn table_resolve(
-    table_node: &TableNode,
-    tables: &BiHashMap<TableMetadata>,
-) -> Result<ResolvedTableNode, ResolveError> {
-    let schema = table_node.schema.as_deref().unwrap_or("public");
-    let table_name = &table_node.name;
+/// Find table metadata for a table reference.
+///
+/// If the table has an explicit schema qualifier, use it directly.
+/// Otherwise, search through the search_path schemas in order.
+fn table_metadata_find<'map, 'node: 'map>(
+    table_node: &'node TableNode,
+    tables: &'map BiHashMap<TableMetadata>,
+    search_path: &[&'map str],
+) -> Option<&'map TableMetadata> {
+    let table_name = table_node.name.as_str();
 
-    // Look up table in metadata
-    let table_metadata =
-        tables
-            .get2(&(schema, table_name.as_str()))
-            .ok_or_else(|| ResolveError::TableNotFound {
-                name: table_name.clone(),
-            })?;
+    // If table has explicit schema, use it directly
+    if let Some(schema) = &table_node.schema {
+        let table_metadata = tables.get2(&(schema.as_str(), table_name))?;
+        return Some(table_metadata);
+    }
 
-    Ok(ResolvedTableNode {
-        schema: table_metadata.schema.clone(),
-        name: table_metadata.name.clone(),
-        alias: table_node.alias.as_ref().map(|a| a.name.clone()),
-        relation_oid: table_metadata.relation_oid,
-    })
+    // Search through search_path schemas in order
+    for schema in search_path {
+        if let Some(table_metadata) = tables.get2(&(*schema, table_name)) {
+            return Some(table_metadata);
+        }
+    }
+
+    None
 }
 
 /// Resolve a column reference to a resolved column node
@@ -385,28 +388,39 @@ fn table_source_resolve<'a>(
     source: &'a TableSource,
     tables: &'a BiHashMap<TableMetadata>,
     scope: &mut ResolutionScope<'a>,
+    search_path: &[&'a str],
 ) -> Result<ResolvedTableSource, ResolveError> {
     match source {
         TableSource::Table(table_node) => {
-            let resolved = table_resolve(table_node, tables)?;
-            let schema = table_node.schema.as_deref().unwrap_or("public");
-            let table_metadata = tables
-                .get2(&(schema, table_node.name.as_str()))
-                .expect("table should exist after resolution");
+            // First find the table metadata (which gives us the schema)
+            let table_metadata =
+                table_metadata_find(table_node, tables, search_path).ok_or_else(|| {
+                    ResolveError::TableNotFound {
+                        name: table_node.name.clone(),
+                    }
+                })?;
 
             scope.table_scope_add(
                 table_metadata,
                 table_node.alias.as_ref().map(|a| a.name.as_str()),
             );
 
+            let resolved = ResolvedTableNode {
+                schema: table_metadata.schema.clone(),
+                name: table_metadata.name.clone(),
+                alias: table_node.alias.as_ref().map(|a| a.name.clone()),
+                relation_oid: table_metadata.relation_oid,
+            };
+
             Ok(ResolvedTableSource::Table(resolved))
         }
         TableSource::Join(join_node) => {
             // Resolve left side first and add to scope
-            let resolved_left = table_source_resolve(&join_node.left, tables, scope)?;
+            let resolved_left = table_source_resolve(&join_node.left, tables, scope, search_path)?;
 
             // Resolve right side and add to scope
-            let resolved_right = table_source_resolve(&join_node.right, tables, scope)?;
+            let resolved_right =
+                table_source_resolve(&join_node.right, tables, scope, search_path)?;
 
             // Resolve join condition using the updated scope
             let resolved_condition = join_node
@@ -518,13 +532,14 @@ fn order_by_resolve(
 pub fn select_statement_resolve(
     stmt: &SelectStatement,
     tables: &BiHashMap<TableMetadata>,
+    search_path: &[&str],
 ) -> Result<ResolvedSelectStatement, ResolveError> {
     let mut scope = ResolutionScope::new();
 
     // First pass: resolve all table references and build scope
     let mut resolved_from = Vec::new();
     for table_source in &stmt.from {
-        let resolved = table_source_resolve(table_source, tables, &mut scope)?;
+        let resolved = table_source_resolve(table_source, tables, &mut scope, search_path)?;
         resolved_from.push(resolved);
     }
 
@@ -662,7 +677,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         assert_eq!(resolved.from.len(), 1);
         if let ResolvedTableSource::Table(table) = &resolved.from[0] {
@@ -687,7 +702,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         assert_eq!(resolved.from.len(), 1);
         if let ResolvedTableSource::Table(table) = &resolved.from[0] {
@@ -711,7 +726,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let result = select_statement_resolve(stmt, &tables);
+        let result = select_statement_resolve(stmt, &tables, &["public"]);
 
         assert!(matches!(result, Err(ResolveError::TableNotFound { .. })));
     }
@@ -728,7 +743,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
@@ -757,7 +772,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
@@ -786,7 +801,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
@@ -816,7 +831,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let result = select_statement_resolve(stmt, &tables);
+        let result = select_statement_resolve(stmt, &tables, &["public"]);
 
         assert!(matches!(result, Err(ResolveError::AmbiguousColumn { .. })));
     }
@@ -833,7 +848,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check that SELECT * was expanded to all columns
         if let ResolvedSelectColumns::All(cols) = &resolved.columns {
@@ -859,7 +874,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check that specific columns were resolved
         if let ResolvedSelectColumns::Columns(cols) = &resolved.columns {
@@ -896,7 +911,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check that JOIN was resolved
         assert_eq!(resolved.from.len(), 1);
@@ -948,7 +963,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check that JOIN with aliases was resolved
         if let ResolvedTableSource::Join(join) = &resolved.from[0] {
@@ -998,7 +1013,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check that complex WHERE was resolved
         if let Some(ResolvedWhereExpr::Binary(and_expr)) = &resolved.where_clause {
@@ -1040,7 +1055,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check ORDER BY was resolved
         assert_eq!(resolved.order_by.len(), 1);
@@ -1068,7 +1083,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check ORDER BY was resolved
         assert_eq!(resolved.order_by.len(), 2);
@@ -1104,7 +1119,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check ORDER BY was resolved with qualified column
         assert_eq!(resolved.order_by.len(), 1);
@@ -1134,7 +1149,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check ORDER BY was resolved across joined tables
         assert_eq!(resolved.order_by.len(), 2);
@@ -1168,7 +1183,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables).unwrap();
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
 
         // Check unqualified ORDER BY column was resolved
         assert_eq!(resolved.order_by.len(), 1);
@@ -1192,7 +1207,7 @@ mod tests {
         let sql_query = sql_query_convert(&ast).unwrap();
 
         let Statement::Select(stmt) = &sql_query.statement;
-        let result = select_statement_resolve(stmt, &tables);
+        let result = select_statement_resolve(stmt, &tables, &["public"]);
 
         // Should fail with column not found error
         assert!(matches!(result, Err(ResolveError::ColumnNotFound { .. })));
