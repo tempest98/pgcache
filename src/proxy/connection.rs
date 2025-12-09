@@ -104,6 +104,7 @@ impl ConnectionState {
     /// Determines whether to forward to origin, check cache, or take other action.
     #[expect(clippy::wildcard_enum_match_arm)]
     async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
+        debug!("client {:?}", &msg);
         match msg.message_type {
             PgFrontendMessageType::Query => {
                 self.metrics.query_increment();
@@ -202,6 +203,7 @@ impl ConnectionState {
             _ => {}
         }
 
+        debug!("{:?}", &msg.data);
         self.client_write_buf.push_back(msg.data);
     }
 

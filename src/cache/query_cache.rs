@@ -196,10 +196,10 @@ impl QueryCache {
         // Ensure all tables are registered in the cache
         for table_node in select_statement.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
-            let schema = table_node.schema.as_deref();
+            let schema = table_node.schema.as_deref().unwrap_or("public");
 
-            if !self.cache.borrow().tables.contains_key2(table_name) {
-                let table = self.cache_table_create(schema, table_name).await?;
+            if !self.cache.borrow().tables.contains_key2(&(schema, table_name)) {
+                let table = self.cache_table_create(Some(schema), table_name).await?;
                 self.cache.borrow_mut().tables.insert_overwrite(table);
             }
         }
@@ -216,11 +216,12 @@ impl QueryCache {
                 query: update_select,
             };
 
+            let schema = table_node.schema.as_deref().unwrap_or("public");
             let relation_oid = self
                 .cache
                 .borrow()
                 .tables
-                .get2(table_node.name.as_str())
+                .get2(&(schema, table_node.name.as_str()))
                 .ok_or(CacheError::UnknownTable {
                     oid: None,
                     name: Some(table_node.name.clone()),

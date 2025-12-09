@@ -255,17 +255,10 @@ fn table_resolve(
     // Look up table in metadata
     let table_metadata =
         tables
-            .get2(table_name.as_str())
+            .get2(&(schema, table_name.as_str()))
             .ok_or_else(|| ResolveError::TableNotFound {
                 name: table_name.clone(),
             })?;
-
-    // Verify schema matches (if schema was explicitly specified)
-    if table_node.schema.is_some() && table_metadata.schema != schema {
-        return Err(ResolveError::SchemaNotFound {
-            schema: schema.to_owned(),
-        });
-    }
 
     Ok(ResolvedTableNode {
         schema: table_metadata.schema.clone(),
@@ -396,8 +389,9 @@ fn table_source_resolve<'a>(
     match source {
         TableSource::Table(table_node) => {
             let resolved = table_resolve(table_node, tables)?;
+            let schema = table_node.schema.as_deref().unwrap_or("public");
             let table_metadata = tables
-                .get2(table_node.name.as_str())
+                .get2(&(schema, table_node.name.as_str()))
                 .expect("table should exist after resolution");
 
             scope.table_scope_add(

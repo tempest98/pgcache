@@ -79,14 +79,14 @@ impl TableMetadata {
 
 impl BiHashItem for TableMetadata {
     type K1<'a> = u32;
-    type K2<'a> = &'a str;
+    type K2<'a> = (&'a str, &'a str);
 
     fn key1(&self) -> Self::K1<'_> {
         self.relation_oid
     }
 
     fn key2(&self) -> Self::K2<'_> {
-        self.name.as_str()
+        (self.schema.as_str(), self.name.as_str())
     }
 
     bi_upcast!();
