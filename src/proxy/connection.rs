@@ -36,7 +36,10 @@ use crate::{
             parse_bind_message, parse_close_message, parse_describe_message, parse_execute_message,
             parse_parameter_description, parse_parse_message,
         },
-        frontend::{PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType},
+        frontend::{
+            PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType,
+            startup_message_parameter,
+        },
     },
     settings::Settings,
 };
@@ -81,6 +84,10 @@ pub(super) struct ConnectionState {
 
     /// Metrics collector for tracking query and cache performance
     metrics: Arc<Metrics>,
+
+    /// PostgreSQL session user from startup message
+    /// TODO: Track SET ROLE queries to update effective user for permission checks
+    session_user: Option<String>,
 }
 
 impl ConnectionState {
@@ -97,6 +104,7 @@ impl ConnectionState {
             portals: HashMap::new(),
             pending_describe_statement: None,
             metrics,
+            session_user: None,
         }
     }
 
@@ -161,6 +169,10 @@ impl ConnectionState {
             }
             PgFrontendMessageType::Flush => {
                 // Flush requests the server to send any pending data
+                self.origin_write_buf.push_back(msg.data);
+            }
+            PgFrontendMessageType::Startup => {
+                self.session_user = startup_message_parameter(&msg.data, "user").map(String::from);
                 self.origin_write_buf.push_back(msg.data);
             }
             _ => {

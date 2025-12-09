@@ -59,6 +59,33 @@ pub struct PgFrontendMessageCodec {
     pub state: PgConnectionState,
 }
 
+/// Extract a parameter value from a startup message by key.
+///
+/// The startup message format is:
+/// - 4 bytes: message length
+/// - 4 bytes: protocol version (3.0)
+/// - Null-terminated key-value pairs until empty key
+///
+/// Returns `Some(&str)` if the key is found, `None` otherwise.
+pub fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option<&'a str> {
+    // Skip length (4 bytes) and protocol version (4 bytes)
+    let params = data.get(8..)?;
+
+    let mut parts = params.split(|&b| b == 0);
+
+    loop {
+        let k = parts.next()?;
+        if k.is_empty() {
+            return None; // End of parameters
+        }
+        let v = parts.next()?;
+
+        if k == key.as_bytes() {
+            return std::str::from_utf8(v).ok();
+        }
+    }
+}
+
 impl Decoder for PgFrontendMessageCodec {
     type Item = PgFrontendMessage;
     type Error = ProtocolError;
