@@ -323,7 +323,8 @@ impl QueryCache {
                 })?;
 
             let pkey_columns = &table.primary_key_columns;
-            let table_name = table.name.as_str();
+            let schema = &table.schema;
+            let table_name = &table.name;
 
             let rows = data_rows
                 .iter()
@@ -355,7 +356,7 @@ impl QueryCache {
                     .collect::<Vec<_>>();
 
                 let mut insert_table =
-                    format!("insert into {}({}) values (", table_name, columns.join(","));
+                    format!("insert into {schema}.{table_name}({}) values (", columns.join(","));
                 insert_table.push_str(&values.join(","));
                 insert_table.push_str(") on conflict (");
                 insert_table.push_str(&pkey_columns.join(","));
@@ -670,8 +671,9 @@ impl QueryCache {
             }
 
             format!(
-                "SELECT {} FROM {} WHERE {}",
+                "SELECT {} FROM {}.{} WHERE {}",
                 comparison_columns.join(", "),
+                table_metadata.schema,
                 table_metadata.name,
                 where_conditions.join(" AND ")
             )
@@ -688,7 +690,8 @@ impl QueryCache {
         &self,
         table_metadata: &TableMetadata,
     ) -> Result<(), CacheError> {
-        let table_name = &table_metadata.name;
+        let schema = &table_metadata.schema;
+        let table = &table_metadata.name;
 
         let column_defs: Vec<String> = table_metadata
             .columns
@@ -699,10 +702,13 @@ impl QueryCache {
 
         let primary_key = table_metadata.primary_key_columns.join(", ");
 
-        let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
+        // Create schema if it doesn't exist, then create table with qualified name
+        let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
+        let drop_sql = format!("DROP TABLE IF EXISTS {schema}.{table}");
         let create_sql =
-            format!("CREATE TABLE {table_name} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)");
+            format!("CREATE TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)");
 
+        self.db_cache.execute(&create_schema_sql, &[]).await?;
         self.db_cache.execute(&drop_sql, &[]).await?;
         self.db_cache.execute(&create_sql, &[]).await?;
 
@@ -712,7 +718,7 @@ impl QueryCache {
             let method = &index.method;
             let columns = index.columns.join(", ");
             let index_sql =
-                format!("CREATE {unique}INDEX ON {table_name} USING {method} ({columns})");
+                format!("CREATE {unique}INDEX ON {schema}.{table} USING {method} ({columns})");
             self.db_cache.execute(&index_sql, &[]).await?;
         }
 
@@ -831,7 +837,8 @@ impl QueryCache {
         let mut select = String::with_capacity(1024);
         value_select.deparse(&mut select);
 
-        let table_name = &table_metadata.name;
+        let schema = &table_metadata.schema;
+        let table = &table_metadata.name;
         let column_list = column_names.join(", ");
         let value_list = values.join(", ");
         let pk_column_list = table_metadata.primary_key_columns.join(", ");
@@ -847,7 +854,7 @@ impl QueryCache {
             .join(", ");
 
         let sql = format!(
-            "INSERT INTO {table_name} ({column_list}) \
+            "INSERT INTO {schema}.{table} ({column_list}) \
             SELECT {value_list} WHERE EXISTS ({select}) \
             ON CONFLICT ({pk_column_list}) \
             DO UPDATE SET {update_list}"
@@ -1198,12 +1205,12 @@ impl QueryCache {
     pub async fn handle_truncate(&self, relation_oids: &[u32]) -> Result<(), CacheError> {
         // Get table metadata for column information
         let truncate_sql = {
-            let mut table_names: Vec<&str> = Vec::new();
+            let mut table_names: Vec<String> = Vec::new();
 
             let cache = self.cache.borrow();
             for oid in relation_oids {
                 if let Some(table_metadata) = cache.tables.get1(oid) {
-                    table_names.push(table_metadata.name.as_str());
+                    table_names.push(format!("{}.{}", table_metadata.schema, table_metadata.name));
                 };
             }
 
@@ -1243,7 +1250,8 @@ impl QueryCache {
         }
 
         let sql = format!(
-            "DELETE FROM {} WHERE {}",
+            "DELETE FROM {}.{} WHERE {}",
+            table_metadata.schema,
             table_metadata.name,
             where_conditions.join(" AND ")
         );
