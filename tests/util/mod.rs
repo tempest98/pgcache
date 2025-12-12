@@ -176,20 +176,44 @@ pub struct TempDBs {
 pub struct TestContext {
     pub dbs: TempDBs,
     pub pgcache: PgCacheProcess,
-    pub cache: Client,  // connected through pgcache proxy
-    pub origin: Client, // direct connection to origin database
+    pub cache_port: u16, // port pgcache proxy is listening on
+    pub cache: Client,   // connected through pgcache proxy
+    pub origin: Client,  // direct connection to origin database
 }
 
 impl TestContext {
     pub async fn setup() -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache) = connect_pgcache(&dbs).await?;
+        let (pgcache, cache_port, cache) = connect_pgcache(&dbs).await?;
         Ok(Self {
             dbs,
             pgcache,
+            cache_port,
             cache,
             origin,
         })
+    }
+
+    /// Reconnect to the pgcache proxy, getting a fresh connection.
+    /// Useful after SET search_path to pick up the new search_path on connection.
+    pub async fn proxy_reconnect(&mut self) -> Result<(), Error> {
+        let (client, connection) = Config::new()
+            .host("localhost")
+            .port(self.cache_port)
+            .user("postgres")
+            .dbname("origin_test")
+            .connect(NoTls)
+            .await
+            .map_err(Error::other)?;
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("connection error: {e}");
+            }
+        });
+
+        self.cache = client;
+        Ok(())
     }
 
     /// Execute query through pgcache proxy
@@ -303,7 +327,7 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
     ))
 }
 
-pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, Client), Error> {
+pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Client), Error> {
     // Find a random available port
     let listen_port = find_available_port()?;
     let listen_socket = format!("127.0.0.1:{}", listen_port);
@@ -354,7 +378,7 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, Client), 
         }
     });
 
-    Ok((pgcache, client))
+    Ok((pgcache, listen_port, client))
 }
 
 pub async fn query<T>(
