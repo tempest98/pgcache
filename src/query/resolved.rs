@@ -3,7 +3,7 @@ use iddqd::BiHashMap;
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
-    ColumnExpr, ColumnNode, ExprOp, JoinType, LiteralValue, OrderDirection, SelectColumns,
+    ColumnExpr, ColumnNode, Deparse, ExprOp, JoinType, LiteralValue, OrderDirection, SelectColumns,
     SelectStatement, TableNode, TableSource, WhereExpr,
 };
 
@@ -42,17 +42,72 @@ pub struct ResolvedTableNode {
     pub relation_oid: u32,
 }
 
+impl Deparse for ResolvedTableNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        buf.push_str(&self.schema);
+        buf.push('.');
+        buf.push_str(&self.name);
+        if let Some(alias) = &self.alias {
+            buf.push(' ');
+            buf.push_str(alias);
+        }
+        buf
+    }
+}
+
 /// Resolved column reference with type information
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Note: PartialEq and Hash are implemented manually to exclude `table_alias`
+/// since aliases are for deparsing only and don't affect column identity.
+#[derive(Debug, Clone, Eq)]
 pub struct ResolvedColumnNode {
     /// Schema name where the table is located
     pub schema: String,
     /// Table name (not alias) where column is defined
     pub table: String,
+    /// Table alias if one was used in the query (for deparsing only, not included in equality)
+    pub table_alias: Option<String>,
     /// Column name
     pub column: String,
     /// Column metadata from catalog (includes type info, position, primary key status, etc.)
     pub column_metadata: ColumnMetadata,
+}
+
+impl PartialEq for ResolvedColumnNode {
+    fn eq(&self, other: &Self) -> bool {
+        // Exclude table_alias from equality - it's only for deparsing
+        self.schema == other.schema
+            && self.table == other.table
+            && self.column == other.column
+            && self.column_metadata == other.column_metadata
+    }
+}
+
+impl std::hash::Hash for ResolvedColumnNode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Exclude table_alias from hash - it's only for deparsing
+        self.schema.hash(state);
+        self.table.hash(state);
+        self.column.hash(state);
+        self.column_metadata.hash(state);
+    }
+}
+
+impl Deparse for ResolvedColumnNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        // Use alias if available, otherwise use schema.table
+        if let Some(alias) = &self.table_alias {
+            buf.push_str(alias);
+        } else {
+            buf.push_str(&self.schema);
+            buf.push('.');
+            buf.push_str(&self.table);
+        }
+        buf.push('.');
+        buf.push_str(&self.column);
+        buf
+    }
 }
 
 /// Resolved unary expression
@@ -99,6 +154,60 @@ pub enum ResolvedWhereExpr {
     Subquery { query: Box<ResolvedSelectStatement> },
 }
 
+impl Deparse for ResolvedWhereExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            ResolvedWhereExpr::Value(lit) => lit.deparse(buf),
+            ResolvedWhereExpr::Column(col) => col.deparse(buf),
+            ResolvedWhereExpr::Unary(unary) => {
+                unary.op.deparse(buf);
+                buf.push(' ');
+                unary.expr.deparse(buf);
+                buf
+            }
+            ResolvedWhereExpr::Binary(binary) => {
+                binary.lexpr.deparse(buf);
+                buf.push(' ');
+                binary.op.deparse(buf);
+                buf.push(' ');
+                binary.rexpr.deparse(buf);
+                buf
+            }
+            ResolvedWhereExpr::Multi(multi) => {
+                let mut sep = "";
+                for expr in &multi.exprs {
+                    buf.push_str(sep);
+                    expr.deparse(buf);
+                    sep = match multi.op {
+                        ExprOp::And => " AND ",
+                        ExprOp::Or => " OR ",
+                        _ => ", ",
+                    };
+                }
+                buf
+            }
+            ResolvedWhereExpr::Function { name, args } => {
+                buf.push_str(name);
+                buf.push('(');
+                let mut sep = "";
+                for arg in args {
+                    buf.push_str(sep);
+                    arg.deparse(buf);
+                    sep = ", ";
+                }
+                buf.push(')');
+                buf
+            }
+            ResolvedWhereExpr::Subquery { query } => {
+                buf.push('(');
+                query.deparse(buf);
+                buf.push(')');
+                buf
+            }
+        }
+    }
+}
+
 /// Resolved column expression in SELECT list
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedColumnExpr {
@@ -115,11 +224,50 @@ pub enum ResolvedColumnExpr {
     Subquery(Box<ResolvedSelectStatement>),
 }
 
+impl Deparse for ResolvedColumnExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            ResolvedColumnExpr::Column(col) => col.deparse(buf),
+            ResolvedColumnExpr::Literal(lit) => lit.deparse(buf),
+            ResolvedColumnExpr::Function { name, args } => {
+                buf.push_str(name);
+                buf.push('(');
+                let mut sep = "";
+                for arg in args {
+                    buf.push_str(sep);
+                    arg.deparse(buf);
+                    sep = ", ";
+                }
+                buf.push(')');
+                buf
+            }
+            ResolvedColumnExpr::Subquery(query) => {
+                buf.push('(');
+                query.deparse(buf);
+                buf.push(')');
+                buf
+            }
+        }
+    }
+}
+
 /// Resolved SELECT column with optional alias
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSelectColumn {
     pub expr: ResolvedColumnExpr,
     pub alias: Option<String>,
+}
+
+impl Deparse for ResolvedSelectColumn {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        self.expr.deparse(buf);
+        if let Some(alias) = &self.alias {
+            buf.push_str(" AS ");
+            buf.push_str(alias);
+        }
+        buf
+    }
 }
 
 /// Resolved SELECT columns list
@@ -131,6 +279,33 @@ pub enum ResolvedSelectColumns {
     All(Vec<ResolvedColumnNode>),
     /// Specific columns
     Columns(Vec<ResolvedSelectColumn>),
+}
+
+impl Deparse for ResolvedSelectColumns {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            ResolvedSelectColumns::None => buf.push(' '),
+            ResolvedSelectColumns::All(columns) => {
+                // Deparse as explicit column list
+                let mut sep = "";
+                for col in columns {
+                    buf.push_str(sep);
+                    buf.push(' ');
+                    col.deparse(buf);
+                    sep = ",";
+                }
+            }
+            ResolvedSelectColumns::Columns(cols) => {
+                let mut sep = "";
+                for col in cols {
+                    buf.push_str(sep);
+                    col.deparse(buf);
+                    sep = ",";
+                }
+            }
+        }
+        buf
+    }
 }
 
 /// Resolved table source
@@ -147,6 +322,22 @@ pub enum ResolvedTableSource {
     Join(Box<ResolvedJoinNode>),
 }
 
+impl Deparse for ResolvedTableSource {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            ResolvedTableSource::Table(table) => table.deparse(buf),
+            ResolvedTableSource::Join(join) => join.deparse(buf),
+            ResolvedTableSource::Subquery { select, alias } => {
+                buf.push_str(" (");
+                select.deparse(buf);
+                buf.push_str(") ");
+                buf.push_str(alias);
+                buf
+            }
+        }
+    }
+}
+
 /// Resolved JOIN node
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedJoinNode {
@@ -156,11 +347,44 @@ pub struct ResolvedJoinNode {
     pub condition: Option<ResolvedWhereExpr>,
 }
 
+impl Deparse for ResolvedJoinNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.left.deparse(buf);
+
+        match self.join_type {
+            JoinType::Inner => buf.push_str(" JOIN"),
+            JoinType::Left => buf.push_str(" LEFT JOIN"),
+            JoinType::Right => buf.push_str(" RIGHT JOIN"),
+            JoinType::Full => buf.push_str(" FULL JOIN"),
+        }
+
+        self.right.deparse(buf);
+
+        if let Some(condition) = &self.condition {
+            buf.push_str(" ON ");
+            condition.deparse(buf);
+        }
+
+        buf
+    }
+}
+
 /// Resolved ORDER BY clause
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedOrderByClause {
     pub expr: ResolvedColumnExpr,
     pub direction: OrderDirection,
+}
+
+impl Deparse for ResolvedOrderByClause {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.expr.deparse(buf);
+        match self.direction {
+            OrderDirection::Asc => buf.push_str(" ASC"),
+            OrderDirection::Desc => buf.push_str(" DESC"),
+        }
+        buf
+    }
 }
 
 /// Resolved LIMIT clause
@@ -200,6 +424,88 @@ impl Default for ResolvedSelectStatement {
     }
 }
 
+impl Deparse for ResolvedSelectStatement {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        // If values is present, output VALUES clause
+        if !self.values.is_empty() {
+            buf.push_str("VALUES ");
+            let mut row_sep = "";
+            buf.push('(');
+            for row in &self.values {
+                buf.push_str(row_sep);
+                let mut sep = "";
+                for value in row {
+                    buf.push_str(sep);
+                    value.deparse(buf);
+                    sep = ", ";
+                }
+                row_sep = "), (";
+            }
+            buf.push(')');
+        } else {
+            buf.push_str("SELECT");
+            if self.distinct {
+                buf.push_str(" DISTINCT");
+            }
+            self.columns.deparse(buf);
+
+            if !self.from.is_empty() {
+                buf.push_str(" FROM");
+                let mut sep = "";
+                for table in &self.from {
+                    buf.push_str(sep);
+                    table.deparse(buf);
+                    sep = ",";
+                }
+            }
+
+            if let Some(expr) = &self.where_clause {
+                buf.push_str(" WHERE ");
+                expr.deparse(buf);
+            }
+
+            if !self.group_by.is_empty() {
+                buf.push_str(" GROUP BY ");
+                let mut sep = "";
+                for col in &self.group_by {
+                    buf.push_str(sep);
+                    col.deparse(buf);
+                    sep = ", ";
+                }
+            }
+
+            if let Some(expr) = &self.having {
+                buf.push_str(" HAVING ");
+                expr.deparse(buf);
+            }
+
+            if !self.order_by.is_empty() {
+                buf.push_str(" ORDER BY");
+                let mut sep = "";
+                for order in &self.order_by {
+                    buf.push_str(sep);
+                    buf.push(' ');
+                    order.deparse(buf);
+                    sep = ",";
+                }
+            }
+
+            if let Some(limit) = &self.limit {
+                if let Some(count) = limit.count {
+                    buf.push_str(" LIMIT ");
+                    buf.push_str(&count.to_string());
+                }
+                if let Some(offset) = limit.offset {
+                    buf.push_str(" OFFSET ");
+                    buf.push_str(&offset.to_string());
+                }
+            }
+        }
+
+        buf
+    }
+}
+
 /// Resolved statement (only SELECT for now)
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedStatement {
@@ -210,6 +516,14 @@ pub enum ResolvedStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSqlQuery {
     pub statement: ResolvedStatement,
+}
+
+impl Deparse for ResolvedSqlQuery {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match &self.statement {
+            ResolvedStatement::Select(select) => select.deparse(buf),
+        }
+    }
 }
 
 /// Resolution scope tracking available tables and their aliases
@@ -280,7 +594,7 @@ fn column_resolve<'a>(
 
     // If column has table qualifier, resolve directly
     if let Some(table_qualifier) = &column_node.table {
-        let (table_metadata, _) =
+        let (table_metadata, alias) =
             scope
                 .table_scope_find(table_qualifier)
                 .ok_or_else(|| ResolveError::TableNotFound {
@@ -298,6 +612,7 @@ fn column_resolve<'a>(
         return Ok(ResolvedColumnNode {
             schema: table_metadata.schema.clone(),
             table: table_metadata.name.clone(),
+            table_alias: alias.map(str::to_owned),
             column: column_metadata.name.clone(),
             column_metadata: column_metadata.clone(),
         });
@@ -305,9 +620,9 @@ fn column_resolve<'a>(
 
     // Unqualified column - search all tables in scope
     let mut matches = Vec::new();
-    for (table_metadata, _) in &scope.tables {
+    for (table_metadata, alias) in &scope.tables {
         if let Some(column_metadata) = table_metadata.columns.get1(column_name.as_str()) {
-            matches.push((table_metadata, column_metadata));
+            matches.push((table_metadata, *alias, column_metadata));
         }
     }
 
@@ -316,9 +631,10 @@ fn column_resolve<'a>(
             table: "<unknown>".to_owned(),
             column: column_name.clone(),
         }),
-        [(table_metadata, column_metadata)] => Ok(ResolvedColumnNode {
+        [(table_metadata, alias, column_metadata)] => Ok(ResolvedColumnNode {
             schema: table_metadata.schema.clone(),
             table: table_metadata.name.clone(),
+            table_alias: alias.map(str::to_owned),
             column: column_metadata.name.clone(),
             column_metadata: (*column_metadata).clone(),
         }),
@@ -483,11 +799,12 @@ fn select_columns_resolve(
         SelectColumns::All => {
             // Expand SELECT * to all columns from all tables in scope
             let mut all_columns = Vec::new();
-            for (table_metadata, _) in &scope.tables {
+            for (table_metadata, alias) in &scope.tables {
                 for column_metadata in &table_metadata.columns {
                     all_columns.push(ResolvedColumnNode {
                         schema: table_metadata.schema.clone(),
                         table: table_metadata.name.clone(),
+                        table_alias: alias.map(str::to_owned),
                         column: column_metadata.name.clone(),
                         column_metadata: column_metadata.clone(),
                     });
@@ -599,6 +916,7 @@ mod tests {
         let col_node = ResolvedColumnNode {
             schema: "public".to_owned(),
             table: "users".to_owned(),
+            table_alias: Some("u".to_owned()),
             column: "id".to_owned(),
             column_metadata: ColumnMetadata {
                 name: "id".to_owned(),
@@ -612,6 +930,7 @@ mod tests {
 
         assert_eq!(col_node.schema, "public");
         assert_eq!(col_node.table, "users");
+        assert_eq!(col_node.table_alias, Some("u".to_owned()));
         assert_eq!(col_node.column, "id");
         assert_eq!(col_node.column_metadata.type_name, "int4");
         assert_eq!(col_node.column_metadata.position, 1);
@@ -1211,5 +1530,206 @@ mod tests {
 
         // Should fail with column not found error
         assert!(matches!(result, Err(ResolveError::ColumnNotFound { .. })));
+    }
+
+    // ==================== Deparse Tests ====================
+
+    fn id_column_metadata() -> ColumnMetadata {
+        ColumnMetadata {
+            name: "id".to_owned(),
+            position: 1,
+            type_oid: 23,
+            data_type: Type::INT4,
+            type_name: "int4".to_owned(),
+            is_primary_key: true,
+        }
+    }
+
+    #[test]
+    fn test_resolved_column_node_deparse_with_alias() {
+        let mut buf = String::new();
+
+        // Column with alias - should use alias
+        ResolvedColumnNode {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+            table_alias: Some("u".to_owned()),
+            column: "id".to_owned(),
+            column_metadata: id_column_metadata(),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, "u.id");
+    }
+
+    #[test]
+    fn test_resolved_column_node_deparse_without_alias() {
+        let mut buf = String::new();
+
+        // Column without alias - should use schema.table
+        ResolvedColumnNode {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+            table_alias: None,
+            column: "id".to_owned(),
+            column_metadata: id_column_metadata(),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, "public.users.id");
+    }
+
+    #[test]
+    fn test_resolved_table_node_deparse_with_alias() {
+        let mut buf = String::new();
+
+        ResolvedTableNode {
+            schema: "public".to_owned(),
+            name: "users".to_owned(),
+            alias: Some("u".to_owned()),
+            relation_oid: 1001,
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " public.users u");
+    }
+
+    #[test]
+    fn test_resolved_table_node_deparse_without_alias() {
+        let mut buf = String::new();
+
+        ResolvedTableNode {
+            schema: "public".to_owned(),
+            name: "users".to_owned(),
+            alias: None,
+            relation_oid: 1001,
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " public.users");
+    }
+
+    #[test]
+    fn test_resolved_select_deparse_with_where() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users WHERE id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        // Without alias, uses schema.table.column
+        assert_eq!(
+            buf,
+            "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_deparse_with_alias() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT u.id, u.name FROM users u WHERE u.id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        // With alias, uses alias.column
+        assert_eq!(
+            buf,
+            "SELECT u.id, u.name FROM public.users u WHERE u.id = 1"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_deparse_join() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let sql = "SELECT u.id, o.name FROM users u JOIN orders o ON u.id = o.id WHERE u.id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT u.id, o.name FROM public.users u JOIN public.orders o ON u.id = o.id WHERE u.id = 1"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_deparse_order_by() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT id FROM users u ORDER BY name DESC";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        assert_eq!(buf, "SELECT u.id FROM public.users u ORDER BY u.name DESC");
+    }
+
+    #[test]
+    fn test_resolved_column_equality_ignores_alias() {
+        // Two columns with same schema/table/column but different aliases should be equal
+        let col1 = ResolvedColumnNode {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+            table_alias: Some("u".to_owned()),
+            column: "id".to_owned(),
+            column_metadata: id_column_metadata(),
+        };
+
+        let col2 = ResolvedColumnNode {
+            schema: "public".to_owned(),
+            table: "users".to_owned(),
+            table_alias: Some("u2".to_owned()), // Different alias
+            column: "id".to_owned(),
+            column_metadata: id_column_metadata(),
+        };
+
+        assert_eq!(col1, col2);
+
+        // Hash should also be equal
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher1 = DefaultHasher::new();
+        col1.hash(&mut hasher1);
+        let hash1 = hasher1.finish();
+
+        let mut hasher2 = DefaultHasher::new();
+        col2.hash(&mut hasher2);
+        let hash2 = hasher2.finish();
+
+        assert_eq!(hash1, hash2);
     }
 }

@@ -14,15 +14,9 @@ mod util;
 async fn test_search_path_custom_schema() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    // Set search_path on database so new connections will use it
     // Must be done BEFORE creating the schema/table so pgcache picks it up
-    ctx.origin_query("ALTER DATABASE origin_test SET search_path TO myapp, public", &[])
-        .await?;
+    ctx.query("SET search_path TO myapp, public", &[]).await?;
 
-    // Reconnect to pick up the new search_path
-    ctx.proxy_reconnect().await?;
-
-    // Now create schema and table through the proxy (so CDC picks them up)
     ctx.query("CREATE SCHEMA IF NOT EXISTS myapp", &[]).await?;
     ctx.query(
         "CREATE TABLE myapp.users (id integer primary key, name text)",
@@ -57,7 +51,11 @@ async fn test_search_path_custom_schema() -> Result<(), Error> {
 
     let metrics = ctx.metrics()?;
     // One cache hit expected (second query)
-    assert_eq!(metrics.queries_cache_hit, 1, "Expected 1 cache hit, got {}", metrics.queries_cache_hit);
+    assert_eq!(
+        metrics.queries_cache_hit, 1,
+        "Expected 1 cache hit, got {}",
+        metrics.queries_cache_hit
+    );
 
     Ok(())
 }
@@ -95,13 +93,8 @@ async fn test_search_path_schema_priority() -> Result<(), Error> {
     .await?;
 
     // Set search_path with schema_a first
-    ctx.origin_query(
-        "ALTER DATABASE origin_test SET search_path TO schema_a, schema_b",
-        &[],
-    )
-    .await?;
-
-    ctx.proxy_reconnect().await?;
+    ctx.query("SET search_path TO schema_a, schema_b", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -149,10 +142,7 @@ async fn test_search_path_explicit_schema() -> Result<(), Error> {
     .await?;
 
     // Set search_path to only public (hidden not included)
-    ctx.origin_query("ALTER DATABASE origin_test SET search_path TO public", &[])
-        .await?;
-
-    ctx.proxy_reconnect().await?;
+    ctx.query("SET search_path TO public", &[]).await?;
 
     wait_for_cdc().await;
 
@@ -244,10 +234,7 @@ async fn test_search_path_cache_invalidation() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.origin_query("ALTER DATABASE origin_test SET search_path TO app, public", &[])
-        .await?;
-
-    ctx.proxy_reconnect().await?;
+    ctx.query("SET search_path TO app, public", &[]).await?;
 
     wait_for_cdc().await;
 
@@ -307,10 +294,7 @@ async fn test_search_path_join() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.origin_query("ALTER DATABASE origin_test SET search_path TO store, public", &[])
-        .await?;
-
-    ctx.proxy_reconnect().await?;
+    ctx.query("SET search_path TO store, public", &[]).await?;
 
     wait_for_cdc().await;
 

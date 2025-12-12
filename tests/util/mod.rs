@@ -194,28 +194,6 @@ impl TestContext {
         })
     }
 
-    /// Reconnect to the pgcache proxy, getting a fresh connection.
-    /// Useful after SET search_path to pick up the new search_path on connection.
-    pub async fn proxy_reconnect(&mut self) -> Result<(), Error> {
-        let (client, connection) = Config::new()
-            .host("localhost")
-            .port(self.cache_port)
-            .user("postgres")
-            .dbname("origin_test")
-            .connect(NoTls)
-            .await
-            .map_err(Error::other)?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("connection error: {e}");
-            }
-        });
-
-        self.cache = client;
-        Ok(())
-    }
-
     /// Execute query through pgcache proxy
     pub async fn query<T>(
         &mut self,
