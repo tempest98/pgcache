@@ -275,7 +275,7 @@ impl ConnectionState {
             _ => {}
         }
 
-        debug!("{:?}", &msg.data);
+        // debug!("{:?}", &msg.data);
         self.client_write_buf.push_back(msg.data);
     }
 

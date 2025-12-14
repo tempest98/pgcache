@@ -8,6 +8,9 @@ use iddqd::{BiHashItem, BiHashMap, bi_upcast};
 use tokio_postgres::types::Type;
 
 use crate::query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectColumns, TableAlias};
+use crate::query::resolved::{
+    ResolvedColumnExpr, ResolvedColumnNode, ResolvedSelectColumn, ResolvedSelectColumns,
+};
 
 /// Metadata about a database table.
 ///
@@ -74,6 +77,29 @@ impl TableMetadata {
             .collect();
 
         SelectColumns::Columns(columns)
+    }
+
+    /// Generate resolved SELECT columns for all columns in this table.
+    ///
+    /// Creates `ResolvedSelectColumns::Columns` with fully qualified column references.
+    /// If a table_alias is provided, columns will use that alias for deparsing.
+    pub fn resolved_select_columns(&self, table_alias: Option<&str>) -> ResolvedSelectColumns {
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| ResolvedSelectColumn {
+                expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
+                    schema: self.schema.clone(),
+                    table: self.name.clone(),
+                    table_alias: table_alias.map(str::to_owned),
+                    column: c.name.clone(),
+                    column_metadata: c.clone(),
+                }),
+                alias: None,
+            })
+            .collect();
+
+        ResolvedSelectColumns::Columns(columns)
     }
 }
 

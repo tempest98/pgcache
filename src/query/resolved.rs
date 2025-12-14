@@ -1,10 +1,12 @@
+use std::any::Any;
+
 use error_set::error_set;
 use iddqd::BiHashMap;
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
     ColumnExpr, ColumnNode, Deparse, ExprOp, JoinType, LiteralValue, OrderDirection, SelectColumns,
-    SelectStatement, TableNode, TableSource, WhereExpr,
+    SelectStatement, TableAlias, TableNode, TableSource, WhereExpr,
 };
 
 error_set! {
@@ -40,6 +42,12 @@ pub struct ResolvedTableNode {
     pub alias: Option<String>,
     /// Relation OID from catalog
     pub relation_oid: u32,
+}
+
+impl ResolvedTableNode {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    }
 }
 
 impl Deparse for ResolvedTableNode {
@@ -94,6 +102,12 @@ impl std::hash::Hash for ResolvedColumnNode {
     }
 }
 
+impl ResolvedColumnNode {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    }
+}
+
 impl Deparse for ResolvedColumnNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         // Use alias if available, otherwise use schema.table
@@ -117,6 +131,14 @@ pub struct ResolvedUnaryExpr {
     pub expr: Box<ResolvedWhereExpr>,
 }
 
+impl ResolvedUnaryExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.expr.nodes();
+        current.chain(children)
+    }
+}
+
 /// Resolved binary expression
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedBinaryExpr {
@@ -125,11 +147,27 @@ pub struct ResolvedBinaryExpr {
     pub rexpr: Box<ResolvedWhereExpr>,
 }
 
+impl ResolvedBinaryExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.lexpr.nodes().chain(self.rexpr.nodes());
+        current.chain(children)
+    }
+}
+
 /// Resolved multi-operand expression
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedMultiExpr {
     pub op: ExprOp,
     pub exprs: Vec<ResolvedWhereExpr>,
+}
+
+impl ResolvedMultiExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.exprs.iter().flat_map(|expr| expr.nodes());
+        current.chain(children)
+    }
 }
 
 /// Resolved WHERE expression with fully qualified references
@@ -154,6 +192,24 @@ pub enum ResolvedWhereExpr {
     Subquery { query: Box<ResolvedSelectStatement> },
 }
 
+impl ResolvedWhereExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
+            ResolvedWhereExpr::Value(lit) => Box::new(lit.nodes()),
+            ResolvedWhereExpr::Column(col) => Box::new(col.nodes()),
+            ResolvedWhereExpr::Unary(unary) => Box::new(unary.nodes()),
+            ResolvedWhereExpr::Binary(binary) => Box::new(binary.nodes()),
+            ResolvedWhereExpr::Multi(multi) => Box::new(multi.nodes()),
+            ResolvedWhereExpr::Function { args, .. } => {
+                Box::new(args.iter().flat_map(|arg| arg.nodes()))
+            }
+            ResolvedWhereExpr::Subquery { query } => Box::new(query.nodes()),
+        };
+        current.chain(children)
+    }
+}
+
 impl Deparse for ResolvedWhereExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
@@ -173,6 +229,7 @@ impl Deparse for ResolvedWhereExpr {
                 binary.rexpr.deparse(buf);
                 buf
             }
+            #[allow(clippy::wildcard_enum_match_arm)]
             ResolvedWhereExpr::Multi(multi) => {
                 let mut sep = "";
                 for expr in &multi.exprs {
@@ -224,6 +281,21 @@ pub enum ResolvedColumnExpr {
     Subquery(Box<ResolvedSelectStatement>),
 }
 
+impl ResolvedColumnExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
+            ResolvedColumnExpr::Column(col) => Box::new(col.nodes()),
+            ResolvedColumnExpr::Literal(lit) => Box::new(lit.nodes()),
+            ResolvedColumnExpr::Function { args, .. } => {
+                Box::new(args.iter().flat_map(|arg| arg.nodes()))
+            }
+            ResolvedColumnExpr::Subquery(query) => Box::new(query.nodes()),
+        };
+        current.chain(children)
+    }
+}
+
 impl Deparse for ResolvedColumnExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
@@ -258,6 +330,14 @@ pub struct ResolvedSelectColumn {
     pub alias: Option<String>,
 }
 
+impl ResolvedSelectColumn {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.expr.nodes();
+        current.chain(children)
+    }
+}
+
 impl Deparse for ResolvedSelectColumn {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push(' ');
@@ -281,19 +361,28 @@ pub enum ResolvedSelectColumns {
     Columns(Vec<ResolvedSelectColumn>),
 }
 
+impl ResolvedSelectColumns {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
+            ResolvedSelectColumns::None => Box::new(std::iter::empty()),
+            ResolvedSelectColumns::All(cols) => {
+                Box::new(cols.iter().flat_map(|col| col.nodes()))
+            }
+            ResolvedSelectColumns::Columns(cols) => {
+                Box::new(cols.iter().flat_map(|col| col.nodes()))
+            }
+        };
+        current.chain(children)
+    }
+}
+
 impl Deparse for ResolvedSelectColumns {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
             ResolvedSelectColumns::None => buf.push(' '),
-            ResolvedSelectColumns::All(columns) => {
-                // Deparse as explicit column list
-                let mut sep = "";
-                for col in columns {
-                    buf.push_str(sep);
-                    buf.push(' ');
-                    col.deparse(buf);
-                    sep = ",";
-                }
+            ResolvedSelectColumns::All(_) => {
+                buf.push_str(" *");
             }
             ResolvedSelectColumns::Columns(cols) => {
                 let mut sep = "";
@@ -313,13 +402,22 @@ impl Deparse for ResolvedSelectColumns {
 pub enum ResolvedTableSource {
     /// Direct table reference
     Table(ResolvedTableNode),
-    /// Resolved subquery (for future support)
-    Subquery {
-        select: Box<ResolvedSelectStatement>,
-        alias: String,
-    },
+    /// Resolved subquery
+    Subquery(ResolvedTableSubqueryNode),
     /// Resolved join
     Join(Box<ResolvedJoinNode>),
+}
+
+impl ResolvedTableSource {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
+            ResolvedTableSource::Table(table) => Box::new(table.nodes()),
+            ResolvedTableSource::Subquery(subquery) => Box::new(subquery.nodes()),
+            ResolvedTableSource::Join(join) => Box::new(join.nodes()),
+        };
+        current.chain(children)
+    }
 }
 
 impl Deparse for ResolvedTableSource {
@@ -327,14 +425,33 @@ impl Deparse for ResolvedTableSource {
         match self {
             ResolvedTableSource::Table(table) => table.deparse(buf),
             ResolvedTableSource::Join(join) => join.deparse(buf),
-            ResolvedTableSource::Subquery { select, alias } => {
-                buf.push_str(" (");
-                select.deparse(buf);
-                buf.push_str(") ");
-                buf.push_str(alias);
-                buf
-            }
+            ResolvedTableSource::Subquery(subquery) => subquery.deparse(buf),
         }
+    }
+}
+
+/// Resolved subquery table source
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedTableSubqueryNode {
+    pub select: Box<ResolvedSelectStatement>,
+    pub alias: TableAlias,
+}
+
+impl ResolvedTableSubqueryNode {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.select.nodes();
+        current.chain(children)
+    }
+}
+
+impl Deparse for ResolvedTableSubqueryNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str(" (");
+        self.select.deparse(buf);
+        buf.push_str(") ");
+        self.alias.deparse(buf);
+        buf
     }
 }
 
@@ -345,6 +462,19 @@ pub struct ResolvedJoinNode {
     pub left: ResolvedTableSource,
     pub right: ResolvedTableSource,
     pub condition: Option<ResolvedWhereExpr>,
+}
+
+impl ResolvedJoinNode {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let left_nodes = self.left.nodes();
+        let right_nodes = self.right.nodes();
+        let condition_nodes = self.condition.iter().flat_map(|c| c.nodes());
+        current
+            .chain(left_nodes)
+            .chain(right_nodes)
+            .chain(condition_nodes)
+    }
 }
 
 impl Deparse for ResolvedJoinNode {
@@ -374,6 +504,14 @@ impl Deparse for ResolvedJoinNode {
 pub struct ResolvedOrderByClause {
     pub expr: ResolvedColumnExpr,
     pub direction: OrderDirection,
+}
+
+impl ResolvedOrderByClause {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.expr.nodes();
+        current.chain(children)
+    }
 }
 
 impl Deparse for ResolvedOrderByClause {
@@ -421,6 +559,31 @@ impl Default for ResolvedSelectStatement {
             distinct: false,
             values: vec![vec![]],
         }
+    }
+}
+
+impl ResolvedSelectStatement {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let columns_nodes = self.columns.nodes();
+        let from_nodes = self.from.iter().flat_map(|t| t.nodes());
+        let where_nodes = self.where_clause.iter().flat_map(|w| w.nodes());
+        let group_by_nodes = self.group_by.iter().flat_map(|c| c.nodes());
+        let having_nodes = self.having.iter().flat_map(|h| h.nodes());
+        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
+
+        current
+            .chain(columns_nodes)
+            .chain(from_nodes)
+            .chain(where_nodes)
+            .chain(group_by_nodes)
+            .chain(having_nodes)
+            .chain(order_by_nodes)
+    }
+
+    /// Check if this SELECT statement references only a single table
+    pub fn is_single_table(&self) -> bool {
+        matches!(self.from.as_slice(), [ResolvedTableSource::Table(_)])
     }
 }
 
@@ -1622,10 +1785,10 @@ mod tests {
         let mut buf = String::new();
         resolved.deparse(&mut buf);
 
-        // Without alias, uses schema.table.column
+        // SELECT * is preserved, table and column references are fully qualified
         assert_eq!(
             buf,
-            "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1"
+            "SELECT * FROM public.users WHERE public.users.id = 1"
         );
     }
 

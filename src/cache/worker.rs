@@ -11,7 +11,7 @@ use crate::settings::Settings;
 
 use super::{
     CacheError,
-    query_cache::{QueryRequest, QueryType},
+    query_cache::{QueryType, WorkerRequest},
 };
 
 const BUFFER_SIZE_THRESHOLD: usize = 64 * 1024;
@@ -45,7 +45,7 @@ impl CacheWorker {
 
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn handle_cached_query(&self, msg: &mut QueryRequest) -> Result<(), CacheError> {
+    pub async fn handle_cached_query(&self, msg: &mut WorkerRequest) -> Result<(), CacheError> {
         let rv = if msg.result_formats.first().is_none_or(|&f| f == 0) {
             self.handle_cached_query_text(msg).await
         } else {
@@ -57,10 +57,10 @@ impl CacheWorker {
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn handle_cached_query_text(&self, msg: &mut QueryRequest) -> Result<(), CacheError> {
-        // Generate SQL query from AST (parameters are already replaced if present)
+    pub async fn handle_cached_query_text(&self, msg: &mut WorkerRequest) -> Result<(), CacheError> {
+        // Generate SQL query from resolved AST (with schema-qualified table names)
         let mut sql = String::new();
-        msg.cacheable_query.statement().deparse(&mut sql);
+        msg.resolved.deparse(&mut sql);
 
         // Execute query against cache database
         let res = self.db_cache.simple_query(&sql).await?;
@@ -135,11 +135,11 @@ impl CacheWorker {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_cached_query_binary(
         &self,
-        msg: &mut QueryRequest,
+        msg: &mut WorkerRequest,
     ) -> Result<(), CacheError> {
-        // Generate SQL query from AST (parameters are already replaced if present)
+        // Generate SQL query from resolved AST (with schema-qualified table names)
         let mut sql = String::new();
-        msg.cacheable_query.statement().deparse(&mut sql);
+        msg.resolved.deparse(&mut sql);
 
         // Execute query against cache database
         let res = self.db_cache.query(&sql, &[]).await?;

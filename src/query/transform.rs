@@ -10,6 +10,10 @@ use crate::{
         ColumnExpr, LiteralValue, SelectColumn, SelectColumns, SelectStatement, TableAlias,
         TableNode, TableSource, TableSubqueryNode, WhereExpr,
     },
+    query::resolved::{
+        ResolvedSelectColumns, ResolvedSelectStatement, ResolvedTableSource,
+        ResolvedTableSubqueryNode,
+    },
 };
 
 error_set! {
@@ -370,6 +374,235 @@ pub fn query_select_replace(
     new_stmt.columns = columns;
 
     new_stmt
+}
+
+/// Replace SELECT columns in a resolved statement.
+///
+/// Similar to `query_select_replace` but operates on the resolved AST.
+pub fn resolved_select_replace(
+    resolved_statement: &ResolvedSelectStatement,
+    columns: ResolvedSelectColumns,
+) -> ResolvedSelectStatement {
+    let mut new_stmt = resolved_statement.clone();
+    new_stmt.columns = columns;
+
+    new_stmt
+}
+
+/// Replace a table source with a VALUES clause in a resolved statement.
+///
+/// Similar to `query_table_replace_with_values` but operates on the resolved AST.
+/// Finds the table matching `table_metadata.relation_oid` and replaces it with a subquery
+/// containing a VALUES clause built from `row_data`.
+///
+/// Also updates all column references for the replaced table to use the subquery alias
+/// instead of the fully qualified schema.table reference.
+pub fn resolved_table_replace_with_values(
+    resolved: &ResolvedSelectStatement,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<String>],
+) -> Result<ResolvedSelectStatement, AstTransformError> {
+    let mut resolved_new = resolved.clone();
+    let relation_oid = table_metadata.relation_oid;
+
+    // Find first matching table source by relation_oid and get the alias
+    let alias = {
+        let Some(first_from) = resolved_new.from.first() else {
+            return Err(AstTransformError::MissingTable);
+        };
+        let mut frontier = vec![first_from];
+        let mut found_alias: Option<String> = None;
+        while let Some(cur) = frontier.pop() {
+            match cur {
+                ResolvedTableSource::Join(join) => {
+                    frontier.push(&join.left);
+                    frontier.push(&join.right);
+                }
+                ResolvedTableSource::Table(table) => {
+                    if table.relation_oid == relation_oid {
+                        found_alias = Some(
+                            table
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| table_metadata.name.clone()),
+                        );
+                        break;
+                    }
+                }
+                _ => (),
+            }
+        }
+        found_alias.ok_or(AstTransformError::MissingTable)?
+    };
+
+    // Update all column references for this table to use the alias
+    resolved_column_alias_update(&mut resolved_new, &table_metadata.schema, &table_metadata.name, &alias);
+
+    // Now replace the table source with a VALUES subquery
+    let Some(first_from) = resolved_new.from.first_mut() else {
+        return Err(AstTransformError::MissingTable);
+    };
+    let mut frontier = vec![first_from];
+    let mut source_node: Option<&mut ResolvedTableSource> = None;
+    while let Some(cur) = frontier.pop() {
+        match cur {
+            ResolvedTableSource::Join(join) => {
+                frontier.push(&mut join.left);
+                frontier.push(&mut join.right);
+            }
+            ResolvedTableSource::Table(table) => {
+                if table.relation_oid == relation_oid {
+                    source_node = Some(cur);
+                    break;
+                }
+            }
+            _ => (),
+        }
+    }
+
+    let Some(source_node) = source_node else {
+        return Err(AstTransformError::MissingTable);
+    };
+
+    // Build VALUES clause from row_data and collect column names
+    let mut values = Vec::new();
+    let mut column_names = Vec::new();
+    for column_meta in &table_metadata.columns {
+        let position = column_meta.position as usize - 1;
+        if let Some(row_value) = row_data.get(position) {
+            let value = row_value.as_deref().map_or(LiteralValue::Null, |v| {
+                LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone())
+            });
+            values.push(value);
+            column_names.push(column_meta.name.clone());
+        }
+    }
+
+    *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
+        select: Box::new(ResolvedSelectStatement {
+            values: vec![values],
+            ..Default::default()
+        }),
+        alias: TableAlias {
+            name: alias,
+            columns: column_names,
+        },
+    });
+
+    Ok(resolved_new)
+}
+
+/// Update all column references for a specific table to use an alias.
+///
+/// This is needed when replacing a table with a VALUES subquery - the column
+/// references need to use just the alias instead of schema.table.
+fn resolved_column_alias_update(
+    resolved: &mut ResolvedSelectStatement,
+    schema: &str,
+    table: &str,
+    alias: &str,
+) {
+    // Update WHERE clause columns
+    if let Some(where_clause) = &mut resolved.where_clause {
+        resolved_where_column_alias_update(where_clause, schema, table, alias);
+    }
+
+    // Update SELECT columns
+    resolved_select_columns_alias_update(&mut resolved.columns, schema, table, alias);
+
+    // Update ORDER BY columns
+    for order_by in &mut resolved.order_by {
+        resolved_column_expr_alias_update(&mut order_by.expr, schema, table, alias);
+    }
+}
+
+fn resolved_where_column_alias_update(
+    expr: &mut crate::query::resolved::ResolvedWhereExpr,
+    schema: &str,
+    table: &str,
+    alias: &str,
+) {
+    use crate::query::resolved::ResolvedWhereExpr;
+
+    match expr {
+        ResolvedWhereExpr::Column(col) => {
+            if col.schema == schema && col.table == table {
+                col.table_alias = Some(alias.to_owned());
+            }
+        }
+        ResolvedWhereExpr::Unary(unary) => {
+            resolved_where_column_alias_update(&mut unary.expr, schema, table, alias);
+        }
+        ResolvedWhereExpr::Binary(binary) => {
+            resolved_where_column_alias_update(&mut binary.lexpr, schema, table, alias);
+            resolved_where_column_alias_update(&mut binary.rexpr, schema, table, alias);
+        }
+        ResolvedWhereExpr::Multi(multi) => {
+            for e in &mut multi.exprs {
+                resolved_where_column_alias_update(e, schema, table, alias);
+            }
+        }
+        ResolvedWhereExpr::Function { args, .. } => {
+            for arg in args {
+                resolved_where_column_alias_update(arg, schema, table, alias);
+            }
+        }
+        ResolvedWhereExpr::Subquery { query } => {
+            resolved_column_alias_update(query, schema, table, alias);
+        }
+        ResolvedWhereExpr::Value(_) => {}
+    }
+}
+
+fn resolved_select_columns_alias_update(
+    columns: &mut crate::query::resolved::ResolvedSelectColumns,
+    schema: &str,
+    table: &str,
+    alias: &str,
+) {
+    use crate::query::resolved::ResolvedSelectColumns;
+
+    match columns {
+        ResolvedSelectColumns::All(cols) => {
+            for col in cols {
+                if col.schema == schema && col.table == table {
+                    col.table_alias = Some(alias.to_owned());
+                }
+            }
+        }
+        ResolvedSelectColumns::Columns(cols) => {
+            for col in cols {
+                resolved_column_expr_alias_update(&mut col.expr, schema, table, alias);
+            }
+        }
+        ResolvedSelectColumns::None => {}
+    }
+}
+
+fn resolved_column_expr_alias_update(
+    expr: &mut crate::query::resolved::ResolvedColumnExpr,
+    schema: &str,
+    table: &str,
+    alias: &str,
+) {
+    use crate::query::resolved::ResolvedColumnExpr;
+
+    match expr {
+        ResolvedColumnExpr::Column(col) => {
+            if col.schema == schema && col.table == table {
+                col.table_alias = Some(alias.to_owned());
+            }
+        }
+        ResolvedColumnExpr::Function { args, .. } => {
+            for arg in args {
+                resolved_column_expr_alias_update(arg, schema, table, alias);
+            }
+        }
+        ResolvedColumnExpr::Subquery(query) => {
+            resolved_column_alias_update(query, schema, table, alias);
+        }
+        ResolvedColumnExpr::Literal(_) => {}
+    }
 }
 
 //generate queries used to check if a dml statement applies to a given table

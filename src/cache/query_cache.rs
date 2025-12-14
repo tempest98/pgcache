@@ -13,13 +13,14 @@ use tokio_util::bytes::BytesMut;
 use tracing::{error, info, instrument, trace};
 
 use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata};
-use crate::query::ast::{
-    ColumnNode, Deparse, JoinNode, SelectStatement, TableNode, ast_query_fingerprint,
-};
+use crate::query::ast::{Deparse, TableNode, ast_query_fingerprint};
 use crate::query::constraints::analyze_query_constraints;
-use crate::query::resolved::select_statement_resolve;
+use crate::query::resolved::{
+    ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectStatement, ResolvedTableNode,
+    select_statement_resolve,
+};
 use crate::query::transform::{
-    query_select_replace, query_table_replace_with_values, query_table_update_queries,
+    query_table_update_queries, resolved_select_replace, resolved_table_replace_with_values,
 };
 use crate::settings::Settings;
 
@@ -48,12 +49,24 @@ pub struct QueryRequest {
     pub search_path: Vec<String>,
 }
 
+/// Request sent to cache worker for executing cached queries.
+/// Contains the resolved AST with schema-qualified table names.
+#[derive(Debug)]
+pub struct WorkerRequest {
+    pub query_type: QueryType,
+    pub data: BytesMut,
+    pub resolved: ResolvedSelectStatement,
+    pub result_formats: Vec<i16>,
+    pub client_socket: TcpStream,
+    pub reply_tx: Sender<CacheReply>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryCache {
     db_cache: Rc<Client>,
     db_origin: Rc<Client>,
 
-    worker_tx: UnboundedSender<QueryRequest>,
+    worker_tx: UnboundedSender<WorkerRequest>,
 
     cache: Rc<RefCell<Cache>>,
 }
@@ -62,7 +75,7 @@ impl QueryCache {
     pub async fn new(
         settings: &Settings,
         cache: Cache,
-        worker_tx: UnboundedSender<QueryRequest>,
+        worker_tx: UnboundedSender<WorkerRequest>,
     ) -> Result<Self, CacheError> {
         let (cache_client, cache_connection) = Config::new()
             .host(&settings.cache.host)
@@ -109,15 +122,24 @@ impl QueryCache {
         let stmt = msg.cacheable_query.statement();
         let fingerprint = ast_query_fingerprint(stmt);
 
-        let cached_query_state = self
+        // Check cache state: Ready -> send to worker, Loading -> forward, None -> register
+        let cache_state = self
             .cache
             .borrow()
             .cached_queries
             .get(&fingerprint)
-            .map(|q| q.state);
+            .map(|q| (q.state, q.resolved.clone()));
 
-        if cached_query_state.is_some_and(|state| state == CachedQueryState::Ready) {
-            self.worker_tx.send(msg).map_err(|e| {
+        if let Some((CachedQueryState::Ready, resolved)) = cache_state {
+            let worker_request = WorkerRequest {
+                query_type: msg.query_type,
+                data: msg.data,
+                resolved,
+                result_formats: msg.result_formats,
+                client_socket: msg.client_socket,
+                reply_tx: msg.reply_tx,
+            };
+            self.worker_tx.send(worker_request).map_err(|e| {
                 error!("worker send {e}");
                 CacheError::WorkerSend
             })
@@ -128,14 +150,15 @@ impl QueryCache {
                 .await
                 .map_err(|_| CacheError::Reply)?;
 
-            if cached_query_state.is_none() {
+            // Only register if not already in cache (state was None, not Loading)
+            if cache_state.is_none() {
                 let search_path_refs: Vec<&str> =
                     msg.search_path.iter().map(String::as_str).collect();
-                let table_oids = self
+                let (table_oids, resolved) = self
                     .query_register(fingerprint, &msg.cacheable_query, &search_path_refs)
                     .await?;
                 for table_oid in table_oids {
-                    let rows = self.query_cache_fetch(table_oid, stmt).await?;
+                    let rows = self.query_cache_fetch(table_oid, &resolved).await?;
                     self.query_cache_results(table_oid, &rows).await?;
                     self.cache
                         .borrow_mut()
@@ -155,7 +178,7 @@ impl QueryCache {
     pub async fn query_cache_fetch(
         &mut self,
         relation_oid: u32,
-        select_statement: &SelectStatement,
+        resolved: &ResolvedSelectStatement,
     ) -> Result<Vec<SimpleQueryMessage>, CacheError> {
         let mut buf = String::with_capacity(1024);
         let query = {
@@ -168,15 +191,14 @@ impl QueryCache {
                     name: None,
                 })?;
 
-            let maybe_alias = select_statement
-                .nodes::<TableNode>()
-                .filter(|&tn| tn.name == table.name)
-                .flat_map(|t| t.alias.as_ref())
-                .next();
+            let maybe_alias = resolved
+                .nodes::<ResolvedTableNode>()
+                .find(|tn| tn.relation_oid == relation_oid)
+                .and_then(|t| t.alias.as_deref());
 
-            let select_columns = table.select_columns(maybe_alias);
+            let select_columns = table.resolved_select_columns(maybe_alias);
 
-            let new_ast = query_select_replace(select_statement, select_columns);
+            let new_ast = resolved_select_replace(resolved, select_columns);
             new_ast.deparse(&mut buf)
         };
 
@@ -187,6 +209,8 @@ impl QueryCache {
     }
 
     /// Registers a query in the cache for future lookups.
+    ///
+    /// Returns the relation OIDs and resolved statement for cache population.
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_register(
@@ -194,7 +218,7 @@ impl QueryCache {
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
-    ) -> Result<Vec<u32>, CacheError> {
+    ) -> Result<(Vec<u32>, ResolvedSelectStatement), CacheError> {
         let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
 
@@ -230,11 +254,6 @@ impl QueryCache {
         let query_constraints = analyze_query_constraints(&resolved);
 
         for (table_node, update_select) in query_table_update_queries(cacheable_query) {
-            let update_query = UpdateQuery {
-                fingerprint,
-                query: update_select,
-            };
-
             // Resolve schema using explicit schema or search_path
             let schema = if let Some(schema) = table_node.schema.as_deref() {
                 schema.to_owned()
@@ -252,6 +271,18 @@ impl QueryCache {
                     name: Some(table_node.name.clone()),
                 })?
                 .relation_oid;
+
+            // Resolve the update query
+            let update_resolved = select_statement_resolve(
+                &update_select,
+                &self.cache.borrow().tables,
+                search_path,
+            )?;
+
+            let update_query = UpdateQuery {
+                fingerprint,
+                resolved: update_resolved,
+            };
 
             self.cache
                 .borrow_mut()
@@ -272,7 +303,7 @@ impl QueryCache {
             fingerprint,
             relation_oids: relation_oids.clone(),
             select_statement: select_statement.clone(),
-            resolved,
+            resolved: resolved.clone(),
             constraints: query_constraints,
         };
 
@@ -283,7 +314,7 @@ impl QueryCache {
             .insert_overwrite(cached_query);
         trace!("cached query loading");
 
-        Ok(relation_oids)
+        Ok((relation_oids, resolved))
     }
 
     /// Check if there are any cached queries for a specific table by relation OID.
@@ -811,7 +842,7 @@ impl QueryCache {
 
     fn cache_upsert_with_predicate_sql(
         &self,
-        select: &SelectStatement,
+        resolved: &ResolvedSelectStatement,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> Result<String, CacheError> {
@@ -833,7 +864,7 @@ impl QueryCache {
             }
         }
 
-        let value_select = query_table_replace_with_values(select, table_metadata, row_data)?;
+        let value_select = resolved_table_replace_with_values(resolved, table_metadata, row_data)?;
         let mut select = String::with_capacity(1024);
         value_select.deparse(&mut select);
 
@@ -889,9 +920,8 @@ impl QueryCache {
 
         let mut sql_list = Vec::new();
         for update_query in &update_queries.queries {
-            let select = &update_query.query;
             sql_list.push(self.cache_upsert_with_predicate_sql(
-                select,
+                &update_query.resolved,
                 table_metadata,
                 row_data,
             )?);
@@ -945,7 +975,7 @@ impl QueryCache {
             // Check if this is an INSERT (row_changes is None)
             if row_changes.is_none() {
                 // If it is not a join then no need to invalidate
-                if update_query.query.is_single_table() {
+                if update_query.resolved.is_single_table() {
                     continue;
                 }
 
@@ -982,20 +1012,19 @@ impl QueryCache {
                 continue;
             }
 
-            let select = &update_query.query;
-            let tables = select
-                .nodes::<TableNode>()
+            let resolved = &update_query.resolved;
+            let tables = resolved
+                .nodes::<ResolvedTableNode>()
                 .flat_map(|t| {
                     [
                         (Some(t.name.as_str()), t.name.as_str()),
-                        (
-                            t.alias.as_ref().map(|alias| alias.name.as_str()),
-                            t.name.as_str(),
-                        ),
+                        (t.alias.as_deref(), t.name.as_str()),
                     ]
                 })
                 .collect::<HashMap<_, _>>();
-            let joins = select.nodes::<JoinNode>().collect::<Vec<_>>();
+            let joins = resolved
+                .nodes::<ResolvedJoinNode>()
+                .collect::<Vec<_>>();
 
             // Check if we need to invalidate based on constraint analysis
             let mut needs_invalidation = false;
@@ -1003,8 +1032,8 @@ impl QueryCache {
             for join in joins {
                 //extract tables and columns used in the join condition
                 let columns = join
-                    .nodes::<ColumnNode>()
-                    .map(|c| (tables.get(&c.table.as_deref()), c.column.as_str()))
+                    .nodes::<ResolvedColumnNode>()
+                    .map(|c| (tables.get(&Some(c.table.as_str())), c.column.as_str()))
                     .collect::<Vec<_>>();
 
                 for (table, column) in columns {

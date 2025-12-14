@@ -16,7 +16,7 @@ use crate::{
         CacheError,
         cdc::CdcProcessor,
         messages::{CacheReply, CdcMessage, ProxyMessage, StreamSource},
-        query_cache::{QueryCache, QueryRequest},
+        query_cache::{QueryCache, QueryRequest, WorkerRequest},
         types::Cache,
         worker::CacheWorker,
     },
@@ -87,7 +87,7 @@ async fn handle_cdc_message(qcache: &mut QueryCache, msg: CdcMessage) {
 }
 
 /// Handles a worker request by executing the query and sending the reply
-async fn handle_worker_request(worker: CacheWorker, mut msg: QueryRequest) {
+async fn handle_worker_request(worker: CacheWorker, mut msg: WorkerRequest) {
     debug!("cache worker task spawn");
 
     let reply = match worker.handle_cached_query(&mut msg).await {
@@ -185,7 +185,7 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 /// Worker runtime - executes cached queries against the database
 fn worker_run(
     settings: &Settings,
-    mut worker_rx: UnboundedReceiver<QueryRequest>,
+    mut worker_rx: UnboundedReceiver<WorkerRequest>,
 ) -> Result<(), CacheError> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 

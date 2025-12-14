@@ -2,9 +2,7 @@ use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
 
 use crate::{
     catalog::TableMetadata,
-    query::{
-        ast::SelectStatement, constraints::QueryConstraints, resolved::ResolvedSelectStatement,
-    },
+    query::{ast::SelectStatement, constraints::QueryConstraints, resolved::ResolvedSelectStatement},
 };
 
 /// State of a cached query
@@ -40,7 +38,8 @@ impl IdHashItem for CachedQuery {
 pub struct UpdateQuery {
     /// Fingerprint of cached query that generated this update query
     pub fingerprint: u64,
-    pub query: SelectStatement,
+    /// Resolved AST query
+    pub resolved: ResolvedSelectStatement,
 }
 
 /// Collection of update queries for a specific relation
