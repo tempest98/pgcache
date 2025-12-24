@@ -79,6 +79,25 @@ When caching a query, the search path determines which schema each unqualified t
 
 If the search path is unknown at cache time, the cache returns an error rather than guessing, forcing the query to be forwarded to the origin database. This ensures correctness over availability.
 
+### Cache Worker Execution
+
+The cache worker executes queries against the cache database using a `WorkerRequest` that contains the **resolved AST** (with schema-qualified table names) rather than the original query. This design means:
+
+- The cache worker's database connection doesn't need the client's search_path
+- Queries are executed with fully-qualified table names (e.g., `myapp.users` instead of `users`)
+- Schema resolution happens once during query registration, not on every cache hit
+
+```rust
+pub struct WorkerRequest {
+    pub query_type: QueryType,
+    pub data: BytesMut,
+    pub resolved: ResolvedSelectStatement,  // Schema-qualified AST
+    pub result_formats: Vec<i16>,
+    pub client_socket: TcpStream,
+    pub reply_tx: Sender<CacheReply>,
+}
+```
+
 ## Consequences
 
 ### Positive
@@ -94,7 +113,7 @@ If the search path is unknown at cache time, the cache returns an error rather t
 - Complexity in tracking query interception state
 
 ### Not Implemented (Future Work)
-- Tracking `SET search_path` commands mid-session
+- Tracking `SET search_path` commands mid-session for PostgreSQL < 18 (PG 18+ tracks via ParameterStatus)
 - `pg_catalog` and `pg_temp` implicit schema handling
 - Function-scoped search_path changes
 - `SET LOCAL` + transaction rollback handling
