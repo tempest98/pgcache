@@ -752,7 +752,7 @@ impl QueryCache {
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
         let drop_sql = format!("DROP TABLE IF EXISTS {schema}.{table}");
         let create_sql = format!(
-            "CREATE TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
+            "CREATE UNLOGGED TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
         );
 
         self.db_cache.execute(&create_schema_sql, &[]).await?;
