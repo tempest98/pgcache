@@ -23,6 +23,10 @@ pub struct CacheWorker {
 
 impl CacheWorker {
     pub async fn new(settings: &Settings) -> Result<Self, CacheError> {
+        debug!(
+            "CacheWorker: connecting to cache db at {}:{}",
+            settings.cache.host, settings.cache.port
+        );
         let (cache_client, cache_connection) = Config::new()
             .host(&settings.cache.host)
             .port(settings.cache.port)
@@ -31,10 +35,15 @@ impl CacheWorker {
             .connect(NoTls)
             .await?;
 
+        debug!("CacheWorker: connection established");
+
         //task to process connection to cache pg db
         tokio::spawn(async move {
+            debug!("CacheWorker: connection task started");
             if let Err(e) = cache_connection.await {
-                error!("connection error: {e}");
+                error!("CacheWorker connection error: {e}");
+            } else {
+                debug!("CacheWorker: connection closed normally");
             }
         });
 
@@ -46,18 +55,41 @@ impl CacheWorker {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_cached_query(&self, msg: &mut WorkerRequest) -> Result<(), CacheError> {
+        // Set generation before query execution (enables row tracking in pgcache_pgrx)
+        debug!("message query generation {}", msg.generation);
+        if msg.generation > 0 {
+            let set_gen = format!("SET mem.query_generation = {}", msg.generation);
+            debug!("{}", set_gen);
+            self.db_cache.simple_query(&set_gen).await?;
+            debug!("done {}", set_gen);
+        }
+
         let rv = if msg.result_formats.first().is_none_or(|&f| f == 0) {
             self.handle_cached_query_text(msg).await
         } else {
             self.handle_cached_query_binary(msg).await
         };
 
+        debug!("rv {:?}", &rv);
+
+        // Reset generation after query (disables row tracking)
+        if msg.generation > 0 {
+            // Ignore errors on reset - query already succeeded/failed
+            let _ = self
+                .db_cache
+                .simple_query("SET mem.query_generation = 0")
+                .await;
+        }
+
         debug!("cache hit");
         rv
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn handle_cached_query_text(&self, msg: &mut WorkerRequest) -> Result<(), CacheError> {
+    pub async fn handle_cached_query_text(
+        &self,
+        msg: &mut WorkerRequest,
+    ) -> Result<(), CacheError> {
         // Generate SQL query from resolved AST (with schema-qualified table names)
         let mut sql = String::new();
         msg.resolved.deparse(&mut sql);

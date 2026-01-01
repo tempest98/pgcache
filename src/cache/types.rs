@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
 
 use crate::{
@@ -17,6 +19,8 @@ pub enum CachedQueryState {
 pub struct CachedQuery {
     pub state: CachedQueryState,
     pub fingerprint: u64,
+    /// Generation number assigned when query was registered (monotonically increasing)
+    pub generation: u64,
     pub relation_oids: Vec<u32>,
     pub select_statement: SelectStatement,
     pub resolved: ResolvedSelectStatement,
@@ -67,6 +71,10 @@ pub struct Cache {
     pub tables: BiHashMap<TableMetadata>,
     pub update_queries: IdHashMap<UpdateQueries>,
     pub cached_queries: IdHashMap<CachedQuery>,
+    /// Monotonically increasing generation counter (starts at 1)
+    pub generation_counter: u64,
+    /// Generations of active cached queries (for efficient min-tracking)
+    pub generations: BTreeSet<u64>,
 }
 
 impl Default for Cache {
@@ -75,6 +83,17 @@ impl Default for Cache {
             tables: BiHashMap::new(),
             update_queries: IdHashMap::new(),
             cached_queries: IdHashMap::new(),
+            generation_counter: 0,
+            generations: BTreeSet::new(),
         }
+    }
+}
+
+impl Cache {
+    /// Returns the minimum generation that can be safely purged.
+    /// This is the highest generation that is less than all active generations.
+    /// Returns None if there are no active cached queries.
+    pub fn generation_purge_threshold(&self) -> Option<u64> {
+        self.generations.first().map(|min| min.saturating_sub(1))
     }
 }

@@ -56,6 +56,8 @@ pub struct WorkerRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
     pub resolved: ResolvedSelectStatement,
+    /// Generation number for row tracking in pgcache_pgrx extension
+    pub generation: u64,
     pub result_formats: Vec<i16>,
     pub client_socket: TcpStream,
     pub reply_tx: Sender<CacheReply>,
@@ -128,13 +130,14 @@ impl QueryCache {
             .borrow()
             .cached_queries
             .get(&fingerprint)
-            .map(|q| (q.state, q.resolved.clone()));
+            .map(|q| (q.state, q.resolved.clone(), q.generation));
 
-        if let Some((CachedQueryState::Ready, resolved)) = cache_state {
+        if let Some((CachedQueryState::Ready, resolved, generation)) = cache_state {
             let worker_request = WorkerRequest {
                 query_type: msg.query_type,
                 data: msg.data,
                 resolved,
+                generation,
                 result_formats: msg.result_formats,
                 client_socket: msg.client_socket,
                 reply_tx: msg.reply_tx,
@@ -304,10 +307,20 @@ impl QueryCache {
             relation_oids.push(relation_oid);
         }
 
+        // Assign a generation number for row tracking
+        let generation = {
+            let mut cache = self.cache.borrow_mut();
+            cache.generation_counter += 1;
+            let generation_num = cache.generation_counter;
+            cache.generations.insert(generation_num);
+            generation_num
+        };
+
         // Create CachedQuery entry with resolved AST and constraints
         let cached_query = CachedQuery {
             state: CachedQueryState::Loading,
             fingerprint,
+            generation,
             relation_oids: relation_oids.clone(),
             select_statement: select_statement.clone(),
             resolved: resolved.clone(),
@@ -848,6 +861,9 @@ impl QueryCache {
 
         trace!("invalidating query {fingerprint}");
 
+        // Remove this query's generation from tracking
+        cache.generations.remove(&query.generation);
+
         trace!("invalidating update queries {fingerprint}");
         for oid in &query.relation_oids {
             if let Some(mut queries) = cache.update_queries.get_mut(oid) {
@@ -1300,5 +1316,22 @@ impl QueryCache {
         );
 
         Ok(sql)
+    }
+
+    /// Purge generation entries where generation <= threshold.
+    /// Calls the pgcache_generation_purge_all() function on the cache database.
+    /// Returns the number of entries purged.
+    #[allow(dead_code)]
+    pub async fn generation_purge(&self, threshold: u64) -> Result<i64, CacheError> {
+        let sql = format!("SELECT pgcache_generation_purge_all({threshold})");
+        let rows = self.db_cache.query(&sql, &[]).await?;
+        Ok(rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(0))
+    }
+
+    /// Get the current purge threshold (generation below which all entries can be purged).
+    /// Returns None if there are no active cached queries.
+    #[allow(dead_code)]
+    pub fn generation_purge_threshold(&self) -> Option<u64> {
+        self.cache.borrow().generation_purge_threshold()
     }
 }

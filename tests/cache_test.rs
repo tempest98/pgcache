@@ -97,7 +97,7 @@ async fn test_cache_join() -> Result<(), Error> {
     wait_for_cdc().await;
 
     let query_str = "select t.id, t.data as test_data, tm.test_id, tm.data as map_data \
-        from test t join test_map tm on tm.test_id = t.id where t.id = 1
+        from test t join test_map tm on tm.test_id = t.id where t.id = 1 \
         order by tm.id;";
 
     // First query to populate cache
@@ -190,8 +190,8 @@ async fn test_cache_join() -> Result<(), Error> {
     assert_eq!(metrics.queries_uncacheable, 4);
     assert_eq!(metrics.queries_unsupported, 4);
     assert_eq!(metrics.queries_invalid, 0);
-    assert_eq!(metrics.queries_cache_hit, 1);
-    assert_eq!(metrics.queries_cache_miss, 2);
+    assert_eq!(metrics.queries_cache_hit, 1, "cache hits");
+    assert_eq!(metrics.queries_cache_miss, 2, "cache misses");
 
     Ok(())
 }

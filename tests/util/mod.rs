@@ -264,10 +264,35 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
 
     let db_cache = PgTempDBBuilder::new()
         .with_dbname("cache_test")
+        .with_config_param("log_destination", "stderr")
+        .with_config_param("log_directory", "/tmp/")
+        .with_config_param("logging_collector", "on")
+        .with_config_param("shared_preload_libraries", "pgcache_pgrx")
         .start_async()
         .await;
 
-    //set up logical replication on origin
+    // Set up pgcache_pgrx extension on cache database
+    let (cache_client, cache_connection) = Config::new()
+        .host("localhost")
+        .port(db_cache.db_port())
+        .user(db_cache.db_user())
+        .dbname(db_cache.db_name())
+        .connect(NoTls)
+        .await
+        .map_err(Error::other)?;
+
+    tokio::spawn(async move {
+        if let Err(e) = cache_connection.await {
+            eprintln!("cache connection error: {e}");
+        }
+    });
+
+    cache_client
+        .execute("CREATE EXTENSION pgcache_pgrx", &[])
+        .await
+        .map_err(Error::other)?;
+
+    // Set up logical replication on origin
     let (origin_client, origin_connection) = Config::new()
         .host("localhost")
         .port(db.db_port())
