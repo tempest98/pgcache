@@ -1,11 +1,9 @@
-use std::{cell::RefCell, collections::VecDeque, rc::Rc, thread};
+use std::sync::{Arc, RwLock};
+use std::thread;
 
 use tokio::{
     runtime::Builder,
-    sync::{
-        Semaphore,
-        mpsc::{Receiver, UnboundedReceiver, UnboundedSender},
-    },
+    sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender},
     task::{LocalSet, spawn_local},
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, wrappers::UnboundedReceiverStream};
@@ -15,10 +13,11 @@ use crate::{
     cache::{
         CacheError,
         cdc::CdcProcessor,
-        messages::{CacheReply, CdcMessage, ProxyMessage, StreamSource},
+        messages::{CacheReply, CdcMessage, ProxyMessage, StreamSource, WriterCommand},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
-        types::Cache,
+        types::CacheStateView,
         worker::CacheWorker,
+        writer::writer_run,
     },
     settings::Settings,
 };
@@ -48,41 +47,38 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
     }
 }
 
-/// Handles a CDC message by updating the query cache
-async fn handle_cdc_message(qcache: &mut QueryCache, msg: CdcMessage) {
-    match msg {
-        CdcMessage::Register(table_metadata) => {
-            if let Err(e) = qcache.cache_table_register(table_metadata).await {
-                error!("failed to register table: {e}");
-            }
-        }
+/// Handles a CDC message by forwarding to the writer thread
+fn handle_cdc_message(writer_tx: &UnboundedSender<WriterCommand>, msg: CdcMessage) {
+    let cmd = match msg {
+        CdcMessage::Register(table_metadata) => WriterCommand::TableRegister(table_metadata),
         CdcMessage::Insert(relation_oid, row_data) => {
-            if let Err(e) = qcache.handle_insert(relation_oid, row_data).await {
-                error!("failed to handle insert: {e}");
+            WriterCommand::CdcInsert {
+                relation_oid,
+                row_data,
             }
         }
-        CdcMessage::Update(update) => {
-            if let Err(e) = qcache
-                .handle_update(update.relation_oid, update.key_data, update.row_data)
-                .await
-            {
-                error!("failed to handle update: {e}");
-            }
-        }
+        CdcMessage::Update(update) => WriterCommand::CdcUpdate {
+            relation_oid: update.relation_oid,
+            key_data: update.key_data,
+            row_data: update.row_data,
+        },
         CdcMessage::Delete(relation_oid, row_data) => {
-            if let Err(e) = qcache.handle_delete(relation_oid, row_data).await {
-                error!("failed to handle delete: {e}");
+            WriterCommand::CdcDelete {
+                relation_oid,
+                row_data,
             }
         }
-        CdcMessage::Truncate(relation_oids) => {
-            if let Err(e) = qcache.handle_truncate(&relation_oids).await {
-                error!("failed to handle truncate: {e}");
-            }
-        }
+        CdcMessage::Truncate(relation_oids) => WriterCommand::CdcTruncate { relation_oids },
         CdcMessage::RelationCheck(relation_oid, reply_tx) => {
-            let exists = qcache.cached_queries_exist(relation_oid).await;
-            let _ = reply_tx.send(exists);
+            WriterCommand::RelationCheck {
+                relation_oid,
+                response_tx: reply_tx,
+            }
         }
+    };
+
+    if let Err(e) = writer_tx.send(cmd) {
+        error!("failed to send to writer: {e}");
     }
 }
 
@@ -110,13 +106,25 @@ async fn handle_worker_request(worker: CacheWorker, mut msg: WorkerRequest) {
 pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Result<(), CacheError> {
     thread::scope(|scope| {
         let rt = Builder::new_current_thread().enable_all().build()?;
-        let cache = Cache::default();
 
+        // Create shared state view for coordinator to read cache state
+        let state_view = Arc::new(RwLock::new(CacheStateView::default()));
+
+        // Spawn writer thread (owns Cache, serializes all mutations)
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state_view_writer = Arc::clone(&state_view);
+        let settings_writer = settings.clone();
+        let _writer_handle = thread::Builder::new()
+            .name("cache writer".to_owned())
+            .spawn_scoped(scope, move || writer_run(&settings_writer, writer_rx, state_view_writer))?;
+
+        // Spawn worker thread (executes cached queries - read-only)
         let (worker_tx, worker_rx) = tokio::sync::mpsc::unbounded_channel();
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
             .spawn_scoped(scope, || worker_run(settings, worker_rx))?;
 
+        // Spawn CDC thread
         let (cdc_tx, cdc_rx) = tokio::sync::mpsc::unbounded_channel();
         let cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
@@ -127,48 +135,25 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 
         let mut stream = cache_rx_mapped.merge(cdc_rx_mapped);
 
-        let cdc_msg_queue = Rc::new(RefCell::new(VecDeque::new()));
-        let cdc_msg_queue_semaphore = Rc::new(Semaphore::new(0));
-
         debug!("cache loop");
         rt.block_on(async {
-            let qcache = QueryCache::new(settings, cache, worker_tx).await?;
+            let qcache = QueryCache::new(settings, writer_tx.clone(), worker_tx, Arc::clone(&state_view)).await?;
 
             LocalSet::new()
                 .run_until(async move {
-                    //task to process cdc messages
-                    {
-                        let mut qcache = qcache.clone();
-                        let sem = Rc::clone(&cdc_msg_queue_semaphore);
-                        let msg_queue = Rc::clone(&cdc_msg_queue);
-                        spawn_local(async move {
-                            while let Ok(permit) = sem.acquire().await {
-                                loop {
-                                    let Some(msg) = msg_queue.borrow_mut().pop_front() else {
-                                        break;
-                                    };
-                                    handle_cdc_message(&mut qcache, msg).await;
-                                }
-                                permit.forget();
-                            }
-                        });
-                    }
-
                     while let Some(src) = stream.next().await {
-                        let mut qcache = qcache.clone();
-                        let cdc_msg_queue = Rc::clone(&cdc_msg_queue);
-                        let cdc_msg_queue_semaphore = Rc::clone(&cdc_msg_queue_semaphore);
-                        spawn_local(async move {
-                            match src {
-                                StreamSource::Proxy(proxy_msg) => {
+                        match src {
+                            StreamSource::Proxy(proxy_msg) => {
+                                let mut qcache = qcache.clone();
+                                spawn_local(async move {
                                     handle_proxy_message(&mut qcache, proxy_msg).await;
-                                }
-                                StreamSource::Cdc(msg) => {
-                                    cdc_msg_queue.borrow_mut().push_back(msg);
-                                    cdc_msg_queue_semaphore.add_permits(1);
-                                }
+                                });
                             }
-                        });
+                            StreamSource::Cdc(msg) => {
+                                // Forward CDC messages directly to writer
+                                handle_cdc_message(&writer_tx, msg);
+                            }
+                        }
 
                         if cdc_handle.is_finished() {
                             return Err(CacheError::CdcFailure);

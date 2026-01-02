@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
 
@@ -96,4 +96,19 @@ impl Cache {
     pub fn generation_purge_threshold(&self) -> Option<u64> {
         self.generations.first().map(|min| min.saturating_sub(1))
     }
+}
+
+/// Lightweight read-only view of cache state for the coordinator.
+/// Updated by the writer thread after each mutation.
+#[derive(Debug, Default)]
+pub struct CacheStateView {
+    pub cached_queries: HashMap<u64, CachedQueryView>,
+}
+
+/// Lightweight view of a cached query for coordinator lookups.
+#[derive(Debug, Clone)]
+pub struct CachedQueryView {
+    pub state: CachedQueryState,
+    pub generation: u64,
+    pub resolved: ResolvedSelectStatement,
 }

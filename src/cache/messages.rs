@@ -2,6 +2,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_util::bytes::BytesMut;
 
+use crate::catalog::TableMetadata;
+use crate::query::resolved::ResolvedSelectStatement;
+
 use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
 
 /// Converted query data ready for processing
@@ -140,4 +143,57 @@ pub struct ProxyMessage {
 pub(crate) enum StreamSource {
     Proxy(ProxyMessage),
     Cdc(CdcMessage),
+}
+
+/// Commands sent to the cache writer thread for serialized cache mutations
+#[derive(Debug)]
+pub enum WriterCommand {
+    /// Register a new query and populate the cache (blocking until complete)
+    /// The writer handles the entire flow: register, fetch from origin, populate cache, mark ready
+    QueryRegisterAndPopulate {
+        fingerprint: u64,
+        cacheable_query: Box<CacheableQuery>,
+        search_path: Vec<String>,
+        response_tx: oneshot::Sender<Result<QueryRegisterResult, CacheError>>,
+    },
+
+    /// Register table metadata from CDC
+    TableRegister(TableMetadata),
+
+    /// CDC Insert operation
+    CdcInsert {
+        relation_oid: u32,
+        row_data: Vec<Option<String>>,
+    },
+
+    /// CDC Update operation
+    CdcUpdate {
+        relation_oid: u32,
+        key_data: Vec<Option<String>>,
+        row_data: Vec<Option<String>>,
+    },
+
+    /// CDC Delete operation
+    CdcDelete {
+        relation_oid: u32,
+        row_data: Vec<Option<String>>,
+    },
+
+    /// CDC Truncate operation
+    CdcTruncate { relation_oids: Vec<u32> },
+
+    /// Check if any cached queries reference a relation (for CDC filtering)
+    RelationCheck {
+        relation_oid: u32,
+        response_tx: oneshot::Sender<bool>,
+    },
+}
+
+/// Result of query registration, returned to coordinator
+#[derive(Debug)]
+pub struct QueryRegisterResult {
+    pub generation: u64,
+    pub relation_oids: Vec<u32>,
+    #[allow(dead_code)] // May be used in future for coordinator-side operations
+    pub resolved: ResolvedSelectStatement,
 }

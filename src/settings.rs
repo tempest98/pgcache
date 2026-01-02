@@ -27,7 +27,7 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PgSettings {
     pub host: String,
     pub port: u16,
@@ -35,18 +35,18 @@ pub struct PgSettings {
     pub database: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CdcSettings {
     pub publication_name: String,
     pub slot_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ListenSettings {
     pub socket: SocketAddr,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
     pub origin: PgSettings,
     pub cache: PgSettings,

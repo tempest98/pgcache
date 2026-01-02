@@ -13,6 +13,7 @@ mod query_cache;
 mod runtime;
 mod types;
 mod worker;
+mod writer;
 
 // Re-export public types
 pub use messages::{
