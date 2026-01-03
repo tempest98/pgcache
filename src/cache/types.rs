@@ -1,12 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 
-use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
+use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
 use crate::{
     catalog::TableMetadata,
     query::{
         ast::SelectStatement, constraints::QueryConstraints, resolved::ResolvedSelectStatement,
     },
+    settings::Settings,
 };
 
 /// State of a cached query
@@ -31,15 +32,30 @@ pub struct CachedQuery {
     pub cached_bytes: usize,
 }
 
-impl IdHashItem for CachedQuery {
-    type Key<'a> = u64;
+impl BiHashItem for CachedQuery {
+    type K1<'a> = u64;
+    type K2<'b> = u64;
 
-    fn key(&self) -> Self::Key<'_> {
+    fn key1(&self) -> Self::K1<'_> {
         self.fingerprint
     }
 
-    id_upcast!();
+    fn key2(&self) -> Self::K2<'_> {
+        self.generation
+    }
+
+    bi_upcast!();
 }
+
+// impl IdHashItem for CachedQuery {
+//     type Key<'a> = u64;
+
+//     fn key(&self) -> Self::Key<'_> {
+//         self.fingerprint
+//     }
+
+//     id_upcast!();
+// }
 
 /// Query used to update cached results when data changes
 #[derive(Debug, Clone)]
@@ -72,26 +88,32 @@ impl IdHashItem for UpdateQueries {
 pub struct Cache {
     pub tables: BiHashMap<TableMetadata>,
     pub update_queries: IdHashMap<UpdateQueries>,
-    pub cached_queries: IdHashMap<CachedQuery>,
+    pub cached_queries: BiHashMap<CachedQuery>,
     /// Monotonically increasing generation counter (starts at 1)
     pub generation_counter: u64,
     /// Generations of active cached queries (for efficient min-tracking)
     pub generations: BTreeSet<u64>,
-}
-
-impl Default for Cache {
-    fn default() -> Self {
-        Self {
-            tables: BiHashMap::new(),
-            update_queries: IdHashMap::new(),
-            cached_queries: IdHashMap::new(),
-            generation_counter: 0,
-            generations: BTreeSet::new(),
-        }
-    }
+    /// Target size of cached data, if the current size is larger then
+    /// queries will be invalidated to decrease cached data
+    pub cache_size: Option<usize>,
+    /// Size of currently cached data, updated after loading queries or purging data
+    /// Actual size can drift from this value because of CDC traffic
+    pub current_size: usize,
 }
 
 impl Cache {
+    pub fn new(settings: &Settings) -> Self {
+        Self {
+            tables: BiHashMap::new(),
+            update_queries: IdHashMap::new(),
+            cached_queries: BiHashMap::new(),
+            generation_counter: 0,
+            generations: BTreeSet::new(),
+            cache_size: settings.cache_size,
+            current_size: 0,
+        }
+    }
+
     /// Returns the minimum generation that can be safely purged.
     /// This is the highest generation that is less than all active generations
     /// or the current generation_counter if there are no active generations

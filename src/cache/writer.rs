@@ -109,7 +109,7 @@ impl CacheWriter {
         }
 
         Ok(Self {
-            cache: Cache::default(),
+            cache: Cache::new(settings),
             db_cache: cache_client,
             db_origin: Rc::new(origin_client),
             state_view,
@@ -140,6 +140,20 @@ impl CacheWriter {
                 cached_bytes,
             } => {
                 self.query_ready_mark(fingerprint, cached_bytes);
+                self.cache.current_size = self.cache_size_load().await?;
+
+                while self
+                    .cache
+                    .cache_size
+                    .is_some_and(|s| self.cache.current_size > s)
+                {
+                    if let Some(min_gen) = self.cache.generations.first()
+                        && let Some(query) = self.cache.cached_queries.get2(min_gen)
+                    {
+                        trace!("exceeded cache size, invalidating query");
+                        self.cache_query_invalidate(query.fingerprint).await?;
+                    }
+                }
             }
             WriterCommand::QueryFailed { fingerprint } => {
                 self.query_failed_cleanup(fingerprint);
@@ -321,10 +335,12 @@ impl CacheWriter {
                 &table_metadata,
                 &resolved_clone,
                 db_origin,
-                db_cache,
-                pool_tx.clone(),
+                &db_cache,
             )
             .await;
+
+            // Return connection to pool
+            let _ = pool_tx.send(db_cache).await;
 
             match result {
                 Ok(cached_bytes) => {
@@ -356,7 +372,8 @@ impl CacheWriter {
 
     /// Mark a query as ready after successful population.
     fn query_ready_mark(&mut self, fingerprint: u64, cached_bytes: usize) {
-        let update_info = if let Some(mut query) = self.cache.cached_queries.get_mut(&fingerprint) {
+        let update_info = if let Some(mut query) = self.cache.cached_queries.get1_mut(&fingerprint)
+        {
             query.state = CachedQueryState::Ready;
             query.cached_bytes = cached_bytes;
             Some((query.generation, query.resolved.clone()))
@@ -373,7 +390,7 @@ impl CacheWriter {
 
     /// Clean up after a failed population.
     fn query_failed_cleanup(&mut self, fingerprint: u64) {
-        if let Some(query) = self.cache.cached_queries.remove(&fingerprint) {
+        if let Some(query) = self.cache.cached_queries.remove1(&fingerprint) {
             // Remove generation from active set
             self.cache.generations.remove(&query.generation);
 
@@ -457,7 +474,7 @@ impl CacheWriter {
 
     /// Invalidate a specific cached query and purge its generation if safe.
     async fn cache_query_invalidate(&mut self, fingerprint: u64) -> Result<(), CacheError> {
-        let Some(query) = self.cache.cached_queries.remove(&fingerprint) else {
+        let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
             return Ok(());
         };
 
@@ -484,10 +501,28 @@ impl CacheWriter {
         // add in cache size check when supported here
         let new_threshold = self.cache.generation_purge_threshold();
         if new_threshold > prev_generation_threshold {
-            self.generation_purge(new_threshold).await?;
+            let mut current_size = self.cache_size_load().await?;
+
+            if self.cache.cache_size.is_some_and(|s| current_size > s) {
+                self.generation_purge(new_threshold).await?;
+                current_size = self.cache_size_load().await?;
+            }
+
+            self.cache.current_size = current_size as usize;
         }
 
         Ok(())
+    }
+
+    /// Utility function to get the size of the currently cached data
+    async fn cache_size_load(&mut self) -> Result<usize, CacheError> {
+        let size: i64 = self
+            .db_cache
+            .query_one("SELECT pgcache_total_size()", &[])
+            .await?
+            .get(0);
+
+        Ok(size as usize)
     }
 
     /// Purge rows with generation <= threshold.
@@ -1094,7 +1129,7 @@ impl CacheWriter {
             let cached_query = self
                 .cache
                 .cached_queries
-                .get(&update_query.fingerprint)
+                .get1(&update_query.fingerprint)
                 .ok_or_else(|| {
                     error!(
                         "Cached query not found for fingerprint: {}",
@@ -1259,8 +1294,7 @@ async fn population_task(
     table_metadata: &[TableMetadata],
     resolved: &ResolvedSelectStatement,
     db_origin: Rc<Client>,
-    db_cache: Client,
-    pool_tx: tokio::sync::mpsc::Sender<Client>,
+    db_cache: &Client,
 ) -> Result<usize, CacheError> {
     // Set generation for tracking triggers
     let set_generation_sql = format!("SET mem.query_generation = {generation}");
@@ -1282,7 +1316,7 @@ async fn population_task(
         let rows = population_fetch(&db_origin, table_oid, table, resolved).await?;
 
         // Populate cache
-        let bytes = population_insert(&db_cache, table, &rows).await?;
+        let bytes = population_insert(db_cache, table, &rows).await?;
         total_bytes += bytes;
     }
 
@@ -1290,9 +1324,6 @@ async fn population_task(
     db_cache
         .execute("SET mem.query_generation = 0", &[])
         .await?;
-
-    // Return connection to pool
-    let _ = pool_tx.send(db_cache).await;
 
     trace!("population complete for query {fingerprint}, bytes={total_bytes}");
     Ok(total_bytes)

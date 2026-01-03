@@ -53,6 +53,7 @@ pub struct Settings {
     pub cdc: CdcSettings,
     pub listen: ListenSettings,
     pub num_workers: usize,
+    pub cache_size: Option<usize>,
 }
 
 impl Settings {
@@ -69,6 +70,7 @@ impl Settings {
         let mut cdc_slot_name: Option<String> = None;
         let mut listen_socket: Option<SocketAddr> = None;
         let mut num_workers: Option<usize> = None;
+        let mut cache_size: Option<usize> = None;
 
         let mut config_settings: Option<Settings> = None;
         let mut parser = lexopt::Parser::from_env();
@@ -93,6 +95,7 @@ impl Settings {
                 Long("cdc_slot_name") => cdc_slot_name = Some(parser.value()?.string()?),
                 Long("listen_socket") => listen_socket = Some(parser.value()?.parse()?),
                 Long("num_workers") => num_workers = Some(parser.value()?.parse()?),
+                Long("cache_size") => cache_size = Some(parser.value()?.parse()?),
                 Long("help") => {
                     Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
                 }
@@ -119,6 +122,7 @@ impl Settings {
             config.cdc.slot_name = cdc_slot_name.unwrap_or(config.cdc.slot_name);
             config.listen.socket = listen_socket.unwrap_or(config.listen.socket);
             config.num_workers = num_workers.unwrap_or(config.num_workers);
+            config.cache_size = num_workers.or(config.cache_size);
 
             config
         } else {
@@ -166,6 +170,7 @@ impl Settings {
                 num_workers: num_workers.ok_or_else(|| ConfigError::ArgumentMissing {
                     name: "num_workers",
                 })?,
+                cache_size,
             }
         };
 
@@ -178,7 +183,8 @@ impl Settings {
             --cache_host HOST --cache_port PORT --cache_user USER --cache_database DB \n \
             --cdc_publication_name NAME --cdc_slot_name SLOT_NAME \n \
             --listen_socket IP_AND_PORT \n \
-            --num_workers NUMBER"
+            --num_workers NUMBER \n \
+            [--cache_size BYTES]"
         );
         std::process::exit(1);
     }
