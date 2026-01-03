@@ -6,6 +6,7 @@ use tokio::{
     sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender},
     task::{LocalSet, spawn_local},
 };
+use tokio_postgres::{Config, NoTls};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, wrappers::UnboundedReceiverStream};
 use tracing::{debug, error, instrument};
 
@@ -51,30 +52,24 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
 fn handle_cdc_message(writer_tx: &UnboundedSender<WriterCommand>, msg: CdcMessage) {
     let cmd = match msg {
         CdcMessage::Register(table_metadata) => WriterCommand::TableRegister(table_metadata),
-        CdcMessage::Insert(relation_oid, row_data) => {
-            WriterCommand::CdcInsert {
-                relation_oid,
-                row_data,
-            }
-        }
+        CdcMessage::Insert(relation_oid, row_data) => WriterCommand::CdcInsert {
+            relation_oid,
+            row_data,
+        },
         CdcMessage::Update(update) => WriterCommand::CdcUpdate {
             relation_oid: update.relation_oid,
             key_data: update.key_data,
             row_data: update.row_data,
         },
-        CdcMessage::Delete(relation_oid, row_data) => {
-            WriterCommand::CdcDelete {
-                relation_oid,
-                row_data,
-            }
-        }
+        CdcMessage::Delete(relation_oid, row_data) => WriterCommand::CdcDelete {
+            relation_oid,
+            row_data,
+        },
         CdcMessage::Truncate(relation_oids) => WriterCommand::CdcTruncate { relation_oids },
-        CdcMessage::RelationCheck(relation_oid, reply_tx) => {
-            WriterCommand::RelationCheck {
-                relation_oid,
-                response_tx: reply_tx,
-            }
-        }
+        CdcMessage::RelationCheck(relation_oid, reply_tx) => WriterCommand::RelationCheck {
+            relation_oid,
+            response_tx: reply_tx,
+        },
     };
 
     if let Err(e) = writer_tx.send(cmd) {
@@ -101,9 +96,80 @@ async fn handle_worker_request(worker: CacheWorker, mut msg: WorkerRequest) {
     debug!("cache worker task done");
 }
 
+/// Reset the cache database by dropping and recreating it
+fn cache_database_reset(settings: &Settings) -> Result<(), CacheError> {
+    let rt = Builder::new_current_thread().enable_all().build()?;
+
+    rt.block_on(async {
+        // Connect to postgres maintenance database
+        let (admin_client, admin_conn) = Config::new()
+            .host(&settings.cache.host)
+            .port(settings.cache.port)
+            .user(&settings.cache.user)
+            .dbname("postgres")
+            .connect(NoTls)
+            .await?;
+
+        tokio::spawn(async move {
+            if let Err(e) = admin_conn.await {
+                error!("admin connection error: {e}");
+            }
+        });
+
+        let db_name = &settings.cache.database;
+        debug!("resetting cache database: {db_name}");
+
+        // Terminate existing connections to the database
+        admin_client
+            .execute(
+                &format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
+                ),
+                &[],
+            )
+            .await?;
+
+        admin_client
+            .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
+            .await?;
+
+        admin_client
+            .execute(&format!("CREATE DATABASE {db_name}"), &[])
+            .await?;
+
+        // Connect to fresh cache database and create extension
+        let (cache_client, cache_conn) = Config::new()
+            .host(&settings.cache.host)
+            .port(settings.cache.port)
+            .user(&settings.cache.user)
+            .dbname(db_name)
+            .connect(NoTls)
+            .await?;
+
+        tokio::spawn(async move {
+            if let Err(e) = cache_conn.await {
+                error!("cache connection error: {e}");
+            }
+        });
+
+        cache_client
+            .execute("CREATE EXTENSION pg_stat_statements", &[])
+            .await?;
+        cache_client
+            .execute("CREATE EXTENSION pgcache_pgrx", &[])
+            .await?;
+
+        Ok(())
+    })
+}
+
 /// Main cache runtime - handles proxy queries and CDC events
 #[instrument(skip_all)]
 pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Result<(), CacheError> {
+    // Reset cache database before starting anything
+    cache_database_reset(settings)?;
+
     thread::scope(|scope| {
         let rt = Builder::new_current_thread().enable_all().build()?;
 
@@ -116,7 +182,9 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
         let settings_writer = settings.clone();
         let _writer_handle = thread::Builder::new()
             .name("cache writer".to_owned())
-            .spawn_scoped(scope, move || writer_run(&settings_writer, writer_rx, state_view_writer))?;
+            .spawn_scoped(scope, move || {
+                writer_run(&settings_writer, writer_rx, state_view_writer)
+            })?;
 
         // Spawn worker thread (executes cached queries - read-only)
         let (worker_tx, worker_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -137,7 +205,13 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 
         debug!("cache loop");
         rt.block_on(async {
-            let qcache = QueryCache::new(settings, writer_tx.clone(), worker_tx, Arc::clone(&state_view)).await?;
+            let qcache = QueryCache::new(
+                settings,
+                writer_tx.clone(),
+                worker_tx,
+                Arc::clone(&state_view),
+            )
+            .await?;
 
             LocalSet::new()
                 .run_until(async move {
