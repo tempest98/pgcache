@@ -3,8 +3,6 @@ use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_util::bytes::BytesMut;
 
 use crate::catalog::TableMetadata;
-use crate::query::resolved::ResolvedSelectStatement;
-
 use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
 
 /// Converted query data ready for processing
@@ -148,14 +146,21 @@ pub(crate) enum StreamSource {
 /// Commands sent to the cache writer thread for serialized cache mutations
 #[derive(Debug)]
 pub enum WriterCommand {
-    /// Register a new query and populate the cache (blocking until complete)
-    /// The writer handles the entire flow: register, fetch from origin, populate cache, mark ready
-    QueryRegisterAndPopulate {
+    /// Register a new query and spawn background population (fire-and-forget)
+    QueryRegister {
         fingerprint: u64,
         cacheable_query: Box<CacheableQuery>,
         search_path: Vec<String>,
-        response_tx: oneshot::Sender<Result<QueryRegisterResult, CacheError>>,
     },
+
+    /// Query population completed successfully
+    QueryReady {
+        fingerprint: u64,
+        cached_bytes: usize,
+    },
+
+    /// Query population failed
+    QueryFailed { fingerprint: u64 },
 
     /// Register table metadata from CDC
     TableRegister(TableMetadata),
@@ -187,13 +192,4 @@ pub enum WriterCommand {
         relation_oid: u32,
         response_tx: oneshot::Sender<bool>,
     },
-}
-
-/// Result of query registration, returned to coordinator
-#[derive(Debug)]
-pub struct QueryRegisterResult {
-    pub generation: u64,
-    pub relation_oids: Vec<u32>,
-    #[allow(dead_code)] // May be used in future for coordinator-side operations
-    pub resolved: ResolvedSelectStatement,
 }

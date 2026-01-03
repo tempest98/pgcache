@@ -47,6 +47,7 @@ error_set! {
     SendError := {
         WorkerSend,
         Reply,
+        PopulationPoolClosed,
     }
 
     WriteError := {

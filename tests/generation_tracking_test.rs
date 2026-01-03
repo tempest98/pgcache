@@ -3,7 +3,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, connect_cache_db, wait_cache_load};
+use crate::util::{TestContext, connect_cache_db, wait_cache_load, wait_for_cdc};
 
 mod util;
 
@@ -21,6 +21,9 @@ async fn test_generation_tracking_basic() -> Result<(), Error> {
         &[],
     )
     .await?;
+
+    // Wait for CDC to process the inserts before caching
+    wait_for_cdc().await;
 
     // First cached query - should get generation 1
     let _res = ctx
@@ -78,6 +81,9 @@ async fn test_generation_tracking_multiple_queries() -> Result<(), Error> {
         &[],
     )
     .await?;
+
+    // Wait for CDC to process the inserts before caching
+    wait_for_cdc().await;
 
     // First cached query - generation 1
     let _res = ctx
@@ -159,6 +165,9 @@ async fn test_generation_purge() -> Result<(), Error> {
         &[],
     )
     .await?;
+
+    // Wait for CDC to process the inserts before caching
+    wait_for_cdc().await;
 
     // Create two cached queries
     let _res = ctx
@@ -297,6 +306,9 @@ async fn test_generation_tracking_join() -> Result<(), Error> {
         &[],
     )
     .await?;
+
+    // Wait for CDC to process the inserts before caching
+    wait_for_cdc().await;
 
     // Cached JOIN query
     let _res = ctx

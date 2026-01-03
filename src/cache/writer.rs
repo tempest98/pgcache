@@ -1,13 +1,15 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
 use iddqd::BiHashMap;
 use postgres_protocol::escape;
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
-use tracing::{error, info, instrument, trace};
+use tracing::{debug, error, info, instrument, trace};
 
 use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata};
 use crate::query::ast::{Deparse, TableNode};
@@ -21,7 +23,7 @@ use crate::settings::Settings;
 
 use super::{
     CacheError,
-    messages::{QueryRegisterResult, WriterCommand},
+    messages::WriterCommand,
     query::CacheableQuery,
     types::{
         Cache, CacheStateView, CachedQuery, CachedQueryState, CachedQueryView, UpdateQueries,
@@ -29,19 +31,29 @@ use super::{
     },
 };
 
+/// Number of connections in the population pool
+const POPULATE_POOL_SIZE: usize = 3;
+
 /// Cache writer that owns the Cache and serializes all mutations.
 /// This ensures no race conditions between query registration and purging.
 pub struct CacheWriter {
     cache: Cache,
     db_cache: Client,
-    db_origin: Client,
+    db_origin: Rc<Client>,
     state_view: Arc<RwLock<CacheStateView>>,
+    /// Channel-based connection pool for population tasks.
+    /// Take a connection to use, return it when done.
+    populate_pool_tx: tokio::sync::mpsc::Sender<Client>,
+    populate_pool_rx: tokio::sync::mpsc::Receiver<Client>,
+    /// Channel for spawned tasks to send commands back to writer
+    writer_tx: UnboundedSender<WriterCommand>,
 }
 
 impl CacheWriter {
     pub async fn new(
         settings: &Settings,
         state_view: Arc<RwLock<CacheStateView>>,
+        writer_tx: UnboundedSender<WriterCommand>,
     ) -> Result<Self, CacheError> {
         let (cache_client, cache_connection) = Config::new()
             .host(&settings.cache.host)
@@ -71,29 +83,66 @@ impl CacheWriter {
             }
         });
 
+        // Create connection pool for population tasks
+        let (populate_pool_tx, populate_pool_rx) = tokio::sync::mpsc::channel(POPULATE_POOL_SIZE);
+
+        // Create pool connections
+        for i in 0..POPULATE_POOL_SIZE {
+            let (client, connection) = Config::new()
+                .host(&settings.cache.host)
+                .port(settings.cache.port)
+                .user(&settings.cache.user)
+                .dbname(&settings.cache.database)
+                .connect(NoTls)
+                .await?;
+
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    error!("populate pool connection {i} error: {e}");
+                }
+            });
+
+            populate_pool_tx
+                .send(client)
+                .await
+                .expect("pool channel send");
+        }
+
         Ok(Self {
             cache: Cache::default(),
             db_cache: cache_client,
-            db_origin: origin_client,
+            db_origin: Rc::new(origin_client),
             state_view,
+            populate_pool_tx,
+            populate_pool_rx,
+            writer_tx,
         })
     }
 
     /// Handle a writer command, dispatching to the appropriate method.
     pub async fn command_handle(&mut self, cmd: WriterCommand) -> Result<(), CacheError> {
         match cmd {
-            WriterCommand::QueryRegisterAndPopulate {
+            WriterCommand::QueryRegister {
                 fingerprint,
                 cacheable_query,
                 search_path,
-                response_tx,
             } => {
-                let search_path_refs: Vec<&str> =
-                    search_path.iter().map(String::as_str).collect();
-                let result = self
-                    .query_register_and_populate(fingerprint, &cacheable_query, &search_path_refs)
-                    .await;
-                let _ = response_tx.send(result);
+                let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
+                if let Err(e) = self
+                    .query_register(fingerprint, &cacheable_query, &search_path_refs)
+                    .await
+                {
+                    error!("query register failed: {e}");
+                }
+            }
+            WriterCommand::QueryReady {
+                fingerprint,
+                cached_bytes,
+            } => {
+                self.query_ready_mark(fingerprint, cached_bytes);
+            }
+            WriterCommand::QueryFailed { fingerprint } => {
+                self.query_failed_cleanup(fingerprint);
             }
             WriterCommand::TableRegister(table_metadata) => {
                 if let Err(e) = self.cache_table_register(table_metadata).await {
@@ -141,15 +190,15 @@ impl CacheWriter {
         Ok(())
     }
 
-    /// Registers a query in the cache, fetches data from origin, and populates the cache.
-    /// Returns the generation, relation OIDs, and resolved statement.
+    /// Registers a query in the cache and spawns background population.
+    /// Registration is synchronous (updates Cache state), population is async.
     #[instrument(skip_all)]
-    pub async fn query_register_and_populate(
+    pub async fn query_register(
         &mut self,
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
-    ) -> Result<QueryRegisterResult, CacheError> {
+    ) -> Result<(), CacheError> {
         let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
 
@@ -174,8 +223,7 @@ impl CacheWriter {
         }
 
         // Resolve the query using catalog metadata
-        let resolved =
-            select_statement_resolve(select_statement, &self.cache.tables, search_path)?;
+        let resolved = select_statement_resolve(select_statement, &self.cache.tables, search_path)?;
 
         // Analyze constraints from the resolved query
         let query_constraints = analyze_query_constraints(&resolved);
@@ -238,163 +286,113 @@ impl CacheWriter {
         trace!("cached query loading");
 
         // Update shared state view with Loading state
-        self.state_view_update(fingerprint, CachedQueryState::Loading, generation, &resolved);
-
-        // Set generation for tracking triggers before populating cache
-        let set_generation_sql = format!("SET mem.query_generation = {generation}");
-        self.db_cache.execute(&set_generation_sql, &[]).await?;
-
-        // Fetch and populate cache for each table
-        let mut total_bytes: usize = 0;
-        for &table_oid in &relation_oids {
-            let rows = self.query_cache_fetch(table_oid, &resolved).await?;
-            let bytes = self.cache_populate(table_oid, &rows).await?;
-            total_bytes += bytes;
-        }
-
-        // Reset generation after population
-        self.db_cache
-            .execute("SET mem.query_generation = 0", &[])
-            .await?;
-
-        // Mark query as ready
-        if let Some(mut query) = self.cache.cached_queries.get_mut(&fingerprint) {
-            query.state = CachedQueryState::Ready;
-            query.cached_bytes = total_bytes;
-        }
-
-        // Update shared state view with Ready state
-        self.state_view_update(fingerprint, CachedQueryState::Ready, generation, &resolved);
-
-        trace!("cached query ready, cached_bytes={total_bytes}");
-
-        Ok(QueryRegisterResult {
+        self.state_view_update(
+            fingerprint,
+            CachedQueryState::Loading,
             generation,
-            relation_oids,
-            resolved,
-        })
-    }
+            &resolved,
+        );
 
-    /// Fetch data from origin database for cache population.
-    #[instrument(skip_all)]
-    async fn query_cache_fetch(
-        &self,
-        relation_oid: u32,
-        resolved: &ResolvedSelectStatement,
-    ) -> Result<Vec<SimpleQueryMessage>, CacheError> {
-        let table = self
-            .cache
-            .tables
-            .get1(&relation_oid)
-            .ok_or(CacheError::UnknownTable {
-                oid: Some(relation_oid),
-                name: None,
-            })?;
+        // Collect table metadata needed for population
+        let table_metadata: Vec<TableMetadata> = relation_oids
+            .iter()
+            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
+            .collect();
 
-        let maybe_alias = resolved
-            .nodes::<ResolvedTableNode>()
-            .find(|tn| tn.relation_oid == relation_oid)
-            .and_then(|t| t.alias.as_deref());
+        // Clone resources for the spawned task
+        let db_origin = Rc::clone(&self.db_origin);
+        let writer_tx = self.writer_tx.clone();
+        let pool_tx = self.populate_pool_tx.clone();
+        let resolved_clone = resolved.clone();
 
-        // Use table metadata to get column list
-        let select_columns = table.resolved_select_columns(maybe_alias);
-
-        // Build query with table columns
-        use crate::query::transform::resolved_select_replace;
-        let new_ast = resolved_select_replace(resolved, select_columns);
-        let mut buf = String::with_capacity(1024);
-        new_ast.deparse(&mut buf);
-
-        self.db_origin
-            .simple_query(&buf)
+        // Get a connection from the pool (wait if none available)
+        let db_cache = self
+            .populate_pool_rx
+            .recv()
             .await
-            .map_err(CacheError::PgError)
+            .ok_or(CacheError::PopulationPoolClosed)?;
+
+        // Spawn population task
+        spawn_local(async move {
+            let result = population_task(
+                fingerprint,
+                generation,
+                &relation_oids,
+                &table_metadata,
+                &resolved_clone,
+                db_origin,
+                db_cache,
+                pool_tx.clone(),
+            )
+            .await;
+
+            match result {
+                Ok(cached_bytes) => {
+                    if writer_tx
+                        .send(WriterCommand::QueryReady {
+                            fingerprint,
+                            cached_bytes,
+                        })
+                        .is_err()
+                    {
+                        error!("failed to send QueryReady");
+                    }
+                }
+                Err(e) => {
+                    error!("population failed for query {fingerprint}: {e}");
+                    if writer_tx
+                        .send(WriterCommand::QueryFailed { fingerprint })
+                        .is_err()
+                    {
+                        error!("failed to send QueryFailed");
+                    }
+                }
+            }
+        });
+
+        trace!("population task spawned for query {fingerprint}");
+        Ok(())
     }
 
-    /// Populate cache with rows for a specific table.
-    /// Returns the number of bytes cached.
-    #[instrument(skip_all)]
-    async fn cache_populate(
-        &self,
-        table_oid: u32,
-        response: &[SimpleQueryMessage],
-    ) -> Result<usize, CacheError> {
-        let [
-            SimpleQueryMessage::RowDescription(row_description),
-            data_rows @ ..,
-            _command_complete,
-        ] = response
-        else {
-            return Ok(0);
+    /// Mark a query as ready after successful population.
+    fn query_ready_mark(&mut self, fingerprint: u64, cached_bytes: usize) {
+        let update_info = if let Some(mut query) = self.cache.cached_queries.get_mut(&fingerprint) {
+            query.state = CachedQueryState::Ready;
+            query.cached_bytes = cached_bytes;
+            Some((query.generation, query.resolved.clone()))
+        } else {
+            None
         };
 
-        let mut cached_bytes: usize = 0;
+        if let Some((generation, resolved)) = update_info {
+            // Update shared state view
+            self.state_view_update(fingerprint, CachedQueryState::Ready, generation, &resolved);
+            trace!("cached query ready, cached_bytes={cached_bytes}");
+        }
+    }
 
-        let sql_list = {
-            let table = self
-                .cache
-                .tables
-                .get1(&table_oid)
-                .ok_or(CacheError::UnknownTable {
-                    oid: Some(table_oid),
-                    name: None,
-                })?;
+    /// Clean up after a failed population.
+    fn query_failed_cleanup(&mut self, fingerprint: u64) {
+        if let Some(query) = self.cache.cached_queries.remove(&fingerprint) {
+            // Remove generation from active set
+            self.cache.generations.remove(&query.generation);
 
-            let pkey_columns = &table.primary_key_columns;
-            let schema = &table.schema;
-            let table_name = &table.name;
-
-            let rows = data_rows
-                .iter()
-                .filter_map(|msg| {
-                    if let SimpleQueryMessage::Row(row) = msg {
-                        Some(row)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let mut sql_list = Vec::new();
-            let columns: Vec<&str> = Vec::from_iter(row_description.iter().map(|c| c.name()));
-            for &row in &rows {
-                let mut values: Vec<String> = Vec::new();
-                for idx in 0..row.columns().len() {
-                    let value = row.get(idx);
-                    cached_bytes += value.map_or(0, |v| v.len());
-                    values.push(
-                        value
-                            .map(escape::escape_literal)
-                            .unwrap_or("NULL".to_owned()),
-                    );
+            // Remove from update_queries
+            for oid in &query.relation_oids {
+                if let Some(mut update_queries) = self.cache.update_queries.get_mut(oid) {
+                    update_queries
+                        .queries
+                        .retain(|q| q.fingerprint != fingerprint);
                 }
-
-                let update_columns = columns
-                    .iter()
-                    .filter(|&&c| !pkey_columns.contains(&c.to_owned()))
-                    .map(|&c| format!("{c} = EXCLUDED.{c}"))
-                    .collect::<Vec<_>>();
-
-                let mut insert_table = format!(
-                    "insert into {schema}.{table_name}({}) values (",
-                    columns.join(",")
-                );
-                insert_table.push_str(&values.join(","));
-                insert_table.push_str(") on conflict (");
-                insert_table.push_str(&pkey_columns.join(","));
-                insert_table.push_str(") do update set ");
-                insert_table.push_str(&update_columns.join(", "));
-
-                sql_list.push(insert_table);
             }
-            sql_list
-        };
 
-        self.db_cache
-            .simple_query(sql_list.join(";").as_str())
-            .await?;
+            // Remove from state view
+            if let Ok(mut view) = self.state_view.write() {
+                view.cached_queries.remove(&fingerprint);
+            }
 
-        Ok(cached_bytes)
+            debug!("cleaned up failed query {fingerprint}");
+        }
     }
 
     /// Check if there are any cached queries for a specific table.
@@ -842,12 +840,7 @@ impl CacheWriter {
         search_path: &[&str],
     ) -> Result<String, CacheError> {
         for schema in search_path {
-            if self
-                .cache
-                .tables
-                .get2(&(*schema, table_name))
-                .is_some()
-            {
+            if self.cache.tables.get2(&(*schema, table_name)).is_some() {
                 return Ok((*schema).to_owned());
             }
         }
@@ -1247,7 +1240,156 @@ impl CacheWriter {
     }
 }
 
-/// Main writer runtime - processes writer commands sequentially.
+/// Background task for populating cache with query results.
+/// Runs on a dedicated pool connection to avoid session variable conflicts.
+#[allow(clippy::too_many_arguments)]
+async fn population_task(
+    fingerprint: u64,
+    generation: u64,
+    relation_oids: &[u32],
+    table_metadata: &[TableMetadata],
+    resolved: &ResolvedSelectStatement,
+    db_origin: Rc<Client>,
+    db_cache: Client,
+    pool_tx: tokio::sync::mpsc::Sender<Client>,
+) -> Result<usize, CacheError> {
+    // Set generation for tracking triggers
+    let set_generation_sql = format!("SET mem.query_generation = {generation}");
+    db_cache.execute(&set_generation_sql, &[]).await?;
+
+    let mut total_bytes: usize = 0;
+
+    // Fetch and populate for each table
+    for &table_oid in relation_oids {
+        let table = table_metadata
+            .iter()
+            .find(|t| t.relation_oid == table_oid)
+            .ok_or(CacheError::UnknownTable {
+                oid: Some(table_oid),
+                name: None,
+            })?;
+
+        // Fetch from origin
+        let rows = population_fetch(&db_origin, table_oid, table, resolved).await?;
+
+        // Populate cache
+        let bytes = population_insert(&db_cache, table, &rows).await?;
+        total_bytes += bytes;
+    }
+
+    // Reset generation
+    db_cache
+        .execute("SET mem.query_generation = 0", &[])
+        .await?;
+
+    // Return connection to pool
+    let _ = pool_tx.send(db_cache).await;
+
+    trace!("population complete for query {fingerprint}, bytes={total_bytes}");
+    Ok(total_bytes)
+}
+
+/// Fetch data from origin database for a single table.
+async fn population_fetch(
+    db_origin: &Client,
+    relation_oid: u32,
+    table: &TableMetadata,
+    resolved: &ResolvedSelectStatement,
+) -> Result<Vec<SimpleQueryMessage>, CacheError> {
+    let maybe_alias = resolved
+        .nodes::<ResolvedTableNode>()
+        .find(|tn| tn.relation_oid == relation_oid)
+        .and_then(|t| t.alias.as_deref());
+
+    // Use table metadata to get column list
+    let select_columns = table.resolved_select_columns(maybe_alias);
+
+    // Build query with table columns
+    use crate::query::transform::resolved_select_replace;
+    let new_ast = resolved_select_replace(resolved, select_columns);
+    let mut buf = String::with_capacity(1024);
+    new_ast.deparse(&mut buf);
+
+    db_origin
+        .simple_query(&buf)
+        .await
+        .map_err(CacheError::PgError)
+}
+
+/// Insert fetched rows into cache table.
+async fn population_insert(
+    db_cache: &Client,
+    table: &TableMetadata,
+    response: &[SimpleQueryMessage],
+) -> Result<usize, CacheError> {
+    let [
+        SimpleQueryMessage::RowDescription(row_description),
+        data_rows @ ..,
+        _command_complete,
+    ] = response
+    else {
+        return Ok(0);
+    };
+
+    let mut cached_bytes: usize = 0;
+
+    let pkey_columns = &table.primary_key_columns;
+    let schema = &table.schema;
+    let table_name = &table.name;
+
+    let rows: Vec<_> = data_rows
+        .iter()
+        .filter_map(|msg| {
+            if let SimpleQueryMessage::Row(row) = msg {
+                Some(row)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut sql_list = Vec::new();
+    let columns: Vec<&str> = Vec::from_iter(row_description.iter().map(|c| c.name()));
+
+    for row in &rows {
+        let mut values: Vec<String> = Vec::new();
+        for idx in 0..row.columns().len() {
+            let value = row.get(idx);
+            cached_bytes += value.map_or(0, |v| v.len());
+            values.push(
+                value
+                    .map(escape::escape_literal)
+                    .unwrap_or("NULL".to_owned()),
+            );
+        }
+
+        let update_columns: Vec<_> = columns
+            .iter()
+            .filter(|&&c| !pkey_columns.contains(&c.to_owned()))
+            .map(|&c| format!("{c} = EXCLUDED.{c}"))
+            .collect();
+
+        let mut insert_table = format!(
+            "insert into {schema}.{table_name}({}) values (",
+            columns.join(",")
+        );
+        insert_table.push_str(&values.join(","));
+        insert_table.push_str(") on conflict (");
+        insert_table.push_str(&pkey_columns.join(","));
+        insert_table.push_str(") do update set ");
+        insert_table.push_str(&update_columns.join(", "));
+
+        sql_list.push(insert_table);
+    }
+
+    if !sql_list.is_empty() {
+        db_cache.simple_query(sql_list.join(";").as_str()).await?;
+    }
+
+    Ok(cached_bytes)
+}
+
+/// Main writer runtime - processes writer commands with LocalSet for spawned tasks.
 pub fn writer_run(
     settings: &Settings,
     mut writer_rx: UnboundedReceiver<WriterCommand>,
@@ -1255,16 +1397,34 @@ pub fn writer_run(
 ) -> Result<(), CacheError> {
     let rt = Builder::new_current_thread().enable_all().build()?;
 
-    tracing::debug!("writer loop");
+    debug!("writer loop");
     rt.block_on(async {
-        let mut writer = CacheWriter::new(settings, state_view).await?;
+        // Create writer channel for spawned tasks to send commands back
+        let (writer_tx, mut internal_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        while let Some(cmd) = writer_rx.recv().await {
-            if let Err(e) = writer.command_handle(cmd).await {
-                error!("writer command failed: {e}");
-            }
-        }
+        let mut writer = CacheWriter::new(settings, state_view, writer_tx).await?;
 
-        Ok(())
+        LocalSet::new()
+            .run_until(async move {
+                loop {
+                    tokio::select! {
+                        // Handle commands from coordinator/CDC
+                        Some(cmd) = writer_rx.recv() => {
+                            if let Err(e) = writer.command_handle(cmd).await {
+                                error!("writer command failed: {e}");
+                            }
+                        }
+                        // Handle commands from spawned population tasks
+                        Some(cmd) = internal_rx.recv() => {
+                            if let Err(e) = writer.command_handle(cmd).await {
+                                error!("writer internal command failed: {e}");
+                            }
+                        }
+                        else => break,
+                    }
+                }
+                Ok(())
+            })
+            .await
     })
 }

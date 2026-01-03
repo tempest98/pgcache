@@ -2,7 +2,6 @@ use std::sync::{Arc, RwLock};
 
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
-use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 use tracing::{error, instrument, trace};
 
@@ -113,25 +112,16 @@ impl QueryCache {
 
             // Only register if not already in cache (state was None, not Loading)
             if cache_state.is_none() {
-                // Send QueryRegisterAndPopulate to writer and wait for response
-                let (response_tx, response_rx) = oneshot::channel();
+                // Fire-and-forget: send to writer, don't wait for response
                 self.writer_tx
-                    .send(WriterCommand::QueryRegisterAndPopulate {
+                    .send(WriterCommand::QueryRegister {
                         fingerprint,
                         cacheable_query: msg.cacheable_query,
                         search_path: msg.search_path,
-                        response_tx,
                     })
                     .map_err(|_| CacheError::WorkerSend)?;
 
-                // Wait for the writer to complete registration and population
-                let result = response_rx.await.map_err(|_| CacheError::Reply)??;
-
-                trace!(
-                    "cached query ready, generation={}, tables={}",
-                    result.generation,
-                    result.relation_oids.len()
-                );
+                trace!("query registration sent to writer");
             }
 
             Ok(())
