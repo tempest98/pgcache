@@ -463,6 +463,8 @@ impl CacheWriter {
 
         trace!("invalidating query {fingerprint}");
 
+        let prev_generation_threshold = self.cache.generation_purge_threshold();
+
         // Remove generation from tracking
         self.cache.generations.remove(&query.generation);
 
@@ -479,21 +481,28 @@ impl CacheWriter {
         }
 
         // Purge generations based on new threshold
-        self.generation_purge().await?;
+        // add in cache size check when supported here
+        let new_threshold = self.cache.generation_purge_threshold();
+        if new_threshold > prev_generation_threshold {
+            self.generation_purge(new_threshold).await?;
+        }
 
         Ok(())
     }
 
     /// Purge rows with generation <= threshold.
-    async fn generation_purge(&mut self) -> Result<(), CacheError> {
-        if let Some(threshold) = self.cache.generation_purge_threshold()
-            && threshold > 0
-        {
-            let sql = format!("SELECT pgcache_generation_purge_all({threshold})");
-            self.db_cache.query(&sql, &[]).await?;
-            trace!("purged generations <= {threshold}");
+    async fn generation_purge(&mut self, threshold: u64) -> Result<i64, CacheError> {
+        if threshold > 0 {
+            let deleted: i64 = self
+                .db_cache
+                .query_one("SELECT pgcache_purge_rows($1)", &[&(threshold as i64)])
+                .await?
+                .get(0);
+            trace!("purged generations <= {threshold}: rows removed [{deleted}]");
+            Ok(deleted)
+        } else {
+            Ok(0)
         }
-        Ok(())
     }
 
     /// Handle INSERT operation.

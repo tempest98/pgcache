@@ -4,7 +4,9 @@ use iddqd::{BiHashMap, IdHashItem, IdHashMap, id_upcast};
 
 use crate::{
     catalog::TableMetadata,
-    query::{ast::SelectStatement, constraints::QueryConstraints, resolved::ResolvedSelectStatement},
+    query::{
+        ast::SelectStatement, constraints::QueryConstraints, resolved::ResolvedSelectStatement,
+    },
 };
 
 /// State of a cached query
@@ -91,10 +93,13 @@ impl Default for Cache {
 
 impl Cache {
     /// Returns the minimum generation that can be safely purged.
-    /// This is the highest generation that is less than all active generations.
-    /// Returns None if there are no active cached queries.
-    pub fn generation_purge_threshold(&self) -> Option<u64> {
-        self.generations.first().map(|min| min.saturating_sub(1))
+    /// This is the highest generation that is less than all active generations
+    /// or the current generation_counter if there are no active generations
+    pub fn generation_purge_threshold(&self) -> u64 {
+        self.generations
+            .first()
+            .map(|min| min.saturating_sub(1))
+            .unwrap_or(self.generation_counter)
     }
 }
 
