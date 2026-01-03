@@ -240,6 +240,10 @@ impl CacheWriter {
         // Update shared state view with Loading state
         self.state_view_update(fingerprint, CachedQueryState::Loading, generation, &resolved);
 
+        // Set generation for tracking triggers before populating cache
+        let set_generation_sql = format!("SET mem.query_generation = {generation}");
+        self.db_cache.execute(&set_generation_sql, &[]).await?;
+
         // Fetch and populate cache for each table
         let mut total_bytes: usize = 0;
         for &table_oid in &relation_oids {
@@ -247,6 +251,11 @@ impl CacheWriter {
             let bytes = self.cache_populate(table_oid, &rows).await?;
             total_bytes += bytes;
         }
+
+        // Reset generation after population
+        self.db_cache
+            .execute("SET mem.query_generation = 0", &[])
+            .await?;
 
         // Mark query as ready
         if let Some(mut query) = self.cache.cached_queries.get_mut(&fingerprint) {
@@ -961,6 +970,11 @@ impl CacheWriter {
                 format!("CREATE {unique}INDEX ON {schema}.{table} USING {method} ({columns})");
             self.db_cache.execute(&index_sql, &[]).await?;
         }
+
+        // Enable generation tracking triggers on the table
+        let enable_tracking_sql =
+            format!("SELECT pgcache_enable_tracking('{schema}.{table}'::regclass::oid)");
+        self.db_cache.execute(&enable_tracking_sql, &[]).await?;
 
         Ok(())
     }
