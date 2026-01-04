@@ -2,8 +2,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_util::bytes::BytesMut;
 
-use crate::catalog::TableMetadata;
 use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
+use crate::catalog::TableMetadata;
 
 /// Converted query data ready for processing
 pub struct QueryData {

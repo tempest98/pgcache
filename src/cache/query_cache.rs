@@ -78,15 +78,11 @@ impl QueryCache {
         let fingerprint = ast_query_fingerprint(stmt);
 
         // Check cache state from shared view
-        let cache_state = self
-            .state_view
-            .read()
-            .ok()
-            .and_then(|view| {
-                view.cached_queries
-                    .get(&fingerprint)
-                    .map(|q| (q.state, q.resolved.clone(), q.generation))
-            });
+        let cache_state = self.state_view.read().ok().and_then(|view| {
+            view.cached_queries
+                .get(&fingerprint)
+                .map(|q| (q.state, q.resolved.clone(), q.generation))
+        });
 
         if let Some((CachedQueryState::Ready, resolved, generation)) = cache_state {
             // Cache hit - send to worker

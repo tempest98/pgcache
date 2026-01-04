@@ -402,7 +402,10 @@ impl CdcProcessor {
     fn parse_relation_to_table_metadata(&self, relation_body: &RelationBody) -> TableMetadata {
         let relation_oid = relation_body.rel_id();
         let table_name = relation_body.name().unwrap_or("unknown_table").to_owned();
-        let schema_name = relation_body.namespace().unwrap_or("unknown_schema").to_owned();
+        let schema_name = relation_body
+            .namespace()
+            .unwrap_or("unknown_schema")
+            .to_owned();
 
         // Build column metadata from relation body
         let mut columns = BiHashMap::new();

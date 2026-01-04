@@ -366,9 +366,7 @@ impl ResolvedSelectColumns {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let children: Box<dyn Iterator<Item = &'_ N>> = match self {
             ResolvedSelectColumns::None => Box::new(std::iter::empty()),
-            ResolvedSelectColumns::All(cols) => {
-                Box::new(cols.iter().flat_map(|col| col.nodes()))
-            }
+            ResolvedSelectColumns::All(cols) => Box::new(cols.iter().flat_map(|col| col.nodes())),
             ResolvedSelectColumns::Columns(cols) => {
                 Box::new(cols.iter().flat_map(|col| col.nodes()))
             }
@@ -1786,10 +1784,7 @@ mod tests {
         resolved.deparse(&mut buf);
 
         // SELECT * is preserved, table and column references are fully qualified
-        assert_eq!(
-            buf,
-            "SELECT * FROM public.users WHERE public.users.id = 1"
-        );
+        assert_eq!(buf, "SELECT * FROM public.users WHERE public.users.id = 1");
     }
 
     #[test]

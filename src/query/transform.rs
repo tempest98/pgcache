@@ -436,7 +436,12 @@ pub fn resolved_table_replace_with_values(
     };
 
     // Update all column references for this table to use the alias
-    resolved_column_alias_update(&mut resolved_new, &table_metadata.schema, &table_metadata.name, &alias);
+    resolved_column_alias_update(
+        &mut resolved_new,
+        &table_metadata.schema,
+        &table_metadata.name,
+        &alias,
+    );
 
     // Now replace the table source with a VALUES subquery
     let Some(first_from) = resolved_new.from.first_mut() else {
