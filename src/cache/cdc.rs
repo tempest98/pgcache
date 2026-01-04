@@ -27,7 +27,8 @@ use tracing::{debug, error};
 
 use crate::{
     catalog::{ColumnMetadata, TableMetadata},
-    settings::Settings,
+    settings::{Settings, SslMode},
+    tls,
 };
 
 use super::{
@@ -58,21 +59,37 @@ impl CdcProcessor {
         settings: &Settings,
         cdc_tx: UnboundedSender<CdcMessage>,
     ) -> Result<Self, CacheError> {
-        let (origin_cdc_client, origin_cdc_connection) = Config::new()
+        // Origin CDC connection with optional TLS
+        let origin_config = Config::new()
             .host(&settings.origin.host)
             .port(settings.origin.port)
             .user(&settings.origin.user)
             .dbname(&settings.origin.database)
             .replication_mode(ReplicationMode::Logical)
-            .connect(NoTls)
-            .await?;
+            .clone();
 
-        //task to process connection to cache pg db
-        tokio::spawn(async move {
-            if let Err(e) = origin_cdc_connection.await {
-                error!("connection error: {e}");
+        // Connect to origin with appropriate TLS mode and spawn connection task
+        let origin_cdc_client = match settings.origin.ssl_mode {
+            SslMode::Disable => {
+                let (client, connection) = origin_config.connect(NoTls).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        error!("CDC origin connection error: {e}");
+                    }
+                });
+                client
             }
-        });
+            SslMode::Require => {
+                let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
+                let (client, connection) = origin_config.connect(tls_connector).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        error!("CDC origin connection error: {e}");
+                    }
+                });
+                client
+            }
+        };
 
         // Create keep-alive timer with 30-second interval (hardcoded for POC)
         let mut timer = interval(Duration::from_secs(30));

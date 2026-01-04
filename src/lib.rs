@@ -6,4 +6,5 @@ pub mod proxy;
 pub mod query;
 pub mod settings;
 pub mod stream_utils;
+pub mod tls;
 pub mod tracing_utils;

@@ -1,7 +1,11 @@
+mod client_stream;
 mod connection;
 mod query;
 pub mod search_path;
 mod server;
+mod tls_stream;
+
+pub use client_stream::{ClientSocket, ClientSocketSource};
 
 use std::io;
 
@@ -19,6 +23,7 @@ error_set! {
 
     FdError := {
         NixError(Errno),
+        FdIoError(io::Error),
     }
 
     ReadError := {
@@ -32,6 +37,7 @@ error_set! {
 
     ConnectError := {
         NoConnection,
+        TlsError(io::Error),
     }
 
     DegradedModeExit := {
@@ -41,6 +47,13 @@ error_set! {
     ParseError := {
         InvalidUtf8,
         Parse(pg_query::Error)
+    }
+}
+
+// Manual From<io::Error> impl for ConnectionError since error_set doesn't do transitive conversions
+impl From<io::Error> for ConnectionError {
+    fn from(e: io::Error) -> Self {
+        ConnectionError::FdIoError(e)
     }
 }
 

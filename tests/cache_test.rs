@@ -3,7 +3,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_row_at, connect_cache_db, wait_cache_load, wait_for_cdc};
+use crate::util::{
+    TestContext, assert_row_at, connect_cache_db, connect_pgcache_tls, start_databases,
+    wait_cache_load, wait_for_cdc,
+};
 
 mod util;
 
@@ -151,7 +154,6 @@ async fn test_cache_join() -> Result<(), Error> {
 
     // Query after CDC should still return correct results
     let res = ctx.simple_query(query_str).await?;
-    dbg!(&res);
     assert_eq!(res.len(), 5);
     assert_row_at(
         &res,
@@ -339,6 +341,69 @@ async fn test_cache_index_creation() -> Result<(), Error> {
         .iter()
         .find(|i| i.1 == "hash" && i.2 == vec!["email"]);
     assert!(hash_idx.is_some(), "Missing hash index on (email)");
+
+    Ok(())
+}
+
+/// Test that client TLS connections work correctly with caching
+#[tokio::test]
+async fn test_client_tls() -> Result<(), Error> {
+    use crate::util::proxy_metrics_get;
+
+    let (dbs, _origin) = start_databases().await?;
+
+    // Connect to pgcache with TLS
+    let (mut pgcache, _port, client) = connect_pgcache_tls(&dbs).await?;
+
+    // Create a table
+    client
+        .execute(
+            "CREATE TABLE tls_test (id INTEGER PRIMARY KEY, data TEXT)",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    // Insert some data
+    client
+        .execute(
+            "INSERT INTO tls_test (id, data) VALUES (1, 'encrypted')",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    // First query - should be a cache miss
+    let rows = client
+        .query("SELECT id, data FROM tls_test WHERE id = $1", &[&1i32])
+        .await
+        .map_err(Error::other)?;
+
+    assert_eq!(rows.len(), 1);
+    let id: i32 = rows[0].get("id");
+    let data: &str = rows[0].get("data");
+    assert_eq!(id, 1);
+    assert_eq!(data, "encrypted");
+
+    // Wait for cache to load
+    wait_cache_load().await;
+
+    // Second query - should be a cache hit
+    let rows = client
+        .query("SELECT id, data FROM tls_test WHERE id = $1", &[&1i32])
+        .await
+        .map_err(Error::other)?;
+
+    assert_eq!(rows.len(), 1);
+    let id: i32 = rows[0].get("id");
+    let data: &str = rows[0].get("data");
+    assert_eq!(id, 1);
+    assert_eq!(data, "encrypted");
+
+    // Verify metrics show 1 cache hit
+    let metrics = proxy_metrics_get(&mut pgcache)?;
+    assert_eq!(metrics.queries_cache_hit, 1, "Expected 1 cache hit");
+    assert_eq!(metrics.queries_cache_miss, 1, "Expected 1 cache miss");
 
     Ok(())
 }

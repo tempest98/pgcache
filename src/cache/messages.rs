@@ -1,9 +1,9 @@
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_util::bytes::BytesMut;
 
 use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
+use crate::proxy::ClientSocket;
 
 /// Converted query data ready for processing
 pub struct QueryData {
@@ -104,8 +104,13 @@ pub enum DataStreamState {
 /// Reply messages sent from cache back to proxy
 #[derive(Debug)]
 pub enum CacheReply {
+    /// Data chunk to write to client (cache worker sends multiple of these)
+    Data(BytesMut),
+    /// Query completed successfully (final message after all Data chunks)
     Complete(BytesMut),
+    /// Query should be forwarded to origin (cache miss or not cacheable)
     Forward(BytesMut),
+    /// Query execution failed
     Error(BytesMut),
 }
 
@@ -131,7 +136,8 @@ pub(crate) enum CdcMessage {
 /// Message from proxy containing query and connection details
 pub struct ProxyMessage {
     pub message: CacheMessage,
-    pub client_socket: TcpStream,
+    /// Socket for sending response data directly to the client
+    pub client_socket: ClientSocket,
     pub reply_tx: Sender<CacheReply>,
     /// Resolved search_path for this connection (with $user expanded to session_user)
     pub search_path: Vec<String>,

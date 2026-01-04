@@ -4,15 +4,29 @@ use std::{
     io::{Error, Read, Write, stdout},
     net::TcpListener,
     ops::{Deref, DerefMut},
+    path::Path,
     process::{Child, Command, Stdio},
+    sync::Once,
     time::Duration,
 };
+
+static CRYPTO_INIT: Once = Once::new();
+
+/// Initialize the rustls crypto provider (required before using TLS)
+fn crypto_provider_init() {
+    CRYPTO_INIT.call_once(|| {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("install crypto provider");
+    });
+}
 
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
 };
 use pgcache_lib::metrics::MetricsSnapshot;
+use pgcache_lib::tls::{MakeRustlsConnect, tls_config_with_cert};
 use pgtemp::{PgTempDB, PgTempDBBuilder};
 use postgres_types::ToSql;
 use regex_lite::Regex;
@@ -372,6 +386,73 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Clie
         .user("postgres")
         .dbname("origin_test")
         .connect(NoTls)
+        .await
+        .map_err(Error::other)?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+
+    Ok((pgcache, listen_port, client))
+}
+
+/// Connect to pgcache with TLS enabled on the proxy
+pub async fn connect_pgcache_tls(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Client), Error> {
+    // Initialize crypto provider (required for rustls)
+    crypto_provider_init();
+
+    // Find a random available port
+    let listen_port = find_available_port()?;
+    let listen_socket = format!("127.0.0.1:{}", listen_port);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pgcache"))
+        .arg("--config")
+        .arg("tests/data/default_config.toml")
+        .arg("--origin_host")
+        .arg("127.0.0.1")
+        .arg("--origin_port")
+        .arg(dbs.origin.db_port().to_string())
+        .arg("--origin_user")
+        .arg(dbs.origin.db_user())
+        .arg("--origin_database")
+        .arg(dbs.origin.db_name())
+        .arg("--cache_host")
+        .arg("127.0.0.1")
+        .arg("--cache_port")
+        .arg(dbs.cache.db_port().to_string())
+        .arg("--cache_user")
+        .arg(dbs.cache.db_user())
+        .arg("--cache_database")
+        .arg(dbs.cache.db_name())
+        .arg("--listen_socket")
+        .arg(&listen_socket)
+        .arg("--tls_cert")
+        .arg("tests/data/certs/server.crt")
+        .arg("--tls_key")
+        .arg("tests/data/certs/server.key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("run pgcache");
+
+    let mut pgcache = PgCacheProcess::new(child);
+
+    //wait to listening message from proxy before proceeding
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+
+    // Connect using TLS, trusting our self-signed certificate
+    let cert_path = Path::new("tests/data/certs/server.crt");
+    let tls_config = tls_config_with_cert(cert_path)?;
+    let tls = MakeRustlsConnect::new(tls_config);
+
+    let (client, connection) = Config::new()
+        .host("localhost")
+        .port(listen_port)
+        .user("postgres")
+        .dbname("origin_test")
+        .connect(tls)
         .await
         .map_err(Error::other)?;
 

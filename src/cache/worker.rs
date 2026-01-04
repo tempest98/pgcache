@@ -115,9 +115,9 @@ impl CacheWorker {
                 error!("no client");
                 return Err(CacheError::Write);
             }
+            // Buffer is guaranteed to be clear if there was no error
         }
 
-        buf.clear();
         for query_msg in data_rows {
             let SimpleQueryMessage::Row(row) = query_msg else {
                 return Err(CacheError::InvalidMessage);
@@ -132,18 +132,16 @@ impl CacheWorker {
             buf.put_u16(field_count);
             buf.put_slice(raw_data);
 
-            //send data if more than 64kB have been accumulated
+            // Send data if more than 64kB have been accumulated
             if buf.len() > BUFFER_SIZE_THRESHOLD
                 && msg.client_socket.write_all_buf(&mut buf).await.is_err()
             {
-                // trace!("(w) client write data");
-
                 error!("no client");
                 return Err(CacheError::Write);
             }
         }
         // trace!("(w) client write data");
-        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+        if !buf.is_empty() && msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
             return Err(CacheError::Write);
         }
@@ -189,17 +187,16 @@ impl CacheWorker {
             buf.put_slice(raw_data);
 
             //send data if more than 64kB have been accumulated
-            if buf.len() > BUFFER_SIZE_THRESHOLD
-                && msg.client_socket.write_all_buf(&mut buf).await.is_err()
-            {
-                // trace!("(w) client write data");
-
-                error!("no client");
-                return Err(CacheError::Write);
+            if buf.len() > BUFFER_SIZE_THRESHOLD {
+                if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+                    error!("no client");
+                    return Err(CacheError::Write);
+                }
+                buf.clear();
             }
         }
         // trace!("(w) client write data [{:?}]", buf);
-        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+        if !buf.is_empty() && msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
             return Err(CacheError::Write);
         }

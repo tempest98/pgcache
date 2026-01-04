@@ -11,6 +11,7 @@ use crate::{
     cache::{CacheError, ProxyMessage, cache_run},
     metrics::Metrics,
     settings::Settings,
+    tls,
 };
 
 use super::{ConnectionError, connection_run};
@@ -34,11 +35,14 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     cache_tx: SenderCacheType,
     metrics: Arc<Metrics>,
+    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<Worker<'scope>, ConnectionError> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
-        .spawn_scoped(scope, || connection_run(settings, rx, cache_tx, metrics))?;
+        .spawn_scoped(scope, || {
+            connection_run(settings, rx, cache_tx, metrics, tls_acceptor)
+        })?;
 
     Ok((join, tx))
 }
@@ -50,6 +54,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     cache_tx: SenderCacheType,
     metrics: Arc<Metrics>,
+    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<WorkerStatus, ConnectionError> {
     let Some(worker) = workers.get_mut(worker_index) else {
         return Err(ConnectionError::IoError(std::io::Error::other(
@@ -58,7 +63,14 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     };
 
     if worker.0.is_finished() {
-        let new_worker = worker_create(worker_index, scope, settings, cache_tx, metrics)?;
+        let new_worker = worker_create(
+            worker_index,
+            scope,
+            settings,
+            cache_tx,
+            metrics,
+            tls_acceptor,
+        )?;
         let old_worker = mem::replace(worker, new_worker);
         match old_worker.0.join() {
             Ok(Err(ConnectionError::CacheDead)) => Ok(WorkerStatus::CacheDead),
@@ -91,11 +103,45 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
 #[tracing::instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), ConnectionError> {
+    // Load TLS config if certificates are provided
+    let tls_acceptor = match (&settings.tls_cert, &settings.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            debug!(
+                "Loading TLS certificates from {:?} and {:?}",
+                cert_path, key_path
+            );
+            let config = tls::server_tls_config_build(cert_path, key_path).map_err(|e| {
+                ConnectionError::IoError(std::io::Error::other(format!(
+                    "Failed to load TLS certificates: {e}"
+                )))
+            })?;
+            Some(Arc::new(tls::TlsAcceptor::from(config)))
+        }
+        (None, None) => {
+            debug!("TLS not configured, accepting plaintext connections only");
+            None
+        }
+        _ => {
+            return Err(ConnectionError::IoError(std::io::Error::other(
+                "Both tls_cert and tls_key must be specified together",
+            )));
+        }
+    };
+
     thread::scope(|scope| {
         let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
 
         let mut workers: Vec<_> = (0..settings.num_workers)
-            .map(|i| worker_create(i, scope, settings, cache_tx.clone(), Arc::clone(&metrics)))
+            .map(|i| {
+                worker_create(
+                    i,
+                    scope,
+                    settings,
+                    cache_tx.clone(),
+                    Arc::clone(&metrics),
+                    tls_acceptor.clone(),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let rt = Builder::new_current_thread().enable_all().build()?;
@@ -127,6 +173,7 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
                     settings,
                     cache_tx.clone(),
                     Arc::clone(&metrics),
+                    tls_acceptor.clone(),
                 )?;
 
                 if matches!(status, WorkerStatus::CacheDead) {

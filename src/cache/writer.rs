@@ -19,7 +19,8 @@ use crate::query::resolved::{
     select_statement_resolve,
 };
 use crate::query::transform::{query_table_update_queries, resolved_table_replace_with_values};
-use crate::settings::Settings;
+use crate::settings::{Settings, SslMode};
+use crate::tls;
 
 use super::{
     CacheError,
@@ -63,23 +64,40 @@ impl CacheWriter {
             .connect(NoTls)
             .await?;
 
-        let (origin_client, origin_connection) = Config::new()
+        // Origin connection with optional TLS
+        let origin_config = Config::new()
             .host(&settings.origin.host)
             .port(settings.origin.port)
             .user(&settings.origin.user)
             .dbname(&settings.origin.database)
-            .connect(NoTls)
-            .await?;
+            .clone();
+
+        // Connect to origin with appropriate TLS mode and spawn connection task
+        let origin_client = match settings.origin.ssl_mode {
+            SslMode::Disable => {
+                let (client, connection) = origin_config.connect(NoTls).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        error!("writer origin connection error: {e}");
+                    }
+                });
+                client
+            }
+            SslMode::Require => {
+                let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
+                let (client, connection) = origin_config.connect(tls_connector).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        error!("writer origin connection error: {e}");
+                    }
+                });
+                client
+            }
+        };
 
         tokio::spawn(async move {
             if let Err(e) = cache_connection.await {
                 error!("writer cache connection error: {e}");
-            }
-        });
-
-        tokio::spawn(async move {
-            if let Err(e) = origin_connection.await {
-                error!("writer origin connection error: {e}");
             }
         });
 

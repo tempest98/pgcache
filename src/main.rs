@@ -14,6 +14,11 @@ use tokio::io;
 use tracing::{Level, info};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Install rustls crypto provider for TLS support
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("install crypto provider");
+
     #[cfg(feature = "hotpath")]
     let _guard = hotpath::GuardBuilder::new("pgcache")
         .percentiles(&[50, 95, 99])

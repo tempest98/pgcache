@@ -1,6 +1,5 @@
 use std::sync::{Arc, RwLock};
 
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio_util::bytes::BytesMut;
 use tracing::{error, instrument, trace};
@@ -15,6 +14,7 @@ use super::{
     query::CacheableQuery,
     types::{CacheStateView, CachedQueryState},
 };
+use crate::proxy::ClientSocket;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryType {
@@ -22,13 +22,12 @@ pub enum QueryType {
     Extended,
 }
 
-#[derive(Debug)]
 pub struct QueryRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
     pub cacheable_query: Box<CacheableQuery>,
     pub result_formats: Vec<i16>,
-    pub client_socket: TcpStream,
+    pub client_socket: ClientSocket,
     pub reply_tx: Sender<CacheReply>,
     /// Resolved search_path for schema resolution
     pub search_path: Vec<String>,
@@ -36,7 +35,6 @@ pub struct QueryRequest {
 
 /// Request sent to cache worker for executing cached queries.
 /// Contains the resolved AST with schema-qualified table names.
-#[derive(Debug)]
 pub struct WorkerRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
@@ -44,7 +42,7 @@ pub struct WorkerRequest {
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
     pub result_formats: Vec<i16>,
-    pub client_socket: TcpStream,
+    pub client_socket: ClientSocket,
     pub reply_tx: Sender<CacheReply>,
 }
 

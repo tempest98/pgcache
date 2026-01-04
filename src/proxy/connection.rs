@@ -2,18 +2,12 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, Error},
     net::SocketAddr,
-    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     sync::Arc,
 };
-
-use nix::unistd::dup;
 use tokio::{
     io::AsyncWriteExt,
-    net::{
-        TcpStream, lookup_host,
-        tcp::{ReadHalf, WriteHalf},
-    },
+    net::{TcpStream, lookup_host},
     runtime::Builder,
     select,
     sync::mpsc::{Sender, UnboundedReceiver, channel},
@@ -45,13 +39,41 @@ use crate::{
         },
     },
     settings::Settings,
+    settings::SslMode,
+    tls::{self},
 };
 
+use super::client_stream::{ClientReadHalf, ClientSocketSource, ClientStream, ClientWriteHalf};
 use super::query::{Action, ForwardReason, handle_query};
 use super::search_path::SearchPath;
+use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{ConnectionError, ProxyMode, ProxyStatus, ReadError};
 
 type SenderCacheType = Sender<ProxyMessage>;
+
+// ============================================================================
+// OriginStream - type aliases using generic TLS stream types
+// ============================================================================
+
+/// Origin database connection stream, either plain TCP or TLS-encrypted.
+pub type OriginStream = TlsStream<rustls::ClientConnection>;
+
+/// Borrowed read half of an OriginStream.
+pub type OriginReadHalf<'a> = TlsReadHalf<'a, rustls::ClientConnection>;
+
+/// Borrowed write half of an OriginStream.
+pub type OriginWriteHalf<'a> = TlsWriteHalf<'a, rustls::ClientConnection>;
+
+/// Create an OriginStream from a tokio-rustls TlsStream.
+///
+/// Decomposes the TlsStream to allow borrowed splits with `.writable()`.
+fn origin_stream_from_tls(tls_stream: tokio_rustls::client::TlsStream<TcpStream>) -> OriginStream {
+    let (tcp, client_connection) = tls_stream.into_inner();
+    TlsStream::Tls {
+        tcp,
+        tls_state: Arc::new(std::sync::Mutex::new(client_connection)),
+    }
+}
 
 /// Manages state for a single client connection.
 /// Encapsulates transaction state, query fingerprint cache, and protocol state.
@@ -74,8 +96,10 @@ pub(super) struct ConnectionState {
     /// Proxy status (normal or degraded if cache is unavailable)
     proxy_status: ProxyStatus,
 
-    /// Duplicated client socket file descriptor for cache worker
-    client_fd_dup: OwnedFd,
+    /// Source for creating ClientSocket instances for cache queries.
+    /// The connection handler writes directly to the client stream, but when
+    /// sending queries to the cache, we create a ClientSocket from this source.
+    client_socket_source: ClientSocketSource,
 
     /// Extended protocol: prepared statements by name
     prepared_statements: HashMap<String, PreparedStatement>,
@@ -104,7 +128,7 @@ pub(super) struct ConnectionState {
 }
 
 impl ConnectionState {
-    fn new(client_fd_dup: OwnedFd, metrics: Arc<Metrics>) -> Self {
+    fn new(client_socket_source: ClientSocketSource, metrics: Arc<Metrics>) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
             client_write_buf: VecDeque::new(),
@@ -112,7 +136,7 @@ impl ConnectionState {
             in_transaction: false,
             proxy_mode: ProxyMode::Read,
             proxy_status: ProxyStatus::Normal,
-            client_fd_dup,
+            client_socket_source,
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
             pending_describe_statement: None,
@@ -190,6 +214,13 @@ impl ConnectionState {
             PgFrontendMessageType::Startup => {
                 self.session_user = startup_message_parameter(&msg.data, "user").map(String::from);
                 self.origin_write_buf.push_back(msg.data);
+            }
+            PgFrontendMessageType::SslRequest => {
+                // SSLRequest should be handled during connection setup before framing begins.
+                // If we receive it here, something unexpected happened - log a warning.
+                // Respond with 'N' to allow the connection to continue.
+                debug!("unexpected SslRequest after TLS negotiation phase, responding 'N'");
+                self.client_write_buf.push_back(BytesMut::from(&[b'N'][..]));
             }
             _ => {
                 // All other message types - forward to origin
@@ -283,6 +314,11 @@ impl ConnectionState {
     /// If cache indicates error or needs forwarding, send query to origin instead.
     fn handle_cache_reply(&mut self, reply: CacheReply) {
         match reply {
+            CacheReply::Data(_) => {
+                // Data chunks are written directly to the client by the cache worker
+                // via CacheClientWriter, so this should not happen through the channel.
+                // No action needed - just wait for Complete.
+            }
             CacheReply::Complete(_) => {
                 self.metrics.cache_hit_increment();
                 self.proxy_mode = ProxyMode::Read;
@@ -490,12 +526,12 @@ impl ConnectionState {
         clippy::indexing_slicing,
         reason = "VecDeque access guarded by !is_empty()"
     )]
-    async fn connection_select(
+    async fn connection_select<'a, 'b>(
         &mut self,
-        origin_read: &mut Pin<&mut FramedOrigin<'_>>,
-        client_read: &mut Pin<&mut FramedClient<'_>>,
-        origin_write: &mut Pin<&mut WriteHalf<'_>>,
-        client_write: &mut Pin<&mut WriteHalf<'_>>,
+        origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
+        client_read: &mut Pin<&mut FramedRead<ClientReadHalf<'a>, PgFrontendMessageCodec>>,
+        origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
+        client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
     ) -> Result<(), ConnectionError> {
         select! {
             Some(res) = client_read.next() => {
@@ -515,19 +551,21 @@ impl ConnectionState {
                         self.handle_origin_message(msg);
                     }
                     Err(err) => {
-                        debug!("read error [{}]", err);
+                        debug!("read error from origin [{}]", err);
                         return Err(ConnectionError::ProtocolError(err));
                     }
                 }
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
-                origin_write.write_buf(&mut self.origin_write_buf[0]).await?;
+                origin_write.write_buf(&mut self.origin_write_buf[0]).await
+                    .map_err(ReadError::IoError)?;
                 if !self.origin_write_buf[0].has_remaining() {
                     self.origin_write_buf.pop_front();
                 }
             }
             _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
-                client_write.write_buf(&mut self.client_write_buf[0]).await?;
+                client_write.write_buf(&mut self.client_write_buf[0]).await
+                    .map_err(ReadError::IoError)?;
                 if !self.client_write_buf[0].has_remaining() {
                     self.client_write_buf.pop_front();
                 }
@@ -541,11 +579,11 @@ impl ConnectionState {
         clippy::indexing_slicing,
         reason = "VecDeque access guarded by !is_empty()"
     )]
-    async fn connection_select_with_cache(
+    async fn connection_select_with_cache<'a, 'b>(
         &mut self,
-        origin_read: &mut Pin<&mut FramedOrigin<'_>>,
-        origin_write: &mut Pin<&mut WriteHalf<'_>>,
-        client_write: &mut Pin<&mut WriteHalf<'_>>,
+        origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
+        origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
+        client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
     ) -> Result<(), ConnectionError> {
         // Extract cache_rx from self.proxy_mode
         let ProxyMode::CacheRead(ref mut cache_rx) = self.proxy_mode else {
@@ -572,13 +610,15 @@ impl ConnectionState {
                 self.handle_cache_reply(reply);
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
-                origin_write.write_buf(&mut self.origin_write_buf[0]).await?;
+                origin_write.write_buf(&mut self.origin_write_buf[0]).await
+                    .map_err(ReadError::IoError)?;
                 if !self.origin_write_buf[0].has_remaining() {
                     self.origin_write_buf.pop_front();
                 }
             }
             _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
-                client_write.write_buf(&mut self.client_write_buf[0]).await?;
+                client_write.write_buf(&mut self.client_write_buf[0]).await
+                    .map_err(ReadError::IoError)?;
                 if !self.client_write_buf[0].has_remaining() {
                     self.client_write_buf.pop_front();
                 }
@@ -591,75 +631,57 @@ impl ConnectionState {
 
 /// Connect to the origin database server.
 /// Tries each address in sequence until one succeeds.
-async fn origin_connect(addrs: &[SocketAddr]) -> Result<TcpStream, ConnectionError> {
+/// If ssl_mode is Require, performs PostgreSQL SSL negotiation and TLS handshake.
+async fn origin_connect(
+    addrs: &[SocketAddr],
+    ssl_mode: SslMode,
+    server_name: &str,
+) -> Result<OriginStream, ConnectionError> {
     for addr in addrs {
         if let Ok(stream) = TcpStream::connect(addr).await {
-            return Ok(stream);
+            return match ssl_mode {
+                SslMode::Disable => Ok(TlsStream::plain(stream)),
+                SslMode::Require => {
+                    let tls_stream = tls::pg_tls_connect(stream, server_name)
+                        .await
+                        .map_err(|e| ConnectionError::TlsError(io::Error::other(e)))?;
+                    Ok(origin_stream_from_tls(tls_stream))
+                }
+            };
         }
     }
     Err(ConnectionError::NoConnection)
 }
 
-type FramedOrigin<'a> = FramedRead<ReadHalf<'a>, PgBackendMessageCodec>;
-type FramedClient<'a> = FramedRead<ReadHalf<'a>, PgFrontendMessageCodec>;
-
-/// Set up the streams for client and origin.
-fn streams_setup<'a>(
-    client_stream: &'a mut TcpStream,
-    origin_stream: &'a mut TcpStream,
-) -> (
-    FramedOrigin<'a>,
-    FramedClient<'a>,
-    WriteHalf<'a>,
-    WriteHalf<'a>,
-) {
-    let (client_read, client_write) = client_stream.split();
-    let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
-
-    let (origin_read, origin_write) = origin_stream.split();
-    let origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
-
-    (
-        origin_framed_read,
-        client_framed_read,
-        origin_write,
-        client_write,
-    )
-}
-
-// SAFETY: fd has to refer to a valid TcpStream
-unsafe fn fd_dup_to_stream(fd: OwnedFd) -> Result<TcpStream, ConnectionError> {
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd.into_raw_fd()) };
-    std_stream.set_nonblocking(true)?;
-    let rv = TcpStream::from_std(std_stream)?;
-    Ok(rv)
-}
-
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_connection(
-    client_stream: &mut TcpStream,
+    mut client_stream: ClientStream,
     addrs: Vec<SocketAddr>,
+    ssl_mode: SslMode,
+    server_name: &str,
     cache_tx: SenderCacheType,
     metrics: Arc<Metrics>,
 ) -> Result<(), ConnectionError> {
-    // Connect to origin database
-    let mut origin_stream = origin_connect(&addrs).await?;
+    // Create ClientSocketSource BEFORE splitting (captures raw fd and TLS state)
+    let client_socket_source = client_stream.socket_source_create();
 
-    // Configure TCP settings
-    let _ = client_stream.set_nodelay(true);
-    let _ = origin_stream.set_nodelay(true);
+    // Connect to origin database (with TLS if required)
+    let mut origin_stream = origin_connect(&addrs, ssl_mode, server_name).await?;
 
-    // Initialize connection state
-    let client_fd_dup = dup(&client_stream)?;
-    let mut state = ConnectionState::new(client_fd_dup, metrics);
+    // Split origin stream (borrowed halves with .writable() support)
+    let (origin_read, origin_write) = origin_stream.split();
+    let origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
 
-    // Set up streams
-    let (origin_read, client_read, origin_write, client_write) =
-        streams_setup(client_stream, &mut origin_stream);
+    // Split client stream in place (borrowed halves with .writable() support)
+    let (client_read, client_write) = client_stream.split();
+    let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
 
-    tokio::pin!(origin_read);
-    tokio::pin!(client_read);
+    // Initialize connection state with socket source
+    let mut state = ConnectionState::new(client_socket_source, metrics);
+
+    tokio::pin!(origin_framed_read);
+    tokio::pin!(client_framed_read);
     tokio::pin!(origin_write);
     tokio::pin!(client_write);
 
@@ -668,8 +690,8 @@ async fn handle_connection(
             ProxyMode::Read => {
                 if let Err(err) = state
                     .connection_select(
-                        &mut origin_read,
-                        &mut client_read,
+                        &mut origin_framed_read,
+                        &mut client_framed_read,
                         &mut origin_write,
                         &mut client_write,
                     )
@@ -682,7 +704,7 @@ async fn handle_connection(
             ProxyMode::CacheRead(_) => {
                 if let Err(err) = state
                     .connection_select_with_cache(
-                        &mut origin_read,
+                        &mut origin_framed_read,
                         &mut origin_write,
                         &mut client_write,
                     )
@@ -720,16 +742,25 @@ async fn handle_connection(
                     state.origin_write_buf.push_back(data);
                 }
 
-                let (reply_tx, reply_rx) = channel(10);
-
-                let client_socket_dup = unsafe {
-                    // SAFETY: client_fd_dup is created from a valid TcpStream
-                    fd_dup_to_stream(state.client_fd_dup.try_clone()?)?
+                // Create ClientSocket for this query (dupes the fd)
+                let client_socket = match state.client_socket_source.socket_create() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to create client socket: {}", e);
+                        state.origin_write_buf.push_back(match msg {
+                            CacheMessage::Query(data, _) => data,
+                            CacheMessage::QueryParameterized(data, _, _, _) => data,
+                        });
+                        state.proxy_mode = ProxyMode::Read;
+                        continue;
+                    }
                 };
+
+                let (reply_tx, reply_rx) = channel(10);
 
                 let proxy_msg = ProxyMessage {
                     message: msg,
-                    client_socket: client_socket_dup,
+                    client_socket,
                     reply_tx,
                     search_path: resolved_search_path,
                 };
@@ -768,8 +799,13 @@ pub fn connection_run(
     mut rx: UnboundedReceiver<TcpStream>,
     cache_tx: SenderCacheType,
     metrics: Arc<Metrics>,
+    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<(), ConnectionError> {
     let rt = Builder::new_current_thread().enable_all().build()?;
+
+    // Extract TLS settings for the connection loop
+    let ssl_mode = settings.origin.ssl_mode;
+    let server_name = settings.origin.host.clone();
 
     debug!("handle connection start");
     rt.block_on(async {
@@ -780,13 +816,43 @@ pub fn connection_run(
 
         LocalSet::new()
             .run_until(async {
-                while let Some(mut socket) = rx.recv().await {
+                while let Some(socket) = rx.recv().await {
                     let addrs = addrs.clone();
+                    let server_name = server_name.clone();
                     let cache_tx = cache_tx.clone();
                     let metrics = Arc::clone(&metrics);
+                    let tls_acceptor = tls_acceptor.clone();
                     spawn_local(async move {
                         debug!("task spawn");
-                        match handle_connection(&mut socket, addrs, cache_tx, metrics).await {
+
+                        // Negotiate client TLS if configured
+                        let client_stream = match tls::client_tls_negotiate(
+                            socket,
+                            tls_acceptor.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(tls::ClientTlsResult::Tls {
+                                tcp_stream,
+                                tls_state,
+                            }) => ClientStream::tls(tcp_stream, tls_state),
+                            Ok(tls::ClientTlsResult::Plain(stream)) => ClientStream::plain(stream),
+                            Err(e) => {
+                                error!("TLS negotiation failed: {}", e);
+                                return Ok(());
+                            }
+                        };
+
+                        match handle_connection(
+                            client_stream,
+                            addrs,
+                            ssl_mode,
+                            &server_name,
+                            cache_tx,
+                            metrics,
+                        )
+                        .await
+                        {
                             Err(ConnectionError::CacheDead) => {
                                 debug!("connection closed in degraded mode");
                                 return Err(Error::other("cache dead"));
