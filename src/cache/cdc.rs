@@ -60,17 +60,23 @@ impl CdcProcessor {
         cdc_tx: UnboundedSender<CdcMessage>,
     ) -> Result<Self, CacheError> {
         // Origin CDC connection with optional TLS
-        let origin_config = Config::new()
+        let mut origin_config = Config::new();
+        origin_config
             .host(&settings.origin.host)
             .port(settings.origin.port)
             .user(&settings.origin.user)
             .dbname(&settings.origin.database)
-            .replication_mode(ReplicationMode::Logical)
-            .clone();
+            .replication_mode(ReplicationMode::Logical);
+        if let Some(ref password) = settings.origin.password {
+            origin_config.password(password);
+        }
+
+        debug!("config {:?}", &settings.origin.password);
 
         // Connect to origin with appropriate TLS mode and spawn connection task
         let origin_cdc_client = match settings.origin.ssl_mode {
             SslMode::Disable => {
+                debug!("connecting without ssl");
                 let (client, connection) = origin_config.connect(NoTls).await?;
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
@@ -80,6 +86,7 @@ impl CdcProcessor {
                 client
             }
             SslMode::Require => {
+                debug!("connecting with ssl");
                 let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
                 let (client, connection) = origin_config.connect(tls_connector).await?;
                 tokio::spawn(async move {

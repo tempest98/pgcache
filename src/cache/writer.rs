@@ -65,12 +65,15 @@ impl CacheWriter {
             .await?;
 
         // Origin connection with optional TLS
-        let origin_config = Config::new()
+        let mut origin_config = Config::new();
+        origin_config
             .host(&settings.origin.host)
             .port(settings.origin.port)
             .user(&settings.origin.user)
-            .dbname(&settings.origin.database)
-            .clone();
+            .dbname(&settings.origin.database);
+        if let Some(ref password) = settings.origin.password {
+            origin_config.password(password);
+        }
 
         // Connect to origin with appropriate TLS mode and spawn connection task
         let origin_client = match settings.origin.ssl_mode {

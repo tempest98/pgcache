@@ -74,6 +74,8 @@ pub struct PgSettings {
     pub host: String,
     pub port: u16,
     pub user: String,
+    #[serde(default)]
+    pub password: Option<String>,
     pub database: String,
     #[serde(default)]
     pub ssl_mode: SslMode,
@@ -113,6 +115,7 @@ impl Settings {
         let mut origin_user: Option<String> = None;
         let mut origin_database: Option<String> = None;
         let mut origin_ssl_mode: Option<SslMode> = None;
+        let mut origin_password: Option<String> = None;
         let mut cache_host: Option<String> = None;
         let mut cache_port: Option<u16> = None;
         let mut cache_user: Option<String> = None;
@@ -144,6 +147,7 @@ impl Settings {
                         ConfigError::ArgumentError(e.to_string().into())
                     })?);
                 }
+                Long("origin_password") => origin_password = Some(parser.value()?.string()?),
                 Long("cache_host") => cache_host = Some(parser.value()?.string()?),
                 Long("cache_port") => cache_port = Some(parser.value()?.parse()?),
                 Long("cache_user") => cache_user = Some(parser.value()?.string()?),
@@ -173,6 +177,7 @@ impl Settings {
             config.origin.user = origin_user.unwrap_or(config.origin.user);
             config.origin.database = origin_database.unwrap_or(config.origin.database);
             config.origin.ssl_mode = origin_ssl_mode.unwrap_or(config.origin.ssl_mode);
+            config.origin.password = origin_password.or(config.origin.password);
 
             config.cache.host = cache_host.unwrap_or(config.cache.host);
             config.cache.port = cache_port.unwrap_or(config.cache.port);
@@ -201,6 +206,7 @@ impl Settings {
                     user: origin_user.ok_or_else(|| ConfigError::ArgumentMissing {
                         name: "origin_user",
                     })?,
+                    password: origin_password,
                     database: origin_database.ok_or_else(|| ConfigError::ArgumentMissing {
                         name: "origin_database",
                     })?,
@@ -213,6 +219,7 @@ impl Settings {
                         .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_port" })?,
                     user: cache_user
                         .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_user" })?,
+                    password: None, // Cache is localhost, uses trust auth
                     database: cache_database.ok_or_else(|| ConfigError::ArgumentMissing {
                         name: "cache_database",
                     })?,
@@ -248,7 +255,7 @@ impl Settings {
     fn print_usage_and_exit(name: &str) -> ! {
         println!(
             "Usage: {name} -c|--config TOML_FILE --origin_host HOST --origin_port PORT --origin_user USER --origin_database DB \n \
-            [--origin_ssl_mode disable|require] \n \
+            [--origin_password PASSWORD] [--origin_ssl_mode disable|require] \n \
             --cache_host HOST --cache_port PORT --cache_user USER --cache_database DB \n \
             --cdc_publication_name NAME --cdc_slot_name SLOT_NAME \n \
             --listen_socket IP_AND_PORT \n \
