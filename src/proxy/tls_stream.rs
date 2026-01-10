@@ -43,7 +43,8 @@ pub trait TlsConnectionOps: Send + 'static {
     fn write_tls<W: std::io::Write>(&mut self, wr: &mut W) -> io::Result<usize>;
 
     /// Process received ciphertext into plaintext.
-    fn process_new_packets(&mut self) -> Result<(), rustls::Error>;
+    /// Returns IoState indicating how many bytes are available.
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error>;
 
     /// Queue a TLS close_notify alert.
     fn send_close_notify(&mut self);
@@ -66,8 +67,8 @@ impl TlsConnectionOps for rustls::ServerConnection {
         self.deref_mut().write_tls(wr)
     }
 
-    fn process_new_packets(&mut self) -> Result<(), rustls::Error> {
-        self.deref_mut().process_new_packets().map(|_| ())
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        self.deref_mut().process_new_packets()
     }
 
     fn send_close_notify(&mut self) {
@@ -92,8 +93,8 @@ impl TlsConnectionOps for rustls::ClientConnection {
         self.deref_mut().write_tls(wr)
     }
 
-    fn process_new_packets(&mut self) -> Result<(), rustls::Error> {
-        self.deref_mut().process_new_packets().map(|_| ())
+    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+        self.deref_mut().process_new_packets()
     }
 
     fn send_close_notify(&mut self) {
@@ -184,72 +185,69 @@ impl<T: TlsConnectionOps> AsyncRead for TlsReadHalf<'_, T> {
 }
 
 /// Poll TLS read: read ciphertext from TCP, decrypt, return plaintext.
+///
+/// Uses a loop to handle TLS 1.3 session tickets, which are post-handshake
+/// messages that produce no plaintext when processed. Without the loop,
+/// consuming a session ticket would cause us to return Pending incorrectly.
 fn poll_tls_read<T: TlsConnectionOps>(
     tcp: &mut ReadHalf<'_>,
     tls_state: &SharedTlsState<T>,
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
 ) -> Poll<io::Result<()>> {
-    // First, check if there's already-buffered plaintext from previous reads or handshake
-    {
-        let mut tls = tls_state
-            .lock()
-            .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
-
-        let unfilled = buf.initialize_unfilled();
-        match tls.reader_read(unfilled) {
-            Ok(0) => {} // No buffered plaintext, need to read from TCP
-            Ok(n) => {
-                buf.advance(n);
-                return Poll::Ready(Ok(()));
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {} // No buffered data
-            Err(e) => return Poll::Ready(Err(e)),
-        }
-    }
-
-    // Read ciphertext from TCP
-    let mut tcp_buf = [0u8; 16 * 1024];
-    let mut tcp_read_buf = ReadBuf::new(&mut tcp_buf);
-
-    match Pin::new(tcp).poll_read(cx, &mut tcp_read_buf) {
-        Poll::Ready(Ok(())) => {
-            let n = tcp_read_buf.filled().len();
-            if n == 0 {
-                return Poll::Ready(Ok(()));
-            }
-
-            // Decrypt ciphertext
+    loop {
+        // First, check if there's already-buffered plaintext from previous reads or handshake
+        {
             let mut tls = tls_state
                 .lock()
                 .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
 
-            let ciphertext = tcp_read_buf.filled();
-            let mut cursor = std::io::Cursor::new(ciphertext);
-            match tls.read_tls(&mut cursor) {
-                Ok(0) => return Poll::Ready(Ok(())),
-                Ok(_) => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-
-            if let Err(e) = tls.process_new_packets() {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
-            }
-
-            // Read plaintext directly into the output buffer
             let unfilled = buf.initialize_unfilled();
             match tls.reader_read(unfilled) {
-                Ok(0) => Poll::Pending,
+                Ok(0) => {}
                 Ok(n) => {
                     buf.advance(n);
-                    Poll::Ready(Ok(()))
+                    return Poll::Ready(Ok(()));
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-                Err(e) => Poll::Ready(Err(e)),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
-        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-        Poll::Pending => Poll::Pending,
+
+        // Read ciphertext from TCP
+        let mut tcp_buf = [0u8; 16 * 1024];
+        let mut tcp_read_buf = ReadBuf::new(&mut tcp_buf);
+
+        match Pin::new(&mut *tcp).poll_read(cx, &mut tcp_read_buf) {
+            Poll::Ready(Ok(())) => {
+                let n = tcp_read_buf.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+
+                // Decrypt ciphertext
+                let mut tls = tls_state
+                    .lock()
+                    .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
+
+                let ciphertext = tcp_read_buf.filled();
+                let mut cursor = std::io::Cursor::new(ciphertext);
+                match tls.read_tls(&mut cursor) {
+                    Ok(0) => return Poll::Ready(Ok(())),
+                    Ok(_) => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+
+                if let Err(e) = tls.process_new_packets() {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
+                }
+
+                // Loop back to check for plaintext - if the ciphertext was a session ticket,
+                // we'll have no plaintext and need to read more TCP data
+            }
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
     }
 }
 
@@ -334,14 +332,10 @@ where
             .lock()
             .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
 
-        if let Err(e) = tls.writer_write_all(buf) {
-            return Poll::Ready(Err(e));
-        }
+        tls.writer_write_all(buf)?;
 
         let mut cipher_buf = Vec::new();
-        if let Err(e) = tls.write_tls(&mut cipher_buf) {
-            return Poll::Ready(Err(e));
-        }
+        tls.write_tls(&mut cipher_buf)?;
         cipher_buf
     };
 
