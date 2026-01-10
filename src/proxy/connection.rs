@@ -222,6 +222,13 @@ impl ConnectionState {
                 debug!("unexpected SslRequest after TLS negotiation phase, responding 'N'");
                 self.client_write_buf.push_back(BytesMut::from(&[b'N'][..]));
             }
+            PgFrontendMessageType::PasswordMessageFamily => {
+                // Forward password/SASL messages to origin.
+                // Note: Channel binding cannot be modified in transit because SCRAM includes
+                // the gs2-header in the cryptographic proof. Clients connecting via TLS must
+                // use channel_binding=disable in their connection string.
+                self.origin_write_buf.push_back(msg.data);
+            }
             _ => {
                 // All other message types - forward to origin
                 self.origin_write_buf.push_back(msg.data);
