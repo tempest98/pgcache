@@ -541,25 +541,39 @@ impl ConnectionState {
         client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
     ) -> Result<(), ConnectionError> {
         select! {
-            Some(res) = client_read.next() => {
+            res = client_read.next() => {
                 match res {
-                    Ok(msg) => {
+                    Some(Ok(msg)) => {
                         self.handle_client_message(msg).await;
                     }
-                    Err(err) => {
-                        debug!("read error [{}]", err);
+                    Some(Err(err)) => {
+                        debug!("client read error [{}]", err);
                         return Err(ConnectionError::ProtocolError(err));
+                    }
+                    None => {
+                        debug!("client stream closed");
+                        return Err(ReadError::IoError(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "client disconnected",
+                        )).into());
                     }
                 }
             }
-            Some(res) = origin_read.next() => {
+            res = origin_read.next() => {
                 match res {
-                    Ok(msg) => {
+                    Some(Ok(msg)) => {
                         self.handle_origin_message(msg);
                     }
-                    Err(err) => {
-                        debug!("read error from origin [{}]", err);
+                    Some(Err(err)) => {
+                        debug!("origin read error [{}]", err);
                         return Err(ConnectionError::ProtocolError(err));
+                    }
+                    None => {
+                        debug!("origin stream closed");
+                        return Err(ReadError::IoError(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "origin disconnected",
+                        )).into());
                     }
                 }
             }
@@ -602,19 +616,34 @@ impl ConnectionState {
         };
 
         select! {
-            Some(res) = origin_read.next() => {
+            res = origin_read.next() => {
                 match res {
-                    Ok(msg) => {
+                    Some(Ok(msg)) => {
                         self.handle_origin_message(msg);
                     }
-                    Err(err) => {
-                        debug!("read error [{}]", err);
+                    Some(Err(err)) => {
+                        debug!("origin read error [{}]", err);
                         return Err(ConnectionError::ProtocolError(err));
+                    }
+                    None => {
+                        debug!("origin stream closed");
+                        return Err(ReadError::IoError(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "origin disconnected",
+                        )).into());
                     }
                 }
             }
-            Some(reply) = cache_rx.recv() => {
-                self.handle_cache_reply(reply);
+            reply = cache_rx.recv() => {
+                match reply {
+                    Some(reply) => {
+                        self.handle_cache_reply(reply);
+                    }
+                    None => {
+                        debug!("cache channel closed");
+                        return Err(ConnectionError::CacheDead);
+                    }
+                }
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
                 origin_write.write_buf(&mut self.origin_write_buf[0]).await
