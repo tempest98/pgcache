@@ -1004,16 +1004,21 @@ impl CacheWriter {
         let column_defs: Vec<String> = table_metadata
             .columns
             .iter()
-            .map(|c| format!("    {} {}", c.name, c.type_name))
+            .map(|c| format!("    \"{}\" {}", c.name, c.type_name))
             .collect();
         let column_defs = column_defs.join(",\n");
 
-        let primary_key = table_metadata.primary_key_columns.join(", ");
+        let primary_key = table_metadata
+            .primary_key_columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
-        let drop_sql = format!("DROP TABLE IF EXISTS {schema}.{table}");
+        let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"");
+        let drop_sql = format!("DROP TABLE IF EXISTS \"{schema}\".\"{table}\"");
         let create_sql = format!(
-            "CREATE UNLOGGED TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
+            "CREATE UNLOGGED TABLE \"{schema}\".\"{table}\" (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
         );
 
         self.db_cache.execute(&create_schema_sql, &[]).await?;
@@ -1024,14 +1029,15 @@ impl CacheWriter {
             let unique = if index.is_unique { "UNIQUE " } else { "" };
             let method = &index.method;
             let columns = index.columns.join(", ");
-            let index_sql =
-                format!("CREATE {unique}INDEX ON {schema}.{table} USING {method} ({columns})");
+            let index_sql = format!(
+                "CREATE {unique}INDEX ON \"{schema}\".\"{table}\" USING {method} ({columns})"
+            );
             self.db_cache.execute(&index_sql, &[]).await?;
         }
 
         // Enable generation tracking triggers on the table
         let enable_tracking_sql =
-            format!("SELECT pgcache_enable_tracking('{schema}.{table}'::regclass::oid)");
+            format!("SELECT pgcache_enable_tracking('\"{schema}\".\"{table}\"'::regclass::oid)");
         self.db_cache.execute(&enable_tracking_sql, &[]).await?;
 
         Ok(())
@@ -1338,6 +1344,7 @@ async fn population_task(
 
         // Populate cache
         let bytes = population_insert(db_cache, table, &rows).await?;
+
         total_bytes += bytes;
     }
 
@@ -1394,7 +1401,11 @@ async fn population_insert(
 
     let mut cached_bytes: usize = 0;
 
-    let pkey_columns = &table.primary_key_columns;
+    let pkey_columns = table
+        .primary_key_columns
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>();
     let schema = &table.schema;
     let table_name = &table.name;
 
@@ -1410,7 +1421,10 @@ async fn population_insert(
         .collect();
 
     let mut sql_list = Vec::new();
-    let columns: Vec<&str> = Vec::from_iter(row_description.iter().map(|c| c.name()));
+    let columns: Vec<String> = row_description
+        .iter()
+        .map(|c| format!("\"{}\"", c.name()))
+        .collect();
 
     for row in &rows {
         let mut values: Vec<String> = Vec::new();
@@ -1426,12 +1440,12 @@ async fn population_insert(
 
         let update_columns: Vec<_> = columns
             .iter()
-            .filter(|&&c| !pkey_columns.contains(&c.to_owned()))
-            .map(|&c| format!("{c} = EXCLUDED.{c}"))
+            .filter(|&c| !pkey_columns.contains(&c.to_owned()))
+            .map(|c| format!("{c} = EXCLUDED.{c}"))
             .collect();
 
         let mut insert_table = format!(
-            "insert into {schema}.{table_name}({}) values (",
+            "insert into \"{schema}\".\"{table_name}\"({}) values (",
             columns.join(",")
         );
         insert_table.push_str(&values.join(","));

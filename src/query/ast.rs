@@ -12,6 +12,7 @@ use pg_query::protobuf::{JoinExpr, RangeSubselect, SortByDir};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
+use crate::pg::identifier_needs_quotes;
 use crate::query::parse::{const_value_extract, node_convert_to_expr, select_stmt_parse_where};
 
 use super::parse::WhereParseError;
@@ -37,6 +38,36 @@ error_set! {
 
 pub trait Deparse {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String;
+}
+
+impl Deparse for String {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match identifier_needs_quotes(self) {
+            true => {
+                buf.push('"');
+                buf.push_str(self);
+                buf.push('"');
+            }
+            false => buf.push_str(self),
+        };
+
+        buf
+    }
+}
+
+impl Deparse for &str {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match identifier_needs_quotes(self) {
+            true => {
+                buf.push('"');
+                buf.push_str(self);
+                buf.push('"');
+            }
+            false => buf.push_str(self),
+        };
+
+        buf
+    }
 }
 
 // Core literal value types that can appear in SQL expressions
@@ -145,10 +176,10 @@ impl ColumnNode {
 impl Deparse for ColumnNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         if let Some(table) = &self.table {
-            buf.push_str(table);
+            table.deparse(buf);
             buf.push('.');
         }
-        buf.push_str(&self.column);
+        self.column.deparse(buf);
 
         buf
     }
@@ -711,7 +742,7 @@ impl Deparse for SelectColumn {
         self.expr.deparse(buf);
         if let Some(alias) = &self.alias {
             buf.push_str(" AS ");
-            buf.push_str(alias);
+            alias.deparse(buf);
         }
         buf
     }
@@ -796,10 +827,15 @@ pub struct TableAlias {
 
 impl Deparse for TableAlias {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        buf.push_str(&self.name);
+        self.name.deparse(buf);
         if !self.columns.is_empty() {
             buf.push('(');
-            buf.push_str(&self.columns.join(", "));
+            let mut sep = "";
+            for column in self.columns.iter().map(|c| c.as_str()) {
+                buf.push_str(sep);
+                column.deparse(buf);
+                sep = ", ";
+            }
             buf.push(')');
         }
 
@@ -907,10 +943,12 @@ impl Deparse for TableNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push(' ');
         if let Some(schema) = &self.schema {
-            buf.push_str(schema);
+            schema.deparse(buf);
             buf.push('.');
         }
-        buf.push_str(self.name.as_str());
+
+        self.name.deparse(buf);
+
         if let Some(alias) = &self.alias {
             buf.push(' ');
             alias.deparse(buf);
@@ -1899,6 +1937,46 @@ mod tests {
     }
 
     #[test]
+    fn test_table_node_deparse() {
+        let mut buf = String::new();
+
+        // Simple table
+        TableNode {
+            schema: None,
+            name: "users".to_owned(),
+            alias: None,
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " users");
+        buf.clear();
+
+        // Qualified table with alias
+        TableNode {
+            schema: Some("public".to_owned()),
+            name: "users".to_owned(),
+            alias: Some(TableAlias {
+                name: "alias".to_owned(),
+                columns: vec![],
+            }),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " public.users alias");
+        buf.clear();
+
+        // table requires quoting
+        TableNode {
+            schema: Some("public".to_owned()),
+            name: "userAccount".to_owned(),
+            alias: Some(TableAlias {
+                name: "usrAcc".to_owned(),
+                columns: vec![],
+            }),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " public.\"userAccount\" \"usrAcc\"");
+    }
+
+    #[test]
     fn test_column_ref_deparse() {
         let mut buf = String::new();
 
@@ -1918,6 +1996,15 @@ mod tests {
         }
         .deparse(&mut buf);
         assert_eq!(buf, "users.name");
+        buf.clear();
+
+        // table and column require quoting
+        ColumnNode {
+            table: Some("Users".to_owned()),
+            column: "firstName".to_owned(),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, "\"Users\".\"firstName\"");
     }
 
     #[test]
@@ -1933,12 +2020,10 @@ mod tests {
             alias: Some("alias".to_owned()),
         }
         .deparse(&mut buf);
-
         assert_eq!(buf, " id AS alias");
         buf.clear();
 
         // Qualified column
-
         SelectColumn {
             expr: ColumnExpr::Column(ColumnNode {
                 table: Some("users".to_owned()),
@@ -1948,6 +2033,18 @@ mod tests {
         }
         .deparse(&mut buf);
         assert_eq!(buf, " users.name AS alias");
+        buf.clear();
+
+        // alias requires quoting
+        SelectColumn {
+            expr: ColumnExpr::Column(ColumnNode {
+                table: None,
+                column: "id".to_owned(),
+            }),
+            alias: Some("Alias".to_owned()),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " id AS \"Alias\"");
     }
 
     #[test]

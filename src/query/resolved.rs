@@ -53,12 +53,12 @@ impl ResolvedTableNode {
 impl Deparse for ResolvedTableNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push(' ');
-        buf.push_str(&self.schema);
+        self.schema.deparse(buf);
         buf.push('.');
-        buf.push_str(&self.name);
+        self.name.deparse(buf);
         if let Some(alias) = &self.alias {
             buf.push(' ');
-            buf.push_str(alias);
+            alias.deparse(buf);
         }
         buf
     }
@@ -112,14 +112,14 @@ impl Deparse for ResolvedColumnNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         // Use alias if available, otherwise use schema.table
         if let Some(alias) = &self.table_alias {
-            buf.push_str(alias);
+            alias.deparse(buf);
         } else {
-            buf.push_str(&self.schema);
+            self.schema.deparse(buf);
             buf.push('.');
-            buf.push_str(&self.table);
+            self.table.deparse(buf);
         }
         buf.push('.');
-        buf.push_str(&self.column);
+        self.column.deparse(buf);
         buf
     }
 }
@@ -1739,6 +1739,22 @@ mod tests {
     }
 
     #[test]
+    fn test_resolved_column_node_deparse_quoting() {
+        let mut buf = String::new();
+
+        // Column without alias - should use schema.table
+        ResolvedColumnNode {
+            schema: "Public".to_owned(),
+            table: "Users".to_owned(),
+            table_alias: None,
+            column: "firstName".to_owned(),
+            column_metadata: id_column_metadata(),
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, "\"Public\".\"Users\".\"firstName\"");
+    }
+
+    #[test]
     fn test_resolved_table_node_deparse_with_alias() {
         let mut buf = String::new();
 
@@ -1764,6 +1780,20 @@ mod tests {
         }
         .deparse(&mut buf);
         assert_eq!(buf, " public.users");
+    }
+
+    #[test]
+    fn test_resolved_table_node_deparse_quoting() {
+        let mut buf = String::new();
+
+        ResolvedTableNode {
+            schema: "Public".to_owned(),
+            name: "Users".to_owned(),
+            alias: None,
+            relation_oid: 1001,
+        }
+        .deparse(&mut buf);
+        assert_eq!(buf, " \"Public\".\"Users\"");
     }
 
     #[test]
