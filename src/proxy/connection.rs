@@ -25,8 +25,8 @@ use crate::{
     metrics::Metrics,
     pg::protocol::{
         backend::{
-            PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType, data_row_first_column,
-            parameter_status_parse,
+            AUTHENTICATION_SASL, PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType,
+            authentication_type, data_row_first_column, parameter_status_parse,
         },
         extended::{
             ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, StatementType,
@@ -38,8 +38,7 @@ use crate::{
             simple_query_message_build, startup_message_parameter,
         },
     },
-    settings::Settings,
-    settings::SslMode,
+    settings::{Settings, SslMode},
     tls::{self},
 };
 
@@ -152,7 +151,7 @@ impl ConnectionState {
     /// Determines whether to forward to origin, check cache, or take other action.
     #[expect(clippy::wildcard_enum_match_arm)]
     async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
-        // debug!("client {:?}", &msg);
+        debug!("client {:?}", &msg);
         match msg.message_type {
             PgFrontendMessageType::Query => {
                 self.metrics.query_increment();
@@ -239,7 +238,9 @@ impl ConnectionState {
     /// Handle a message from the origin database (backend).
     /// Updates transaction state, captures parameter OIDs, and forwards to client.
     #[expect(clippy::wildcard_enum_match_arm)]
-    fn handle_origin_message(&mut self, msg: PgBackendMessage) {
+    fn handle_origin_message(&mut self, mut msg: PgBackendMessage) {
+        debug!("origin {:?}", &msg);
+
         // Intercept SHOW search_path response (don't forward to client)
         if self.search_path_query_pending {
             match msg.message_type {
@@ -282,6 +283,27 @@ impl ConnectionState {
                         stmt_name, parsed.parameter_oids
                     );
                     stmt.parameter_oids = parsed.parameter_oids;
+                }
+            }
+            PgBackendMessageType::Authentication => {
+                if authentication_type(&msg.data).is_some_and(|v| v == AUTHENTICATION_SASL) {
+                    // Strip SCRAM-SHA-256-PLUS from SASL authentication options.
+                    // Channel binding cannot be supported because the proxy terminates TLS.
+                    let needle = b"SCRAM-SHA-256-PLUS\0";
+                    if let Some(pos) = msg
+                        .data
+                        .windows(needle.len())
+                        .position(|window| window == needle)
+                    {
+                        // Remove needle in place using split/unsplit
+                        let mut tail = msg.data.split_off(pos);
+                        let after_needle = tail.split_off(needle.len());
+                        msg.data.unsplit(after_needle);
+
+                        // Update the length field (bytes 1-4, big-endian i32, excludes tag byte)
+                        let new_len = (msg.data.len() - 1) as i32;
+                        msg.data[1..5].copy_from_slice(&new_len.to_be_bytes());
+                    }
                 }
             }
             PgBackendMessageType::ReadyForQuery => {

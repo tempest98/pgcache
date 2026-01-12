@@ -100,6 +100,17 @@ const BACKEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgBackendMessageType> = phf_map! {
     b'T' => PgBackendMessageType::RowDescription,
 };
 
+pub const AUTHENTICATION_OK: i32 = 0;
+pub const AUTHENTICATION_KERBEROSV5: i32 = 2;
+pub const AUTHENTICATION_CLEARTEXT_PASSWORD: i32 = 3;
+pub const AUTHENTICATION_MD5_PASSWORD: i32 = 5;
+pub const AUTHENTICATION_GSS: i32 = 7;
+pub const AUTHENTICATION_GSS_CONTINUE: i32 = 8;
+pub const AUTHENTICATION_SSPI: i32 = 9;
+pub const AUTHENTICATION_SASL: i32 = 10;
+pub const AUTHENTICATION_SASL_CONTINUE: i32 = 11;
+pub const AUTHENTICATION_SASL_FINAL: i32 = 12;
+
 #[derive(Debug, Default)]
 pub struct PgBackendMessageCodec {
     pub state: PgConnectionState,
@@ -111,7 +122,6 @@ impl PgBackendMessageCodec {
         buf: &mut BytesMut,
     ) -> Result<Option<PgMessage<PgBackendMessageType>>, ProtocolError> {
         const MIN_AUTHENTICATION_LEN: usize = 9;
-        const AUTHENTICATION_OK: i32 = 0;
         if buf.remaining() < MIN_AUTHENTICATION_LEN {
             return Ok(None);
         }
@@ -134,43 +144,6 @@ impl PgBackendMessageCodec {
             data: buf.split_to(msg_len),
         }))
     }
-}
-
-/// Parse a ParameterStatus message to extract name and value.
-///
-/// Message format: 'S' | int32 len | string name (null-terminated) | string value (null-terminated)
-///
-/// Returns `None` if the message is malformed.
-pub fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
-    // Skip tag ('S') and length (4 bytes)
-    let payload = data.get(5..)?;
-
-    // Split on null bytes: [name, value, ""]
-    let mut parts = payload.split(|&b| b == 0);
-
-    let name = std::str::from_utf8(parts.next()?).ok()?;
-    let value = std::str::from_utf8(parts.next()?).ok()?;
-
-    Some((name, value))
-}
-
-/// Extract the first column value from a DataRow message as a string.
-///
-/// Message format: 'D' | int32 len | int16 column_count | (int32 col_len | bytes col_data)*
-///
-/// Returns `None` if the message is malformed or the column is NULL.
-pub fn data_row_first_column(data: &[u8]) -> Option<&str> {
-    // Skip tag ('D') and length (4 bytes) and column count (2 bytes)
-    let payload = data.get(7..)?;
-
-    // First 4 bytes are the column length (-1 means NULL)
-    let col_len = i32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
-    if col_len < 0 {
-        return None; // NULL value
-    }
-
-    let col_data = payload.get(4..4 + col_len as usize)?;
-    std::str::from_utf8(col_data).ok()
 }
 
 impl Decoder for PgBackendMessageCodec {
@@ -271,4 +244,51 @@ impl Decoder for PgBackendMessageCodec {
             }
         }
     }
+}
+
+/// Parse a ParameterStatus message to extract name and value.
+///
+/// Message format: 'S' | int32 len | string name (null-terminated) | string value (null-terminated)
+///
+/// Returns `None` if the message is malformed.
+pub fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
+    // Skip tag ('S') and length (4 bytes)
+    let payload = data.get(5..)?;
+
+    // Split on null bytes: [name, value, ""]
+    let mut parts = payload.split(|&b| b == 0);
+
+    let name = std::str::from_utf8(parts.next()?).ok()?;
+    let value = std::str::from_utf8(parts.next()?).ok()?;
+
+    Some((name, value))
+}
+
+/// Extract the authentication type from an Authentication message.
+///
+/// Message format: 'R' | int32 len | int32 auth_type | ...
+///
+/// Returns `None` if the message is too short.
+pub fn authentication_type(data: &BytesMut) -> Option<i32> {
+    let auth_type_bytes = data.get(5..9)?;
+    Some(i32::from_be_bytes(auth_type_bytes.try_into().ok()?))
+}
+
+/// Extract the first column value from a DataRow message as a string.
+///
+/// Message format: 'D' | int32 len | int16 column_count | (int32 col_len | bytes col_data)*
+///
+/// Returns `None` if the message is malformed or the column is NULL.
+pub fn data_row_first_column(data: &[u8]) -> Option<&str> {
+    // Skip tag ('D') and length (4 bytes) and column count (2 bytes)
+    let payload = data.get(7..)?;
+
+    // First 4 bytes are the column length (-1 means NULL)
+    let col_len = i32::from_be_bytes(payload.get(..4)?.try_into().ok()?);
+    if col_len < 0 {
+        return None; // NULL value
+    }
+
+    let col_data = payload.get(4..4 + col_len as usize)?;
+    std::str::from_utf8(col_data).ok()
 }
