@@ -170,7 +170,7 @@ impl Settings {
             }
         }
 
-        let settings = if let Some(mut config) = config_settings {
+        let mut settings = if let Some(mut config) = config_settings {
             //command line arguments can override values loaded from a config file
             config.origin.host = origin_host.unwrap_or(config.origin.host);
             config.origin.port = origin_port.unwrap_or(config.origin.port);
@@ -248,6 +248,10 @@ impl Settings {
                 tls_key,
             }
         };
+
+        //make cdc settings lowercase to avoid having to quote them in postgres
+        settings.cdc.publication_name = settings.cdc.publication_name.to_ascii_lowercase();
+        settings.cdc.slot_name = settings.cdc.slot_name.to_ascii_lowercase();
 
         Ok(settings)
     }
