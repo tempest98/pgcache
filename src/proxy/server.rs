@@ -10,6 +10,7 @@ use tracing::{debug, error};
 use crate::{
     cache::{CacheError, ProxyMessage, cache_run},
     metrics::Metrics,
+    pg::cdc::{replication_cleanup, replication_provision},
     settings::Settings,
     tls,
 };
@@ -100,11 +101,8 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     Ok((cache_handle, cache_tx))
 }
 
-#[tracing::instrument(skip_all)]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), ConnectionError> {
-    // Load TLS config if certificates are provided
-    let tls_acceptor = match (&settings.tls_cert, &settings.tls_key) {
+fn tls_config_load(settings: &Settings) -> Result<Option<Arc<tls::TlsAcceptor>>, ConnectionError> {
+    match (&settings.tls_cert, &settings.tls_key) {
         (Some(cert_path), Some(key_path)) => {
             debug!(
                 "Loading TLS certificates from {:?} and {:?}",
@@ -115,20 +113,29 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
                     "Failed to load TLS certificates: {e}"
                 )))
             })?;
-            Some(Arc::new(tls::TlsAcceptor::from(config)))
+            Ok(Some(Arc::new(tls::TlsAcceptor::from(config))))
         }
         (None, None) => {
             debug!("TLS not configured, accepting plaintext connections only");
-            None
+            Ok(None)
         }
-        _ => {
-            return Err(ConnectionError::IoError(std::io::Error::other(
-                "Both tls_cert and tls_key must be specified together",
-            )));
-        }
-    };
+        _ => Err(ConnectionError::IoError(std::io::Error::other(
+            "Both tls_cert and tls_key must be specified together",
+        ))),
+    }
+}
+
+#[tracing::instrument(skip_all)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), ConnectionError> {
+    // Load TLS config if certificates are provided
+    let tls_acceptor = tls_config_load(settings)?;
 
     thread::scope(|scope| {
+        let rt = Builder::new_current_thread().enable_all().build()?;
+
+        let _ = rt.block_on(async { replication_provision(settings).await });
+
         let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
 
         let mut workers: Vec<_> = (0..settings.num_workers)
@@ -143,8 +150,6 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-
-        let rt = Builder::new_current_thread().enable_all().build()?;
 
         debug!("accept loop");
         rt.block_on(async {
@@ -181,12 +186,15 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
                     if cache_handle.is_finished() {
                         let _ = cache_handle.join(); // Clean up old cache thread
                     }
+                    replication_provision(settings).await?;
                     (cache_handle, cache_tx) = cache_create(scope, settings)?;
                     debug!("cache thread restarted");
                 }
 
                 cur_worker = (cur_worker + 1) % settings.num_workers;
             }
+
+            replication_cleanup(settings).await?;
 
             Ok(())
         })

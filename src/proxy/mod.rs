@@ -13,6 +13,7 @@ use error_set::error_set;
 use nix::errno::Errno;
 use tokio::sync::mpsc::Receiver;
 
+use crate::pg::cdc::PgCdcError;
 use crate::pg::protocol::ProtocolError;
 
 pub use connection::connection_run;
@@ -37,6 +38,7 @@ error_set! {
 
     ConnectError := {
         NoConnection,
+        CdcError(PgCdcError),
         TlsError(io::Error),
     }
 

@@ -1,3 +1,4 @@
+pub(crate) mod cdc;
 pub(crate) mod protocol;
 
 pub fn identifier_needs_quotes(id: &str) -> bool {

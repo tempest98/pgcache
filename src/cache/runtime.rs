@@ -230,10 +230,12 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                         }
 
                         if cdc_handle.is_finished() {
+                            debug!("cdc failure");
                             return Err(CacheError::CdcFailure);
                         }
                     }
 
+                    debug!("cache loop exiting");
                     Ok(())
                 })
                 .await
