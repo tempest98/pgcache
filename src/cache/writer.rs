@@ -12,6 +12,7 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata};
+use crate::pg;
 use crate::query::ast::{Deparse, TableNode};
 use crate::query::constraints::analyze_query_constraints;
 use crate::query::resolved::{
@@ -19,8 +20,7 @@ use crate::query::resolved::{
     select_statement_resolve,
 };
 use crate::query::transform::{query_table_update_queries, resolved_table_replace_with_values};
-use crate::settings::{Settings, SslMode};
-use crate::tls;
+use crate::settings::Settings;
 
 use super::{
     CacheError,
@@ -64,45 +64,13 @@ impl CacheWriter {
             .connect(NoTls)
             .await?;
 
-        // Origin connection with optional TLS
-        let mut origin_config = Config::new();
-        origin_config
-            .host(&settings.origin.host)
-            .port(settings.origin.port)
-            .user(&settings.origin.user)
-            .dbname(&settings.origin.database);
-        if let Some(ref password) = settings.origin.password {
-            origin_config.password(password);
-        }
-
-        // Connect to origin with appropriate TLS mode and spawn connection task
-        let origin_client = match settings.origin.ssl_mode {
-            SslMode::Disable => {
-                let (client, connection) = origin_config.connect(NoTls).await?;
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        error!("writer origin connection error: {e}");
-                    }
-                });
-                client
-            }
-            SslMode::Require => {
-                let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
-                let (client, connection) = origin_config.connect(tls_connector).await?;
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        error!("writer origin connection error: {e}");
-                    }
-                });
-                client
-            }
-        };
-
         tokio::spawn(async move {
             if let Err(e) = cache_connection.await {
                 error!("writer cache connection error: {e}");
             }
         });
+
+        let origin_client = pg::connect(&settings.origin, "writer origin").await?;
 
         // Create connection pool for population tasks
         let (populate_pool_tx, populate_pool_rx) = tokio::sync::mpsc::channel(POPULATE_POOL_SIZE);

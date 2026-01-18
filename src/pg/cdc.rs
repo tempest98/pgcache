@@ -1,12 +1,12 @@
 use error_set::error_set;
 use std::io;
-use tokio_postgres::{Config, Error, NoTls};
-use tracing::{debug, error};
+use tokio_postgres::config::ReplicationMode;
+use tokio_postgres::{Client, Error};
+use tracing::debug;
 
-use crate::{
-    settings::{Settings, SslMode},
-    tls,
-};
+use crate::settings::{PgSettings, Settings};
+
+use super::connect::{config_build, config_connect, connect};
 
 error_set! {
     PgCdcError := {
@@ -26,41 +26,7 @@ pub async fn replication_provision(settings: &Settings) -> Result<(), PgCdcError
         publication_name, slot_name
     );
 
-    // Build regular (non-replication) connection config
-    let mut config = Config::new();
-    config
-        .host(&settings.origin.host)
-        .port(settings.origin.port)
-        .user(&settings.origin.user)
-        .dbname(&settings.origin.database);
-    if let Some(ref password) = settings.origin.password {
-        config.password(password);
-    }
-
-    debug!("cdc provisioning config {:?}", config);
-
-    // Connect with appropriate TLS mode
-    let client = match settings.origin.ssl_mode {
-        SslMode::Disable => {
-            let (client, connection) = config.connect(NoTls).await?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("Provisioning connection error: {e}");
-                }
-            });
-            client
-        }
-        SslMode::Require => {
-            let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
-            let (client, connection) = config.connect(tls_connector).await?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("Provisioning connection error: {e}");
-                }
-            });
-            client
-        }
-    };
+    let client = connect(&settings.origin, "replication provisioning").await?;
 
     debug!("cdc provisioning connected");
 
@@ -119,39 +85,7 @@ pub async fn replication_cleanup(settings: &Settings) -> Result<(), PgCdcError> 
         publication_name, slot_name
     );
 
-    // Build regular (non-replication) connection config
-    let mut config = Config::new();
-    config
-        .host(&settings.origin.host)
-        .port(settings.origin.port)
-        .user(&settings.origin.user)
-        .dbname(&settings.origin.database);
-    if let Some(ref password) = settings.origin.password {
-        config.password(password);
-    }
-
-    // Connect with appropriate TLS mode
-    let client = match settings.origin.ssl_mode {
-        SslMode::Disable => {
-            let (client, connection) = config.connect(NoTls).await?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("Cleanup connection error: {e}");
-                }
-            });
-            client
-        }
-        SslMode::Require => {
-            let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
-            let (client, connection) = config.connect(tls_connector).await?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("Cleanup connection error: {e}");
-                }
-            });
-            client
-        }
-    };
+    let client = connect(&settings.origin, "replication cleanup").await?;
 
     // Drop replication slot if it exists
     debug!("Dropping replication slot: {}", slot_name);
@@ -169,4 +103,13 @@ pub async fn replication_cleanup(settings: &Settings) -> Result<(), PgCdcError> 
 
     debug!("Replication cleanup complete");
     Ok(())
+}
+
+/// Connect to a PostgreSQL database in logical replication mode.
+///
+/// This is used for CDC streaming connections that receive logical replication events.
+pub async fn connect_replication(settings: &PgSettings, context: &str) -> Result<Client, Error> {
+    let mut config = config_build(settings);
+    config.replication_mode(ReplicationMode::Logical);
+    config_connect(config, settings.ssl_mode, context).await
 }

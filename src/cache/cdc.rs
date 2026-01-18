@@ -17,19 +17,16 @@ use tokio::{
     pin,
     time::{Interval, interval},
 };
-use tokio_postgres::config::ReplicationMode;
-use tokio_postgres::{Client, Config, Error, NoTls};
+use tokio_postgres::{Client, Error};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
 
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error};
 
-use crate::{
-    catalog::{ColumnMetadata, TableMetadata},
-    settings::{Settings, SslMode},
-    tls,
-};
+use crate::catalog::{ColumnMetadata, TableMetadata};
+use crate::pg::cdc::connect_replication;
+use crate::settings::Settings;
 
 use super::{
     CacheError,
@@ -59,42 +56,7 @@ impl CdcProcessor {
         settings: &Settings,
         cdc_tx: UnboundedSender<CdcMessage>,
     ) -> Result<Self, CacheError> {
-        // Origin CDC connection with optional TLS (replication mode)
-        let mut origin_config = Config::new();
-        origin_config
-            .host(&settings.origin.host)
-            .port(settings.origin.port)
-            .user(&settings.origin.user)
-            .dbname(&settings.origin.database)
-            .replication_mode(ReplicationMode::Logical);
-        if let Some(ref password) = settings.origin.password {
-            origin_config.password(password);
-        }
-
-        // Connect to origin with appropriate TLS mode and spawn connection task
-        let origin_cdc_client = match settings.origin.ssl_mode {
-            SslMode::Disable => {
-                debug!("connecting without ssl");
-                let (client, connection) = origin_config.connect(NoTls).await?;
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        error!("CDC origin connection error: {e}");
-                    }
-                });
-                client
-            }
-            SslMode::Require => {
-                debug!("connecting with ssl");
-                let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
-                let (client, connection) = origin_config.connect(tls_connector).await?;
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        error!("CDC origin connection error: {e}");
-                    }
-                });
-                client
-            }
-        };
+        let origin_cdc_client = connect_replication(&settings.origin, "CDC origin").await?;
 
         // Create keep-alive timer with 30-second interval (hardcoded for POC)
         let mut timer = interval(Duration::from_secs(30));

@@ -1,5 +1,8 @@
 pub(crate) mod cdc;
+pub(crate) mod connect;
 pub(crate) mod protocol;
+
+pub use connect::{config_build, config_connect, connect};
 
 pub fn identifier_needs_quotes(id: &str) -> bool {
     match id.as_bytes() {
