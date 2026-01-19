@@ -61,6 +61,13 @@ pub enum CacheMessage {
 }
 
 impl CacheMessage {
+    /// Extracts the raw query data buffer, discarding the parsed query information.
+    pub fn into_data(self) -> BytesMut {
+        match self {
+            CacheMessage::Query(data, _) | CacheMessage::QueryParameterized(data, _, _, _) => data,
+        }
+    }
+
     /// Converts the cache message into query data ready for processing.
     /// For parameterized queries, this performs parameter replacement in the AST.
     ///

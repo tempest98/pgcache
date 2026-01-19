@@ -781,11 +781,7 @@ async fn handle_connection(
                 }) else {
                     debug!("search_path unknown, forwarding to origin");
                     state.metrics.uncacheable_increment();
-                    let data = match msg {
-                        CacheMessage::Query(data, _) => data,
-                        CacheMessage::QueryParameterized(data, _, _, _) => data,
-                    };
-                    state.origin_write_buf.push_back(data);
+                    state.origin_write_buf.push_back(msg.into_data());
                     state.proxy_mode = ProxyMode::Read;
                     continue;
                 };
@@ -803,10 +799,7 @@ async fn handle_connection(
                     Ok(s) => s,
                     Err(e) => {
                         error!("Failed to create client socket: {}", e);
-                        state.origin_write_buf.push_back(match msg {
-                            CacheMessage::Query(data, _) => data,
-                            CacheMessage::QueryParameterized(data, _, _, _) => data,
-                        });
+                        state.origin_write_buf.push_back(msg.into_data());
                         state.proxy_mode = ProxyMode::Read;
                         continue;
                     }
@@ -829,12 +822,9 @@ async fn handle_connection(
                         // Cache is unavailable, fall back to proxying directly to origin
                         debug!("cache unavailable");
                         state.proxy_status = ProxyStatus::Degraded;
-                        let data = match e.0.message {
-                            CacheMessage::Query(data, _) => data,
-                            CacheMessage::QueryParameterized(data, _, _, _) => data,
-                        };
-
-                        state.origin_write_buf.push_back(data);
+                        state
+                            .origin_write_buf
+                            .push_back(e.into_message().message.into_data());
                         state.proxy_mode = ProxyMode::Read;
                     }
                 }
