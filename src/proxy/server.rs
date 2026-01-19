@@ -125,19 +125,31 @@ type Worker<'scope> = (
     UnboundedSender<TcpStream>,
 );
 
+/// Shared resources passed to worker threads.
+#[derive(Clone)]
+struct WorkerResources {
+    cache_sender: CacheSender,
+    metrics: Arc<Metrics>,
+    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+}
+
 fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     worker_id: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_sender: CacheSender,
-    metrics: Arc<Metrics>,
-    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+    resources: WorkerResources,
 ) -> Result<Worker<'scope>, ConnectionError> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
         .spawn_scoped(scope, || {
-            connection_run(settings, rx, cache_sender, metrics, tls_acceptor)
+            connection_run(
+                settings,
+                rx,
+                resources.cache_sender,
+                resources.metrics,
+                resources.tls_acceptor,
+            )
         })?;
 
     Ok((join, tx))
@@ -146,21 +158,10 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
 fn workers_create_all<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_sender: CacheSender,
-    metrics: Arc<Metrics>,
-    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+    resources: WorkerResources,
 ) -> Result<Vec<Worker<'scope>>, ConnectionError> {
     (0..settings.num_workers)
-        .map(|i| {
-            worker_create(
-                i,
-                scope,
-                settings,
-                cache_sender.clone(),
-                Arc::clone(&metrics),
-                tls_acceptor.clone(),
-            )
-        })
+        .map(|i| worker_create(i, scope, settings, resources.clone()))
         .collect()
 }
 
@@ -169,9 +170,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     worker_index: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_sender: CacheSender,
-    metrics: Arc<Metrics>,
-    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+    resources: WorkerResources,
 ) -> Result<(), ConnectionError> {
     let Some(worker) = workers.get_mut(worker_index) else {
         return Err(ConnectionError::IoError(std::io::Error::other(
@@ -180,14 +179,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     };
 
     if worker.0.is_finished() {
-        let new_worker = worker_create(
-            worker_index,
-            scope,
-            settings,
-            cache_sender,
-            metrics,
-            tls_acceptor,
-        )?;
+        let new_worker = worker_create(worker_index, scope, settings, resources)?;
         let old_worker = mem::replace(worker, new_worker);
         let _ = old_worker.0.join();
     }
@@ -274,13 +266,13 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
         let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
         let mut cache_state = ProxyCacheState::new(cache_handle, updater, cache_tx);
 
-        let mut workers = workers_create_all(
-            scope,
-            settings,
+        let resources = WorkerResources {
             cache_sender,
-            Arc::clone(&metrics),
-            tls_acceptor.clone(),
-        )?;
+            metrics,
+            tls_acceptor,
+        };
+
+        let mut workers = workers_create_all(scope, settings, resources.clone())?;
 
         debug!("accept loop");
         rt.block_on(async {
@@ -315,9 +307,10 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
                             cur_worker,
                             scope,
                             settings,
-                            cache_state.updater.sender_subscribe(),
-                            Arc::clone(&metrics),
-                            tls_acceptor.clone(),
+                            WorkerResources {
+                                cache_sender: cache_state.updater.sender_subscribe(),
+                                ..resources.clone()
+                            },
                         )?;
 
                         cur_worker = (cur_worker + 1) % settings.num_workers;
