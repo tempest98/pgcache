@@ -7,14 +7,13 @@ use tokio::{
     task::{LocalSet, spawn_local},
 };
 use tokio_postgres::{Config, NoTls};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream, wrappers::UnboundedReceiverStream};
 use tracing::{debug, error, instrument};
 
 use crate::{
     cache::{
         CacheError,
         cdc::CdcProcessor,
-        messages::{CacheReply, CdcMessage, ProxyMessage, StreamSource, WriterCommand},
+        messages::{CacheReply, CdcMessage, ProxyMessage, WriterCommand},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
         types::CacheStateView,
         worker::CacheWorker,
@@ -193,15 +192,10 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
             .spawn_scoped(scope, || worker_run(settings, worker_rx))?;
 
         // Spawn CDC thread
-        let (cdc_tx, cdc_rx) = tokio::sync::mpsc::unbounded_channel();
-        let cdc_handle = thread::Builder::new()
+        let (cdc_tx, mut cdc_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
             .spawn_scoped(scope, move || cdc_run(settings, cdc_tx))?;
-
-        let cache_rx_mapped = ReceiverStream::new(cache_rx).map(StreamSource::Proxy);
-        let cdc_rx_mapped = UnboundedReceiverStream::new(cdc_rx).map(StreamSource::Cdc);
-
-        let mut stream = cache_rx_mapped.merge(cdc_rx_mapped);
 
         debug!("cache loop");
         rt.block_on(async {
@@ -215,23 +209,32 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 
             LocalSet::new()
                 .run_until(async move {
-                    while let Some(src) = stream.next().await {
-                        match src {
-                            StreamSource::Proxy(proxy_msg) => {
-                                let mut qcache = qcache.clone();
-                                spawn_local(async move {
-                                    handle_proxy_message(&mut qcache, proxy_msg).await;
-                                });
+                    let mut cache_rx = cache_rx;
+                    loop {
+                        tokio::select! {
+                            msg = cdc_rx.recv() => {
+                                match msg {
+                                    Some(msg) => handle_cdc_message(&writer_tx, msg),
+                                    None => {
+                                        error!("CDC channel closed unexpectedly");
+                                        return Err(CacheError::CdcFailure);
+                                    }
+                                }
                             }
-                            StreamSource::Cdc(msg) => {
-                                // Forward CDC messages directly to writer
-                                handle_cdc_message(&writer_tx, msg);
+                            msg = cache_rx.recv() => {
+                                match msg {
+                                    Some(proxy_msg) => {
+                                        let mut qcache = qcache.clone();
+                                        spawn_local(async move {
+                                            handle_proxy_message(&mut qcache, proxy_msg).await;
+                                        });
+                                    }
+                                    None => {
+                                        debug!("proxy channel closed");
+                                        break;
+                                    }
+                                }
                             }
-                        }
-
-                        if cdc_handle.is_finished() {
-                            debug!("cdc failure");
-                            return Err(CacheError::CdcFailure);
                         }
                     }
 

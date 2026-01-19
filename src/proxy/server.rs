@@ -1,4 +1,4 @@
-use std::{io::Error, mem, sync::Arc, thread};
+use std::{io::Error, mem, sync::Arc, thread, time::Duration};
 
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -24,12 +24,6 @@ type Worker<'scope> = (
     UnboundedSender<TcpStream>,
 );
 
-enum WorkerStatus {
-    Alive,
-    Exited,
-    CacheDead,
-}
-
 fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     worker_id: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
@@ -48,6 +42,27 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     Ok((join, tx))
 }
 
+fn workers_create_all<'scope, 'env: 'scope, 'settings: 'scope>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+    cache_tx: SenderCacheType,
+    metrics: Arc<Metrics>,
+    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+) -> Result<Vec<Worker<'scope>>, ConnectionError> {
+    (0..settings.num_workers)
+        .map(|i| {
+            worker_create(
+                i,
+                scope,
+                settings,
+                cache_tx.clone(),
+                Arc::clone(&metrics),
+                tls_acceptor.clone(),
+            )
+        })
+        .collect()
+}
+
 fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     workers: &mut [Worker<'scope>],
     worker_index: usize,
@@ -56,7 +71,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     cache_tx: SenderCacheType,
     metrics: Arc<Metrics>,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-) -> Result<WorkerStatus, ConnectionError> {
+) -> Result<(), ConnectionError> {
     let Some(worker) = workers.get_mut(worker_index) else {
         return Err(ConnectionError::IoError(std::io::Error::other(
             "worker index out of bounds",
@@ -73,13 +88,10 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
             tls_acceptor,
         )?;
         let old_worker = mem::replace(worker, new_worker);
-        match old_worker.0.join() {
-            Ok(Err(ConnectionError::CacheDead)) => Ok(WorkerStatus::CacheDead),
-            _ => Ok(WorkerStatus::Exited),
-        }
-    } else {
-        Ok(WorkerStatus::Alive)
+        let _ = old_worker.0.join();
     }
+
+    Ok(())
 }
 
 type Cache<'scope> = (
@@ -138,18 +150,13 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
 
         let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
 
-        let mut workers: Vec<_> = (0..settings.num_workers)
-            .map(|i| {
-                worker_create(
-                    i,
-                    scope,
-                    settings,
-                    cache_tx.clone(),
-                    Arc::clone(&metrics),
-                    tls_acceptor.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut workers = workers_create_all(
+            scope,
+            settings,
+            cache_tx.clone(),
+            Arc::clone(&metrics),
+            tls_acceptor.clone(),
+        )?;
 
         debug!("accept loop");
         rt.block_on(async {
@@ -164,39 +171,57 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
             debug!("Listening to {}", &settings.listen.socket);
 
             let mut cur_worker = 0;
-            while let Ok((socket, _)) = listener.accept().await {
-                debug!("socket accepted");
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        let (socket, _) = result.map_err(|e| {
+                            ConnectionError::IoError(std::io::Error::other(format!(
+                                "accept error: {e}"
+                            )))
+                        })?;
+                        debug!("socket accepted");
 
-                if let Some(worker) = workers.get(cur_worker) {
-                    let _ = worker.1.send(socket);
-                }
+                        if let Some(worker) = workers.get(cur_worker) {
+                            let _ = worker.1.send(socket);
+                        }
 
-                let status = worker_ensure_alive(
-                    &mut workers,
-                    cur_worker,
-                    scope,
-                    settings,
-                    cache_tx.clone(),
-                    Arc::clone(&metrics),
-                    tls_acceptor.clone(),
-                )?;
+                        worker_ensure_alive(
+                            &mut workers,
+                            cur_worker,
+                            scope,
+                            settings,
+                            cache_tx.clone(),
+                            Arc::clone(&metrics),
+                            tls_acceptor.clone(),
+                        )?;
 
-                if matches!(status, WorkerStatus::CacheDead) {
-                    error!("cache thread detected as dead, restarting...");
-                    if cache_handle.is_finished() {
-                        let _ = cache_handle.join(); // Clean up old cache thread
+                        cur_worker = (cur_worker + 1) % settings.num_workers;
                     }
-                    replication_provision(settings).await?;
-                    (cache_handle, cache_tx) = cache_create(scope, settings)?;
-                    debug!("cache thread restarted");
+                    _ = cache_tx.closed() => {
+                        error!("cache thread exited, restarting...");
+                        let _ = cache_handle.join();
+                        debug!("cache handle joined");
+                        replication_provision(settings).await?;
+                        debug!("replication_provision");
+                        (cache_handle, cache_tx) = cache_create(scope, settings)?;
+                        debug!("cache_create");
+                        workers = workers_create_all(
+                            scope,
+                            settings,
+                            cache_tx.clone(),
+                            Arc::clone(&metrics),
+                            tls_acceptor.clone(),
+                        )?;
+                        debug!("cache thread restarted");
+                    }
                 }
-
-                cur_worker = (cur_worker + 1) % settings.num_workers;
             }
 
-            replication_cleanup(settings).await?;
-
-            Ok(())
+            #[allow(unreachable_code)]
+            {
+                replication_cleanup(settings).await?;
+                Ok(())
+            }
         })
     })
 }

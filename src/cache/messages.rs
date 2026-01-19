@@ -143,12 +143,6 @@ pub struct ProxyMessage {
     pub search_path: Vec<String>,
 }
 
-/// Unified stream source for multiplexing proxy and CDC messages
-pub(crate) enum StreamSource {
-    Proxy(ProxyMessage),
-    Cdc(CdcMessage),
-}
-
 /// Commands sent to the cache writer thread for serialized cache mutations
 #[derive(Debug)]
 pub enum WriterCommand {

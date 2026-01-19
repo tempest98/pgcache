@@ -1452,18 +1452,33 @@ pub fn writer_run(
                 loop {
                     tokio::select! {
                         // Handle commands from coordinator/CDC
-                        Some(cmd) = writer_rx.recv() => {
-                            if let Err(e) = writer.command_handle(cmd).await {
-                                error!("writer command failed: {e}");
+                        msg = writer_rx.recv() => {
+                            match msg {
+                                Some(cmd) => {
+                                    if let Err(e) = writer.command_handle(cmd).await {
+                                        error!("writer command failed: {e}");
+                                    }
+                                }
+                                None => {
+                                    debug!("writer channel closed, shutting down");
+                                    break;
+                                }
                             }
                         }
                         // Handle commands from spawned population tasks
-                        Some(cmd) = internal_rx.recv() => {
-                            if let Err(e) = writer.command_handle(cmd).await {
-                                error!("writer internal command failed: {e}");
+                        msg = internal_rx.recv() => {
+                            match msg {
+                                Some(cmd) => {
+                                    if let Err(e) = writer.command_handle(cmd).await {
+                                        error!("writer internal command failed: {e}");
+                                    }
+                                }
+                                None => {
+                                    debug!("writer internal channel closed, shutting down");
+                                    break;
+                                }
                             }
                         }
-                        else => break,
                     }
                 }
                 Ok(())
