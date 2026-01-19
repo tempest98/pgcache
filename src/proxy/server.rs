@@ -3,21 +3,122 @@ use std::{io::Error, mem, sync::Arc, thread, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},
     runtime::Builder,
-    sync::mpsc::{Sender, UnboundedSender, channel, unbounded_channel},
+    sync::mpsc::{UnboundedSender, channel, unbounded_channel},
+    time::{Sleep, sleep},
 };
 use tracing::{debug, error};
 
+/// Initial backoff delay for cache restart attempts
+const INITIAL_BACKOFF_MS: u64 = 100;
+/// Maximum backoff delay (steady state) for cache restart attempts
+const STEADY_STATE_BACKOFF_MS: u64 = 60_000;
+
+struct ProxyCacheState<'scope> {
+    handle: Option<thread::ScopedJoinHandle<'scope, Result<(), CacheError>>>,
+    updater: CacheSenderUpdater,
+    /// Current sender for detecting when the cache thread exits via `.closed()`.
+    current_tx: CacheSenderInner,
+    alive: bool,
+    attempts: u32,
+    backoff: Option<std::pin::Pin<Box<Sleep>>>,
+    backoff_ms: u64,
+}
+
+impl<'scope> ProxyCacheState<'scope> {
+    fn new(
+        handle: thread::ScopedJoinHandle<'scope, Result<(), CacheError>>,
+        updater: CacheSenderUpdater,
+        current_tx: CacheSenderInner,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            updater,
+            current_tx,
+            alive: true,
+            attempts: 0,
+            backoff: None,
+            backoff_ms: INITIAL_BACKOFF_MS,
+        }
+    }
+
+    fn handle_exit(&mut self) {
+        self.alive = false;
+        self.attempts += 1;
+
+        // Mark cache as unavailable immediately so connections fall back to origin
+        self.updater.sender_clear();
+
+        let exit_result = self.handle.take().map(|h| h.join());
+        error!(
+            "cache thread exited (attempt {}): {:?}",
+            self.attempts, exit_result
+        );
+
+        self.backoff_schedule();
+    }
+
+    async fn handle_backoff_expired<'env: 'scope, 'settings: 'scope>(
+        &mut self,
+        scope: &'scope thread::Scope<'scope, 'env>,
+        settings: &'settings Settings,
+    ) {
+        self.backoff = None;
+        self.attempts += 1;
+
+        debug!(
+            "backoff expired, attempting restart (attempt {})",
+            self.attempts
+        );
+
+        if let Some((new_handle, new_tx)) = cache_restart_attempt(scope, settings).await {
+            self.handle = Some(new_handle);
+            // Update all subscribers with the new cache sender
+            self.updater.sender_update(new_tx.clone());
+            self.current_tx = new_tx;
+            self.restart_reset();
+            debug!("cache thread restarted successfully");
+        } else {
+            self.backoff_increase();
+            debug!(
+                "restart failed, backing off {}ms before next attempt",
+                self.backoff_ms
+            );
+            self.backoff_schedule();
+        }
+    }
+
+    fn restart_reset(&mut self) {
+        self.alive = true;
+        self.attempts = 0;
+        self.backoff_ms = INITIAL_BACKOFF_MS;
+    }
+
+    fn backoff_schedule(&mut self) {
+        self.backoff = Some(Box::pin(sleep(Duration::from_millis(self.backoff_ms))));
+    }
+
+    fn backoff_increase(&mut self) {
+        self.backoff_ms = (self.backoff_ms * 2).min(STEADY_STATE_BACKOFF_MS);
+    }
+
+    async fn backoff_wait(backoff: &mut Option<std::pin::Pin<Box<Sleep>>>) {
+        match backoff {
+            Some(sleep) => sleep.as_mut().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 use crate::{
-    cache::{CacheError, ProxyMessage, cache_run},
+    cache::{CacheError, cache_run},
     metrics::Metrics,
     pg::cdc::{replication_cleanup, replication_provision},
     settings::Settings,
     tls,
 };
 
-use super::{ConnectionError, connection_run};
-
-type SenderCacheType = Sender<ProxyMessage>;
+use super::cache_sender::CacheSenderInner;
+use super::{CacheSender, CacheSenderUpdater, ConnectionError, connection_run};
 
 type Worker<'scope> = (
     thread::ScopedJoinHandle<'scope, Result<(), ConnectionError>>,
@@ -28,7 +129,7 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     worker_id: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_tx: SenderCacheType,
+    cache_sender: CacheSender,
     metrics: Arc<Metrics>,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<Worker<'scope>, ConnectionError> {
@@ -36,7 +137,7 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
         .spawn_scoped(scope, || {
-            connection_run(settings, rx, cache_tx, metrics, tls_acceptor)
+            connection_run(settings, rx, cache_sender, metrics, tls_acceptor)
         })?;
 
     Ok((join, tx))
@@ -45,7 +146,7 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
 fn workers_create_all<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_tx: SenderCacheType,
+    cache_sender: CacheSender,
     metrics: Arc<Metrics>,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<Vec<Worker<'scope>>, ConnectionError> {
@@ -55,7 +156,7 @@ fn workers_create_all<'scope, 'env: 'scope, 'settings: 'scope>(
                 i,
                 scope,
                 settings,
-                cache_tx.clone(),
+                cache_sender.clone(),
                 Arc::clone(&metrics),
                 tls_acceptor.clone(),
             )
@@ -68,7 +169,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     worker_index: usize,
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-    cache_tx: SenderCacheType,
+    cache_sender: CacheSender,
     metrics: Arc<Metrics>,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<(), ConnectionError> {
@@ -83,7 +184,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
             worker_index,
             scope,
             settings,
-            cache_tx,
+            cache_sender,
             metrics,
             tls_acceptor,
         )?;
@@ -96,7 +197,7 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
 
 type Cache<'scope> = (
     thread::ScopedJoinHandle<'scope, Result<(), CacheError>>,
-    SenderCacheType,
+    CacheSenderInner,
 );
 
 fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
@@ -111,6 +212,27 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
         .spawn_scoped(scope, || cache_run(settings, cache_rx))?;
 
     Ok((cache_handle, cache_tx))
+}
+
+/// Attempts to restart the cache thread.
+/// On success, returns Some with the new cache handle and sender.
+/// On failure, returns None.
+async fn cache_restart_attempt<'scope, 'env: 'scope, 'settings: 'scope>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+) -> Option<Cache<'scope>> {
+    if let Err(e) = replication_provision(settings).await {
+        error!("replication provision failed: {:?}", e);
+        return None;
+    }
+
+    match cache_create(scope, settings) {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            error!("cache creation failed: {:?}", e);
+            None
+        }
+    }
 }
 
 fn tls_config_load(settings: &Settings) -> Result<Option<Arc<tls::TlsAcceptor>>, ConnectionError> {
@@ -148,12 +270,14 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
 
         let _ = rt.block_on(async { replication_provision(settings).await });
 
-        let (mut cache_handle, mut cache_tx) = cache_create(scope, settings)?;
+        let (cache_handle, cache_tx) = cache_create(scope, settings)?;
+        let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
+        let mut cache_state = ProxyCacheState::new(cache_handle, updater, cache_tx);
 
         let mut workers = workers_create_all(
             scope,
             settings,
-            cache_tx.clone(),
+            cache_sender,
             Arc::clone(&metrics),
             tls_acceptor.clone(),
         )?;
@@ -173,6 +297,7 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
             let mut cur_worker = 0;
             loop {
                 tokio::select! {
+                    // Branch 1: Accept new connections
                     result = listener.accept() => {
                         let (socket, _) = result.map_err(|e| {
                             ConnectionError::IoError(std::io::Error::other(format!(
@@ -190,34 +315,29 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
                             cur_worker,
                             scope,
                             settings,
-                            cache_tx.clone(),
+                            cache_state.updater.sender_subscribe(),
                             Arc::clone(&metrics),
                             tls_acceptor.clone(),
                         )?;
 
                         cur_worker = (cur_worker + 1) % settings.num_workers;
                     }
-                    _ = cache_tx.closed() => {
-                        error!("cache thread exited, restarting...");
-                        let _ = cache_handle.join();
-                        debug!("cache handle joined");
-                        replication_provision(settings).await?;
-                        debug!("replication_provision");
-                        (cache_handle, cache_tx) = cache_create(scope, settings)?;
-                        debug!("cache_create");
-                        workers = workers_create_all(
-                            scope,
-                            settings,
-                            cache_tx.clone(),
-                            Arc::clone(&metrics),
-                            tls_acceptor.clone(),
-                        )?;
-                        debug!("cache thread restarted");
+
+                    // Branch 2: Cache thread exited - initiate restart
+                    _ = cache_state.current_tx.closed(), if cache_state.alive => {
+                        cache_state.handle_exit();
+                    }
+
+                    // Branch 3: Backoff timer expired - retry restart
+                    _ = ProxyCacheState::backoff_wait(&mut cache_state.backoff) => {
+                        cache_state
+                            .handle_backoff_expired(scope, settings)
+                            .await;
                     }
                 }
             }
 
-            #[allow(unreachable_code)]
+            #[expect(unreachable_code)]
             {
                 replication_cleanup(settings).await?;
                 Ok(())

@@ -1,9 +1,12 @@
+mod cache_sender;
 mod client_stream;
 mod connection;
 mod query;
 pub mod search_path;
 mod server;
 mod tls_stream;
+
+pub use cache_sender::{CacheSendError, CacheSender, CacheSenderUpdater};
 
 pub use client_stream::{ClientSocket, ClientSocketSource};
 

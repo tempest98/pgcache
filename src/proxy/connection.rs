@@ -10,7 +10,7 @@ use tokio::{
     net::{TcpStream, lookup_host},
     runtime::Builder,
     select,
-    sync::mpsc::{Sender, UnboundedReceiver, channel},
+    sync::mpsc::{UnboundedReceiver, channel},
     task::{LocalSet, spawn_local},
 };
 use tokio_stream::StreamExt;
@@ -46,9 +46,7 @@ use super::client_stream::{ClientReadHalf, ClientSocketSource, ClientStream, Cli
 use super::query::{Action, ForwardReason, handle_query};
 use super::search_path::SearchPath;
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
-use super::{ConnectionError, ProxyMode, ProxyStatus, ReadError};
-
-type SenderCacheType = Sender<ProxyMessage>;
+use super::{CacheSender, ConnectionError, ProxyMode, ProxyStatus, ReadError};
 
 // ============================================================================
 // OriginStream - type aliases using generic TLS stream types
@@ -718,7 +716,7 @@ async fn handle_connection(
     addrs: Vec<SocketAddr>,
     ssl_mode: SslMode,
     server_name: &str,
-    cache_tx: SenderCacheType,
+    cache_sender: CacheSender,
     metrics: Arc<Metrics>,
 ) -> Result<(), ConnectionError> {
     // Create ClientSocketSource BEFORE splitting (captures raw fd and TLS state)
@@ -823,13 +821,13 @@ async fn handle_connection(
                     search_path: resolved_search_path,
                 };
 
-                match cache_tx.send(proxy_msg).await {
+                match cache_sender.send(proxy_msg).await {
                     Ok(()) => {
                         state.proxy_mode = ProxyMode::CacheRead(reply_rx);
                     }
                     Err(e) => {
                         // Cache is unavailable, fall back to proxying directly to origin
-                        debug!("cache unavailable, degrading to proxy mode: {}", e);
+                        debug!("cache unavailable");
                         state.proxy_status = ProxyStatus::Degraded;
                         let data = match e.0.message {
                             CacheMessage::Query(data, _) => data,
@@ -855,7 +853,7 @@ async fn handle_connection(
 pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
-    cache_tx: SenderCacheType,
+    cache_sender: CacheSender,
     metrics: Arc<Metrics>,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<(), ConnectionError> {
@@ -877,7 +875,7 @@ pub fn connection_run(
                 while let Some(socket) = rx.recv().await {
                     let addrs = addrs.clone();
                     let server_name = server_name.clone();
-                    let cache_tx = cache_tx.clone();
+                    let cache_sender = cache_sender.clone();
                     let metrics = Arc::clone(&metrics);
                     let tls_acceptor = tls_acceptor.clone();
                     spawn_local(async move {
@@ -906,7 +904,7 @@ pub fn connection_run(
                             addrs,
                             ssl_mode,
                             &server_name,
-                            cache_tx,
+                            cache_sender,
                             metrics,
                         )
                         .await
