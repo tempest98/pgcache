@@ -23,7 +23,7 @@ use crate::query::transform::{query_table_update_queries, resolved_table_replace
 use crate::settings::Settings;
 
 use super::{
-    CacheError,
+    CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::WriterCommand,
     query::CacheableQuery,
     types::{
@@ -535,7 +535,7 @@ impl CacheWriter {
         &mut self,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
-    ) -> Result<(), CacheError> {
+    ) -> CacheResult<()> {
         let fp_list = self.update_queries_check_invalidate(relation_oid, &None, &row_data)?;
         for fp in fp_list {
             self.cache_query_invalidate(fp).await?;
@@ -544,11 +544,15 @@ impl CacheWriter {
         let sql_list = self.update_queries_sql_list(relation_oid, &row_data)?;
 
         for sql in sql_list {
-            let modified_cnt = self.db_cache.execute(sql.as_str(), &[]).await?;
+            let modified_cnt = self
+                .db_cache
+                .execute(sql.as_str(), &[])
+                .await
+                .map_into_report::<CacheError>()?;
             if modified_cnt == 1 {
                 break;
             } else if modified_cnt > 1 {
-                return Err(CacheError::TooManyModifiedRows);
+                return Err(CacheError::TooManyModifiedRows.into());
             }
         }
 

@@ -1,9 +1,17 @@
 use std::io;
 
 use error_set::error_set;
+use rootcause::Report;
 use tokio_postgres::Error;
 
 use crate::query::{resolved::ResolveError, transform::AstTransformError};
+
+/// Result type with location-tracking error reports.
+/// Use this for functions where you want automatic file:line capture on errors.
+pub type CacheResult<T> = Result<T, Report<CacheError>>;
+
+// Re-export result extensions for convenience when using CacheResult
+pub use crate::result::{MapIntoReport, ReportExt};
 
 // Module declarations
 mod cdc;

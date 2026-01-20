@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod pg;
 pub mod proxy;
 pub mod query;
+pub mod result;
 pub mod settings;
 pub mod stream_utils;
 pub mod tls;
