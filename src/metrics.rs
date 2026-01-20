@@ -1,89 +1,65 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-/// Metrics collector for tracking query and cache performance.
-/// Uses lock-free atomic counters for minimal overhead in hot paths.
-#[derive(Debug, Default)]
-pub struct Metrics {
-    /// Total number of queries received from clients (Query + Execute messages)
-    queries_total: AtomicU64,
+use metrics::{Counter, Key, KeyName, Recorder, SharedString, Unit};
+use metrics_util::registry::{AtomicStorage, Registry};
 
-    /// Number of queries determined to be cacheable
-    queries_cacheable: AtomicU64,
-
-    /// Number of queries that cannot be cached
-    queries_uncacheable: AtomicU64,
-
-    /// Number of non-SELECT statements (INSERT, UPDATE, DELETE, DDL, etc.)
-    queries_unsupported: AtomicU64,
-
-    /// Number of queries that failed to parse
-    queries_invalid: AtomicU64,
-
-    /// Number of queries served from cache (cache hits)
-    queries_cache_hit: AtomicU64,
-
-    /// Number of queries where cache check failed (cache misses)
-    queries_cache_miss: AtomicU64,
-
-    /// Number of queries where cache returned an error
-    queries_cache_error: AtomicU64,
+/// Metric names as constants for consistency
+pub mod names {
+    pub const QUERIES_TOTAL: &str = "pgcache.queries.total";
+    pub const QUERIES_CACHEABLE: &str = "pgcache.queries.cacheable";
+    pub const QUERIES_UNCACHEABLE: &str = "pgcache.queries.uncacheable";
+    pub const QUERIES_UNSUPPORTED: &str = "pgcache.queries.unsupported";
+    pub const QUERIES_INVALID: &str = "pgcache.queries.invalid";
+    pub const QUERIES_CACHE_HIT: &str = "pgcache.queries.cache_hit";
+    pub const QUERIES_CACHE_MISS: &str = "pgcache.queries.cache_miss";
+    pub const QUERIES_CACHE_ERROR: &str = "pgcache.queries.cache_error";
 }
 
-impl Metrics {
+/// Simple recorder that stores counter values for snapshot support.
+/// Uses metrics-util's Registry with AtomicStorage for thread-safe counters.
+///
+/// The registry is wrapped in Arc to allow cloning and shared access
+/// between the global recorder and snapshot functionality.
+#[derive(Clone)]
+pub struct PgCacheRecorder {
+    registry: Arc<Registry<Key, AtomicStorage>>,
+}
+
+impl PgCacheRecorder {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            registry: Arc::new(Registry::new(AtomicStorage)),
+        }
     }
 
-    /// Increment total queries counter
-    pub fn query_increment(&self) {
-        self.queries_total.fetch_add(1, Ordering::Relaxed);
+    /// Install this recorder as the global metrics recorder.
+    /// Returns a clone of the recorder for snapshot access.
+    pub fn install() -> Result<Self, &'static str> {
+        let recorder = Self::new();
+        let recorder_clone = recorder.clone();
+        metrics::set_global_recorder(recorder)
+            .map_err(|_| "failed to install metrics recorder")?;
+        Ok(recorder_clone)
     }
 
-    /// Increment cacheable queries counter
-    pub fn cacheable_increment(&self) {
-        self.queries_cacheable.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment uncacheable queries counter
-    pub fn uncacheable_increment(&self) {
-        self.queries_uncacheable.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment non-SELECT queries counter
-    pub fn unsupported_increment(&self) {
-        self.queries_unsupported.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment parse error counter
-    pub fn invalid_increment(&self) {
-        self.queries_invalid.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment cache hit counter
-    pub fn cache_hit_increment(&self) {
-        self.queries_cache_hit.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment cache miss counter
-    pub fn cache_miss_increment(&self) {
-        self.queries_cache_miss.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment cache error counter
-    pub fn cache_error_increment(&self) {
-        self.queries_cache_error.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Get current metrics snapshot
+    /// Get a point-in-time snapshot of all metrics.
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let total = self.queries_total.load(Ordering::Relaxed);
-        let cacheable = self.queries_cacheable.load(Ordering::Relaxed);
-        let uncacheable = self.queries_uncacheable.load(Ordering::Relaxed);
-        let non_select = self.queries_unsupported.load(Ordering::Relaxed);
-        let parse_error = self.queries_invalid.load(Ordering::Relaxed);
-        let cache_hit = self.queries_cache_hit.load(Ordering::Relaxed);
-        let cache_miss = self.queries_cache_miss.load(Ordering::Relaxed);
-        let cache_error = self.queries_cache_error.load(Ordering::Relaxed);
+        let counter_value = |name: &'static str| -> u64 {
+            let key = Key::from_static_name(name);
+            self.registry
+                .get_counter(&key)
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0)
+        };
+
+        let total = counter_value(names::QUERIES_TOTAL);
+        let cacheable = counter_value(names::QUERIES_CACHEABLE);
+        let uncacheable = counter_value(names::QUERIES_UNCACHEABLE);
+        let unsupported = counter_value(names::QUERIES_UNSUPPORTED);
+        let invalid = counter_value(names::QUERIES_INVALID);
+        let cache_hit = counter_value(names::QUERIES_CACHE_HIT);
+        let cache_miss = counter_value(names::QUERIES_CACHE_MISS);
+        let cache_error = counter_value(names::QUERIES_CACHE_ERROR);
 
         let cache_hit_rate = if cacheable > 0 {
             (cache_hit as f64 / cacheable as f64) * 100.0
@@ -91,7 +67,7 @@ impl Metrics {
             0.0
         };
 
-        let queries_select = total.saturating_sub(non_select).saturating_sub(parse_error);
+        let queries_select = total.saturating_sub(unsupported).saturating_sub(invalid);
         let cacheability_rate = if queries_select > 0 {
             (cacheable as f64 / queries_select as f64) * 100.0
         } else {
@@ -102,14 +78,57 @@ impl Metrics {
             queries_total: total,
             queries_cacheable: cacheable,
             queries_uncacheable: uncacheable,
-            queries_unsupported: non_select,
-            queries_invalid: parse_error,
+            queries_unsupported: unsupported,
+            queries_invalid: invalid,
             queries_cache_hit: cache_hit,
             queries_cache_miss: cache_miss,
             queries_cache_error: cache_error,
             cache_hit_rate,
             cacheability_rate,
         }
+    }
+}
+
+impl Default for PgCacheRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Recorder for PgCacheRecorder {
+    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        // Descriptions not needed for our use case
+    }
+
+    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        // Descriptions not needed for our use case
+    }
+
+    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        // Descriptions not needed for our use case
+    }
+
+    fn register_counter(&self, key: &Key, _metadata: &metrics::Metadata<'_>) -> Counter {
+        self.registry
+            .get_or_create_counter(key, |c| Arc::clone(c).into())
+    }
+
+    fn register_gauge(
+        &self,
+        key: &Key,
+        _metadata: &metrics::Metadata<'_>,
+    ) -> metrics::Gauge {
+        self.registry
+            .get_or_create_gauge(key, |g| Arc::clone(g).into())
+    }
+
+    fn register_histogram(
+        &self,
+        key: &Key,
+        _metadata: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        self.registry
+            .get_or_create_histogram(key, |h| Arc::clone(h).into())
     }
 }
 

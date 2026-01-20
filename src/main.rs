@@ -5,7 +5,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::{error::Error, thread};
 
-use pgcache_lib::metrics::Metrics;
+use pgcache_lib::metrics::PgCacheRecorder;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use pgcache_lib::tracing_utils::SimpeFormatter;
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .build();
 
     let settings = Settings::from_args()?;
-    let metrics = Arc::new(Metrics::new());
+    let recorder = PgCacheRecorder::install().expect("install metrics recorder");
 
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     thread::scope(|scope| {
         let proxy_handle = thread::Builder::new()
             .name("proxy".to_owned())
-            .spawn_scoped(scope, || proxy_run(&settings, Arc::clone(&metrics)))?;
+            .spawn_scoped(scope, || proxy_run(&settings))?;
 
         let sleep_duration = Duration::from_millis(500);
 
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             if sigusr1.load(Ordering::Relaxed) {
                 sigusr1.store(false, Ordering::Relaxed);
-                let snapshot = metrics.snapshot();
+                let snapshot = recorder.snapshot();
                 info!("metrics: {}", snapshot);
             }
 
@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         info!("process terminating {res:?}");
 
         // Log final metrics
-        let snapshot = metrics.snapshot();
+        let snapshot = recorder.snapshot();
         info!("Final metrics: {}", snapshot);
 
         // print the report.

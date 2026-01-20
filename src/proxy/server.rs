@@ -111,7 +111,6 @@ impl<'scope> ProxyCacheState<'scope> {
 
 use crate::{
     cache::{CacheError, cache_run},
-    metrics::Metrics,
     pg::cdc::{replication_cleanup, replication_provision},
     settings::Settings,
     tls,
@@ -129,7 +128,6 @@ type Worker<'scope> = (
 #[derive(Clone)]
 struct WorkerResources {
     cache_sender: CacheSender,
-    metrics: Arc<Metrics>,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 }
 
@@ -147,7 +145,6 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
                 settings,
                 rx,
                 resources.cache_sender,
-                resources.metrics,
                 resources.tls_acceptor,
             )
         })?;
@@ -253,7 +250,7 @@ fn tls_config_load(settings: &Settings) -> Result<Option<Arc<tls::TlsAcceptor>>,
 
 #[tracing::instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), ConnectionError> {
+pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
     // Load TLS config if certificates are provided
     let tls_acceptor = tls_config_load(settings)?;
 
@@ -268,7 +265,6 @@ pub fn proxy_run(settings: &Settings, metrics: Arc<Metrics>) -> Result<(), Conne
 
         let resources = WorkerResources {
             cache_sender,
-            metrics,
             tls_acceptor,
         };
 

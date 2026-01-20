@@ -22,7 +22,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     cache::{CacheMessage, CacheReply, ProxyMessage, query::CacheableQuery},
-    metrics::Metrics,
+    metrics::names,
     pg::protocol::{
         backend::{
             AUTHENTICATION_SASL, PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType,
@@ -107,9 +107,6 @@ pub(super) struct ConnectionState {
     /// Extended protocol: name of statement most recently described (awaiting ParameterDescription)
     pending_describe_statement: Option<String>,
 
-    /// Metrics collector for tracking query and cache performance
-    metrics: Arc<Metrics>,
-
     /// PostgreSQL session user from startup message
     /// TODO: Track SET ROLE queries to update effective user for permission checks
     session_user: Option<String>,
@@ -125,7 +122,7 @@ pub(super) struct ConnectionState {
 }
 
 impl ConnectionState {
-    fn new(client_socket_source: ClientSocketSource, metrics: Arc<Metrics>) -> Self {
+    fn new(client_socket_source: ClientSocketSource) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
             client_write_buf: VecDeque::new(),
@@ -137,7 +134,6 @@ impl ConnectionState {
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
             pending_describe_statement: None,
-            metrics,
             session_user: None,
             search_path: None,
             search_path_query_pending: false,
@@ -152,7 +148,7 @@ impl ConnectionState {
         // debug!("client {:?}", &msg);
         match msg.message_type {
             PgFrontendMessageType::Query => {
-                self.metrics.query_increment();
+                metrics::counter!(names::QUERIES_TOTAL).increment(1);
 
                 if !self.in_transaction {
                     self.proxy_mode =
@@ -160,12 +156,14 @@ impl ConnectionState {
                             Ok(Action::Forward(reason)) => {
                                 match reason {
                                     ForwardReason::UnsupportedStatement => {
-                                        self.metrics.unsupported_increment()
+                                        metrics::counter!(names::QUERIES_UNSUPPORTED).increment(1);
                                     }
                                     ForwardReason::UncacheableSelect => {
-                                        self.metrics.uncacheable_increment()
+                                        metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
                                     }
-                                    ForwardReason::Invalid => self.metrics.invalid_increment(),
+                                    ForwardReason::Invalid => {
+                                        metrics::counter!(names::QUERIES_INVALID).increment(1);
+                                    }
                                 }
                                 self.origin_write_buf.push_back(msg.data);
                                 ProxyMode::Read
@@ -174,15 +172,15 @@ impl ConnectionState {
                                 ProxyMode::CacheWrite(CacheMessage::Query(msg.data, ast))
                             }
                             Err(e) => {
-                                self.metrics.uncacheable_increment();
-                                self.metrics.invalid_increment();
+                                metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
+                                metrics::counter!(names::QUERIES_INVALID).increment(1);
                                 error!("handle_query {}", e);
                                 self.origin_write_buf.push_back(msg.data);
                                 ProxyMode::Read
                             }
                         };
                 } else {
-                    self.metrics.uncacheable_increment();
+                    metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
                     self.origin_write_buf.push_back(msg.data);
                 }
             }
@@ -299,7 +297,9 @@ impl ConnectionState {
                         msg.data.unsplit(after_needle);
 
                         // Update the length field (bytes 1-4, big-endian i32, excludes tag byte)
+                        // Safety: Message format guarantees at least 5 bytes (1 tag + 4 length)
                         let new_len = (msg.data.len() - 1) as i32;
+                        #[expect(clippy::indexing_slicing, reason = "PostgreSQL message format guarantees 5+ bytes")]
                         msg.data[1..5].copy_from_slice(&new_len.to_be_bytes());
                     }
                 }
@@ -347,17 +347,17 @@ impl ConnectionState {
                 // No action needed - just wait for Complete.
             }
             CacheReply::Complete(_) => {
-                self.metrics.cache_hit_increment();
+                metrics::counter!(names::QUERIES_CACHE_HIT).increment(1);
                 self.proxy_mode = ProxyMode::Read;
             }
             CacheReply::Error(buf) => {
-                self.metrics.cache_error_increment();
+                metrics::counter!(names::QUERIES_CACHE_ERROR).increment(1);
                 debug!("forwarding to origin");
                 self.origin_write_buf.push_back(buf);
                 self.proxy_mode = ProxyMode::Read;
             }
             CacheReply::Forward(buf) => {
-                self.metrics.cache_miss_increment();
+                metrics::counter!(names::QUERIES_CACHE_MISS).increment(1);
                 debug!("forwarding to origin");
                 self.origin_write_buf.push_back(buf);
                 self.proxy_mode = ProxyMode::Read;
@@ -395,12 +395,12 @@ impl ConnectionState {
 
     /// Handle Execute message - check cache for cacheable parameterized queries, otherwise forward to origin.
     fn handle_execute_message(&mut self, msg: PgFrontendMessage) {
-        self.metrics.query_increment();
+        metrics::counter!(names::QUERIES_TOTAL).increment(1);
 
         self.proxy_mode = match self.try_cache_execute(&msg) {
             Some(cache_msg) => ProxyMode::CacheWrite(cache_msg),
             None => {
-                self.metrics.uncacheable_increment();
+                metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
 
                 // Track statement type for metrics
                 if let Ok(parsed) = parse_execute_message(&msg.data)
@@ -408,8 +408,12 @@ impl ConnectionState {
                     && let Some(stmt) = self.prepared_statements.get(&portal.statement_name)
                 {
                     match &stmt.sql_type {
-                        StatementType::NonSelect => self.metrics.unsupported_increment(),
-                        StatementType::ParseError => self.metrics.invalid_increment(),
+                        StatementType::NonSelect => {
+                            metrics::counter!(names::QUERIES_UNSUPPORTED).increment(1);
+                        }
+                        StatementType::ParseError => {
+                            metrics::counter!(names::QUERIES_INVALID).increment(1);
+                        }
                         StatementType::Cacheable(_) | StatementType::UncacheableSelect => {}
                     }
                 }
@@ -717,7 +721,6 @@ async fn handle_connection(
     ssl_mode: SslMode,
     server_name: &str,
     cache_sender: CacheSender,
-    metrics: Arc<Metrics>,
 ) -> Result<(), ConnectionError> {
     // Create ClientSocketSource BEFORE splitting (captures raw fd and TLS state)
     let client_socket_source = client_stream.socket_source_create();
@@ -734,7 +737,7 @@ async fn handle_connection(
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
 
     // Initialize connection state with socket source
-    let mut state = ConnectionState::new(client_socket_source, metrics);
+    let mut state = ConnectionState::new(client_socket_source);
 
     tokio::pin!(origin_framed_read);
     tokio::pin!(client_framed_read);
@@ -780,13 +783,13 @@ async fn handle_connection(
                         .collect::<Vec<_>>()
                 }) else {
                     debug!("search_path unknown, forwarding to origin");
-                    state.metrics.uncacheable_increment();
+                    metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
                     state.origin_write_buf.push_back(msg.into_data());
                     state.proxy_mode = ProxyMode::Read;
                     continue;
                 };
 
-                state.metrics.cacheable_increment();
+                metrics::counter!(names::QUERIES_CACHEABLE).increment(1);
 
                 if matches!(msg, CacheMessage::QueryParameterized(_, _, _, _)) {
                     //send a flush to orgin
@@ -844,7 +847,6 @@ pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
     cache_sender: CacheSender,
-    metrics: Arc<Metrics>,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
 ) -> Result<(), ConnectionError> {
     let rt = Builder::new_current_thread().enable_all().build()?;
@@ -866,7 +868,6 @@ pub fn connection_run(
                     let addrs = addrs.clone();
                     let server_name = server_name.clone();
                     let cache_sender = cache_sender.clone();
-                    let metrics = Arc::clone(&metrics);
                     let tls_acceptor = tls_acceptor.clone();
                     spawn_local(async move {
                         debug!("task spawn");
@@ -895,7 +896,6 @@ pub fn connection_run(
                             ssl_mode,
                             &server_name,
                             cache_sender,
-                            metrics,
                         )
                         .await
                         {
