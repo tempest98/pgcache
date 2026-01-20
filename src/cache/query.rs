@@ -6,7 +6,7 @@ use crate::{
             WhereExpr,
         },
         evaluate::is_simple_comparison,
-        transform::{AstTransformError, ast_parameters_replace},
+        transform::{AstTransformResult, ast_parameters_replace},
     },
 };
 use error_set::error_set;
@@ -41,11 +41,8 @@ impl CacheableQuery {
     /// * `parameters` - The parameter values, indexed from 0 (for $1, $2, etc.)
     ///
     /// # Errors
-    /// Returns `CacheabilityError` if parameter replacement fails (e.g., invalid index, invalid UTF-8)
-    pub fn parameters_replace(
-        &mut self,
-        parameters: &QueryParameters,
-    ) -> Result<(), AstTransformError> {
+    /// Returns `AstTransformError` if parameter replacement fails (e.g., invalid index, invalid UTF-8)
+    pub fn parameters_replace(&mut self, parameters: &QueryParameters) -> AstTransformResult<()> {
         self.statement = ast_parameters_replace(&self.statement, parameters)?;
         Ok(())
     }

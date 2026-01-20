@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, Error},
+    io,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -46,7 +46,8 @@ use super::client_stream::{ClientReadHalf, ClientSocketSource, ClientStream, Cli
 use super::query::{Action, ForwardReason, handle_query};
 use super::search_path::SearchPath;
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
-use super::{CacheSender, ConnectionError, ProxyMode, ProxyStatus, ReadError};
+use super::{CacheSender, ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
+use crate::result::MapIntoReport;
 
 // ============================================================================
 // OriginStream - type aliases using generic TLS stream types
@@ -299,7 +300,10 @@ impl ConnectionState {
                         // Update the length field (bytes 1-4, big-endian i32, excludes tag byte)
                         // Safety: Message format guarantees at least 5 bytes (1 tag + 4 length)
                         let new_len = (msg.data.len() - 1) as i32;
-                        #[expect(clippy::indexing_slicing, reason = "PostgreSQL message format guarantees 5+ bytes")]
+                        #[expect(
+                            clippy::indexing_slicing,
+                            reason = "PostgreSQL message format guarantees 5+ bytes"
+                        )]
                         msg.data[1..5].copy_from_slice(&new_len.to_be_bytes());
                     }
                 }
@@ -563,7 +567,7 @@ impl ConnectionState {
         client_read: &mut Pin<&mut FramedRead<ClientReadHalf<'a>, PgFrontendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
         client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
-    ) -> Result<(), ConnectionError> {
+    ) -> ConnectionResult<()> {
         select! {
             res = client_read.next() => {
                 match res {
@@ -572,11 +576,11 @@ impl ConnectionState {
                     }
                     Some(Err(err)) => {
                         debug!("client read error [{}]", err);
-                        return Err(ConnectionError::ProtocolError(err));
+                        return Err(ConnectionError::ProtocolError(err).into());
                     }
                     None => {
                         debug!("client stream closed");
-                        return Err(ReadError::IoError(io::Error::new(
+                        return Err(ConnectionError::IoError(io::Error::new(
                             io::ErrorKind::ConnectionReset,
                             "client disconnected",
                         )).into());
@@ -590,11 +594,11 @@ impl ConnectionState {
                     }
                     Some(Err(err)) => {
                         debug!("origin read error [{}]", err);
-                        return Err(ConnectionError::ProtocolError(err));
+                        return Err(ConnectionError::ProtocolError(err).into());
                     }
                     None => {
                         debug!("origin stream closed");
-                        return Err(ReadError::IoError(io::Error::new(
+                        return Err(ConnectionError::IoError(io::Error::new(
                             io::ErrorKind::ConnectionReset,
                             "origin disconnected",
                         )).into());
@@ -603,14 +607,14 @@ impl ConnectionState {
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
                 origin_write.write_buf(&mut self.origin_write_buf[0]).await
-                    .map_err(ReadError::IoError)?;
+                    .map_err(ConnectionError::IoError)?;
                 if !self.origin_write_buf[0].has_remaining() {
                     self.origin_write_buf.pop_front();
                 }
             }
             _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
                 client_write.write_buf(&mut self.client_write_buf[0]).await
-                    .map_err(ReadError::IoError)?;
+                    .map_err(ConnectionError::IoError)?;
                 if !self.client_write_buf[0].has_remaining() {
                     self.client_write_buf.pop_front();
                 }
@@ -629,10 +633,10 @@ impl ConnectionState {
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
         client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
-    ) -> Result<(), ConnectionError> {
+    ) -> ConnectionResult<()> {
         // Extract cache_rx from self.proxy_mode
         let ProxyMode::CacheRead(ref mut cache_rx) = self.proxy_mode else {
-            return Err(ReadError::IoError(io::Error::new(
+            return Err(ConnectionError::IoError(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Expected CacheRead mode",
             ))
@@ -647,11 +651,11 @@ impl ConnectionState {
                     }
                     Some(Err(err)) => {
                         debug!("origin read error [{}]", err);
-                        return Err(ConnectionError::ProtocolError(err));
+                        return Err(ConnectionError::ProtocolError(err).into());
                     }
                     None => {
                         debug!("origin stream closed");
-                        return Err(ReadError::IoError(io::Error::new(
+                        return Err(ConnectionError::IoError(io::Error::new(
                             io::ErrorKind::ConnectionReset,
                             "origin disconnected",
                         )).into());
@@ -665,20 +669,20 @@ impl ConnectionState {
                     }
                     None => {
                         debug!("cache channel closed");
-                        return Err(ConnectionError::CacheDead);
+                        return Err(ConnectionError::CacheDead.into());
                     }
                 }
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
                 origin_write.write_buf(&mut self.origin_write_buf[0]).await
-                    .map_err(ReadError::IoError)?;
+                    .map_err(ConnectionError::IoError)?;
                 if !self.origin_write_buf[0].has_remaining() {
                     self.origin_write_buf.pop_front();
                 }
             }
             _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
                 client_write.write_buf(&mut self.client_write_buf[0]).await
-                    .map_err(ReadError::IoError)?;
+                    .map_err(ConnectionError::IoError)?;
                 if !self.client_write_buf[0].has_remaining() {
                     self.client_write_buf.pop_front();
                 }
@@ -696,21 +700,26 @@ async fn origin_connect(
     addrs: &[SocketAddr],
     ssl_mode: SslMode,
     server_name: &str,
-) -> Result<OriginStream, ConnectionError> {
+) -> ConnectionResult<OriginStream> {
     for addr in addrs {
         if let Ok(stream) = TcpStream::connect(addr).await {
             return match ssl_mode {
                 SslMode::Disable => Ok(TlsStream::plain(stream)),
                 SslMode::Require => {
-                    let tls_stream = tls::pg_tls_connect(stream, server_name)
-                        .await
-                        .map_err(|e| ConnectionError::TlsError(io::Error::other(e)))?;
+                    let tls_stream =
+                        tls::pg_tls_connect(stream, server_name)
+                            .await
+                            .map_err(|e| {
+                                ConnectionError::TlsError(io::Error::other(
+                                    e.into_current_context(),
+                                ))
+                            })?;
                     Ok(origin_stream_from_tls(tls_stream))
                 }
             };
         }
     }
-    Err(ConnectionError::NoConnection)
+    Err(ConnectionError::NoConnection.into())
 }
 
 #[instrument(skip_all)]
@@ -721,7 +730,7 @@ async fn handle_connection(
     ssl_mode: SslMode,
     server_name: &str,
     cache_sender: CacheSender,
-) -> Result<(), ConnectionError> {
+) -> ConnectionResult<()> {
     // Create ClientSocketSource BEFORE splitting (captures raw fd and TLS state)
     let client_socket_source = client_stream.socket_source_create();
 
@@ -836,7 +845,7 @@ async fn handle_connection(
     }
 
     match state.proxy_status {
-        ProxyStatus::Degraded => Err(ConnectionError::CacheDead),
+        ProxyStatus::Degraded => Err(ConnectionError::CacheDead.into()),
         ProxyStatus::Normal => Ok(()),
     }
 }
@@ -848,8 +857,11 @@ pub fn connection_run(
     mut rx: UnboundedReceiver<TcpStream>,
     cache_sender: CacheSender,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-) -> Result<(), ConnectionError> {
-    let rt = Builder::new_current_thread().enable_all().build()?;
+) -> ConnectionResult<()> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_into_report::<ConnectionError>()?;
 
     // Extract TLS settings for the connection loop
     let ssl_mode = settings.origin.ssl_mode;
@@ -859,7 +871,8 @@ pub fn connection_run(
     rt.block_on(async {
         let addrs: Vec<SocketAddr> =
             lookup_host((settings.origin.host.as_str(), settings.origin.port))
-                .await?
+                .await
+                .map_into_report::<ConnectionError>()?
                 .collect();
 
         LocalSet::new()
@@ -898,10 +911,11 @@ pub fn connection_run(
                             cache_sender,
                         )
                         .await
+                        .map_err(|e| e.into_current_context())
                         {
                             Err(ConnectionError::CacheDead) => {
                                 debug!("connection closed in degraded mode");
-                                return Err(Error::other("cache dead"));
+                                return Err(io::Error::other("cache dead"));
                             }
                             Err(e) => {
                                 error!("{}", e);

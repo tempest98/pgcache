@@ -1,5 +1,8 @@
-use std::{io::Error, mem, sync::Arc, thread, time::Duration};
+use std::{mem, sync::Arc, thread, time::Duration};
 
+use rootcause::Report;
+
+use crate::result::MapIntoReport;
 use tokio::{
     net::{TcpListener, TcpStream},
     runtime::Builder,
@@ -14,7 +17,7 @@ const INITIAL_BACKOFF_MS: u64 = 100;
 const STEADY_STATE_BACKOFF_MS: u64 = 60_000;
 
 struct ProxyCacheState<'scope> {
-    handle: Option<thread::ScopedJoinHandle<'scope, Result<(), CacheError>>>,
+    handle: Option<thread::ScopedJoinHandle<'scope, CacheResult<()>>>,
     updater: CacheSenderUpdater,
     /// Current sender for detecting when the cache thread exits via `.closed()`.
     current_tx: CacheSenderInner,
@@ -26,7 +29,7 @@ struct ProxyCacheState<'scope> {
 
 impl<'scope> ProxyCacheState<'scope> {
     fn new(
-        handle: thread::ScopedJoinHandle<'scope, Result<(), CacheError>>,
+        handle: thread::ScopedJoinHandle<'scope, CacheResult<()>>,
         updater: CacheSenderUpdater,
         current_tx: CacheSenderInner,
     ) -> Self {
@@ -110,17 +113,17 @@ impl<'scope> ProxyCacheState<'scope> {
 }
 
 use crate::{
-    cache::{CacheError, cache_run},
+    cache::{CacheResult, cache_run},
     pg::cdc::{replication_cleanup, replication_provision},
     settings::Settings,
     tls,
 };
 
 use super::cache_sender::CacheSenderInner;
-use super::{CacheSender, CacheSenderUpdater, ConnectionError, connection_run};
+use super::{CacheSender, CacheSenderUpdater, ConnectionError, ConnectionResult, connection_run};
 
 type Worker<'scope> = (
-    thread::ScopedJoinHandle<'scope, Result<(), ConnectionError>>,
+    thread::ScopedJoinHandle<'scope, ConnectionResult<()>>,
     UnboundedSender<TcpStream>,
 );
 
@@ -136,18 +139,14 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     resources: WorkerResources,
-) -> Result<Worker<'scope>, ConnectionError> {
+) -> ConnectionResult<Worker<'scope>> {
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
         .spawn_scoped(scope, || {
-            connection_run(
-                settings,
-                rx,
-                resources.cache_sender,
-                resources.tls_acceptor,
-            )
-        })?;
+            connection_run(settings, rx, resources.cache_sender, resources.tls_acceptor)
+        })
+        .map_into_report::<ConnectionError>()?;
 
     Ok((join, tx))
 }
@@ -156,7 +155,7 @@ fn workers_create_all<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     resources: WorkerResources,
-) -> Result<Vec<Worker<'scope>>, ConnectionError> {
+) -> ConnectionResult<Vec<Worker<'scope>>> {
     (0..settings.num_workers)
         .map(|i| worker_create(i, scope, settings, resources.clone()))
         .collect()
@@ -168,11 +167,11 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     resources: WorkerResources,
-) -> Result<(), ConnectionError> {
+) -> ConnectionResult<()> {
     let Some(worker) = workers.get_mut(worker_index) else {
-        return Err(ConnectionError::IoError(std::io::Error::other(
-            "worker index out of bounds",
-        )));
+        return Err(
+            ConnectionError::IoError(std::io::Error::other("worker index out of bounds")).into(),
+        );
     };
 
     if worker.0.is_finished() {
@@ -185,14 +184,14 @@ fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
 }
 
 type Cache<'scope> = (
-    thread::ScopedJoinHandle<'scope, Result<(), CacheError>>,
+    thread::ScopedJoinHandle<'scope, CacheResult<()>>,
     CacheSenderInner,
 );
 
 fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
-) -> Result<Cache<'scope>, Error> {
+) -> Result<Cache<'scope>, std::io::Error> {
     const DEFAULT_CHANNEL_SIZE: usize = 100;
     let (cache_tx, cache_rx) = channel(DEFAULT_CHANNEL_SIZE);
 
@@ -224,7 +223,7 @@ async fn cache_restart_attempt<'scope, 'env: 'scope, 'settings: 'scope>(
     }
 }
 
-fn tls_config_load(settings: &Settings) -> Result<Option<Arc<tls::TlsAcceptor>>, ConnectionError> {
+fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsAcceptor>>> {
     match (&settings.tls_cert, &settings.tls_key) {
         (Some(cert_path), Some(key_path)) => {
             debug!(
@@ -232,9 +231,9 @@ fn tls_config_load(settings: &Settings) -> Result<Option<Arc<tls::TlsAcceptor>>,
                 cert_path, key_path
             );
             let config = tls::server_tls_config_build(cert_path, key_path).map_err(|e| {
-                ConnectionError::IoError(std::io::Error::other(format!(
+                Report::from(ConnectionError::IoError(std::io::Error::other(format!(
                     "Failed to load TLS certificates: {e}"
-                )))
+                ))))
             })?;
             Ok(Some(Arc::new(tls::TlsAcceptor::from(config))))
         }
@@ -244,22 +243,27 @@ fn tls_config_load(settings: &Settings) -> Result<Option<Arc<tls::TlsAcceptor>>,
         }
         _ => Err(ConnectionError::IoError(std::io::Error::other(
             "Both tls_cert and tls_key must be specified together",
-        ))),
+        ))
+        .into()),
     }
 }
 
 #[tracing::instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
+pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
     // Load TLS config if certificates are provided
     let tls_acceptor = tls_config_load(settings)?;
 
     thread::scope(|scope| {
-        let rt = Builder::new_current_thread().enable_all().build()?;
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_into_report::<ConnectionError>()?;
 
         let _ = rt.block_on(async { replication_provision(settings).await });
 
-        let (cache_handle, cache_tx) = cache_create(scope, settings)?;
+        let (cache_handle, cache_tx) =
+            cache_create(scope, settings).map_into_report::<ConnectionError>()?;
         let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
         let mut cache_state = ProxyCacheState::new(cache_handle, updater, cache_tx);
 
@@ -275,10 +279,10 @@ pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
             let listener = TcpListener::bind(&settings.listen.socket)
                 .await
                 .map_err(|e| {
-                    ConnectionError::IoError(std::io::Error::other(format!(
+                    Report::from(ConnectionError::IoError(std::io::Error::other(format!(
                         "bind error [{}] {e}",
                         &settings.listen.socket
-                    )))
+                    ))))
                 })?;
             debug!("Listening to {}", &settings.listen.socket);
 
@@ -288,9 +292,9 @@ pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
                     // Branch 1: Accept new connections
                     result = listener.accept() => {
                         let (socket, _) = result.map_err(|e| {
-                            ConnectionError::IoError(std::io::Error::other(format!(
+                            Report::from(ConnectionError::IoError(std::io::Error::other(format!(
                                 "accept error: {e}"
-                            )))
+                            ))))
                         })?;
                         debug!("socket accepted");
 
@@ -328,7 +332,9 @@ pub fn proxy_run(settings: &Settings) -> Result<(), ConnectionError> {
 
             #[expect(unreachable_code)]
             {
-                replication_cleanup(settings).await?;
+                replication_cleanup(settings)
+                    .await
+                    .map_err(|r| ConnectionError::CdcError(r.into_current_context()))?;
                 Ok(())
             }
         })

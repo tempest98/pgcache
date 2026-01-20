@@ -4,7 +4,10 @@ use std::{
 
 use error_set::error_set;
 use lexopt::prelude::*;
+use rootcause::Report;
 use serde::Deserialize;
+
+use crate::result::MapIntoReport;
 
 error_set! {
     ConfigError := {
@@ -16,6 +19,9 @@ error_set! {
         IoError(io::Error),
     }
 }
+
+/// Result type with location-tracking error reports for configuration operations.
+pub type ConfigResult<T> = Result<T, Report<ConfigError>>;
 
 impl From<lexopt::Error> for ConfigError {
     fn from(error: lexopt::Error) -> Self {
@@ -109,7 +115,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn from_args() -> Result<Settings, ConfigError> {
+    pub fn from_args() -> ConfigResult<Settings> {
         let mut origin_host: Option<String> = None;
         let mut origin_port: Option<u16> = None;
         let mut origin_user: Option<String> = None;
@@ -130,42 +136,176 @@ impl Settings {
 
         let mut config_settings: Option<Settings> = None;
         let mut parser = lexopt::Parser::from_env();
-        while let Some(arg) = parser.next()? {
+        while let Some(arg) = parser.next().map_into_report::<ConfigError>()? {
             match arg {
                 Short('c') | Long("config") => {
-                    let path = parser.value()?.string()?;
-                    let file = read_to_string(path)?;
-                    config_settings = Some(toml::from_str(&file)?);
+                    let path = parser
+                        .value()
+                        .map_into_report::<ConfigError>()?
+                        .string()
+                        .map_into_report::<ConfigError>()?;
+                    let file = read_to_string(path).map_into_report::<ConfigError>()?;
+                    config_settings = Some(toml::from_str(&file).map_into_report::<ConfigError>()?);
                 }
-                Long("origin_host") => origin_host = Some(parser.value()?.string()?),
-                Long("origin_port") => origin_port = Some(parser.value()?.parse()?),
-                Long("origin_user") => origin_user = Some(parser.value()?.string()?),
-                Long("origin_database") => origin_database = Some(parser.value()?.string()?),
+                Long("origin_host") => {
+                    origin_host = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("origin_port") => {
+                    origin_port = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .parse()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("origin_user") => {
+                    origin_user = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("origin_database") => {
+                    origin_database = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
                 Long("origin_ssl_mode") => {
-                    let mode_str = parser.value()?.string()?;
+                    let mode_str = parser
+                        .value()
+                        .map_into_report::<ConfigError>()?
+                        .string()
+                        .map_into_report::<ConfigError>()?;
                     origin_ssl_mode = Some(mode_str.parse().map_err(|e: ParseSslModeError| {
-                        ConfigError::ArgumentError(e.to_string().into())
+                        Report::from(ConfigError::ArgumentError(e.to_string().into()))
                     })?);
                 }
-                Long("origin_password") => origin_password = Some(parser.value()?.string()?),
-                Long("cache_host") => cache_host = Some(parser.value()?.string()?),
-                Long("cache_port") => cache_port = Some(parser.value()?.parse()?),
-                Long("cache_user") => cache_user = Some(parser.value()?.string()?),
-                Long("cache_database") => cache_database = Some(parser.value()?.string()?),
-                Long("cdc_publication_name") => {
-                    cdc_publication_name = Some(parser.value()?.string()?)
+                Long("origin_password") => {
+                    origin_password = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
                 }
-                Long("cdc_slot_name") => cdc_slot_name = Some(parser.value()?.string()?),
-                Long("listen_socket") => listen_socket = Some(parser.value()?.parse()?),
-                Long("num_workers") => num_workers = Some(parser.value()?.parse()?),
-                Long("cache_size") => cache_size = Some(parser.value()?.parse()?),
-                Long("tls_cert") => tls_cert = Some(PathBuf::from(parser.value()?.string()?)),
-                Long("tls_key") => tls_key = Some(PathBuf::from(parser.value()?.string()?)),
+                Long("cache_host") => {
+                    cache_host = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("cache_port") => {
+                    cache_port = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .parse()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("cache_user") => {
+                    cache_user = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("cache_database") => {
+                    cache_database = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("cdc_publication_name") => {
+                    cdc_publication_name = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("cdc_slot_name") => {
+                    cdc_slot_name = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("listen_socket") => {
+                    listen_socket = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .parse()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("num_workers") => {
+                    num_workers = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .parse()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("cache_size") => {
+                    cache_size = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .parse()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
+                Long("tls_cert") => {
+                    tls_cert = Some(PathBuf::from(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    ))
+                }
+                Long("tls_key") => {
+                    tls_key = Some(PathBuf::from(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    ))
+                }
                 Long("help") => {
                     Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
                 }
                 Short(_) | Long(_) | Value(_) => {
-                    return Err(ConfigError::ArgumentError(Box::new(arg.unexpected())));
+                    return Err(ConfigError::ArgumentError(Box::new(arg.unexpected())).into());
                 }
             }
         }
@@ -197,51 +337,70 @@ impl Settings {
         } else {
             Settings {
                 origin: PgSettings {
-                    host: origin_host.ok_or_else(|| ConfigError::ArgumentMissing {
-                        name: "origin_host",
+                    host: origin_host.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing {
+                            name: "origin_host",
+                        })
                     })?,
-                    port: origin_port.ok_or_else(|| ConfigError::ArgumentMissing {
-                        name: "origin_port",
+                    port: origin_port.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing {
+                            name: "origin_port",
+                        })
                     })?,
-                    user: origin_user.ok_or_else(|| ConfigError::ArgumentMissing {
-                        name: "origin_user",
+                    user: origin_user.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing {
+                            name: "origin_user",
+                        })
                     })?,
                     password: origin_password,
-                    database: origin_database.ok_or_else(|| ConfigError::ArgumentMissing {
-                        name: "origin_database",
+                    database: origin_database.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing {
+                            name: "origin_database",
+                        })
                     })?,
                     ssl_mode: origin_ssl_mode.unwrap_or_default(),
                 },
                 cache: PgSettings {
-                    host: cache_host
-                        .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_host" })?,
-                    port: cache_port
-                        .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_port" })?,
-                    user: cache_user
-                        .ok_or_else(|| ConfigError::ArgumentMissing { name: "cache_user" })?,
+                    host: cache_host.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing { name: "cache_host" })
+                    })?,
+                    port: cache_port.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing { name: "cache_port" })
+                    })?,
+                    user: cache_user.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing { name: "cache_user" })
+                    })?,
                     password: None, // Cache is localhost, uses trust auth
-                    database: cache_database.ok_or_else(|| ConfigError::ArgumentMissing {
-                        name: "cache_database",
+                    database: cache_database.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing {
+                            name: "cache_database",
+                        })
                     })?,
                     ssl_mode: SslMode::Disable, // Cache is always localhost, no TLS needed
                 },
                 cdc: CdcSettings {
                     publication_name: cdc_publication_name.ok_or_else(|| {
-                        ConfigError::ArgumentMissing {
+                        Report::from(ConfigError::ArgumentMissing {
                             name: "cdc_publication_name",
-                        }
+                        })
                     })?,
-                    slot_name: cdc_slot_name.ok_or_else(|| ConfigError::ArgumentMissing {
-                        name: "cdc_slot_name",
+                    slot_name: cdc_slot_name.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing {
+                            name: "cdc_slot_name",
+                        })
                     })?,
                 },
                 listen: ListenSettings {
-                    socket: listen_socket.ok_or_else(|| ConfigError::ArgumentMissing {
-                        name: "listen_socket",
+                    socket: listen_socket.ok_or_else(|| {
+                        Report::from(ConfigError::ArgumentMissing {
+                            name: "listen_socket",
+                        })
                     })?,
                 },
-                num_workers: num_workers.ok_or_else(|| ConfigError::ArgumentMissing {
-                    name: "num_workers",
+                num_workers: num_workers.ok_or_else(|| {
+                    Report::from(ConfigError::ArgumentMissing {
+                        name: "num_workers",
+                    })
                 })?,
                 cache_size,
                 tls_cert,

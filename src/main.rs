@@ -1,19 +1,20 @@
 use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
-use std::{error::Error, thread};
 
 use pgcache_lib::metrics::PgCacheRecorder;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use pgcache_lib::tracing_utils::SimpeFormatter;
+use rootcause::Report;
 
 use tokio::io;
 use tracing::{Level, info};
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Report> {
     // Install rustls crypto provider for TLS support
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -52,11 +53,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 res = proxy_handle
                     .join()
                     .unwrap_or_else(|_panic| {
-                        Err(ConnectionError::IoError(io::Error::other(
-                            "proxy thread panicked",
-                        )))
+                        Err(
+                            ConnectionError::IoError(io::Error::other("proxy thread panicked"))
+                                .into(),
+                        )
                     })
-                    .map_err(|e| Box::new(e) as Box<dyn Error>);
+                    .map_err(|e| e.into_dynamic());
                 break;
             }
 

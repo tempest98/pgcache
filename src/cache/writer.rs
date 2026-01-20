@@ -55,14 +55,15 @@ impl CacheWriter {
         settings: &Settings,
         state_view: Arc<RwLock<CacheStateView>>,
         writer_tx: UnboundedSender<WriterCommand>,
-    ) -> Result<Self, CacheError> {
+    ) -> CacheResult<Self> {
         let (cache_client, cache_connection) = Config::new()
             .host(&settings.cache.host)
             .port(settings.cache.port)
             .user(&settings.cache.user)
             .dbname(&settings.cache.database)
             .connect(NoTls)
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         tokio::spawn(async move {
             if let Err(e) = cache_connection.await {
@@ -70,7 +71,9 @@ impl CacheWriter {
             }
         });
 
-        let origin_client = pg::connect(&settings.origin, "writer origin").await?;
+        let origin_client = pg::connect(&settings.origin, "writer origin")
+            .await
+            .map_into_report::<CacheError>()?;
 
         // Create connection pool for population tasks
         let (populate_pool_tx, populate_pool_rx) = tokio::sync::mpsc::channel(POPULATE_POOL_SIZE);
@@ -83,7 +86,8 @@ impl CacheWriter {
                 .user(&settings.cache.user)
                 .dbname(&settings.cache.database)
                 .connect(NoTls)
-                .await?;
+                .await
+                .map_into_report::<CacheError>()?;
 
             tokio::spawn(async move {
                 if let Err(e) = connection.await {
@@ -109,7 +113,7 @@ impl CacheWriter {
     }
 
     /// Handle a writer command, dispatching to the appropriate method.
-    pub async fn command_handle(&mut self, cmd: WriterCommand) -> Result<(), CacheError> {
+    pub async fn command_handle(&mut self, cmd: WriterCommand) -> CacheResult<()> {
         match cmd {
             WriterCommand::QueryRegister {
                 fingerprint,
@@ -201,7 +205,7 @@ impl CacheWriter {
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
-    ) -> Result<(), CacheError> {
+    ) -> CacheResult<()> {
         let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
 
@@ -226,7 +230,8 @@ impl CacheWriter {
         }
 
         // Resolve the query using catalog metadata
-        let resolved = select_statement_resolve(select_statement, &self.cache.tables, search_path)?;
+        let resolved = select_statement_resolve(select_statement, &self.cache.tables, search_path)
+            .map_err(|e| CacheError::from(e.into_current_context()))?;
 
         // Analyze constraints from the resolved query
         let query_constraints = analyze_query_constraints(&resolved);
@@ -249,7 +254,8 @@ impl CacheWriter {
                 .relation_oid;
 
             let update_resolved =
-                select_statement_resolve(&update_select, &self.cache.tables, search_path)?;
+                select_statement_resolve(&update_select, &self.cache.tables, search_path)
+                    .map_err(|e| CacheError::from(e.into_current_context()))?;
 
             let update_query = UpdateQuery {
                 fingerprint,
@@ -414,7 +420,7 @@ impl CacheWriter {
     pub async fn cache_table_register(
         &mut self,
         mut table_metadata: TableMetadata,
-    ) -> Result<(), CacheError> {
+    ) -> CacheResult<()> {
         let relation_oid = table_metadata.relation_oid;
 
         let table_exists = self.cache.tables.contains_key1(&relation_oid);
@@ -446,7 +452,7 @@ impl CacheWriter {
     }
 
     /// Invalidate all cached queries that reference a table.
-    async fn cache_table_invalidate(&mut self, relation_oid: u32) -> Result<(), CacheError> {
+    async fn cache_table_invalidate(&mut self, relation_oid: u32) -> CacheResult<()> {
         let fingerprints: Vec<u64> = self
             .cache
             .cached_queries
@@ -462,7 +468,7 @@ impl CacheWriter {
     }
 
     /// Invalidate a specific cached query and purge its generation if safe.
-    async fn cache_query_invalidate(&mut self, fingerprint: u64) -> Result<(), CacheError> {
+    async fn cache_query_invalidate(&mut self, fingerprint: u64) -> CacheResult<()> {
         let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
             return Ok(());
         };
@@ -504,23 +510,25 @@ impl CacheWriter {
     }
 
     /// Utility function to get the size of the currently cached data
-    async fn cache_size_load(&mut self) -> Result<usize, CacheError> {
+    async fn cache_size_load(&mut self) -> CacheResult<usize> {
         let size: i64 = self
             .db_cache
             .query_one("SELECT pgcache_total_size()", &[])
-            .await?
+            .await
+            .map_into_report::<CacheError>()?
             .get(0);
 
         Ok(size as usize)
     }
 
     /// Purge rows with generation <= threshold.
-    async fn generation_purge(&mut self, threshold: u64) -> Result<i64, CacheError> {
+    async fn generation_purge(&mut self, threshold: u64) -> CacheResult<i64> {
         if threshold > 0 {
             let deleted: i64 = self
                 .db_cache
                 .query_one("SELECT pgcache_purge_rows($1)", &[&(threshold as i64)])
-                .await?
+                .await
+                .map_into_report::<CacheError>()?
                 .get(0);
             trace!("purged generations <= {threshold}: rows removed [{deleted}]");
             Ok(deleted)
@@ -536,12 +544,19 @@ impl CacheWriter {
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
-        let fp_list = self.update_queries_check_invalidate(relation_oid, &None, &row_data)?;
+        let fp_list = self
+            .update_queries_check_invalidate(relation_oid, &None, &row_data)
+            .attach_loc("checking for query invalidations")?;
+
         for fp in fp_list {
-            self.cache_query_invalidate(fp).await?;
+            self.cache_query_invalidate(fp)
+                .await
+                .attach_loc("invalidating query")?;
         }
 
-        let sql_list = self.update_queries_sql_list(relation_oid, &row_data)?;
+        let sql_list = self
+            .update_queries_sql_list(relation_oid, &row_data)
+            .attach_loc("building update SQL")?;
 
         for sql in sql_list {
             let modified_cnt = self
@@ -566,7 +581,7 @@ impl CacheWriter {
         relation_oid: u32,
         key_data: Vec<Option<String>>,
         new_row_data: Vec<Option<String>>,
-    ) -> Result<(), CacheError> {
+    ) -> CacheResult<()> {
         let row_changes = self.query_row_changes(relation_oid, &new_row_data).await?;
 
         let fp_list = self.update_queries_check_invalidate(
@@ -582,12 +597,16 @@ impl CacheWriter {
 
         let mut matched = false;
         for sql in sql_list {
-            let modified_cnt = self.db_cache.execute(sql.as_str(), &[]).await?;
+            let modified_cnt = self
+                .db_cache
+                .execute(sql.as_str(), &[])
+                .await
+                .map_into_report::<CacheError>()?;
             if modified_cnt == 1 {
                 matched = true;
                 break;
             } else if modified_cnt > 1 {
-                return Err(CacheError::TooManyModifiedRows);
+                return Err(CacheError::TooManyModifiedRows.into());
             }
         }
 
@@ -597,11 +616,15 @@ impl CacheWriter {
                 return Err(CacheError::UnknownTable {
                     oid: Some(relation_oid),
                     name: None,
-                });
+                }
+                .into());
             };
 
             let delete_sql = self.cache_delete_sql(table_metadata, &new_row_data)?;
-            self.db_cache.execute(delete_sql.as_str(), &[]).await?;
+            self.db_cache
+                .execute(delete_sql.as_str(), &[])
+                .await
+                .map_into_report::<CacheError>()?;
         }
 
         if !key_data.is_empty() {
@@ -610,11 +633,15 @@ impl CacheWriter {
                 return Err(CacheError::UnknownTable {
                     oid: Some(relation_oid),
                     name: None,
-                });
+                }
+                .into());
             };
 
             let delete_sql = self.cache_delete_sql(table_metadata, &key_data)?;
-            self.db_cache.execute(delete_sql.as_str(), &[]).await?;
+            self.db_cache
+                .execute(delete_sql.as_str(), &[])
+                .await
+                .map_into_report::<CacheError>()?;
         }
 
         Ok(())
@@ -626,7 +653,7 @@ impl CacheWriter {
         &self,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
-    ) -> Result<(), CacheError> {
+    ) -> CacheResult<()> {
         let table_metadata = match self.cache.tables.get1(&relation_oid) {
             Some(metadata) => metadata,
             None => {
@@ -636,14 +663,17 @@ impl CacheWriter {
         };
 
         let delete_sql = self.cache_delete_sql(table_metadata, &row_data)?;
-        self.db_cache.execute(delete_sql.as_str(), &[]).await?;
+        self.db_cache
+            .execute(delete_sql.as_str(), &[])
+            .await
+            .map_into_report::<CacheError>()?;
 
         Ok(())
     }
 
     /// Handle TRUNCATE operation.
     #[instrument(skip_all)]
-    pub async fn handle_truncate(&self, relation_oids: &[u32]) -> Result<(), CacheError> {
+    pub async fn handle_truncate(&self, relation_oids: &[u32]) -> CacheResult<()> {
         let mut table_names: Vec<String> = Vec::new();
 
         for oid in relation_oids {
@@ -653,7 +683,10 @@ impl CacheWriter {
         }
 
         let truncate_sql = format!("TRUNCATE {}", table_names.join(", "));
-        self.db_cache.execute(truncate_sql.as_str(), &[]).await?;
+        self.db_cache
+            .execute(truncate_sql.as_str(), &[])
+            .await
+            .map_into_report::<CacheError>()?;
 
         Ok(())
     }
@@ -684,7 +717,7 @@ impl CacheWriter {
         &self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<TableMetadata, CacheError> {
+    ) -> CacheResult<TableMetadata> {
         let table = self.query_table_metadata(schema, table).await?;
         self.cache_table_create_from_metadata(&table).await?;
         Ok(table)
@@ -695,7 +728,7 @@ impl CacheWriter {
         &self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<TableMetadata, CacheError> {
+    ) -> CacheResult<TableMetadata> {
         let rows = self.query_table_columns_get(schema, table).await?;
 
         let mut primary_key_columns: Vec<String> = Vec::new();
@@ -737,11 +770,12 @@ impl CacheWriter {
             return Err(CacheError::UnknownTable {
                 oid: relation_oid,
                 name: None,
-            });
+            }
+            .into());
         };
 
         let Some(schema) = schema else {
-            return Err(CacheError::UnknownSchema);
+            return Err(CacheError::UnknownSchema.into());
         };
 
         let indexes = self.query_table_indexes_get(relation_oid).await?;
@@ -763,7 +797,7 @@ impl CacheWriter {
         &self,
         schema: Option<&str>,
         table: &str,
-    ) -> Result<Vec<Row>, CacheError> {
+    ) -> CacheResult<Vec<Row>> {
         let rows = if let Some(schema) = schema {
             let sql = r"
                 SELECT
@@ -788,7 +822,10 @@ impl CacheWriter {
                 ORDER BY a.attnum;
             ";
 
-            self.db_origin.query(sql, &[&table, &schema]).await?
+            self.db_origin
+                .query(sql, &[&table, &schema])
+                .await
+                .map_into_report::<CacheError>()?
         } else {
             let sql = r"
                 SELECT
@@ -822,17 +859,17 @@ impl CacheWriter {
                 ORDER BY a.attnum;
             ";
 
-            self.db_origin.query(sql, &[&table]).await?
+            self.db_origin
+                .query(sql, &[&table])
+                .await
+                .map_into_report::<CacheError>()?
         };
 
         Ok(rows)
     }
 
     #[instrument(skip_all)]
-    async fn query_table_indexes_get(
-        &self,
-        relation_oid: u32,
-    ) -> Result<Vec<IndexMetadata>, CacheError> {
+    async fn query_table_indexes_get(&self, relation_oid: u32) -> CacheResult<Vec<IndexMetadata>> {
         let sql = r"
             SELECT
                 i.relname AS index_name,
@@ -852,7 +889,11 @@ impl CacheWriter {
             ORDER BY i.relname;
         ";
 
-        let rows = self.db_origin.query(sql, &[&relation_oid]).await?;
+        let rows = self
+            .db_origin
+            .query(sql, &[&relation_oid])
+            .await
+            .map_into_report::<CacheError>()?;
 
         let indexes = rows
             .iter()
@@ -875,7 +916,7 @@ impl CacheWriter {
         &self,
         table_name: &str,
         search_path: &[&str],
-    ) -> Result<String, CacheError> {
+    ) -> CacheResult<String> {
         for schema in search_path {
             if self.cache.tables.get2(&(*schema, table_name)).is_some() {
                 return Ok((*schema).to_owned());
@@ -896,13 +937,17 @@ impl CacheWriter {
         let rows = self
             .db_origin
             .query(sql, &[&table_name, &search_path])
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         rows.first()
             .map(|row| row.get::<_, String>(0))
-            .ok_or_else(|| CacheError::UnknownTable {
-                oid: None,
-                name: Some(table_name.to_owned()),
+            .ok_or_else(|| {
+                CacheError::UnknownTable {
+                    oid: None,
+                    name: Some(table_name.to_owned()),
+                }
+                .into()
             })
     }
 
@@ -910,7 +955,7 @@ impl CacheWriter {
         &self,
         relation_oid: u32,
         row_data: &[Option<String>],
-    ) -> Result<Vec<Row>, CacheError> {
+    ) -> CacheResult<Vec<Row>> {
         let table_metadata =
             self.cache
                 .tables
@@ -934,7 +979,7 @@ impl CacheWriter {
         }
 
         if where_conditions.is_empty() {
-            return Err(CacheError::NoPrimaryKey);
+            return Err(CacheError::NoPrimaryKey.into());
         }
 
         let mut comparison_columns = Vec::new();
@@ -962,14 +1007,14 @@ impl CacheWriter {
         self.db_cache
             .query(&sql, &[])
             .await
-            .map_err(CacheError::PgError)
+            .map_into_report::<CacheError>()
     }
 
     #[instrument(skip_all)]
     async fn cache_table_create_from_metadata(
         &self,
         table_metadata: &TableMetadata,
-    ) -> Result<(), CacheError> {
+    ) -> CacheResult<()> {
         let schema = &table_metadata.schema;
         let table = &table_metadata.name;
 
@@ -993,9 +1038,18 @@ impl CacheWriter {
             "CREATE UNLOGGED TABLE \"{schema}\".\"{table}\" (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
         );
 
-        self.db_cache.execute(&create_schema_sql, &[]).await?;
-        self.db_cache.execute(&drop_sql, &[]).await?;
-        self.db_cache.execute(&create_sql, &[]).await?;
+        self.db_cache
+            .execute(&create_schema_sql, &[])
+            .await
+            .map_into_report::<CacheError>()?;
+        self.db_cache
+            .execute(&drop_sql, &[])
+            .await
+            .map_into_report::<CacheError>()?;
+        self.db_cache
+            .execute(&create_sql, &[])
+            .await
+            .map_into_report::<CacheError>()?;
 
         for index in &table_metadata.indexes {
             let unique = if index.is_unique { "UNIQUE " } else { "" };
@@ -1004,13 +1058,19 @@ impl CacheWriter {
             let index_sql = format!(
                 "CREATE {unique}INDEX ON \"{schema}\".\"{table}\" USING {method} ({columns})"
             );
-            self.db_cache.execute(&index_sql, &[]).await?;
+            self.db_cache
+                .execute(&index_sql, &[])
+                .await
+                .map_into_report::<CacheError>()?;
         }
 
         // Enable generation tracking triggers on the table
         let enable_tracking_sql =
             format!("SELECT pgcache_enable_tracking('\"{schema}\".\"{table}\"'::regclass::oid)");
-        self.db_cache.execute(&enable_tracking_sql, &[]).await?;
+        self.db_cache
+            .execute(&enable_tracking_sql, &[])
+            .await
+            .map_into_report::<CacheError>()?;
 
         Ok(())
     }
@@ -1020,7 +1080,7 @@ impl CacheWriter {
         resolved: &ResolvedSelectStatement,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
-    ) -> Result<String, CacheError> {
+    ) -> CacheResult<String> {
         let mut column_names = Vec::new();
         let mut values = Vec::new();
 
@@ -1036,7 +1096,8 @@ impl CacheWriter {
             }
         }
 
-        let value_select = resolved_table_replace_with_values(resolved, table_metadata, row_data)?;
+        let value_select = resolved_table_replace_with_values(resolved, table_metadata, row_data)
+            .map_err(|e| CacheError::from(e.into_current_context()))?;
         let mut select = String::with_capacity(1024);
         value_select.deparse(&mut select);
 
@@ -1070,7 +1131,7 @@ impl CacheWriter {
         &self,
         relation_oid: u32,
         row_data: &[Option<String>],
-    ) -> Result<Vec<String>, CacheError> {
+    ) -> CacheResult<Vec<String>> {
         let update_queries =
             self.cache
                 .update_queries
@@ -1085,7 +1146,8 @@ impl CacheWriter {
             return Err(CacheError::UnknownTable {
                 oid: Some(relation_oid),
                 name: None,
-            });
+            }
+            .into());
         };
 
         let mut sql_list = Vec::new();
@@ -1105,7 +1167,7 @@ impl CacheWriter {
         relation_oid: u32,
         row_changes: &Option<&Row>,
         row_data: &[Option<String>],
-    ) -> Result<Vec<u64>, CacheError> {
+    ) -> CacheResult<Vec<u64>> {
         let update_queries =
             self.cache
                 .update_queries
@@ -1120,7 +1182,8 @@ impl CacheWriter {
             return Err(CacheError::UnknownTable {
                 oid: Some(relation_oid),
                 name: None,
-            });
+            }
+            .into());
         };
 
         let mut fp_list = Vec::new();
@@ -1252,7 +1315,7 @@ impl CacheWriter {
         &self,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
-    ) -> Result<String, CacheError> {
+    ) -> CacheResult<String> {
         let mut where_conditions = Vec::new();
 
         for pk_column in &table_metadata.primary_key_columns {
@@ -1269,7 +1332,7 @@ impl CacheWriter {
 
         if where_conditions.is_empty() {
             error!("Cannot build DELETE WHERE clause: no primary key values found");
-            return Err(CacheError::NoPrimaryKey);
+            return Err(CacheError::NoPrimaryKey.into());
         }
 
         let sql = format!(
@@ -1294,10 +1357,13 @@ async fn population_task(
     resolved: &ResolvedSelectStatement,
     db_origin: Rc<Client>,
     db_cache: &Client,
-) -> Result<usize, CacheError> {
+) -> CacheResult<usize> {
     // Set generation for tracking triggers
     let set_generation_sql = format!("SET mem.query_generation = {generation}");
-    db_cache.execute(&set_generation_sql, &[]).await?;
+    db_cache
+        .execute(&set_generation_sql, &[])
+        .await
+        .map_into_report::<CacheError>()?;
 
     let mut total_bytes: usize = 0;
 
@@ -1323,7 +1389,8 @@ async fn population_task(
     // Reset generation
     db_cache
         .execute("SET mem.query_generation = 0", &[])
-        .await?;
+        .await
+        .map_into_report::<CacheError>()?;
 
     trace!("population complete for query {fingerprint}, bytes={total_bytes}");
     Ok(total_bytes)
@@ -1335,7 +1402,7 @@ async fn population_fetch(
     relation_oid: u32,
     table: &TableMetadata,
     resolved: &ResolvedSelectStatement,
-) -> Result<Vec<SimpleQueryMessage>, CacheError> {
+) -> CacheResult<Vec<SimpleQueryMessage>> {
     let maybe_alias = resolved
         .nodes::<ResolvedTableNode>()
         .find(|tn| tn.relation_oid == relation_oid)
@@ -1353,7 +1420,7 @@ async fn population_fetch(
     db_origin
         .simple_query(&buf)
         .await
-        .map_err(CacheError::PgError)
+        .map_into_report::<CacheError>()
 }
 
 /// Insert fetched rows into cache table.
@@ -1361,7 +1428,7 @@ async fn population_insert(
     db_cache: &Client,
     table: &TableMetadata,
     response: &[SimpleQueryMessage],
-) -> Result<usize, CacheError> {
+) -> CacheResult<usize> {
     let [
         SimpleQueryMessage::RowDescription(row_description),
         data_rows @ ..,
@@ -1430,7 +1497,10 @@ async fn population_insert(
     }
 
     if !sql_list.is_empty() {
-        db_cache.simple_query(sql_list.join(";").as_str()).await?;
+        db_cache
+            .simple_query(sql_list.join(";").as_str())
+            .await
+            .map_into_report::<CacheError>()?;
     }
 
     Ok(cached_bytes)
@@ -1441,8 +1511,11 @@ pub fn writer_run(
     settings: &Settings,
     mut writer_rx: UnboundedReceiver<WriterCommand>,
     state_view: Arc<RwLock<CacheStateView>>,
-) -> Result<(), CacheError> {
-    let rt = Builder::new_current_thread().enable_all().build()?;
+) -> CacheResult<()> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_into_report::<CacheError>()?;
 
     debug!("writer loop");
     rt.block_on(async {

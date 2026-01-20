@@ -37,8 +37,7 @@ impl PgCacheRecorder {
     pub fn install() -> Result<Self, &'static str> {
         let recorder = Self::new();
         let recorder_clone = recorder.clone();
-        metrics::set_global_recorder(recorder)
-            .map_err(|_| "failed to install metrics recorder")?;
+        metrics::set_global_recorder(recorder).map_err(|_| "failed to install metrics recorder")?;
         Ok(recorder_clone)
     }
 
@@ -113,11 +112,7 @@ impl Recorder for PgCacheRecorder {
             .get_or_create_counter(key, |c| Arc::clone(c).into())
     }
 
-    fn register_gauge(
-        &self,
-        key: &Key,
-        _metadata: &metrics::Metadata<'_>,
-    ) -> metrics::Gauge {
+    fn register_gauge(&self, key: &Key, _metadata: &metrics::Metadata<'_>) -> metrics::Gauge {
         self.registry
             .get_or_create_gauge(key, |g| Arc::clone(g).into())
     }

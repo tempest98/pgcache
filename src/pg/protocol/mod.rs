@@ -3,6 +3,7 @@
 use std::io;
 
 use error_set::error_set;
+use rootcause::Report;
 use tokio_util::bytes::BytesMut;
 
 pub(crate) mod backend;
@@ -25,6 +26,9 @@ error_set! {
         IoError(io::Error),
     }
 }
+
+/// Result type with location-tracking error reports for protocol operations.
+pub type ProtocolResult<T> = Result<T, Report<ProtocolError>>;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) enum PgConnectionState {

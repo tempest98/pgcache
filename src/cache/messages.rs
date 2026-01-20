@@ -88,7 +88,7 @@ impl CacheMessage {
             ) => {
                 // Replace parameters in AST
                 if let Err(e) = cacheable_query.parameters_replace(&parameters) {
-                    return Err((e.into(), data));
+                    return Err((e.into_current_context().into(), data));
                 }
                 Ok(QueryData {
                     data,

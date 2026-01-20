@@ -10,7 +10,7 @@ use crate::query::ast::Deparse;
 use crate::settings::Settings;
 
 use super::{
-    CacheError,
+    CacheError, CacheResult, MapIntoReport,
     query_cache::{QueryType, WorkerRequest},
 };
 
@@ -22,7 +22,7 @@ pub struct CacheWorker {
 }
 
 impl CacheWorker {
-    pub async fn new(settings: &Settings) -> Result<Self, CacheError> {
+    pub async fn new(settings: &Settings) -> CacheResult<Self> {
         debug!(
             "CacheWorker: connecting to cache db at {}:{}",
             settings.cache.host, settings.cache.port
@@ -33,7 +33,8 @@ impl CacheWorker {
             .user(&settings.cache.user)
             .dbname(&settings.cache.database)
             .connect(NoTls)
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         debug!("CacheWorker: connection established");
 
@@ -54,13 +55,16 @@ impl CacheWorker {
 
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn handle_cached_query(&self, msg: &mut WorkerRequest) -> Result<(), CacheError> {
+    pub async fn handle_cached_query(&self, msg: &mut WorkerRequest) -> CacheResult<()> {
         // Set generation before query execution (enables row tracking in pgcache_pgrx)
         debug!("message query generation {}", msg.generation);
         if msg.generation > 0 {
             let set_gen = format!("SET mem.query_generation = {}", msg.generation);
             debug!("{}", set_gen);
-            self.db_cache.simple_query(&set_gen).await?;
+            self.db_cache
+                .simple_query(&set_gen)
+                .await
+                .map_into_report::<CacheError>()?;
             debug!("done {}", set_gen);
         }
 
@@ -86,16 +90,17 @@ impl CacheWorker {
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn handle_cached_query_text(
-        &self,
-        msg: &mut WorkerRequest,
-    ) -> Result<(), CacheError> {
+    pub async fn handle_cached_query_text(&self, msg: &mut WorkerRequest) -> CacheResult<()> {
         // Generate SQL query from resolved AST (with schema-qualified table names)
         let mut sql = String::new();
         msg.resolved.deparse(&mut sql);
 
         // Execute query against cache database
-        let res = self.db_cache.simple_query(&sql).await?;
+        let res = self
+            .db_cache
+            .simple_query(&sql)
+            .await
+            .map_into_report::<CacheError>()?;
 
         let [
             SimpleQueryMessage::RowDescription(desc),
@@ -103,7 +108,7 @@ impl CacheWorker {
             SimpleQueryMessage::CommandComplete(cnt),
         ] = res.as_slice()
         else {
-            return Err(CacheError::InvalidMessage);
+            return Err(CacheError::InvalidMessage.into());
         };
 
         let mut buf = BytesMut::new();
@@ -113,14 +118,14 @@ impl CacheWorker {
             // trace!("(w) client write {:?}", buf);
             if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
                 error!("no client");
-                return Err(CacheError::Write);
+                return Err(CacheError::Write.into());
             }
             // Buffer is guaranteed to be clear if there was no error
         }
 
         for query_msg in data_rows {
             let SimpleQueryMessage::Row(row) = query_msg else {
-                return Err(CacheError::InvalidMessage);
+                return Err(CacheError::InvalidMessage.into());
             };
             // Use raw buffer directly to avoid decode/encode overhead
             // The raw buffer contains field data but not the field count
@@ -137,13 +142,13 @@ impl CacheWorker {
                 && msg.client_socket.write_all_buf(&mut buf).await.is_err()
             {
                 error!("no client");
-                return Err(CacheError::Write);
+                return Err(CacheError::Write.into());
             }
         }
         // trace!("(w) client write data");
         if !buf.is_empty() && msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
-            return Err(CacheError::Write);
+            return Err(CacheError::Write.into());
         }
 
         let mut buf = BytesMut::new();
@@ -156,23 +161,24 @@ impl CacheWorker {
         // trace!("(w) client write {:?}", buf);
         if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
-            return Err(CacheError::Write);
+            return Err(CacheError::Write.into());
         }
 
         Ok(())
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn handle_cached_query_binary(
-        &self,
-        msg: &mut WorkerRequest,
-    ) -> Result<(), CacheError> {
+    pub async fn handle_cached_query_binary(&self, msg: &mut WorkerRequest) -> CacheResult<()> {
         // Generate SQL query from resolved AST (with schema-qualified table names)
         let mut sql = String::new();
         msg.resolved.deparse(&mut sql);
 
         // Execute query against cache database
-        let res = self.db_cache.query(&sql, &[]).await?;
+        let res = self
+            .db_cache
+            .query(&sql, &[])
+            .await
+            .map_into_report::<CacheError>()?;
 
         let mut buf = BytesMut::new();
         for row in &res {
@@ -190,7 +196,7 @@ impl CacheWorker {
             if buf.len() > BUFFER_SIZE_THRESHOLD {
                 if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
                     error!("no client");
-                    return Err(CacheError::Write);
+                    return Err(CacheError::Write.into());
                 }
                 buf.clear();
             }
@@ -198,7 +204,7 @@ impl CacheWorker {
         // trace!("(w) client write data [{:?}]", buf);
         if !buf.is_empty() && msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
-            return Err(CacheError::Write);
+            return Err(CacheError::Write.into());
         }
 
         let mut buf = BytesMut::new();
@@ -207,7 +213,7 @@ impl CacheWorker {
         // trace!("(w) client write {:?}", buf);
         if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
             error!("no client");
-            return Err(CacheError::Write);
+            return Err(CacheError::Write.into());
         }
 
         Ok(())

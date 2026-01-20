@@ -14,6 +14,7 @@ use std::io;
 
 use error_set::error_set;
 use nix::errno::Errno;
+use rootcause::Report;
 use tokio::sync::mpsc::Receiver;
 
 use crate::pg::cdc::PgCdcError;
@@ -54,6 +55,9 @@ error_set! {
         Parse(pg_query::Error)
     }
 }
+
+/// Result type with location-tracking error reports for connection operations.
+pub type ConnectionResult<T> = Result<T, Report<ConnectionError>>;
 
 // Manual From<io::Error> impl for ConnectionError since error_set doesn't do transitive conversions
 impl From<io::Error> for ConnectionError {

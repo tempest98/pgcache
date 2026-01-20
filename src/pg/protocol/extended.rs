@@ -1,6 +1,6 @@
 use tokio_util::bytes::{Buf, BytesMut};
 
-use super::ProtocolError;
+use super::{ProtocolError, ProtocolResult};
 use crate::cache::query::CacheableQuery;
 
 /// Classification of a prepared statement based on SQL analysis
@@ -89,14 +89,13 @@ pub struct ParsedCloseMessage {
 }
 
 /// Read a null-terminated string from the buffer
-fn read_cstring<'a>(buf: &mut &'a [u8]) -> Result<&'a str, ProtocolError> {
-    let null_pos = buf
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(ProtocolError::IoError(std::io::Error::new(
+fn read_cstring<'a>(buf: &mut &'a [u8]) -> ProtocolResult<&'a str> {
+    let null_pos = buf.iter().position(|&b| b == 0).ok_or_else(|| {
+        ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "missing null terminator",
-        )))?;
+        ))
+    })?;
 
     let (bytes, rest) = buf.split_at(null_pos);
     let s = std::str::from_utf8(bytes).map_err(|_| {
@@ -121,12 +120,13 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> Result<&'a str, ProtocolError> {
 /// Int16 - number of parameter data types
 /// For each parameter:
 ///     Int32 - OID of parameter data type (0 = unspecified)
-pub fn parse_parse_message(data: &BytesMut) -> Result<ParsedParseMessage, ProtocolError> {
+pub fn parse_parse_message(data: &BytesMut) -> ProtocolResult<ParsedParseMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Parse message too short",
-        )));
+        ))
+        .into());
     };
 
     let mut buf = buf; // Skip message tag (1 byte) and length (4 bytes)
@@ -138,7 +138,8 @@ pub fn parse_parse_message(data: &BytesMut) -> Result<ParsedParseMessage, Protoc
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "missing parameter count",
-        )));
+        ))
+        .into());
     }
 
     let param_count = buf.get_i16() as usize;
@@ -149,7 +150,8 @@ pub fn parse_parse_message(data: &BytesMut) -> Result<ParsedParseMessage, Protoc
             return Err(ProtocolError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "missing parameter OID",
-            )));
+            ))
+            .into());
         }
         parameter_oids.push(buf.get_u32());
     }
@@ -178,12 +180,13 @@ pub fn parse_parse_message(data: &BytesMut) -> Result<ParsedParseMessage, Protoc
 /// Int16 - number of result column format codes
 /// For each format code:
 ///     Int16 - format code (0=text, 1=binary)
-pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, ProtocolError> {
+pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Bind message too short",
-        )));
+        ))
+        .into());
     };
 
     let mut buf = buf; // Skip message tag and length
@@ -196,7 +199,8 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "missing format code count",
-        )));
+        ))
+        .into());
     }
     let format_code_count = buf.get_i16() as usize;
     let mut parameter_formats = Vec::with_capacity(format_code_count);
@@ -206,7 +210,8 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
             return Err(ProtocolError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "missing format code",
-            )));
+            ))
+            .into());
         }
         parameter_formats.push(buf.get_i16());
     }
@@ -216,7 +221,8 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "missing parameter value count",
-        )));
+        ))
+        .into());
     }
     let param_value_count = buf.get_i16() as usize;
     let mut parameter_values = Vec::with_capacity(param_value_count);
@@ -226,7 +232,8 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
             return Err(ProtocolError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "missing parameter length",
-            )));
+            ))
+            .into());
         }
         let param_len = buf.get_i32();
 
@@ -239,7 +246,8 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
                 return Err(ProtocolError::IoError(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "parameter value truncated",
-                )));
+                ))
+                .into());
             };
             let value = value_bytes.to_vec();
             buf.advance(param_len);
@@ -252,7 +260,8 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "missing result format code count",
-        )));
+        ))
+        .into());
     }
     let result_format_count = buf.get_i16() as usize;
     let mut result_formats = Vec::with_capacity(result_format_count);
@@ -262,7 +271,8 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
             return Err(ProtocolError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "missing result format code",
-            )));
+            ))
+            .into());
         }
         result_formats.push(buf.get_i16());
     }
@@ -283,12 +293,13 @@ pub fn parse_bind_message(data: &BytesMut) -> Result<ParsedBindMessage, Protocol
 /// Int32 - message length
 /// String - portal name (empty string for unnamed)
 /// Int32 - maximum number of rows to return (0 = unlimited)
-pub fn parse_execute_message(data: &BytesMut) -> Result<ParsedExecuteMessage, ProtocolError> {
+pub fn parse_execute_message(data: &BytesMut) -> ProtocolResult<ParsedExecuteMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Execute message too short",
-        )));
+        ))
+        .into());
     };
 
     let mut buf = buf; // Skip message tag and length
@@ -299,7 +310,8 @@ pub fn parse_execute_message(data: &BytesMut) -> Result<ParsedExecuteMessage, Pr
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "missing max_rows",
-        )));
+        ))
+        .into());
     }
     let max_rows = buf.get_i32();
 
@@ -316,12 +328,13 @@ pub fn parse_execute_message(data: &BytesMut) -> Result<ParsedExecuteMessage, Pr
 /// Int32 - message length
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
-pub fn parse_describe_message(data: &BytesMut) -> Result<ParsedDescribeMessage, ProtocolError> {
+pub fn parse_describe_message(data: &BytesMut) -> ProtocolResult<ParsedDescribeMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Describe message too short",
-        )));
+        ))
+        .into());
     };
 
     // Need at least 1 byte for describe_type
@@ -329,7 +342,8 @@ pub fn parse_describe_message(data: &BytesMut) -> Result<ParsedDescribeMessage, 
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Describe message too short",
-        )));
+        ))
+        .into());
     }
 
     let mut buf = buf; // Skip message tag and length
@@ -350,12 +364,13 @@ pub fn parse_describe_message(data: &BytesMut) -> Result<ParsedDescribeMessage, 
 /// Int32 - message length
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
-pub fn parse_close_message(data: &BytesMut) -> Result<ParsedCloseMessage, ProtocolError> {
+pub fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedCloseMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Close message too short",
-        )));
+        ))
+        .into());
     };
 
     // Need at least 1 byte for close_type
@@ -363,7 +378,8 @@ pub fn parse_close_message(data: &BytesMut) -> Result<ParsedCloseMessage, Protoc
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "Close message too short",
-        )));
+        ))
+        .into());
     }
 
     let mut buf = buf; // Skip message tag and length
@@ -382,22 +398,22 @@ pub fn parse_close_message(data: &BytesMut) -> Result<ParsedCloseMessage, Protoc
 /// Int16 - number of parameters
 /// For each parameter:
 ///     Int32 - OID of parameter data type
-pub fn parse_parameter_description(
-    data: &BytesMut,
-) -> Result<ParsedParameterDescription, ProtocolError> {
+pub fn parse_parameter_description(data: &BytesMut) -> ProtocolResult<ParsedParameterDescription> {
     // Need at least 7 bytes: tag(1) + length(4) + param_count(2)
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "ParameterDescription message too short",
-        )));
+        ))
+        .into());
     };
 
     if buf.len() < 2 {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "ParameterDescription message too short",
-        )));
+        ))
+        .into());
     }
 
     let mut buf = buf; // Skip message tag and length
@@ -410,7 +426,8 @@ pub fn parse_parameter_description(
             return Err(ProtocolError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "missing parameter OID in ParameterDescription",
-            )));
+            ))
+            .into());
         }
         parameter_oids.push(buf.get_u32());
     }

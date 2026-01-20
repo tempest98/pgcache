@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use error_set::error_set;
+use rootcause::Report;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+use crate::result::MapIntoReport;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pemfile::{certs, private_key};
 use std::fs::File;
@@ -44,6 +47,9 @@ error_set! {
         UnexpectedResponse { byte: u8 },
     }
 }
+
+/// Result type with location-tracking error reports for TLS operations.
+pub type TlsResult<T> = Result<T, Report<TlsError>>;
 
 /// Build a rustls ClientConfig using webpki root certificates
 ///
@@ -100,15 +106,21 @@ const SSL_REQUEST: &[u8] = &[0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 pub async fn pg_tls_connect(
     mut stream: TcpStream,
     server_name: &str,
-) -> Result<RustlsTlsStream<TcpStream>, TlsError> {
+) -> TlsResult<RustlsTlsStream<TcpStream>> {
     tracing::debug!("pg_tls_connect: sending SSLRequest to {}", server_name);
 
     // Send SSLRequest
-    stream.write_all(SSL_REQUEST).await?;
+    stream
+        .write_all(SSL_REQUEST)
+        .await
+        .map_into_report::<TlsError>()?;
 
     // Read response (single byte: 'S' or 'N')
     let mut response = [0u8; 1];
-    stream.read_exact(&mut response).await?;
+    stream
+        .read_exact(&mut response)
+        .await
+        .map_into_report::<TlsError>()?;
 
     tracing::debug!("pg_tls_connect: received response byte: {}", response[0]);
 
@@ -118,13 +130,19 @@ pub async fn pg_tls_connect(
             tracing::debug!("pg_tls_connect: server accepts SSL, starting TLS handshake");
             let config = tls_config_build();
             let connector = TlsConnector::from(config);
-            let server_name: ServerName<'_> = server_name.to_owned().try_into()?;
-            let tls_stream = connector.connect(server_name, stream).await?;
+            let server_name: ServerName<'_> = server_name
+                .to_owned()
+                .try_into()
+                .map_into_report::<TlsError>()?;
+            let tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_into_report::<TlsError>()?;
             tracing::debug!("pg_tls_connect: TLS handshake complete");
             Ok(tls_stream)
         }
-        b'N' => Err(TlsError::SslNotSupported),
-        byte => Err(TlsError::UnexpectedResponse { byte }),
+        b'N' => Err(TlsError::SslNotSupported.into()),
+        byte => Err(TlsError::UnexpectedResponse { byte }.into()),
     }
 }
 
@@ -199,7 +217,7 @@ pub enum ClientTlsResult {
 pub async fn client_tls_negotiate(
     mut stream: TcpStream,
     acceptor: Option<&TlsAcceptor>,
-) -> Result<ClientTlsResult, TlsError> {
+) -> TlsResult<ClientTlsResult> {
     tracing::debug!(
         "client_tls_negotiate: starting, acceptor={}",
         acceptor.is_some()
@@ -207,23 +225,32 @@ pub async fn client_tls_negotiate(
     // Peek at first 8 bytes to check for SSLRequest
     let mut peek_buf = [0u8; 8];
     tracing::debug!("client_tls_negotiate: about to peek");
-    let n = stream.peek(&mut peek_buf).await?;
+    let n = stream
+        .peek(&mut peek_buf)
+        .await
+        .map_into_report::<TlsError>()?;
     tracing::debug!("client_tls_negotiate: peek returned {} bytes", n);
 
     if n >= 8 && peek_buf == SSL_REQUEST {
         // Client sent SSLRequest - consume it
         let mut discard = [0u8; 8];
-        stream.read_exact(&mut discard).await?;
+        stream
+            .read_exact(&mut discard)
+            .await
+            .map_into_report::<TlsError>()?;
 
         if let Some(acceptor) = acceptor {
             // TLS configured - accept SSL
-            stream.write_all(b"S").await?;
-            stream.flush().await?;
+            stream.write_all(b"S").await.map_into_report::<TlsError>()?;
+            stream.flush().await.map_into_report::<TlsError>()?;
 
             tracing::debug!("client_tls_negotiate: accepted SSL, starting TLS handshake");
 
             // Perform TLS handshake
-            let tls_stream = acceptor.accept(stream).await?;
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .map_into_report::<TlsError>()?;
 
             tracing::debug!("client_tls_negotiate: TLS handshake complete");
 
@@ -239,8 +266,8 @@ pub async fn client_tls_negotiate(
         } else {
             // No TLS configured - decline SSL
             tracing::debug!("client_tls_negotiate: TLS not configured, responding 'N'");
-            stream.write_all(b"N").await?;
-            stream.flush().await?;
+            stream.write_all(b"N").await.map_into_report::<TlsError>()?;
+            stream.flush().await.map_into_report::<TlsError>()?;
             Ok(ClientTlsResult::Plain(stream))
         }
     } else {

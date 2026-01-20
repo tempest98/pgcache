@@ -11,7 +11,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     cache::{
-        CacheError,
+        CacheError, CacheResult, MapIntoReport,
         cdc::CdcProcessor,
         messages::{CacheReply, CdcMessage, ProxyMessage, WriterCommand},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
@@ -96,8 +96,11 @@ async fn handle_worker_request(worker: CacheWorker, mut msg: WorkerRequest) {
 }
 
 /// Reset the cache database by dropping and recreating it
-fn cache_database_reset(settings: &Settings) -> Result<(), CacheError> {
-    let rt = Builder::new_current_thread().enable_all().build()?;
+fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_into_report::<CacheError>()?;
 
     rt.block_on(async {
         // Connect to postgres maintenance database
@@ -107,7 +110,8 @@ fn cache_database_reset(settings: &Settings) -> Result<(), CacheError> {
             .user(&settings.cache.user)
             .dbname("postgres")
             .connect(NoTls)
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         tokio::spawn(async move {
             if let Err(e) = admin_conn.await {
@@ -127,15 +131,18 @@ fn cache_database_reset(settings: &Settings) -> Result<(), CacheError> {
                 ),
                 &[],
             )
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         admin_client
             .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         admin_client
             .execute(&format!("CREATE DATABASE {db_name}"), &[])
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         // Connect to fresh cache database and create extension
         let (cache_client, cache_conn) = Config::new()
@@ -144,7 +151,8 @@ fn cache_database_reset(settings: &Settings) -> Result<(), CacheError> {
             .user(&settings.cache.user)
             .dbname(db_name)
             .connect(NoTls)
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         tokio::spawn(async move {
             if let Err(e) = cache_conn.await {
@@ -154,10 +162,12 @@ fn cache_database_reset(settings: &Settings) -> Result<(), CacheError> {
 
         cache_client
             .execute("CREATE EXTENSION pg_stat_statements", &[])
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
         cache_client
             .execute("CREATE EXTENSION pgcache_pgrx", &[])
-            .await?;
+            .await
+            .map_into_report::<CacheError>()?;
 
         Ok(())
     })
@@ -165,12 +175,15 @@ fn cache_database_reset(settings: &Settings) -> Result<(), CacheError> {
 
 /// Main cache runtime - handles proxy queries and CDC events
 #[instrument(skip_all)]
-pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Result<(), CacheError> {
+pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> CacheResult<()> {
     // Reset cache database before starting anything
     cache_database_reset(settings)?;
 
     thread::scope(|scope| {
-        let rt = Builder::new_current_thread().enable_all().build()?;
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_into_report::<CacheError>()?;
 
         // Create shared state view for coordinator to read cache state
         let state_view = Arc::new(RwLock::new(CacheStateView::default()));
@@ -183,19 +196,22 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
             .name("cache writer".to_owned())
             .spawn_scoped(scope, move || {
                 writer_run(&settings_writer, writer_rx, state_view_writer)
-            })?;
+            })
+            .map_into_report::<CacheError>()?;
 
         // Spawn worker thread (executes cached queries - read-only)
         let (worker_tx, worker_rx) = tokio::sync::mpsc::unbounded_channel();
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
-            .spawn_scoped(scope, || worker_run(settings, worker_rx))?;
+            .spawn_scoped(scope, || worker_run(settings, worker_rx))
+            .map_into_report::<CacheError>()?;
 
         // Spawn CDC thread
         let (cdc_tx, mut cdc_rx) = tokio::sync::mpsc::unbounded_channel();
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
-            .spawn_scoped(scope, move || cdc_run(settings, cdc_tx))?;
+            .spawn_scoped(scope, move || cdc_run(settings, cdc_tx))
+            .map_into_report::<CacheError>()?;
 
         debug!("cache loop");
         rt.block_on(async {
@@ -217,7 +233,7 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
                                     Some(msg) => handle_cdc_message(&writer_tx, msg),
                                     None => {
                                         error!("CDC channel closed unexpectedly");
-                                        return Err(CacheError::CdcFailure);
+                                        return Err(CacheError::CdcFailure.into());
                                     }
                                 }
                             }
@@ -250,8 +266,11 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Resul
 fn worker_run(
     settings: &Settings,
     mut worker_rx: UnboundedReceiver<WorkerRequest>,
-) -> Result<(), CacheError> {
-    let rt = Builder::new_current_thread().enable_all().build()?;
+) -> CacheResult<()> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_into_report::<CacheError>()?;
 
     debug!("worker loop");
     rt.block_on(async {
@@ -274,8 +293,11 @@ fn worker_run(
 
 /// CDC runtime - processes change data capture events.
 /// The CDC processor should run indefinitely, so any exit is considered a failure.
-fn cdc_run(settings: &Settings, cdc_tx: UnboundedSender<CdcMessage>) -> Result<(), CacheError> {
-    let rt = Builder::new_current_thread().enable_all().build()?;
+fn cdc_run(settings: &Settings, cdc_tx: UnboundedSender<CdcMessage>) -> CacheResult<()> {
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_into_report::<CacheError>()?;
 
     debug!("cdc loop");
     rt.block_on(async {
@@ -291,6 +313,6 @@ fn cdc_run(settings: &Settings, cdc_tx: UnboundedSender<CdcMessage>) -> Result<(
             }
         }
 
-        Err(CacheError::CdcFailure)
+        Err(CacheError::CdcFailure.into())
     })
 }

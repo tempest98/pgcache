@@ -9,7 +9,7 @@ use crate::query::resolved::ResolvedSelectStatement;
 use crate::settings::Settings;
 
 use super::{
-    CacheError,
+    CacheError, CacheResult,
     messages::{CacheReply, WriterCommand},
     query::CacheableQuery,
     types::{CacheStateView, CachedQueryState},
@@ -60,7 +60,7 @@ impl QueryCache {
         writer_tx: UnboundedSender<WriterCommand>,
         worker_tx: UnboundedSender<WorkerRequest>,
         state_view: Arc<RwLock<CacheStateView>>,
-    ) -> Result<Self, CacheError> {
+    ) -> CacheResult<Self> {
         Ok(Self {
             writer_tx,
             worker_tx,
@@ -70,7 +70,7 @@ impl QueryCache {
 
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn query_dispatch(&mut self, msg: QueryRequest) -> Result<(), CacheError> {
+    pub async fn query_dispatch(&mut self, msg: QueryRequest) -> CacheResult<()> {
         // Generate fingerprint from AST
         let stmt = msg.cacheable_query.statement();
         let fingerprint = ast_query_fingerprint(stmt);
@@ -95,7 +95,7 @@ impl QueryCache {
             };
             self.worker_tx.send(worker_request).map_err(|e| {
                 error!("worker send {e}");
-                CacheError::WorkerSend
+                CacheError::WorkerSend.into()
             })
         } else {
             // Forward query to origin and load cache

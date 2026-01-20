@@ -2,6 +2,7 @@ use error_set::error_set;
 use ordered_float::NotNan;
 use postgres_protocol::types as pg_types;
 use postgres_types::Type as PgType;
+use rootcause::Report;
 
 use crate::{
     cache::{QueryParameter, QueryParameters, query::CacheableQuery},
@@ -32,6 +33,9 @@ error_set! {
     }
 }
 
+/// Result type with location-tracking error reports for AST transform operations.
+pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
+
 /// Replace parameter placeholders ($1, $2, etc.) in a SelectStatement with actual values.
 ///
 /// This function traverses the AST and replaces all `LiteralValue::Parameter` nodes
@@ -52,7 +56,7 @@ error_set! {
 pub fn ast_parameters_replace(
     select_statement: &SelectStatement,
     parameters: &QueryParameters,
-) -> Result<SelectStatement, AstTransformError> {
+) -> AstTransformResult<SelectStatement> {
     let mut new_stmt = select_statement.clone();
 
     // Replace parameters in WHERE clause
@@ -77,7 +81,7 @@ pub fn ast_parameters_replace(
 fn table_source_parameters_replace(
     table_source: &mut TableSource,
     parameters: &QueryParameters,
-) -> Result<(), AstTransformError> {
+) -> AstTransformResult<()> {
     match table_source {
         TableSource::Join(join) => {
             // Replace in JOIN condition
@@ -103,7 +107,7 @@ fn table_source_parameters_replace(
 fn where_expr_parameters_replace(
     expr: &mut WhereExpr,
     parameters: &QueryParameters,
-) -> Result<(), AstTransformError> {
+) -> AstTransformResult<()> {
     match expr {
         WhereExpr::Value(literal) => {
             // Only replace if this is a parameter placeholder
@@ -112,13 +116,12 @@ fn where_expr_parameters_replace(
                 let index = parameter_index_parse(placeholder)?;
 
                 // Get parameter
-                let param =
-                    parameters
-                        .get(index)
-                        .ok_or(AstTransformError::ParameterOutOfBounds {
-                            index,
-                            count: parameters.len(),
-                        })?;
+                let param = parameters.get(index).ok_or_else(|| {
+                    Report::from(AstTransformError::ParameterOutOfBounds {
+                        index,
+                        count: parameters.len(),
+                    })
+                })?;
 
                 // Replace the LiteralValue in place
                 *literal = parameter_to_literal(&param)?;
@@ -153,25 +156,26 @@ fn where_expr_parameters_replace(
 }
 
 /// Parse parameter index from placeholder string (e.g., "$1" -> 0, "$2" -> 1)
-fn parameter_index_parse(placeholder: &str) -> Result<usize, AstTransformError> {
+fn parameter_index_parse(placeholder: &str) -> AstTransformResult<usize> {
     if !placeholder.starts_with('$') {
         return Err(AstTransformError::InvalidParameterPlaceholder {
             placeholder: placeholder.to_owned(),
-        });
+        }
+        .into());
     }
 
     let index_str = &placeholder[1..];
-    let param_num =
-        index_str
-            .parse::<usize>()
-            .map_err(|_| AstTransformError::InvalidParameterPlaceholder {
-                placeholder: placeholder.to_owned(),
-            })?;
+    let param_num = index_str.parse::<usize>().map_err(|_| {
+        Report::from(AstTransformError::InvalidParameterPlaceholder {
+            placeholder: placeholder.to_owned(),
+        })
+    })?;
 
     if param_num == 0 {
         return Err(AstTransformError::InvalidParameterPlaceholder {
             placeholder: placeholder.to_owned(),
-        });
+        }
+        .into());
     }
 
     Ok(param_num - 1) // Convert 1-indexed to 0-indexed
@@ -182,7 +186,7 @@ fn parameter_index_parse(placeholder: &str) -> Result<usize, AstTransformError> 
 /// Handles both text format (format=0) and binary format (format=1) parameters
 /// from the PostgreSQL extended query protocol. Uses the OID to determine the
 /// appropriate type conversion.
-fn parameter_to_literal(param: &QueryParameter) -> Result<LiteralValue, AstTransformError> {
+fn parameter_to_literal(param: &QueryParameter) -> AstTransformResult<LiteralValue> {
     match &param.value {
         None => Ok(LiteralValue::Null),
         Some(bytes) => {
@@ -196,8 +200,9 @@ fn parameter_to_literal(param: &QueryParameter) -> Result<LiteralValue, AstTrans
 }
 
 /// Convert a text format parameter to a LiteralValue based on OID.
-fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, AstTransformError> {
-    let s = String::from_utf8(bytes.to_vec()).map_err(|_| AstTransformError::InvalidUtf8)?;
+fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
+    let s = String::from_utf8(bytes.to_vec())
+        .map_err(|_| Report::from(AstTransformError::InvalidUtf8))?;
 
     // Use postgres_types to identify the type from OID
     let pg_type = PgType::from_oid(oid);
@@ -208,23 +213,24 @@ fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, Ast
             Ok(LiteralValue::Boolean(value))
         }
         Some(PgType::INT2 | PgType::INT4 | PgType::INT8) => {
-            let value = s
-                .parse::<i64>()
-                .map_err(|e| AstTransformError::InvalidParameterValue {
+            let value = s.parse::<i64>().map_err(|e| {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid integer '{}': {}", s, e),
-                })?;
+                })
+            })?;
             Ok(LiteralValue::Integer(value))
         }
         Some(PgType::FLOAT4 | PgType::FLOAT8) => {
-            let value = s
-                .parse::<f64>()
-                .map_err(|e| AstTransformError::InvalidParameterValue {
+            let value = s.parse::<f64>().map_err(|e| {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid float '{}': {}", s, e),
-                })?;
-            let value =
-                NotNan::new(value).map_err(|_| AstTransformError::InvalidParameterValue {
+                })
+            })?;
+            let value = NotNan::new(value).map_err(|_| {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("NaN is not a valid float value: {}", s),
-                })?;
+                })
+            })?;
             Ok(LiteralValue::Float(value))
         }
         // String-like types
@@ -253,65 +259,66 @@ fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, Ast
 }
 
 /// Convert a binary format parameter to a LiteralValue based on OID.
-fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, AstTransformError> {
+fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
     let pg_type = PgType::from_oid(oid);
 
     match pg_type {
         Some(PgType::BOOL) => {
             let value = pg_types::bool_from_sql(bytes).map_err(|e| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid binary bool: {}", e),
-                }
+                })
             })?;
             Ok(LiteralValue::Boolean(value))
         }
         Some(PgType::INT2) => {
             let value = pg_types::int2_from_sql(bytes).map_err(|e| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid binary int2: {}", e),
-                }
+                })
             })?;
             Ok(LiteralValue::Integer(value as i64))
         }
         Some(PgType::INT4) => {
             let value = pg_types::int4_from_sql(bytes).map_err(|e| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid binary int4: {}", e),
-                }
+                })
             })?;
             Ok(LiteralValue::Integer(value as i64))
         }
         Some(PgType::INT8) => {
             let value = pg_types::int8_from_sql(bytes).map_err(|e| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid binary int8: {}", e),
-                }
+                })
             })?;
             Ok(LiteralValue::Integer(value))
         }
         Some(PgType::FLOAT4) => {
             let value = pg_types::float4_from_sql(bytes).map_err(|e| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid binary float4: {}", e),
-                }
+                })
             })?;
             let value = NotNan::new(value as f64).map_err(|_| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: "NaN is not a valid float value".to_owned(),
-                }
+                })
             })?;
             Ok(LiteralValue::Float(value))
         }
         Some(PgType::FLOAT8) => {
             let value = pg_types::float8_from_sql(bytes).map_err(|e| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid binary float8: {}", e),
-                }
+                })
             })?;
-            let value =
-                NotNan::new(value).map_err(|_| AstTransformError::InvalidParameterValue {
+            let value = NotNan::new(value).map_err(|_| {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: "NaN is not a valid float value".to_owned(),
-                })?;
+                })
+            })?;
             Ok(LiteralValue::Float(value))
         }
         Some(
@@ -323,23 +330,22 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, A
             | PgType::UNKNOWN,
         ) => {
             let value = pg_types::text_from_sql(bytes).map_err(|e| {
-                AstTransformError::InvalidParameterValue {
+                Report::from(AstTransformError::InvalidParameterValue {
                     message: format!("invalid binary text: {}", e),
-                }
+                })
             })?;
             Ok(LiteralValue::String(value.to_owned()))
         }
         Some(PgType::UUID) => {
             // UUID binary format is 16 bytes
-            let bytes: &[u8; 16] =
-                bytes
-                    .try_into()
-                    .map_err(|_| AstTransformError::InvalidParameterValue {
-                        message: format!(
-                            "invalid UUID length: expected 16 bytes, got {}",
-                            bytes.len()
-                        ),
-                    })?;
+            let bytes: &[u8; 16] = bytes.try_into().map_err(|_| {
+                Report::from(AstTransformError::InvalidParameterValue {
+                    message: format!(
+                        "invalid UUID length: expected 16 bytes, got {}",
+                        bytes.len()
+                    ),
+                })
+            })?;
             let uuid_str = format!(
                 "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                 bytes[0],
@@ -361,8 +367,10 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> Result<LiteralValue, A
             );
             Ok(LiteralValue::String(uuid_str))
         }
-        Some(pg_type) => Err(AstTransformError::UnsupportedBinaryFormat { oid: pg_type.oid() }),
-        None => Err(AstTransformError::UnsupportedBinaryFormat { oid }),
+        Some(pg_type) => {
+            Err(AstTransformError::UnsupportedBinaryFormat { oid: pg_type.oid() }.into())
+        }
+        None => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
     }
 }
 
@@ -401,14 +409,14 @@ pub fn resolved_table_replace_with_values(
     resolved: &ResolvedSelectStatement,
     table_metadata: &TableMetadata,
     row_data: &[Option<String>],
-) -> Result<ResolvedSelectStatement, AstTransformError> {
+) -> AstTransformResult<ResolvedSelectStatement> {
     let mut resolved_new = resolved.clone();
     let relation_oid = table_metadata.relation_oid;
 
     // Find first matching table source by relation_oid and get the alias
     let alias = {
         let Some(first_from) = resolved_new.from.first() else {
-            return Err(AstTransformError::MissingTable);
+            return Err(AstTransformError::MissingTable.into());
         };
         let mut frontier = vec![first_from];
         let mut found_alias: Option<String> = None;
@@ -432,7 +440,7 @@ pub fn resolved_table_replace_with_values(
                 _ => (),
             }
         }
-        found_alias.ok_or(AstTransformError::MissingTable)?
+        found_alias.ok_or_else(|| Report::from(AstTransformError::MissingTable))?
     };
 
     // Update all column references for this table to use the alias
@@ -445,7 +453,7 @@ pub fn resolved_table_replace_with_values(
 
     // Now replace the table source with a VALUES subquery
     let Some(first_from) = resolved_new.from.first_mut() else {
-        return Err(AstTransformError::MissingTable);
+        return Err(AstTransformError::MissingTable.into());
     };
     let mut frontier = vec![first_from];
     let mut source_node: Option<&mut ResolvedTableSource> = None;
@@ -466,7 +474,7 @@ pub fn resolved_table_replace_with_values(
     }
 
     let Some(source_node) = source_node else {
-        return Err(AstTransformError::MissingTable);
+        return Err(AstTransformError::MissingTable.into());
     };
 
     // Build VALUES clause from row_data and collect column names
@@ -644,12 +652,12 @@ pub fn query_table_replace_with_values(
     select: &SelectStatement,
     table_metadata: &TableMetadata,
     row_data: &[Option<String>],
-) -> Result<SelectStatement, AstTransformError> {
+) -> AstTransformResult<SelectStatement> {
     let mut select_new = select.clone();
 
     //find first matching table source
     let Some(first_from) = select_new.from.first_mut() else {
-        return Err(AstTransformError::MissingTable);
+        return Err(AstTransformError::MissingTable.into());
     };
     let mut frontier = vec![first_from];
     let mut source_node: Option<&mut TableSource> = None;
@@ -670,10 +678,10 @@ pub fn query_table_replace_with_values(
     }
 
     let Some(source_node) = source_node else {
-        return Err(AstTransformError::MissingTable);
+        return Err(AstTransformError::MissingTable.into());
     };
     let TableSource::Table(table_node) = source_node else {
-        return Err(AstTransformError::MissingTable);
+        return Err(AstTransformError::MissingTable.into());
     };
 
     let mut column_names = Vec::new();
@@ -843,7 +851,7 @@ mod tests {
         let result = ast_parameters_replace(stmt, &params);
 
         assert!(result.is_err());
-        match result {
+        match result.map_err(|e| e.into_current_context()) {
             Err(AstTransformError::ParameterOutOfBounds { index, count }) => {
                 assert_eq!(index, 1); // $2 -> index 1
                 assert_eq!(count, 1); // Only 1 parameter provided
@@ -1061,7 +1069,7 @@ mod tests {
             oid: PgType::INT4.oid(),
         };
 
-        let result = parameter_to_literal(&param);
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
             Err(AstTransformError::InvalidParameterValue { .. })
@@ -1238,7 +1246,7 @@ mod tests {
             oid: PgType::TIMESTAMP.oid(), // Timestamp not supported in binary
         };
 
-        let result = parameter_to_literal(&param);
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
             Err(AstTransformError::UnsupportedBinaryFormat { .. })

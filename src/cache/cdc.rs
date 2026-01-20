@@ -29,7 +29,7 @@ use crate::pg::cdc::connect_replication;
 use crate::settings::Settings;
 
 use super::{
-    CacheError,
+    CacheError, CacheResult, MapIntoReport,
     messages::{CdcMessage, CdcMessageUpdate},
 };
 
@@ -55,8 +55,10 @@ impl CdcProcessor {
     pub async fn new(
         settings: &Settings,
         cdc_tx: UnboundedSender<CdcMessage>,
-    ) -> Result<Self, CacheError> {
-        let origin_cdc_client = connect_replication(&settings.origin, "CDC origin").await?;
+    ) -> CacheResult<Self> {
+        let origin_cdc_client = connect_replication(&settings.origin, "CDC origin")
+            .await
+            .map_into_report::<CacheError>()?;
 
         // Create keep-alive timer with 30-second interval (hardcoded for POC)
         let mut timer = interval(Duration::from_secs(30));

@@ -2,6 +2,7 @@ use std::any::Any;
 
 use error_set::error_set;
 use iddqd::BiHashMap;
+use rootcause::Report;
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
@@ -30,6 +31,9 @@ error_set! {
         InvalidTableRef,
     }
 }
+
+/// Result type with location-tracking error reports for resolution operations.
+pub type ResolveResult<T> = Result<T, Report<ResolveError>>;
 
 /// Resolved table reference with complete metadata
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -750,24 +754,25 @@ fn table_metadata_find<'map, 'node: 'map>(
 fn column_resolve<'a>(
     column_node: &ColumnNode,
     scope: &ResolutionScope<'a>,
-) -> Result<ResolvedColumnNode, ResolveError> {
+) -> ResolveResult<ResolvedColumnNode> {
     let column_name = &column_node.column;
 
     // If column has table qualifier, resolve directly
     if let Some(table_qualifier) = &column_node.table {
-        let (table_metadata, alias) =
-            scope
-                .table_scope_find(table_qualifier)
-                .ok_or_else(|| ResolveError::TableNotFound {
-                    name: table_qualifier.clone(),
-                })?;
+        let (table_metadata, alias) = scope.table_scope_find(table_qualifier).ok_or_else(|| {
+            Report::from(ResolveError::TableNotFound {
+                name: table_qualifier.clone(),
+            })
+        })?;
 
         let column_metadata = table_metadata
             .columns
             .get1(column_name.as_str())
-            .ok_or_else(|| ResolveError::ColumnNotFound {
-                table: table_metadata.name.clone(),
-                column: column_name.clone(),
+            .ok_or_else(|| {
+                Report::from(ResolveError::ColumnNotFound {
+                    table: table_metadata.name.clone(),
+                    column: column_name.clone(),
+                })
             })?;
 
         return Ok(ResolvedColumnNode {
@@ -791,7 +796,8 @@ fn column_resolve<'a>(
         [] => Err(ResolveError::ColumnNotFound {
             table: "<unknown>".to_owned(),
             column: column_name.clone(),
-        }),
+        }
+        .into()),
         [(table_metadata, alias, column_metadata)] => Ok(ResolvedColumnNode {
             schema: table_metadata.schema.clone(),
             table: table_metadata.name.clone(),
@@ -801,7 +807,8 @@ fn column_resolve<'a>(
         }),
         _ => Err(ResolveError::AmbiguousColumn {
             column: column_name.clone(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -809,7 +816,7 @@ fn column_resolve<'a>(
 fn where_expr_resolve(
     expr: &WhereExpr,
     scope: &ResolutionScope,
-) -> Result<ResolvedWhereExpr, ResolveError> {
+) -> ResolveResult<ResolvedWhereExpr> {
     match expr {
         WhereExpr::Value(lit) => Ok(ResolvedWhereExpr::Value(lit.clone())),
         WhereExpr::Column(col) => {
@@ -837,7 +844,7 @@ fn where_expr_resolve(
                 .exprs
                 .iter()
                 .map(|e| where_expr_resolve(e, scope))
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<ResolveResult<Vec<_>>>()?;
             Ok(ResolvedWhereExpr::Multi(ResolvedMultiExpr {
                 op: multi.op,
                 exprs: resolved_exprs,
@@ -847,7 +854,7 @@ fn where_expr_resolve(
             let resolved_args = args
                 .iter()
                 .map(|arg| where_expr_resolve(arg, scope))
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<ResolveResult<Vec<_>>>()?;
             Ok(ResolvedWhereExpr::Function {
                 name: name.clone(),
                 args: resolved_args,
@@ -855,7 +862,7 @@ fn where_expr_resolve(
         }
         WhereExpr::Subquery { .. } => {
             // Subqueries not yet supported
-            Err(ResolveError::InvalidTableRef)
+            Err(ResolveError::InvalidTableRef.into())
         }
     }
 }
@@ -866,15 +873,15 @@ fn table_source_resolve<'a>(
     tables: &'a BiHashMap<TableMetadata>,
     scope: &mut ResolutionScope<'a>,
     search_path: &[&'a str],
-) -> Result<ResolvedTableSource, ResolveError> {
+) -> ResolveResult<ResolvedTableSource> {
     match source {
         TableSource::Table(table_node) => {
             // First find the table metadata (which gives us the schema)
             let table_metadata =
                 table_metadata_find(table_node, tables, search_path).ok_or_else(|| {
-                    ResolveError::TableNotFound {
+                    Report::from(ResolveError::TableNotFound {
                         name: table_node.name.clone(),
-                    }
+                    })
                 })?;
 
             scope.table_scope_add(
@@ -915,7 +922,7 @@ fn table_source_resolve<'a>(
         }
         TableSource::Subquery(_) => {
             // Subqueries not yet supported
-            Err(ResolveError::InvalidTableRef)
+            Err(ResolveError::InvalidTableRef.into())
         }
     }
 }
@@ -924,7 +931,7 @@ fn table_source_resolve<'a>(
 fn column_expr_resolve(
     expr: &ColumnExpr,
     scope: &ResolutionScope,
-) -> Result<ResolvedColumnExpr, ResolveError> {
+) -> ResolveResult<ResolvedColumnExpr> {
     match expr {
         ColumnExpr::Column(col) => {
             let resolved = column_resolve(col, scope)?;
@@ -937,7 +944,7 @@ fn column_expr_resolve(
                 .args
                 .iter()
                 .map(|arg| column_expr_resolve(arg, scope))
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<ResolveResult<Vec<_>>>()?;
             Ok(ResolvedColumnExpr::Function {
                 name: func.name.clone(),
                 args: resolved_args,
@@ -945,7 +952,7 @@ fn column_expr_resolve(
         }
         ColumnExpr::Subquery(_) => {
             // Subqueries not yet supported
-            Err(ResolveError::InvalidTableRef)
+            Err(ResolveError::InvalidTableRef.into())
         }
     }
 }
@@ -954,7 +961,7 @@ fn column_expr_resolve(
 fn select_columns_resolve(
     columns: &SelectColumns,
     scope: &ResolutionScope,
-) -> Result<ResolvedSelectColumns, ResolveError> {
+) -> ResolveResult<ResolvedSelectColumns> {
     match columns {
         SelectColumns::None => Ok(ResolvedSelectColumns::None),
         SelectColumns::All => {
@@ -983,7 +990,7 @@ fn select_columns_resolve(
                         alias: col.alias.clone(),
                     })
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<ResolveResult<Vec<_>>>()?;
             Ok(ResolvedSelectColumns::Columns(resolved_cols))
         }
     }
@@ -993,7 +1000,7 @@ fn select_columns_resolve(
 fn order_by_resolve(
     order_by: &[crate::query::ast::OrderByClause],
     scope: &ResolutionScope,
-) -> Result<Vec<ResolvedOrderByClause>, ResolveError> {
+) -> ResolveResult<Vec<ResolvedOrderByClause>> {
     order_by
         .iter()
         .map(|clause| {
@@ -1011,7 +1018,7 @@ pub fn select_statement_resolve(
     stmt: &SelectStatement,
     tables: &BiHashMap<TableMetadata>,
     search_path: &[&str],
-) -> Result<ResolvedSelectStatement, ResolveError> {
+) -> ResolveResult<ResolvedSelectStatement> {
     let mut scope = ResolutionScope::new();
 
     // First pass: resolve all table references and build scope
@@ -1208,7 +1215,10 @@ mod tests {
         let Statement::Select(stmt) = &sql_query.statement;
         let result = select_statement_resolve(stmt, &tables, &["public"]);
 
-        assert!(matches!(result, Err(ResolveError::TableNotFound { .. })));
+        assert!(matches!(
+            result.map_err(|e| e.into_current_context()),
+            Err(ResolveError::TableNotFound { .. })
+        ));
     }
 
     #[test]
@@ -1313,7 +1323,10 @@ mod tests {
         let Statement::Select(stmt) = &sql_query.statement;
         let result = select_statement_resolve(stmt, &tables, &["public"]);
 
-        assert!(matches!(result, Err(ResolveError::AmbiguousColumn { .. })));
+        assert!(matches!(
+            result.map_err(|e| e.into_current_context()),
+            Err(ResolveError::AmbiguousColumn { .. })
+        ));
     }
 
     #[test]
@@ -1690,7 +1703,10 @@ mod tests {
         let result = select_statement_resolve(stmt, &tables, &["public"]);
 
         // Should fail with column not found error
-        assert!(matches!(result, Err(ResolveError::ColumnNotFound { .. })));
+        assert!(matches!(
+            result.map_err(|e| e.into_current_context()),
+            Err(ResolveError::ColumnNotFound { .. })
+        ));
     }
 
     // ==================== Deparse Tests ====================
