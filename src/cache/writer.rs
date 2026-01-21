@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use iddqd::BiHashMap;
 use postgres_protocol::escape;
+use rootcause::Report;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, spawn_local};
@@ -73,7 +74,8 @@ impl CacheWriter {
 
         let origin_client = pg::connect(&settings.origin, "writer origin")
             .await
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("connecting to origin database")?;
 
         // Create connection pool for population tasks
         let (populate_pool_tx, populate_pool_rx) = tokio::sync::mpsc::channel(POPULATE_POOL_SIZE);
@@ -231,7 +233,8 @@ impl CacheWriter {
 
         // Resolve the query using catalog metadata
         let resolved = select_statement_resolve(select_statement, &self.cache.tables, search_path)
-            .map_err(|e| CacheError::from(e.into_current_context()))?;
+            .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
+            .attach_loc("resolving select statement")?;
 
         // Analyze constraints from the resolved query
         let query_constraints = analyze_query_constraints(&resolved);
@@ -255,7 +258,8 @@ impl CacheWriter {
 
             let update_resolved =
                 select_statement_resolve(&update_select, &self.cache.tables, search_path)
-                    .map_err(|e| CacheError::from(e.into_current_context()))?;
+                    .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
+                    .attach_loc("resolving update select statement")?;
 
             let update_query = UpdateQuery {
                 fingerprint,
@@ -1152,11 +1156,17 @@ impl CacheWriter {
 
         let mut sql_list = Vec::new();
         for update_query in &update_queries.queries {
-            sql_list.push(self.cache_upsert_with_predicate_sql(
-                &update_query.resolved,
-                table_metadata,
-                row_data,
-            )?);
+            sql_list.push(
+                self.cache_upsert_with_predicate_sql(
+                    &update_query.resolved,
+                    table_metadata,
+                    row_data,
+                )
+                .attach_loc(format!(
+                    "building update SQL for query {}",
+                    update_query.fingerprint
+                ))?,
+            );
         }
 
         Ok(sql_list)

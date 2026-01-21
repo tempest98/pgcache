@@ -29,7 +29,7 @@ use crate::pg::cdc::connect_replication;
 use crate::settings::Settings;
 
 use super::{
-    CacheError, CacheResult, MapIntoReport,
+    CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcMessage, CdcMessageUpdate},
 };
 
@@ -58,7 +58,8 @@ impl CdcProcessor {
     ) -> CacheResult<Self> {
         let origin_cdc_client = connect_replication(&settings.origin, "CDC origin")
             .await
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("connecting to origin for CDC")?;
 
         // Create keep-alive timer with 30-second interval (hardcoded for POC)
         let mut timer = interval(Duration::from_secs(30));

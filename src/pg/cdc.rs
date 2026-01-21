@@ -5,7 +5,7 @@ use tokio_postgres::config::ReplicationMode;
 use tokio_postgres::{Client, Error};
 use tracing::debug;
 
-use crate::result::MapIntoReport;
+use crate::result::{MapIntoReport, ReportExt};
 use crate::settings::{PgSettings, Settings};
 
 use super::connect::{config_build, config_connect, connect};
@@ -33,7 +33,8 @@ pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
 
     let client = connect(&settings.origin, "replication provisioning")
         .await
-        .map_into_report::<PgCdcError>()?;
+        .map_into_report::<PgCdcError>()
+        .attach_loc("connecting for replication provision")?;
 
     debug!("cdc provisioning connected");
 
@@ -54,7 +55,8 @@ pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
         client
             .execute(&create_pub, &[])
             .await
-            .map_into_report::<PgCdcError>()?;
+            .map_into_report::<PgCdcError>()
+            .attach_loc("creating publication")?;
         debug!("Publication created successfully");
     } else {
         debug!("Publication already exists: {}", publication_name);
@@ -78,7 +80,8 @@ pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
                 &[&slot_name],
             )
             .await
-            .map_into_report::<PgCdcError>()?;
+            .map_into_report::<PgCdcError>()
+            .attach_loc("creating replication slot")?;
         debug!("Replication slot created successfully");
     } else {
         debug!("Replication slot already exists: {}", slot_name);
@@ -100,7 +103,8 @@ pub async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> {
 
     let client = connect(&settings.origin, "replication cleanup")
         .await
-        .map_into_report::<PgCdcError>()?;
+        .map_into_report::<PgCdcError>()
+        .attach_loc("connecting for replication cleanup")?;
 
     // Drop replication slot if it exists
     debug!("Dropping replication slot: {}", slot_name);
@@ -110,7 +114,8 @@ pub async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> {
             &[&slot_name],
         )
         .await
-        .map_into_report::<PgCdcError>()?;
+        .map_into_report::<PgCdcError>()
+        .attach_loc("dropping replication slot")?;
 
     // Drop publication if it exists
     debug!("Dropping publication: {}", publication_name);
@@ -118,7 +123,8 @@ pub async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> {
     client
         .execute(&drop_pub, &[])
         .await
-        .map_into_report::<PgCdcError>()?;
+        .map_into_report::<PgCdcError>()
+        .attach_loc("dropping publication")?;
 
     debug!("Replication cleanup complete");
     Ok(())

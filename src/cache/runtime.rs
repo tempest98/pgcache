@@ -11,7 +11,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     cache::{
-        CacheError, CacheResult, MapIntoReport,
+        CacheError, CacheResult, MapIntoReport, ReportExt,
         cdc::CdcProcessor,
         messages::{CacheReply, CdcMessage, ProxyMessage, WriterCommand},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
@@ -132,17 +132,20 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
                 &[],
             )
             .await
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("terminating existing connections")?;
 
         admin_client
             .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
             .await
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("dropping cache database")?;
 
         admin_client
             .execute(&format!("CREATE DATABASE {db_name}"), &[])
             .await
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("creating cache database")?;
 
         // Connect to fresh cache database and create extension
         let (cache_client, cache_conn) = Config::new()
@@ -163,11 +166,13 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
         cache_client
             .execute("CREATE EXTENSION pg_stat_statements", &[])
             .await
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("creating pg_stat_statements extension")?;
         cache_client
             .execute("CREATE EXTENSION pgcache_pgrx", &[])
             .await
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("creating pgcache_pgrx extension")?;
 
         Ok(())
     })
@@ -177,7 +182,7 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
 #[instrument(skip_all)]
 pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> CacheResult<()> {
     // Reset cache database before starting anything
-    cache_database_reset(settings)?;
+    cache_database_reset(settings).attach_loc("resetting cache database")?;
 
     thread::scope(|scope| {
         let rt = Builder::new_current_thread()
@@ -197,21 +202,24 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
             .spawn_scoped(scope, move || {
                 writer_run(&settings_writer, writer_rx, state_view_writer)
             })
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("spawning writer thread")?;
 
         // Spawn worker thread (executes cached queries - read-only)
         let (worker_tx, worker_rx) = tokio::sync::mpsc::unbounded_channel();
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
             .spawn_scoped(scope, || worker_run(settings, worker_rx))
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("spawning worker thread")?;
 
         // Spawn CDC thread
         let (cdc_tx, mut cdc_rx) = tokio::sync::mpsc::unbounded_channel();
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
             .spawn_scoped(scope, move || cdc_run(settings, cdc_tx))
-            .map_into_report::<CacheError>()?;
+            .map_into_report::<CacheError>()
+            .attach_loc("spawning CDC thread")?;
 
         debug!("cache loop");
         rt.block_on(async {
@@ -221,7 +229,8 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                 worker_tx,
                 Arc::clone(&state_view),
             )
-            .await?;
+            .await
+            .attach_loc("creating query cache")?;
 
             LocalSet::new()
                 .run_until(async move {
@@ -274,7 +283,9 @@ fn worker_run(
 
     debug!("worker loop");
     rt.block_on(async {
-        let worker = CacheWorker::new(settings).await?;
+        let worker = CacheWorker::new(settings)
+            .await
+            .attach_loc("creating cache worker")?;
 
         LocalSet::new()
             .run_until(async move {
@@ -301,7 +312,9 @@ fn cdc_run(settings: &Settings, cdc_tx: UnboundedSender<CdcMessage>) -> CacheRes
 
     debug!("cdc loop");
     rt.block_on(async {
-        let mut cdc = CdcProcessor::new(settings, cdc_tx).await?;
+        let mut cdc = CdcProcessor::new(settings, cdc_tx)
+            .await
+            .attach_loc("initializing CDC processor")?;
 
         // CDC should run forever - any return (Ok or Err) is unexpected
         match cdc.run().await {

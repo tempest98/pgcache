@@ -2,7 +2,7 @@ use std::{mem, sync::Arc, thread, time::Duration};
 
 use rootcause::Report;
 
-use crate::result::MapIntoReport;
+use crate::result::{MapIntoReport, ReportExt};
 use tokio::{
     net::{TcpListener, TcpStream},
     runtime::Builder,
@@ -262,8 +262,9 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
 
         let _ = rt.block_on(async { replication_provision(settings).await });
 
-        let (cache_handle, cache_tx) =
-            cache_create(scope, settings).map_into_report::<ConnectionError>()?;
+        let (cache_handle, cache_tx) = cache_create(scope, settings)
+            .map_into_report::<ConnectionError>()
+            .attach_loc("creating cache thread")?;
         let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
         let mut cache_state = ProxyCacheState::new(cache_handle, updater, cache_tx);
 
@@ -334,7 +335,8 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
             {
                 replication_cleanup(settings)
                     .await
-                    .map_err(|r| ConnectionError::CdcError(r.into_current_context()))?;
+                    .map_err(|r| Report::from(ConnectionError::CdcError(r.into_current_context())))
+                    .attach_loc("cleaning up replication")?;
                 Ok(())
             }
         })

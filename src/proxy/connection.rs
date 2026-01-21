@@ -5,6 +5,8 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
+
+use rootcause::Report;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpStream, lookup_host},
@@ -47,7 +49,7 @@ use super::query::{Action, ForwardReason, handle_query};
 use super::search_path::SearchPath;
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{CacheSender, ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
-use crate::result::MapIntoReport;
+use crate::result::{MapIntoReport, ReportExt};
 
 // ============================================================================
 // OriginStream - type aliases using generic TLS stream types
@@ -706,14 +708,14 @@ async fn origin_connect(
             return match ssl_mode {
                 SslMode::Disable => Ok(TlsStream::plain(stream)),
                 SslMode::Require => {
-                    let tls_stream =
-                        tls::pg_tls_connect(stream, server_name)
-                            .await
-                            .map_err(|e| {
-                                ConnectionError::TlsError(io::Error::other(
-                                    e.into_current_context(),
-                                ))
-                            })?;
+                    let tls_stream = tls::pg_tls_connect(stream, server_name)
+                        .await
+                        .map_err(|e| {
+                            Report::from(ConnectionError::TlsError(io::Error::other(
+                                e.into_current_context(),
+                            )))
+                        })
+                        .attach_loc("establishing TLS connection")?;
                     Ok(origin_stream_from_tls(tls_stream))
                 }
             };
@@ -735,7 +737,9 @@ async fn handle_connection(
     let client_socket_source = client_stream.socket_source_create();
 
     // Connect to origin database (with TLS if required)
-    let mut origin_stream = origin_connect(&addrs, ssl_mode, server_name).await?;
+    let mut origin_stream = origin_connect(&addrs, ssl_mode, server_name)
+        .await
+        .attach_loc("connecting to origin")?;
 
     // Split origin stream (borrowed halves with .writable() support)
     let (origin_read, origin_write) = origin_stream.split();
@@ -861,7 +865,8 @@ pub fn connection_run(
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_into_report::<ConnectionError>()?;
+        .map_into_report::<ConnectionError>()
+        .attach_loc("creating connection runtime")?;
 
     // Extract TLS settings for the connection loop
     let ssl_mode = settings.origin.ssl_mode;
@@ -872,7 +877,8 @@ pub fn connection_run(
         let addrs: Vec<SocketAddr> =
             lookup_host((settings.origin.host.as_str(), settings.origin.port))
                 .await
-                .map_into_report::<ConnectionError>()?
+                .map_into_report::<ConnectionError>()
+                .attach_loc("resolving origin host")?
                 .collect();
 
         LocalSet::new()
