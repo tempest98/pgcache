@@ -51,7 +51,11 @@ pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
     if !pub_exists {
         debug!("Creating publication: {}", publication_name);
         // Note: publication names can't be parameterized, must use format!
-        let create_pub = format!("CREATE PUBLICATION {} FOR ALL TABLES", publication_name);
+        // publish_via_partition_root ensures CDC reports parent table OID for partition changes
+        let create_pub = format!(
+            "CREATE PUBLICATION {} FOR ALL TABLES WITH (publish_via_partition_root = true)",
+            publication_name
+        );
         client
             .execute(&create_pub, &[])
             .await
@@ -60,6 +64,16 @@ pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
         debug!("Publication created successfully");
     } else {
         debug!("Publication already exists: {}", publication_name);
+        // Ensure publish_via_partition_root is enabled for partitioned table support
+        let alter_pub = format!(
+            "ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
+            publication_name
+        );
+        client
+            .execute(&alter_pub, &[])
+            .await
+            .map_into_report::<PgCdcError>()
+            .attach_loc("setting publish_via_partition_root")?;
     }
 
     // Check if replication slot exists

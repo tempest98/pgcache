@@ -323,7 +323,10 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
     });
 
     origin_client
-        .execute("CREATE PUBLICATION pub_test FOR ALL TABLES", &[])
+        .execute(
+            "CREATE PUBLICATION pub_test FOR ALL TABLES WITH (publish_via_partition_root = true)",
+            &[],
+        )
         .await
         .map_err(Error::other)?;
 

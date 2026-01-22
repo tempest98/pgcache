@@ -852,7 +852,7 @@ impl CacheWriter {
                     FROM pg_class c2
                     JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
                     WHERE c2.relname = $1
-                    AND c2.relkind = 'r'
+                    AND c2.relkind IN ('r', 'p')
                     AND n2.nspname = any(current_schemas(false))
                     ORDER BY array_position(current_schemas(false), n2.nspname)
                     LIMIT 1
@@ -872,8 +872,33 @@ impl CacheWriter {
         Ok(rows)
     }
 
+    /// Find one child partition of a partitioned table, if any.
+    /// Returns None for regular tables or partitioned tables with no children.
+    #[instrument(skip_all)]
+    async fn partition_child_find(&self, relation_oid: u32) -> CacheResult<Option<u32>> {
+        let sql = r"
+            SELECT inhrelid::oid
+            FROM pg_inherits
+            WHERE inhparent = $1
+            LIMIT 1
+        ";
+
+        let row = self
+            .db_origin
+            .query_opt(sql, &[&relation_oid])
+            .await
+            .map_into_report::<CacheError>()?;
+
+        Ok(row.map(|r| r.get::<_, u32>(0)))
+    }
+
     #[instrument(skip_all)]
     async fn query_table_indexes_get(&self, relation_oid: u32) -> CacheResult<Vec<IndexMetadata>> {
+        // For partitioned tables, query indexes from a child partition.
+        // Falls back to parent (works for regular tables and partitioned tables with no children).
+        let child_oid = self.partition_child_find(relation_oid).await?;
+        let target_oid = child_oid.unwrap_or(relation_oid);
+
         let sql = r"
             SELECT
                 i.relname AS index_name,
@@ -895,7 +920,7 @@ impl CacheWriter {
 
         let rows = self
             .db_origin
-            .query(sql, &[&relation_oid])
+            .query(sql, &[&target_oid])
             .await
             .map_into_report::<CacheError>()?;
 
@@ -932,7 +957,7 @@ impl CacheWriter {
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relname = $1
-            AND c.relkind = 'r'
+            AND c.relkind IN ('r', 'p')
             AND n.nspname = any($2)
             ORDER BY array_position($2::text[], n.nspname::text)
             LIMIT 1;

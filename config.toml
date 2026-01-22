@@ -2,17 +2,17 @@ num_workers = 2
 cache_size = 100000
 
 [origin]
-#host = "localhost"
-#port = 5432
-#user = "postgres"
-#database = "origin"
+host = "localhost"
+port = 5432
+user = "postgres"
+database = "origin"
 #database = "sakila"
 
-host = "ep-orange-river-afs4ceae.c-2.us-west-2.aws.neon.tech"
-port = 5432
-user = "neondb_owner"
-database = "neondb"
-ssl_mode = "require"
+#host = "ep-orange-river-afs4ceae.c-2.us-west-2.aws.neon.tech"
+#port = 5432
+#user = "neondb_owner"
+#database = "neondb"
+#ssl_mode = "require"
 
 [cache]
 host = "localhost"
