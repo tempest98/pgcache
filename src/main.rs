@@ -5,7 +5,7 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-use pgcache_lib::metrics::DualRecorder;
+use pgcache_lib::metrics::prometheus_install;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use pgcache_lib::tracing_utils::SimpeFormatter;
@@ -28,7 +28,7 @@ fn main() -> Result<(), Report> {
 
     let settings = Settings::from_args()?;
     let metrics_socket = settings.metrics.as_ref().map(|m| m.socket);
-    let recorder = DualRecorder::install(metrics_socket).expect("install metrics recorder");
+    prometheus_install(metrics_socket).expect("install metrics recorder");
 
     if let Some(socket) = metrics_socket {
         info!("Prometheus metrics available at http://{}/metrics", socket);
@@ -41,9 +41,7 @@ fn main() -> Result<(), Report> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let sigint = Arc::new(AtomicBool::new(false));
-    let sigusr1 = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))?;
-    signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&sigusr1))?;
 
     thread::scope(|scope| {
         let proxy_handle = thread::Builder::new()
@@ -67,19 +65,9 @@ fn main() -> Result<(), Report> {
                 break;
             }
 
-            if sigusr1.load(Ordering::Relaxed) {
-                sigusr1.store(false, Ordering::Relaxed);
-                let snapshot = recorder.snapshot();
-                info!("metrics: {}", snapshot);
-            }
-
             sleep(sleep_duration);
         }
         info!("process terminating {res:?}");
-
-        // Log final metrics
-        let snapshot = recorder.snapshot();
-        info!("Final metrics: {}", snapshot);
 
         // print the report.
         #[cfg(feature = "hotpath")]

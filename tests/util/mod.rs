@@ -24,13 +24,28 @@ fn crypto_provider_init() {
     });
 }
 
-use pgcache_lib::metrics::MetricsSnapshot;
 use pgcache_lib::tls::{MakeRustlsConnect, tls_config_with_cert};
 use pgtemp::{PgTempDB, PgTempDBBuilder};
 use postgres_types::ToSql;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, Statement, ToStatement};
 use tokio_util::bytes::{Buf, BytesMut};
+
+/// Point-in-time snapshot of metrics for test assertions.
+/// Populated by parsing metrics from the Prometheus HTTP endpoint.
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    pub queries_total: u64,
+    pub queries_cacheable: u64,
+    pub queries_uncacheable: u64,
+    pub queries_unsupported: u64,
+    pub queries_invalid: u64,
+    pub queries_cache_hit: u64,
+    pub queries_cache_miss: u64,
+    pub queries_cache_error: u64,
+    pub cache_hit_rate: f64,
+    pub cacheability_rate: f64,
+}
 
 /// Guard structure that automatically kills and waits for the pgcache process on drop
 /// This ensures proper cleanup even if tests panic
