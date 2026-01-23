@@ -99,6 +99,11 @@ pub struct ListenSettings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct MetricsSettings {
+    pub socket: SocketAddr,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
     pub origin: PgSettings,
     pub cache: PgSettings,
@@ -112,6 +117,9 @@ pub struct Settings {
     /// TLS private key file path (PEM format) for client connections
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
+    /// Prometheus metrics endpoint configuration
+    #[serde(default)]
+    pub metrics: Option<MetricsSettings>,
 }
 
 impl Settings {
@@ -133,6 +141,7 @@ impl Settings {
         let mut cache_size: Option<usize> = None;
         let mut tls_cert: Option<PathBuf> = None;
         let mut tls_key: Option<PathBuf> = None;
+        let mut metrics_socket: Option<SocketAddr> = None;
 
         let mut config_settings: Option<Settings> = None;
         let mut parser = lexopt::Parser::from_env();
@@ -301,6 +310,15 @@ impl Settings {
                             .map_into_report::<ConfigError>()?,
                     ))
                 }
+                Long("metrics_socket") => {
+                    metrics_socket = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .parse()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
                 Long("help") => {
                     Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
                 }
@@ -332,6 +350,9 @@ impl Settings {
             config.cache_size = cache_size.or(config.cache_size);
             config.tls_cert = tls_cert.or(config.tls_cert);
             config.tls_key = tls_key.or(config.tls_key);
+            config.metrics = metrics_socket
+                .map(|socket| MetricsSettings { socket })
+                .or(config.metrics);
 
             config
         } else {
@@ -405,6 +426,7 @@ impl Settings {
                 cache_size,
                 tls_cert,
                 tls_key,
+                metrics: metrics_socket.map(|socket| MetricsSettings { socket }),
             }
         };
 
@@ -424,7 +446,8 @@ impl Settings {
             --listen_socket IP_AND_PORT \n \
             --num_workers NUMBER \n \
             [--cache_size BYTES] \n \
-            [--tls_cert CERT_FILE --tls_key KEY_FILE]"
+            [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
+            [--metrics_socket IP_AND_PORT]"
         );
         std::process::exit(1);
     }

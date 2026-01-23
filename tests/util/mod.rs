@@ -53,8 +53,10 @@ impl Drop for PgCacheProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
 
-        //drain stdout
-        let _ = std::io::copy(&mut self.stdout.as_mut().unwrap(), &mut stdout());
+        // Drain stdout if available
+        if let Some(ref mut child_stdout) = self.child.stdout {
+            let _ = std::io::copy(child_stdout, &mut stdout());
+        }
     }
 }
 
@@ -348,9 +350,11 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
 }
 
 pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Client), Error> {
-    // Find a random available port
+    // Find random available ports for listen and metrics
     let listen_port = find_available_port()?;
     let listen_socket = format!("127.0.0.1:{}", listen_port);
+    let metrics_port = find_available_port()?;
+    let metrics_socket = format!("127.0.0.1:{}", metrics_port);
 
     let child = Command::new(env!("CARGO_BIN_EXE_pgcache"))
         .arg("--config")
@@ -373,6 +377,8 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Clie
         .arg(dbs.cache.db_name())
         .arg("--listen_socket")
         .arg(&listen_socket)
+        .arg("--metrics_socket")
+        .arg(&metrics_socket)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -406,9 +412,11 @@ pub async fn connect_pgcache_tls(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, 
     // Initialize crypto provider (required for rustls)
     crypto_provider_init();
 
-    // Find a random available port
+    // Find random available ports for listen and metrics
     let listen_port = find_available_port()?;
     let listen_socket = format!("127.0.0.1:{}", listen_port);
+    let metrics_port = find_available_port()?;
+    let metrics_socket = format!("127.0.0.1:{}", metrics_port);
 
     let child = Command::new(env!("CARGO_BIN_EXE_pgcache"))
         .arg("--config")
@@ -431,12 +439,14 @@ pub async fn connect_pgcache_tls(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, 
         .arg(dbs.cache.db_name())
         .arg("--listen_socket")
         .arg(&listen_socket)
+        .arg("--metrics_socket")
+        .arg(&metrics_socket)
         .arg("--tls_cert")
         .arg("tests/data/certs/server.crt")
         .arg("--tls_key")
         .arg("tests/data/certs/server.key")
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()
         .expect("run pgcache");
 

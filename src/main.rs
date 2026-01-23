@@ -5,7 +5,7 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-use pgcache_lib::metrics::PgCacheRecorder;
+use pgcache_lib::metrics::DualRecorder;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use pgcache_lib::tracing_utils::SimpeFormatter;
@@ -27,7 +27,12 @@ fn main() -> Result<(), Report> {
         .build();
 
     let settings = Settings::from_args()?;
-    let recorder = PgCacheRecorder::install().expect("install metrics recorder");
+    let metrics_socket = settings.metrics.as_ref().map(|m| m.socket);
+    let recorder = DualRecorder::install(metrics_socket).expect("install metrics recorder");
+
+    if let Some(socket) = metrics_socket {
+        info!("Prometheus metrics available at http://{}/metrics", socket);
+    }
 
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)

@@ -28,3 +28,6 @@ slot_name = "slot_test"
 
 [listen]
 socket = "127.0.0.1:6432"
+
+[metrics]
+socket = "127.0.0.1:9090"

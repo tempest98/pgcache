@@ -4,6 +4,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
+    time::Instant,
 };
 
 use rootcause::Report;
@@ -50,6 +51,15 @@ use super::search_path::SearchPath;
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{CacheSender, ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::result::{MapIntoReport, ReportExt};
+
+/// Guard that decrements active connections gauge when dropped.
+struct ActiveConnectionGuard;
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        metrics::gauge!(names::CONNECTIONS_ACTIVE).decrement(1.0);
+    }
+}
 
 // ============================================================================
 // OriginStream - type aliases using generic TLS stream types
@@ -122,6 +132,12 @@ pub(super) struct ConnectionState {
 
     /// Whether this is the first ReadyForQuery after authentication
     first_ready_for_query: bool,
+
+    /// Start time of the current query (for latency tracking)
+    query_start: Option<Instant>,
+
+    /// Start time of origin query (for origin latency tracking)
+    origin_query_start: Option<Instant>,
 }
 
 impl ConnectionState {
@@ -141,9 +157,13 @@ impl ConnectionState {
             search_path: None,
             search_path_query_pending: false,
             first_ready_for_query: true,
+            query_start: None,
+            origin_query_start: None,
         }
     }
+}
 
+impl ConnectionState {
     /// Handle a message from the client (frontend).
     /// Determines whether to forward to origin, check cache, or take other action.
     #[expect(clippy::wildcard_enum_match_arm)]
@@ -152,6 +172,8 @@ impl ConnectionState {
         match msg.message_type {
             PgFrontendMessageType::Query => {
                 metrics::counter!(names::QUERIES_TOTAL).increment(1);
+                metrics::counter!(names::PROTOCOL_SIMPLE_QUERIES).increment(1);
+                self.query_start = Some(Instant::now());
 
                 if !self.in_transaction {
                     self.proxy_mode =
@@ -168,6 +190,7 @@ impl ConnectionState {
                                         metrics::counter!(names::QUERIES_INVALID).increment(1);
                                     }
                                 }
+                                self.origin_query_start = Some(Instant::now());
                                 self.origin_write_buf.push_back(msg.data);
                                 ProxyMode::Read
                             }
@@ -178,12 +201,14 @@ impl ConnectionState {
                                 metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
                                 metrics::counter!(names::QUERIES_INVALID).increment(1);
                                 error!("handle_query {}", e);
+                                self.origin_query_start = Some(Instant::now());
                                 self.origin_write_buf.push_back(msg.data);
                                 ProxyMode::Read
                             }
                         };
                 } else {
                     metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
+                    self.origin_query_start = Some(Instant::now());
                     self.origin_write_buf.push_back(msg.data);
                 }
             }
@@ -317,6 +342,20 @@ impl ConnectionState {
                 // 'E' = in failed transaction block
                 self.in_transaction = msg.data.get(5).is_some_and(|&b| b == b'T' || b == b'E');
 
+                // Record origin latency
+                if let Some(start) = self.origin_query_start.take() {
+                    let duration = start.elapsed();
+                    metrics::histogram!(names::ORIGIN_LATENCY_SECONDS)
+                        .record(duration.as_secs_f64());
+                }
+
+                // Record total query latency
+                if let Some(start) = self.query_start.take() {
+                    let duration = start.elapsed();
+                    metrics::histogram!(names::QUERY_LATENCY_SECONDS)
+                        .record(duration.as_secs_f64());
+                }
+
                 // Clean up unnamed portals when transaction ends
                 if !self.in_transaction {
                     self.portals.retain(|name, _| !name.is_empty());
@@ -354,17 +393,25 @@ impl ConnectionState {
             }
             CacheReply::Complete(_) => {
                 metrics::counter!(names::QUERIES_CACHE_HIT).increment(1);
+                // Record query latency for cache hit
+                if let Some(start) = self.query_start.take() {
+                    let duration = start.elapsed();
+                    metrics::histogram!(names::QUERY_LATENCY_SECONDS)
+                        .record(duration.as_secs_f64());
+                }
                 self.proxy_mode = ProxyMode::Read;
             }
             CacheReply::Error(buf) => {
                 metrics::counter!(names::QUERIES_CACHE_ERROR).increment(1);
                 debug!("forwarding to origin");
+                self.origin_query_start = Some(Instant::now());
                 self.origin_write_buf.push_back(buf);
                 self.proxy_mode = ProxyMode::Read;
             }
             CacheReply::Forward(buf) => {
                 metrics::counter!(names::QUERIES_CACHE_MISS).increment(1);
                 debug!("forwarding to origin");
+                self.origin_query_start = Some(Instant::now());
                 self.origin_write_buf.push_back(buf);
                 self.proxy_mode = ProxyMode::Read;
             }
@@ -402,6 +449,8 @@ impl ConnectionState {
     /// Handle Execute message - check cache for cacheable parameterized queries, otherwise forward to origin.
     fn handle_execute_message(&mut self, msg: PgFrontendMessage) {
         metrics::counter!(names::QUERIES_TOTAL).increment(1);
+        metrics::counter!(names::PROTOCOL_EXTENDED_QUERIES).increment(1);
+        self.query_start = Some(Instant::now());
 
         self.proxy_mode = match self.try_cache_execute(&msg) {
             Some(cache_msg) => ProxyMode::CacheWrite(cache_msg),
@@ -424,6 +473,7 @@ impl ConnectionState {
                     }
                 }
 
+                self.origin_query_start = Some(Instant::now());
                 self.origin_write_buf.push_back(msg.data);
                 ProxyMode::Read
             }
@@ -517,6 +567,10 @@ impl ConnectionState {
             sql_type,
         };
         debug!("parsed statement insert {}", parsed.statement_name);
+        // Only increment gauge if this is a new statement (not replacing)
+        if !self.prepared_statements.contains_key(&parsed.statement_name) {
+            metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).increment(1.0);
+        }
         self.prepared_statements
             .entry(parsed.statement_name)
             .or_insert(stmt);
@@ -539,7 +593,9 @@ impl ConnectionState {
 
     /// Remove a prepared statement from connection state.
     fn statement_close(&mut self, name: &str) {
-        self.prepared_statements.remove(name);
+        if self.prepared_statements.remove(name).is_some() {
+            metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).decrement(1.0);
+        }
     }
 
     /// Remove a portal from connection state.
@@ -733,6 +789,10 @@ async fn handle_connection(
     server_name: &str,
     cache_sender: CacheSender,
 ) -> ConnectionResult<()> {
+    // Track active connections - guard ensures decrement on any exit path
+    metrics::gauge!(names::CONNECTIONS_ACTIVE).increment(1.0);
+    let _connection_guard = ActiveConnectionGuard;
+
     // Create ClientSocketSource BEFORE splitting (captures raw fd and TLS state)
     let client_socket_source = client_stream.socket_source_create();
 
@@ -848,6 +908,12 @@ async fn handle_connection(
         }
     }
 
+    // Clean up prepared statements gauge before connection state is dropped
+    let remaining_stmts = state.prepared_statements.len();
+    if remaining_stmts > 0 {
+        metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).decrement(remaining_stmts as f64);
+    }
+
     match state.proxy_status {
         ProxyStatus::Degraded => Err(ConnectionError::CacheDead.into()),
         ProxyStatus::Normal => Ok(()),
@@ -904,6 +970,7 @@ pub fn connection_run(
                             }) => ClientStream::tls(tcp_stream, tls_state),
                             Ok(tls::ClientTlsResult::Plain(stream)) => ClientStream::plain(stream),
                             Err(e) => {
+                                metrics::counter!(names::CONNECTIONS_ERRORS).increment(1);
                                 error!("TLS negotiation failed: {}", e);
                                 return Ok(());
                             }
@@ -924,6 +991,7 @@ pub fn connection_run(
                                 return Err(io::Error::other("cache dead"));
                             }
                             Err(e) => {
+                                metrics::counter!(names::CONNECTIONS_ERRORS).increment(1);
                                 error!("{}", e);
                             }
                             Ok(_) => {}

@@ -1,8 +1,11 @@
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio_util::bytes::BytesMut;
 use tracing::{error, instrument, trace};
+
+use crate::metrics::names;
 
 use crate::query::ast::ast_query_fingerprint;
 use crate::query::resolved::ResolvedSelectStatement;
@@ -75,12 +78,20 @@ impl QueryCache {
         let stmt = msg.cacheable_query.statement();
         let fingerprint = ast_query_fingerprint(stmt);
 
+        // Measure cache lookup latency
+        let lookup_start = Instant::now();
+
         // Check cache state from shared view
         let cache_state = self.state_view.read().ok().and_then(|view| {
             view.cached_queries
                 .get(&fingerprint)
                 .map(|q| (q.state, q.resolved.clone(), q.generation))
         });
+
+        // Record cache lookup latency
+        let lookup_duration = lookup_start.elapsed();
+        metrics::histogram!(names::CACHE_LOOKUP_LATENCY_SECONDS)
+            .record(lookup_duration.as_secs_f64());
 
         if let Some((CachedQueryState::Ready, resolved, generation)) = cache_state {
             // Cache hit - send to worker

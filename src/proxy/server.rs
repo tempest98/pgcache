@@ -11,6 +11,8 @@ use tokio::{
 };
 use tracing::{debug, error};
 
+use crate::metrics::names;
+
 /// Initial backoff delay for cache restart attempts
 const INITIAL_BACKOFF_MS: u64 = 100;
 /// Maximum backoff delay (steady state) for cache restart attempts
@@ -297,6 +299,7 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
                                 "accept error: {e}"
                             ))))
                         })?;
+                        metrics::counter!(names::CONNECTIONS_TOTAL).increment(1);
                         debug!("socket accepted");
 
                         if let Some(worker) = workers.get(cur_worker) {

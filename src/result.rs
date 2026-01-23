@@ -105,6 +105,8 @@ impl<T, E> MapIntoReport<T, E> for Result<T, E> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use rootcause::prelude::ResultExt;
     use std::fmt;

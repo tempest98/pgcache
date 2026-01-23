@@ -13,6 +13,7 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata};
+use crate::metrics::names;
 use crate::pg;
 use crate::query::ast::{Deparse, TableNode};
 use crate::query::constraints::analyze_query_constraints;
@@ -129,6 +130,7 @@ impl CacheWriter {
                 {
                     error!("query register failed: {e}");
                 }
+                self.state_gauges_update();
             }
             WriterCommand::QueryReady {
                 fingerprint,
@@ -145,10 +147,12 @@ impl CacheWriter {
                     if let Some(min_gen) = self.cache.generations.first()
                         && let Some(query) = self.cache.cached_queries.get2(min_gen)
                     {
-                        trace!("exceeded cache size, invalidating query");
+                        trace!("exceeded cache size, evicting query");
+                        metrics::counter!(names::CACHE_EVICTIONS).increment(1);
                         self.cache_query_invalidate(query.fingerprint).await?;
                     }
                 }
+                self.state_gauges_update();
             }
             WriterCommand::QueryFailed { fingerprint } => {
                 self.query_failed_cleanup(fingerprint);
@@ -157,6 +161,7 @@ impl CacheWriter {
                 if let Err(e) = self.cache_table_register(table_metadata).await {
                     error!("table register failed: {e}");
                 }
+                self.state_gauges_update();
             }
             WriterCommand::CdcInsert {
                 relation_oid,
@@ -552,10 +557,15 @@ impl CacheWriter {
             .update_queries_check_invalidate(relation_oid, &None, &row_data)
             .attach_loc("checking for query invalidations")?;
 
+        let invalidation_count = fp_list.len() as u64;
         for fp in fp_list {
             self.cache_query_invalidate(fp)
                 .await
                 .attach_loc("invalidating query")?;
+        }
+        if invalidation_count > 0 {
+            metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
+            self.state_gauges_update();
         }
 
         let sql_list = self
@@ -593,8 +603,13 @@ impl CacheWriter {
             &row_changes.first(),
             &new_row_data,
         )?;
+        let invalidation_count = fp_list.len() as u64;
         for fp in fp_list {
             self.cache_query_invalidate(fp).await?;
+        }
+        if invalidation_count > 0 {
+            metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
+            self.state_gauges_update();
         }
 
         let sql_list = self.update_queries_sql_list(relation_oid, &new_row_data)?;
@@ -714,6 +729,18 @@ impl CacheWriter {
                 },
             );
         }
+    }
+
+    /// Update cache state gauges with current values.
+    fn state_gauges_update(&self) {
+        metrics::gauge!(names::CACHE_QUERIES_REGISTERED)
+            .set(self.cache.cached_queries.len() as f64);
+        metrics::gauge!(names::CACHE_SIZE_BYTES).set(self.cache.current_size as f64);
+        if let Some(limit) = self.cache.cache_size {
+            metrics::gauge!(names::CACHE_SIZE_LIMIT_BYTES).set(limit as f64);
+        }
+        metrics::gauge!(names::CACHE_GENERATION).set(self.cache.generation_counter as f64);
+        metrics::gauge!(names::CACHE_TABLES_TRACKED).set(self.cache.tables.len() as f64);
     }
 
     #[instrument(skip_all)]

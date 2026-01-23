@@ -25,6 +25,7 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error};
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
+use crate::metrics::names;
 use crate::pg::cdc::connect_replication;
 use crate::settings::Settings;
 
@@ -131,10 +132,17 @@ impl CdcProcessor {
         Ok(())
     }
 
-    /// Updates the last received LSN from XLogData message.
+    /// Updates the last received LSN from XLogData message and records time-based lag.
     async fn update_lsn(&mut self, xlog_data: &XLogDataBody<LogicalReplicationMessage>) {
         let lsn = xlog_data.wal_start();
         self.last_received_lsn = lsn;
+
+        // Calculate time-based lag: difference between server timestamp and our current time
+        let server_timestamp = xlog_data.timestamp();
+        let now = Self::get_pg_timestamp();
+        let lag_micros = now.saturating_sub(server_timestamp);
+        let lag_seconds = lag_micros as f64 / 1_000_000.0;
+        metrics::gauge!(names::CDC_LAG_SECONDS).set(lag_seconds);
     }
 
     /// Marks the current LSN as fully applied after successful processing.
@@ -201,10 +209,14 @@ impl CdcProcessor {
         // Check if PostgreSQL requested a reply
         let reply_requested = keep_alive.reply() == 1;
 
+        // Update byte-based lag metric: difference between server's WAL end and our applied position
+        let wal_end = keep_alive.wal_end();
+        let lag_bytes = wal_end.saturating_sub(self.last_applied_lsn);
+        metrics::gauge!(names::CDC_LAG_BYTES).set(lag_bytes as f64);
+
         debug!(
             "Received keep-alive from PostgreSQL (wal_end: {}, reply_requested: {})",
-            keep_alive.wal_end(),
-            reply_requested
+            wal_end, reply_requested
         );
 
         if reply_requested {
@@ -225,6 +237,7 @@ impl CdcProcessor {
     ) -> Result<(), Error> {
         match msg {
             ReplicationMessage::XLogData(xlog_data) => {
+                metrics::counter!(names::CDC_EVENTS_PROCESSED).increment(1);
                 self.update_lsn(&xlog_data).await;
                 let result = match xlog_data.into_data() {
                     LogicalReplicationMessage::Begin(body) => self.process_begin(&body).await,
@@ -304,7 +317,7 @@ impl CdcProcessor {
 
     /// Processes insert messages with query-aware filtering.
     async fn process_insert(&mut self, body: &InsertBody) -> Result<(), Error> {
-        debug!("-----------process_insert");
+        metrics::counter!(names::CDC_INSERTS).increment(1);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
@@ -326,6 +339,7 @@ impl CdcProcessor {
 
     /// Processes update messages with query-aware filtering.
     async fn process_update(&mut self, body: &UpdateBody) -> Result<(), Error> {
+        metrics::counter!(names::CDC_UPDATES).increment(1);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
@@ -351,6 +365,7 @@ impl CdcProcessor {
 
     /// Processes delete messages with query-aware filtering.
     async fn process_delete(&mut self, body: &DeleteBody) -> Result<(), Error> {
+        metrics::counter!(names::CDC_DELETES).increment(1);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
