@@ -4,27 +4,43 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_row_at, connect_cache_db, connect_pgcache_tls, start_databases,
-    wait_cache_load, wait_for_cdc,
+    TestContext, assert_row_at, connect_cache_db, connect_pgcache_tls, metrics_delta,
+    metrics_http_get, start_databases, wait_cache_load, wait_for_cdc,
 };
 
 mod util;
 
+/// Consolidated test for cache functionality.
+/// Combines individual tests into one to reduce setup overhead.
 #[tokio::test]
-async fn test_cache_simple() -> Result<(), Error> {
+async fn test_cache() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    ctx.query("create table test (id integer primary key, data text)", &[])
-        .await?;
+    cache_simple(&mut ctx).await?;
+    cache_join(&mut ctx).await?;
+    cache_index_creation(&mut ctx).await?;
+
+    Ok(())
+}
+
+/// Test basic caching with simple queries
+async fn cache_simple(ctx: &mut TestContext) -> Result<(), Error> {
+    let before = ctx.metrics().await?;
 
     ctx.query(
-        "insert into test (id, data) values (1, 'foo'), (2, 'bar')",
+        "create table test_simple (id integer primary key, data text)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "insert into test_simple (id, data) values (1, 'foo'), (2, 'bar')",
         &[],
     )
     .await?;
 
     let res = ctx
-        .simple_query("select id, data from test where data = 'foo'")
+        .simple_query("select id, data from test_simple where data = 'foo'")
         .await?;
 
     assert_eq!(res.len(), 3);
@@ -33,14 +49,14 @@ async fn test_cache_simple() -> Result<(), Error> {
     wait_cache_load().await;
 
     let res = ctx
-        .simple_query("select id, data from test where data = 'foo'")
+        .simple_query("select id, data from test_simple where data = 'foo'")
         .await?;
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
 
     ctx.origin_query(
-        "insert into test (id, data) values (3, 'foo'), (4, 'bar')",
+        "insert into test_simple (id, data) values (3, 'foo'), (4, 'bar')",
         &[],
     )
     .await?;
@@ -48,45 +64,50 @@ async fn test_cache_simple() -> Result<(), Error> {
     wait_for_cdc().await;
 
     let res = ctx
-        .simple_query("select id, data from test where data = 'foo'")
+        .simple_query("select id, data from test_simple where data = 'foo'")
         .await?;
 
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("data", "foo")])?;
 
-    let metrics = ctx.metrics()?;
-    assert_eq!(metrics.queries_total, 5);
-    assert_eq!(metrics.queries_cacheable, 3);
-    assert_eq!(metrics.queries_uncacheable, 2);
-    assert_eq!(metrics.queries_unsupported, 2);
-    assert_eq!(metrics.queries_cache_hit, 2);
-    assert_eq!(metrics.queries_cache_miss, 1);
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_total, 5);
+    assert_eq!(delta.queries_cacheable, 3);
+    assert_eq!(delta.queries_uncacheable, 2);
+    assert_eq!(delta.queries_unsupported, 2);
+    assert_eq!(delta.queries_cache_hit, 2);
+    assert_eq!(delta.queries_cache_miss, 1);
 
     Ok(())
 }
 
-#[tokio::test]
-async fn test_cache_join() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-
-    ctx.query("create table test (id integer primary key, data text)", &[])
-        .await?;
+/// Test caching with join queries
+async fn cache_join(ctx: &mut TestContext) -> Result<(), Error> {
+    let before = ctx.metrics().await?;
 
     ctx.query(
-        "create table test_map (id serial primary key, test_id integer, data text)",
+        "create table test_join (id integer primary key, data text)",
         &[],
     )
     .await?;
 
     ctx.query(
-        "insert into test (id, data) values (1, 'foo'), (2, 'bar')",
+        "create table test_map_join (id serial primary key, test_id integer, data text)",
         &[],
     )
     .await?;
 
     ctx.query(
-        "insert into test_map (test_id, data) values \
+        "insert into test_join (id, data) values (1, 'foo'), (2, 'bar')",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "insert into test_map_join (test_id, data) values \
         (1, 'foo'), \
         (1, 'bar'), \
         (1, 'baz'), \
@@ -100,7 +121,7 @@ async fn test_cache_join() -> Result<(), Error> {
     wait_for_cdc().await;
 
     let query_str = "select t.id, t.data as test_data, tm.test_id, tm.data as map_data \
-        from test t join test_map tm on tm.test_id = t.id where t.id = 1 \
+        from test_join t join test_map_join tm on tm.test_id = t.id where t.id = 1 \
         order by tm.id;";
 
     // First query to populate cache
@@ -144,10 +165,10 @@ async fn test_cache_join() -> Result<(), Error> {
     )?;
 
     // Trigger CDC events by modifying the test table
-    ctx.origin_query("update test set id = 10 where id = 1", &[])
+    ctx.origin_query("update test_join set id = 10 where id = 1", &[])
         .await?;
 
-    ctx.origin_query("update test set id = 1 where id = 10", &[])
+    ctx.origin_query("update test_join set id = 1 where id = 10", &[])
         .await?;
 
     wait_for_cdc().await;
@@ -186,23 +207,22 @@ async fn test_cache_join() -> Result<(), Error> {
         ],
     )?;
 
-    let metrics = ctx.metrics()?;
-    assert_eq!(metrics.queries_total, 7);
-    assert_eq!(metrics.queries_cacheable, 3);
-    assert_eq!(metrics.queries_uncacheable, 4);
-    assert_eq!(metrics.queries_unsupported, 4);
-    assert_eq!(metrics.queries_invalid, 0);
-    assert_eq!(metrics.queries_cache_hit, 1, "cache hits");
-    assert_eq!(metrics.queries_cache_miss, 2, "cache misses");
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_total, 7);
+    assert_eq!(delta.queries_cacheable, 3);
+    assert_eq!(delta.queries_uncacheable, 4);
+    assert_eq!(delta.queries_unsupported, 4);
+    assert_eq!(delta.queries_invalid, 0);
+    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
 
     Ok(())
 }
 
 /// Test that indexes from the origin table are created on the cache table
-#[tokio::test]
-async fn test_cache_index_creation() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-
+async fn cache_index_creation(ctx: &mut TestContext) -> Result<(), Error> {
     // Create table with multiple indexes on origin
     ctx.query(
         "CREATE TABLE test_indexed (
@@ -348,12 +368,10 @@ async fn test_cache_index_creation() -> Result<(), Error> {
 /// Test that client TLS connections work correctly with caching
 #[tokio::test]
 async fn test_client_tls() -> Result<(), Error> {
-    use crate::util::proxy_metrics_get;
-
     let (dbs, _origin) = start_databases().await?;
 
     // Connect to pgcache with TLS
-    let (mut pgcache, _port, client) = connect_pgcache_tls(&dbs).await?;
+    let (_pgcache, _port, metrics_port, client) = connect_pgcache_tls(&dbs).await?;
 
     // Create a table
     client
@@ -401,7 +419,7 @@ async fn test_client_tls() -> Result<(), Error> {
     assert_eq!(data, "encrypted");
 
     // Verify metrics show 1 cache hit
-    let metrics = proxy_metrics_get(&mut pgcache)?;
+    let metrics = metrics_http_get(metrics_port).await?;
     assert_eq!(metrics.queries_cache_hit, 1, "Expected 1 cache hit");
     assert_eq!(metrics.queries_cache_miss, 1, "Expected 1 cache miss");
 

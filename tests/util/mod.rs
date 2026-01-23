@@ -10,6 +10,9 @@ use std::{
     time::Duration,
 };
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream as TokioTcpStream;
+
 static CRYPTO_INIT: Once = Once::new();
 
 /// Initialize the rustls crypto provider (required before using TLS)
@@ -21,15 +24,10 @@ fn crypto_provider_init() {
     });
 }
 
-use nix::{
-    sys::signal::{Signal, kill},
-    unistd::Pid,
-};
 use pgcache_lib::metrics::MetricsSnapshot;
 use pgcache_lib::tls::{MakeRustlsConnect, tls_config_with_cert};
 use pgtemp::{PgTempDB, PgTempDBBuilder};
 use postgres_types::ToSql;
-use regex_lite::Regex;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, Statement, ToStatement};
 use tokio_util::bytes::{Buf, BytesMut};
@@ -106,82 +104,6 @@ pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn proxy_metrics_get(pgcache: &mut PgCacheProcess) -> Result<MetricsSnapshot, Error> {
-    kill(Pid::from_raw(pgcache.child.id() as i32), Signal::SIGUSR1).unwrap();
-
-    const NEEDLE: &str = "metrics:";
-    let mut buf = BytesMut::new();
-    let mut read_buf = [0u8; 1024];
-
-    let mut stdout = pgcache.stdout.take().unwrap();
-    while !String::from_utf8_lossy(&buf).contains(NEEDLE) {
-        if buf.len() > NEEDLE.len() {
-            buf.advance(buf.len() - NEEDLE.len());
-        }
-        let cnt = stdout.read(&mut read_buf).unwrap_or_default();
-        if cnt == 0 {
-            return Err(Error::other("Unexpected end of stdout"));
-        }
-        std::io::stdout().write_all(&read_buf[0..cnt])?;
-        buf.extend_from_slice(&read_buf[0..cnt]);
-    }
-
-    const END: &str = "metrics end";
-    while !String::from_utf8_lossy(&buf).contains(END) {
-        let cnt = stdout.read(&mut read_buf).unwrap_or_default();
-        if cnt == 0 {
-            return Err(Error::other("Unexpected end of stdout"));
-        }
-        std::io::stdout().write_all(&read_buf[0..cnt])?;
-        buf.extend_from_slice(&read_buf[0..cnt]);
-    }
-
-    let re = Regex::new(NEEDLE).unwrap();
-    let str = String::from_utf8_lossy(&buf);
-    let mat = re.find(&str).unwrap();
-    buf.advance(mat.end());
-
-    pgcache.stdout = Some(stdout);
-
-    let mut metrics = MetricsSnapshot {
-        queries_total: 0,
-        queries_cacheable: 0,
-        queries_uncacheable: 0,
-        queries_unsupported: 0,
-        queries_invalid: 0,
-        queries_cache_hit: 0,
-        queries_cache_miss: 0,
-        queries_cache_error: 0,
-        cache_hit_rate: 0.0,
-        cacheability_rate: 0.0,
-    };
-
-    let re = Regex::new(r"([a-z_]+)=([0-9.]+)").unwrap();
-    for (_, [name, value]) in re
-        .captures_iter(&String::from_utf8_lossy(&buf))
-        .map(|c| c.extract())
-    {
-        match name {
-            "queries_total" => metrics.queries_total = value.parse().unwrap(),
-            "queries_cacheable" => metrics.queries_cacheable = value.parse().unwrap(),
-            "queries_uncacheable" => metrics.queries_uncacheable = value.parse().unwrap(),
-            "queries_unsupported" => metrics.queries_unsupported = value.parse().unwrap(),
-            "queries_invalid" => metrics.queries_invalid = value.parse().unwrap(),
-            "queries_cache_hit" => metrics.queries_cache_hit = value.parse().unwrap(),
-            "queries_cache_miss" => metrics.queries_cache_miss = value.parse().unwrap(),
-            "queries_cache_error" => metrics.queries_cache_error = value.parse().unwrap(),
-            "cache_hit_rate" => metrics.cache_hit_rate = value.parse().unwrap(),
-            "cacheability_rate" => metrics.cacheability_rate = value.parse().unwrap(),
-            name => {
-                dbg!(name);
-                todo!();
-            }
-        }
-    }
-
-    Ok(metrics)
-}
-
 pub struct TempDBs {
     pub origin: PgTempDB,
     pub cache: PgTempDB,
@@ -192,19 +114,21 @@ pub struct TempDBs {
 pub struct TestContext {
     pub dbs: TempDBs,
     pub pgcache: PgCacheProcess,
-    pub cache_port: u16, // port pgcache proxy is listening on
-    pub cache: Client,   // connected through pgcache proxy
-    pub origin: Client,  // direct connection to origin database
+    pub cache_port: u16,   // port pgcache proxy is listening on
+    pub metrics_port: u16, // port for HTTP metrics endpoint
+    pub cache: Client,     // connected through pgcache proxy
+    pub origin: Client,    // direct connection to origin database
 }
 
 impl TestContext {
     pub async fn setup() -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, cache) = connect_pgcache(&dbs).await?;
+        let (pgcache, cache_port, metrics_port, cache) = connect_pgcache(&dbs).await?;
         Ok(Self {
             dbs,
             pgcache,
             cache_port,
+            metrics_port,
             cache,
             origin,
         })
@@ -245,9 +169,9 @@ impl TestContext {
         self.cache.simple_query(query).await.map_err(Error::other)
     }
 
-    /// Get metrics from pgcache process
-    pub fn metrics(&mut self) -> Result<MetricsSnapshot, Error> {
-        proxy_metrics_get(&mut self.pgcache)
+    /// Get metrics from pgcache HTTP endpoint
+    pub async fn metrics(&mut self) -> Result<MetricsSnapshot, Error> {
+        metrics_http_get(self.metrics_port).await
     }
 
     /// Prepare a statement through pgcache proxy
@@ -349,7 +273,7 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
     ))
 }
 
-pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Client), Error> {
+pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     // Find random available ports for listen and metrics
     let listen_port = find_available_port()?;
     let listen_socket = format!("127.0.0.1:{}", listen_port);
@@ -404,11 +328,13 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Clie
         }
     });
 
-    Ok((pgcache, listen_port, client))
+    Ok((pgcache, listen_port, metrics_port, client))
 }
 
 /// Connect to pgcache with TLS enabled on the proxy
-pub async fn connect_pgcache_tls(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, Client), Error> {
+pub async fn connect_pgcache_tls(
+    dbs: &TempDBs,
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     // Initialize crypto provider (required for rustls)
     crypto_provider_init();
 
@@ -475,7 +401,7 @@ pub async fn connect_pgcache_tls(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, 
         }
     });
 
-    Ok((pgcache, listen_port, client))
+    Ok((pgcache, listen_port, metrics_port, client))
 }
 
 pub async fn query<T>(
@@ -510,6 +436,96 @@ pub async fn wait_for_cdc() {
 pub async fn wait_cache_load() {
     // TODO: Replace with proper synchronization mechanism (polling, notification, etc.)
     sleep(Duration::from_millis(250)).await;
+}
+
+/// Fetch metrics via HTTP from the Prometheus endpoint
+pub async fn metrics_http_get(port: u16) -> Result<MetricsSnapshot, Error> {
+    let mut stream = TokioTcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .map_err(Error::other)?;
+
+    // Send HTTP GET request
+    let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(Error::other)?;
+
+    // Read response
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .map_err(Error::other)?;
+
+    // Parse Prometheus text format
+    metrics_prometheus_parse(&response)
+}
+
+/// Parse Prometheus text format into MetricsSnapshot
+fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
+    let mut queries_total = 0u64;
+    let mut queries_cacheable = 0u64;
+    let mut queries_uncacheable = 0u64;
+    let mut queries_unsupported = 0u64;
+    let mut queries_invalid = 0u64;
+    let mut queries_cache_hit = 0u64;
+    let mut queries_cache_miss = 0u64;
+    let mut queries_cache_error = 0u64;
+
+    for line in response.lines() {
+        // Skip comments and empty lines
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+
+        // Parse "metric_name value" format
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let name = parts[0];
+            let value: u64 = parts[1].parse().unwrap_or(0);
+
+            match name {
+                "pgcache_queries_total" => queries_total = value,
+                "pgcache_queries_cacheable" => queries_cacheable = value,
+                "pgcache_queries_uncacheable" => queries_uncacheable = value,
+                "pgcache_queries_unsupported" => queries_unsupported = value,
+                "pgcache_queries_invalid" => queries_invalid = value,
+                "pgcache_queries_cache_hit" => queries_cache_hit = value,
+                "pgcache_queries_cache_miss" => queries_cache_miss = value,
+                "pgcache_queries_cache_error" => queries_cache_error = value,
+                _ => {}
+            }
+        }
+    }
+
+    let cache_hit_rate = if queries_cacheable > 0 {
+        (queries_cache_hit as f64 / queries_cacheable as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let queries_select = queries_total
+        .saturating_sub(queries_unsupported)
+        .saturating_sub(queries_invalid);
+    let cacheability_rate = if queries_select > 0 {
+        (queries_cacheable as f64 / queries_select as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(MetricsSnapshot {
+        queries_total,
+        queries_cacheable,
+        queries_uncacheable,
+        queries_unsupported,
+        queries_invalid,
+        queries_cache_hit,
+        queries_cache_miss,
+        queries_cache_error,
+        cache_hit_rate,
+        cacheability_rate,
+    })
 }
 
 /// Extract a row from SimpleQueryMessage results at the specified index
@@ -577,31 +593,20 @@ pub async fn connect_cache_db(dbs: &TempDBs) -> Result<Client, Error> {
     Ok(client)
 }
 
-/// Setup test and test_map tables with base data for constraint invalidation tests
-/// Creates tables and inserts base data:
-/// - test: (1, 'foo'), (2, 'bar'), (3, 'baz')
-/// - test_map: (1, 1, 'alpha'), (2, 1, 'beta'), (3, 2, 'gamma')
-pub async fn setup_constraint_test_tables(ctx: &mut TestContext) -> Result<(), Error> {
-    ctx.query("create table test (id integer primary key, data text)", &[])
-        .await?;
-
-    ctx.query(
-        "create table test_map (id serial primary key, test_id integer, data text)",
-        &[],
-    )
-    .await?;
-
-    ctx.query(
-        "insert into test (id, data) values (1, 'foo'), (2, 'bar'), (3, 'baz')",
-        &[],
-    )
-    .await?;
-
-    ctx.query(
-        "insert into test_map (test_id, data) values (1, 'alpha'), (1, 'beta'), (2, 'gamma')",
-        &[],
-    )
-    .await?;
-
-    Ok(())
+/// Calculate metrics delta between two snapshots.
+/// Useful for asserting metrics within a consolidated test where metrics accumulate.
+pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> MetricsSnapshot {
+    MetricsSnapshot {
+        queries_total: after.queries_total - before.queries_total,
+        queries_cacheable: after.queries_cacheable - before.queries_cacheable,
+        queries_uncacheable: after.queries_uncacheable - before.queries_uncacheable,
+        queries_unsupported: after.queries_unsupported - before.queries_unsupported,
+        queries_invalid: after.queries_invalid - before.queries_invalid,
+        queries_cache_hit: after.queries_cache_hit - before.queries_cache_hit,
+        queries_cache_miss: after.queries_cache_miss - before.queries_cache_miss,
+        queries_cache_error: after.queries_cache_error - before.queries_cache_error,
+        // Rates are cumulative averages, not meaningful for deltas
+        cache_hit_rate: 0.0,
+        cacheability_rate: 0.0,
+    }
 }
