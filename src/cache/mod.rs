@@ -42,6 +42,7 @@ error_set! {
         NoConnection,
         PgError(Error),
         CdcFailure,
+        WriterFailure,
         TooManyModifiedRows,
     }
 
@@ -68,6 +69,13 @@ error_set! {
         UnknownTable {
             oid: Option<u32>,
             name: Option<String>,
+        },
+        #[display("Unknown type OID {type_oid} ('{type_name}') for column '{column_name}' in table '{table_name}'")]
+        UnknownType {
+            type_oid: u32,
+            type_name: String,
+            column_name: String,
+            table_name: String,
         },
         UnknownColumn,
         UnknownSchema,

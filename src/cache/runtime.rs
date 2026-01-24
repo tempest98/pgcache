@@ -237,6 +237,10 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                     let mut cache_rx = cache_rx;
                     loop {
                         tokio::select! {
+                            _ = writer_tx.closed() => {
+                                error!("writer thread exited unexpectedly");
+                                return Err(CacheError::WriterFailure.into());
+                            }
                             msg = cdc_rx.recv() => {
                                 match msg {
                                     Some(msg) => handle_cdc_message(&writer_tx, msg),

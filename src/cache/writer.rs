@@ -776,8 +776,13 @@ impl CacheWriter {
                 schema = Some(row.get("table_schema"));
             }
 
-            let type_oid = row.get("type_oid");
-            let data_type = Type::from_oid(type_oid).expect("valid type");
+            let type_oid: u32 = row.get("type_oid");
+            let data_type = Type::from_oid(type_oid).ok_or_else(|| CacheError::UnknownType {
+                type_oid,
+                type_name: row.get("type_name"),
+                column_name: row.get("column_name"),
+                table_name: table.to_owned(),
+            })?;
             let type_name = data_type.name().to_owned();
             let pg_position: i64 = row.get("position");
 
