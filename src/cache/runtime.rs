@@ -236,6 +236,7 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                 .run_until(async move {
                     let mut cache_rx = cache_rx;
                     loop {
+                        // Block until at least one message arrives
                         tokio::select! {
                             _ = writer_tx.closed() => {
                                 error!("writer thread exited unexpectedly");
@@ -265,6 +266,17 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                                 }
                             }
                         }
+
+                        // Drain all immediately available messages without parking
+                        while let Ok(msg) = cdc_rx.try_recv() {
+                            handle_cdc_message(&writer_tx, msg);
+                        }
+                        while let Ok(proxy_msg) = cache_rx.try_recv() {
+                            let mut qcache = qcache.clone();
+                            spawn_local(async move {
+                                handle_proxy_message(&mut qcache, proxy_msg).await;
+                            });
+                        }
                     }
 
                     debug!("cache loop exiting");
@@ -293,11 +305,25 @@ fn worker_run(
 
         LocalSet::new()
             .run_until(async move {
-                while let Some(msg) = worker_rx.recv().await {
-                    let worker = worker.clone();
+                loop {
+                    // Block for at least one message
+                    let Some(msg) = worker_rx.recv().await else {
+                        break;
+                    };
+
+                    // Process first message
+                    let w = worker.clone();
                     spawn_local(async move {
-                        handle_worker_request(worker, msg).await;
+                        handle_worker_request(w, msg).await;
                     });
+
+                    // Drain all immediately available messages without parking
+                    while let Ok(msg) = worker_rx.try_recv() {
+                        let w = worker.clone();
+                        spawn_local(async move {
+                            handle_worker_request(w, msg).await;
+                        });
+                    }
                 }
 
                 Ok(())
