@@ -120,6 +120,10 @@ pub struct Settings {
     /// Prometheus metrics endpoint configuration
     #[serde(default)]
     pub metrics: Option<MetricsSettings>,
+    /// Log level filter (supports tracing EnvFilter syntax)
+    /// Examples: "debug", "info", "pgcache_lib::cache=debug,info"
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 impl Settings {
@@ -142,6 +146,7 @@ impl Settings {
         let mut tls_cert: Option<PathBuf> = None;
         let mut tls_key: Option<PathBuf> = None;
         let mut metrics_socket: Option<SocketAddr> = None;
+        let mut log_level: Option<String> = None;
 
         let mut config_settings: Option<Settings> = None;
         let mut parser = lexopt::Parser::from_env();
@@ -319,6 +324,15 @@ impl Settings {
                             .map_into_report::<ConfigError>()?,
                     )
                 }
+                Long("log_level") => {
+                    log_level = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .string()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
                 Long("help") => {
                     Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
                 }
@@ -353,6 +367,7 @@ impl Settings {
             config.metrics = metrics_socket
                 .map(|socket| MetricsSettings { socket })
                 .or(config.metrics);
+            config.log_level = log_level.or(config.log_level);
 
             config
         } else {
@@ -427,6 +442,7 @@ impl Settings {
                 tls_cert,
                 tls_key,
                 metrics: metrics_socket.map(|socket| MetricsSettings { socket }),
+                log_level,
             }
         };
 
@@ -447,7 +463,8 @@ impl Settings {
             --num_workers NUMBER \n \
             [--cache_size BYTES] \n \
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
-            [--metrics_socket IP_AND_PORT]"
+            [--metrics_socket IP_AND_PORT] \n \
+            [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug)"
         );
         std::process::exit(1);
     }

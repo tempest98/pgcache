@@ -12,7 +12,8 @@ use pgcache_lib::tracing_utils::SimpeFormatter;
 use rootcause::Report;
 
 use tokio::io;
-use tracing::{Level, info};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Report> {
     // Install rustls crypto provider for TLS support
@@ -34,8 +35,16 @@ fn main() -> Result<(), Report> {
         info!("Prometheus metrics available at http://{}/metrics", socket);
     }
 
+    // Log level precedence: CLI arg > config file > RUST_LOG env var > default (info)
+    let filter = settings
+        .log_level
+        .as_deref()
+        .map(EnvFilter::new)
+        .or_else(|| EnvFilter::try_from_default_env().ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
+        .with_env_filter(filter)
         .event_format(SimpeFormatter)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;

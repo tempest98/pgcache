@@ -9,7 +9,7 @@ use tokio::{
     sync::mpsc::{UnboundedSender, channel, unbounded_channel},
     time::{Sleep, sleep},
 };
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::metrics::names;
 
@@ -287,7 +287,7 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
                         &settings.listen.socket
                     ))))
                 })?;
-            debug!("Listening to {}", &settings.listen.socket);
+            info!("Listening to {}", &settings.listen.socket);
 
             let mut cur_worker = 0;
             loop {
