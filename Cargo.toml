@@ -41,14 +41,14 @@ tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = "0.7.18"
 tokio-stream = "0.1.18"
 
-# tokio-postgres = { path = "../rust-postgres/tokio-postgres", default-features = false }
-# postgres-protocol = { path = "../rust-postgres/postgres-protocol" }
-# postgres-replication = { path = "../rust-postgres/postgres-replication", default-features = false }
-# postgres-types = { path = "../rust-postgres/postgres-types" }
-tokio-postgres = { git = "https://github.com/tempest98/rust-postgres", default-features = false, features = ["runtime"], branch = "compat" }
-postgres-protocol = {git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
-postgres-replication = { git = "https://github.com/tempest98/rust-postgres", default-features = false, branch = "compat" }
-postgres-types = { git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
+tokio-postgres = { path = "../rust-postgres/tokio-postgres", default-features = false, features = ["runtime"] }
+postgres-protocol = { path = "../rust-postgres/postgres-protocol" }
+postgres-replication = { path = "../rust-postgres/postgres-replication", default-features = false }
+postgres-types = { path = "../rust-postgres/postgres-types" }
+# tokio-postgres = { git = "https://github.com/tempest98/rust-postgres", default-features = false, features = ["runtime"], branch = "compat" }
+# postgres-protocol = {git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
+# postgres-replication = { git = "https://github.com/tempest98/rust-postgres", default-features = false, branch = "compat" }
+# postgres-types = { git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
 pgwire = { git = "https://github.com/tempest98/pgwire", features = [
     "client-api",
     "server-api-ring",

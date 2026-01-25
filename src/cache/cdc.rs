@@ -24,7 +24,7 @@ use tokio_util::bytes::Bytes;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, error};
 
-use crate::catalog::{ColumnMetadata, TableMetadata};
+use crate::catalog::{ColumnMetadata, TableMetadata, cache_type_name_resolve};
 use crate::metrics::names;
 use crate::pg::cdc::connect_replication;
 use crate::settings::Settings;
@@ -420,7 +420,11 @@ impl CdcProcessor {
             let data_type = tokio_postgres::types::Type::from_oid(type_oid)
                 .unwrap_or(tokio_postgres::types::Type::TEXT); // Fallback for unknown types
 
-            let type_name = data_type.name().to_owned(); // Get the type name from tokio_postgres Type
+            let type_name = data_type.name().to_owned();
+            // For CDC-discovered types, use the resolved cache type name.
+            // Unknown types fall back to TEXT, which resolves to "text" for cache.
+            let cache_type_name =
+                cache_type_name_resolve(&data_type).unwrap_or_else(|_| "text".to_owned());
 
             let column_metadata = ColumnMetadata {
                 name: column.name().unwrap_or("unknown_column").to_owned(),
@@ -428,6 +432,7 @@ impl CdcProcessor {
                 type_oid,
                 data_type,
                 type_name,
+                cache_type_name,
                 is_primary_key,
             };
 

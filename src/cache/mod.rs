@@ -77,6 +77,11 @@ error_set! {
             column_name: String,
             table_name: String,
         },
+        #[display("Unsupported type '{type_name}': {reason}")]
+        UnsupportedType {
+            type_name: String,
+            reason: String,
+        },
         UnknownColumn,
         UnknownSchema,
         NoPrimaryKey,

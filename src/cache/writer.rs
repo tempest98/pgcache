@@ -12,7 +12,7 @@ use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
 use tracing::{debug, error, info, instrument, trace};
 
-use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata};
+use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata, cache_type_name_resolve};
 use crate::metrics::names;
 use crate::pg;
 use crate::query::ast::{Deparse, TableNode};
@@ -777,13 +777,20 @@ impl CacheWriter {
             }
 
             let type_oid: u32 = row.get("type_oid");
-            let data_type = Type::from_oid(type_oid).ok_or_else(|| CacheError::UnknownType {
-                type_oid,
-                type_name: row.get("type_name"),
-                column_name: row.get("column_name"),
-                table_name: table.to_owned(),
-            })?;
+
+            // Try built-in types first (fast path), then discover custom types from origin
+            let data_type = match Type::from_oid(type_oid) {
+                Some(t) => t,
+                None => {
+                    self.db_origin
+                        .get_type(type_oid)
+                        .await
+                        .map_into_report::<CacheError>()?
+                }
+            };
+
             let type_name = data_type.name().to_owned();
+            let cache_type_name = cache_type_name_resolve(&data_type)?;
             let pg_position: i64 = row.get("position");
 
             let column = ColumnMetadata {
@@ -792,6 +799,7 @@ impl CacheWriter {
                 type_oid,
                 data_type,
                 type_name,
+                cache_type_name,
                 is_primary_key: row.get("is_primary_key"),
             };
 
@@ -1082,7 +1090,7 @@ impl CacheWriter {
         let column_defs: Vec<String> = table_metadata
             .columns
             .iter()
-            .map(|c| format!("    \"{}\" {}", c.name, c.type_name))
+            .map(|c| format!("    \"{}\" {}", c.name, c.cache_type_name))
             .collect();
         let column_defs = column_defs.join(",\n");
 

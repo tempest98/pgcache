@@ -363,6 +363,7 @@ mod tests {
             type_oid: 23, // INT4
             data_type: Type::INT4,
             type_name: "integer".to_owned(),
+            cache_type_name: "int4".to_owned(),
             is_primary_key: true,
         });
 
@@ -372,6 +373,7 @@ mod tests {
             type_oid: 25, // TEXT
             data_type: Type::TEXT,
             type_name: "text".to_owned(),
+            cache_type_name: "text".to_owned(),
             is_primary_key: false,
         });
 
@@ -381,6 +383,7 @@ mod tests {
             type_oid: 16, // BOOL
             data_type: Type::BOOL,
             type_name: "boolean".to_owned(),
+            cache_type_name: "bool".to_owned(),
             is_primary_key: false,
         });
 
@@ -1049,6 +1052,7 @@ mod tests {
             type_oid: 701, // FLOAT8
             data_type: Type::FLOAT8,
             type_name: "double precision".to_owned(),
+            cache_type_name: "float8".to_owned(),
             is_primary_key: false,
         });
 
@@ -1059,6 +1063,7 @@ mod tests {
             type_oid: 701,
             data_type: Type::FLOAT8,
             type_name: "double precision".to_owned(),
+            cache_type_name: "float8".to_owned(),
             is_primary_key: false,
         });
 

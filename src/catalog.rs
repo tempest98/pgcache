@@ -5,7 +5,9 @@
 //! and the query resolution subsystem (for name resolution and type information).
 
 use iddqd::{BiHashItem, BiHashMap, bi_upcast};
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{Kind, Type};
+
+use crate::cache::CacheError;
 
 use crate::query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectColumns, TableAlias};
 use crate::query::resolved::{
@@ -128,12 +130,14 @@ pub struct ColumnMetadata {
     pub name: String,
     /// 1-based position in table (matches PostgreSQL attnum)
     pub position: i16,
-    /// PostgreSQL type OID
+    /// PostgreSQL type OID (original from origin database, used in RowDescription)
     pub type_oid: u32,
-    /// Parsed PostgreSQL type
+    /// Parsed PostgreSQL type (may be Domain, Enum, etc.)
     pub data_type: Type,
-    /// Human-readable type name (e.g., "integer", "text")
+    /// Human-readable type name from origin (e.g., "year", "mood")
     pub type_name: String,
+    /// Type name for cache table creation (e.g., "integer" for year domain, "text" for enums)
+    pub cache_type_name: String,
     /// Whether this column is part of the primary key
     pub is_primary_key: bool,
 }
@@ -145,6 +149,7 @@ impl std::hash::Hash for ColumnMetadata {
         self.position.hash(state);
         self.type_oid.hash(state);
         self.type_name.hash(state);
+        self.cache_type_name.hash(state);
         self.is_primary_key.hash(state);
     }
 }
@@ -179,4 +184,36 @@ pub struct IndexMetadata {
     pub method: String,
     /// Ordered list of column names in the index
     pub columns: Vec<String>,
+}
+
+/// Resolves a PostgreSQL Type to its cache-compatible storage type name.
+///
+/// - **Domains** are resolved to their base type recursively (e.g., `year` → `integer`)
+/// - **Enums** are stored as `text` (PostgreSQL transmits enum labels as text)
+/// - **Composites** return an error (not yet supported)
+/// - **Arrays** resolve the element type and append `[]`
+/// - **Built-in types** use their PostgreSQL name directly
+///
+/// # Errors
+///
+/// Returns `CacheError::UnsupportedType` for composite types.
+pub fn cache_type_name_resolve(data_type: &Type) -> Result<String, CacheError> {
+    match data_type.kind() {
+        Kind::Domain(base) => cache_type_name_resolve(base),
+        Kind::Enum(_) => Ok("text".to_owned()),
+        Kind::Composite(_) => Err(CacheError::UnsupportedType {
+            type_name: data_type.name().to_owned(),
+            reason: "composite types not yet supported".to_owned(),
+        }),
+        Kind::Array(elem) => {
+            let elem_name = cache_type_name_resolve(elem)?;
+            Ok(format!("{}[]", elem_name))
+        }
+        // Built-in types use their PostgreSQL name directly
+        Kind::Simple | Kind::Pseudo | Kind::Range(_) | Kind::Multirange(_) => {
+            Ok(data_type.name().to_owned())
+        }
+        // Kind is non-exhaustive; treat unknown kinds as their type name
+        _ => Ok(data_type.name().to_owned()),
+    }
 }

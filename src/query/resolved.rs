@@ -1092,6 +1092,7 @@ mod tests {
                 type_oid: 23,
                 data_type: Type::INT4,
                 type_name: "int4".to_owned(),
+                cache_type_name: "int4".to_owned(),
                 is_primary_key: true,
             },
         };
@@ -1129,6 +1130,7 @@ mod tests {
             type_oid: 23,
             data_type: Type::INT4,
             type_name: "int4".to_owned(),
+            cache_type_name: "int4".to_owned(),
             is_primary_key: true,
         });
 
@@ -1139,6 +1141,7 @@ mod tests {
             type_oid: 25,
             data_type: Type::TEXT,
             type_name: "text".to_owned(),
+            cache_type_name: "text".to_owned(),
             is_primary_key: false,
         });
 
@@ -1718,6 +1721,7 @@ mod tests {
             type_oid: 23,
             data_type: Type::INT4,
             type_name: "int4".to_owned(),
+            cache_type_name: "int4".to_owned(),
             is_primary_key: true,
         }
     }

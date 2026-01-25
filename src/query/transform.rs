@@ -367,10 +367,19 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Lit
             );
             Ok(LiteralValue::String(uuid_str))
         }
-        Some(pg_type) => {
-            Err(AstTransformError::UnsupportedBinaryFormat { oid: pg_type.oid() }.into())
+        // For known but unhandled types, try to interpret as text
+        Some(_) => {
+            // Attempt to decode as UTF-8 text (works for enums which use text labels)
+            match std::str::from_utf8(bytes) {
+                Ok(s) => Ok(LiteralValue::String(s.to_owned())),
+                Err(_) => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
+            }
         }
-        None => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
+        // Unknown OID (custom types like domains or enums) - try text interpretation
+        None => match std::str::from_utf8(bytes) {
+            Ok(s) => Ok(LiteralValue::String(s.to_owned())),
+            Err(_) => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
+        },
     }
 }
 
@@ -1239,9 +1248,11 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_parameter_unsupported_type() {
+    fn test_binary_parameter_unsupported_type_with_invalid_utf8() {
+        // Use invalid UTF-8 bytes to test that we get an error when
+        // the fallback text interpretation fails
         let param = QueryParameter {
-            value: Some(vec![0x00]),
+            value: Some(vec![0xFF, 0xFE]), // Invalid UTF-8 sequence
             format: 1,
             oid: PgType::TIMESTAMP.oid(), // Timestamp not supported in binary
         };
@@ -1251,6 +1262,19 @@ mod tests {
             result,
             Err(AstTransformError::UnsupportedBinaryFormat { .. })
         ));
+    }
+
+    #[test]
+    fn test_binary_parameter_unsupported_type_valid_utf8_fallback() {
+        // Known but unhandled types with valid UTF-8 should fallback to string
+        let param = QueryParameter {
+            value: Some(b"2024-01-15".to_vec()), // Valid UTF-8 text representation
+            format: 1,
+            oid: PgType::DATE.oid(), // Date not supported in binary
+        };
+
+        let result = parameter_to_literal(&param).expect("should fallback to string");
+        assert_eq!(result, LiteralValue::String("2024-01-15".to_owned()));
     }
 
     #[test]

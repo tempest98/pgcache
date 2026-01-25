@@ -2043,7 +2043,6 @@ checksum = "f89776e4d69bb58bc6993e99ffa1d11f228b839984854c7daeb5d37f87cbe950"
 [[package]]
 name = "postgres-protocol"
 version = "0.6.8"
-source = "git+https://github.com/tempest98/rust-postgres?branch=compat#b6c70a043786efec4fd3ebc79ce46b3caabc5885"
 dependencies = [
  "base64",
  "byteorder",
@@ -2078,7 +2077,6 @@ dependencies = [
 [[package]]
 name = "postgres-replication"
 version = "0.6.7"
-source = "git+https://github.com/tempest98/rust-postgres?branch=compat#b6c70a043786efec4fd3ebc79ce46b3caabc5885"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2093,7 +2091,6 @@ dependencies = [
 [[package]]
 name = "postgres-types"
 version = "0.2.9"
-source = "git+https://github.com/tempest98/rust-postgres?branch=compat#b6c70a043786efec4fd3ebc79ce46b3caabc5885"
 dependencies = [
  "bytes",
  "fallible-iterator",
@@ -3109,7 +3106,6 @@ dependencies = [
 [[package]]
 name = "tokio-postgres"
 version = "0.7.13"
-source = "git+https://github.com/tempest98/rust-postgres?branch=compat#b6c70a043786efec4fd3ebc79ce46b3caabc5885"
 dependencies = [
  "async-trait",
  "byteorder",
