@@ -35,8 +35,17 @@ use super::{
     },
 };
 
-/// Number of connections in the population pool
+/// Number of persistent population workers.
 const POPULATE_POOL_SIZE: usize = 3;
+
+/// Work item for population worker pool.
+struct PopulationWork {
+    fingerprint: u64,
+    generation: u64,
+    relation_oids: Vec<u32>,
+    table_metadata: Vec<TableMetadata>,
+    resolved: ResolvedSelectStatement,
+}
 
 /// Cache writer that owns the Cache and serializes all mutations.
 /// This ensures no race conditions between query registration and purging.
@@ -45,12 +54,10 @@ pub struct CacheWriter {
     db_cache: Client,
     db_origin: Rc<Client>,
     state_view: Arc<RwLock<CacheStateView>>,
-    /// Channel-based connection pool for population tasks.
-    /// Take a connection to use, return it when done.
-    populate_pool_tx: tokio::sync::mpsc::Sender<Client>,
-    populate_pool_rx: tokio::sync::mpsc::Receiver<Client>,
-    /// Channel for spawned tasks to send commands back to writer
-    writer_tx: UnboundedSender<WriterCommand>,
+    /// Channels to persistent population workers (round-robin dispatch).
+    populate_txs: Vec<UnboundedSender<PopulationWork>>,
+    /// Index for round-robin dispatch to population workers.
+    populate_next: usize,
 }
 
 impl CacheWriter {
@@ -79,12 +86,13 @@ impl CacheWriter {
             .map_into_report::<CacheError>()
             .attach_loc("connecting to origin database")?;
 
-        // Create connection pool for population tasks
-        let (populate_pool_tx, populate_pool_rx) = tokio::sync::mpsc::channel(POPULATE_POOL_SIZE);
+        let db_origin = Rc::new(origin_client);
 
-        // Create pool connections
+        // Spawn persistent population workers (each with its own cache connection)
+        let mut populate_txs = Vec::with_capacity(POPULATE_POOL_SIZE);
+
         for i in 0..POPULATE_POOL_SIZE {
-            let (client, connection) = Config::new()
+            let (cache_conn, cache_conn_task) = Config::new()
                 .host(&settings.cache.host)
                 .port(settings.cache.port)
                 .user(&settings.cache.user)
@@ -94,25 +102,29 @@ impl CacheWriter {
                 .map_into_report::<CacheError>()?;
 
             tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("populate pool connection {i} error: {e}");
+                if let Err(e) = cache_conn_task.await {
+                    error!("population worker {i} connection error: {e}");
                 }
             });
 
-            populate_pool_tx
-                .send(client)
-                .await
-                .expect("pool channel send");
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            populate_txs.push(tx);
+
+            let worker_db_origin = Rc::clone(&db_origin);
+            let worker_writer_tx = writer_tx.clone();
+
+            spawn_local(async move {
+                population_worker(i, rx, worker_db_origin, cache_conn, worker_writer_tx).await;
+            });
         }
 
         Ok(Self {
             cache: Cache::new(settings),
             db_cache: cache_client,
-            db_origin: Rc::new(origin_client),
+            db_origin,
             state_view,
-            populate_pool_tx,
-            populate_pool_rx,
-            writer_tx,
+            populate_txs,
+            populate_next: 0,
         })
     }
 
@@ -321,60 +333,24 @@ impl CacheWriter {
             .filter_map(|oid| self.cache.tables.get1(oid).cloned())
             .collect();
 
-        // Clone resources for the spawned task
-        let db_origin = Rc::clone(&self.db_origin);
-        let writer_tx = self.writer_tx.clone();
-        let pool_tx = self.populate_pool_tx.clone();
-        let resolved_clone = resolved.clone();
+        // Create work item for population worker
+        let work = PopulationWork {
+            fingerprint,
+            generation,
+            relation_oids,
+            table_metadata,
+            resolved,
+        };
 
-        // Get a connection from the pool (wait if none available)
-        let db_cache = self
-            .populate_pool_rx
-            .recv()
-            .await
-            .ok_or(CacheError::PopulationPoolClosed)?;
+        // Round-robin dispatch to population workers
+        let idx = self.populate_next;
+        self.populate_next = (self.populate_next + 1) % POPULATE_POOL_SIZE;
 
-        // Spawn population task
-        spawn_local(async move {
-            let result = population_task(
-                fingerprint,
-                generation,
-                &relation_oids,
-                &table_metadata,
-                &resolved_clone,
-                db_origin,
-                &db_cache,
-            )
-            .await;
+        if self.populate_txs[idx].send(work).is_err() {
+            error!("population worker {idx} channel closed");
+        }
 
-            // Return connection to pool
-            let _ = pool_tx.send(db_cache).await;
-
-            match result {
-                Ok(cached_bytes) => {
-                    if writer_tx
-                        .send(WriterCommand::QueryReady {
-                            fingerprint,
-                            cached_bytes,
-                        })
-                        .is_err()
-                    {
-                        error!("failed to send QueryReady");
-                    }
-                }
-                Err(e) => {
-                    error!("population failed for query {fingerprint}: {e}");
-                    if writer_tx
-                        .send(WriterCommand::QueryFailed { fingerprint })
-                        .is_err()
-                    {
-                        error!("failed to send QueryFailed");
-                    }
-                }
-            }
-        });
-
-        trace!("population task spawned for query {fingerprint}");
+        trace!("population work queued for query {fingerprint} to worker {idx}");
         Ok(())
     }
 
@@ -1439,6 +1415,61 @@ impl CacheWriter {
     }
 }
 
+/// Persistent population worker that processes work items from a channel.
+/// Each worker owns its own cache database connection.
+async fn population_worker(
+    id: usize,
+    mut rx: UnboundedReceiver<PopulationWork>,
+    db_origin: Rc<Client>,
+    db_cache: Client,
+    writer_tx: UnboundedSender<WriterCommand>,
+) {
+    debug!("population worker {id} started");
+
+    while let Some(work) = rx.recv().await {
+        let result = population_task(
+            work.fingerprint,
+            work.generation,
+            &work.relation_oids,
+            &work.table_metadata,
+            &work.resolved,
+            Rc::clone(&db_origin),
+            &db_cache,
+        )
+        .await;
+
+        match result {
+            Ok(cached_bytes) => {
+                if writer_tx
+                    .send(WriterCommand::QueryReady {
+                        fingerprint: work.fingerprint,
+                        cached_bytes,
+                    })
+                    .is_err()
+                {
+                    error!("population worker {id}: failed to send QueryReady");
+                }
+            }
+            Err(e) => {
+                error!(
+                    "population worker {id}: population failed for query {}: {e}",
+                    work.fingerprint
+                );
+                if writer_tx
+                    .send(WriterCommand::QueryFailed {
+                        fingerprint: work.fingerprint,
+                    })
+                    .is_err()
+                {
+                    error!("population worker {id}: failed to send QueryFailed");
+                }
+            }
+        }
+    }
+
+    debug!("population worker {id} shutting down");
+}
+
 /// Background task for populating cache with query results.
 /// Runs on a dedicated pool connection to avoid session variable conflicts.
 #[allow(clippy::too_many_arguments)]
@@ -1630,10 +1661,11 @@ pub fn writer_run(
         // Create writer channel for spawned tasks to send commands back
         let (writer_tx, mut internal_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut writer = CacheWriter::new(settings, state_view, writer_tx).await?;
-
         LocalSet::new()
             .run_until(async move {
+                // Create writer inside LocalSet so spawn_local works for population workers
+                let mut writer = CacheWriter::new(settings, state_view, writer_tx).await?;
+
                 loop {
                     tokio::select! {
                         // Handle commands from coordinator/CDC
@@ -1666,9 +1698,7 @@ pub fn writer_run(
                         }
                     }
 
-                    // Drain available messages, but limit to avoid starving spawned tasks
-                    const MAX_DRAIN: usize = 100;
-                    for _ in 0..MAX_DRAIN {
+                    for _ in 0..writer_rx.len() {
                         if let Ok(cmd) = writer_rx.try_recv() {
                             if let Err(e) = writer.command_handle(cmd).await {
                                 error!("writer command failed: {e}");
@@ -1677,7 +1707,8 @@ pub fn writer_run(
                             break;
                         }
                     }
-                    for _ in 0..MAX_DRAIN {
+
+                    for _ in 0..internal_rx.len() {
                         if let Ok(cmd) = internal_rx.try_recv() {
                             if let Err(e) = writer.command_handle(cmd).await {
                                 error!("writer internal command failed: {e}");
