@@ -18,6 +18,8 @@ pub mod names {
     pub const QUERY_LATENCY_SECONDS: &str = "pgcache.query.latency_seconds";
     pub const CACHE_LOOKUP_LATENCY_SECONDS: &str = "pgcache.cache.lookup_latency_seconds";
     pub const ORIGIN_LATENCY_SECONDS: &str = "pgcache.origin.latency_seconds";
+    pub const QUERY_REGISTRATION_LATENCY_SECONDS: &str =
+        "pgcache.query.registration_latency_seconds";
 
     // Connection metrics
     pub const CONNECTIONS_TOTAL: &str = "pgcache.connections.total";
@@ -38,6 +40,7 @@ pub mod names {
 
     // Cache state metrics
     pub const CACHE_QUERIES_REGISTERED: &str = "pgcache.cache.queries_registered";
+    pub const CACHE_QUERIES_LOADING: &str = "pgcache.cache.queries_loading";
     pub const CACHE_SIZE_BYTES: &str = "pgcache.cache.size_bytes";
     pub const CACHE_SIZE_LIMIT_BYTES: &str = "pgcache.cache.size_limit_bytes";
     pub const CACHE_GENERATION: &str = "pgcache.cache.generation";

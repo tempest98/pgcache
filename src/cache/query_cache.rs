@@ -15,7 +15,7 @@ use super::{
     CacheError, CacheResult,
     messages::{CacheReply, WriterCommand},
     query::CacheableQuery,
-    types::{CacheStateView, CachedQueryState},
+    types::{CacheStateView, CachedQueryState, CachedQueryView},
 };
 use crate::proxy::ClientSocket;
 
@@ -82,19 +82,24 @@ impl QueryCache {
         let lookup_start = Instant::now();
 
         // Check cache state from shared view
-        let cache_state = self.state_view.read().ok().and_then(|view| {
-            view.cached_queries
-                .get(&fingerprint)
-                .map(|q| (q.state, q.resolved.clone(), q.generation))
-        });
+        let cache_entry = self
+            .state_view
+            .read()
+            .ok()
+            .and_then(|view| view.cached_queries.get(&fingerprint).cloned());
 
         // Record cache lookup latency
         let lookup_duration = lookup_start.elapsed();
         metrics::histogram!(names::CACHE_LOOKUP_LATENCY_SECONDS)
             .record(lookup_duration.as_secs_f64());
 
-        if let Some((CachedQueryState::Ready, resolved, generation)) = cache_state {
-            // Cache hit - send to worker
+        // Cache hit: Ready state with resolved query
+        if let Some(CachedQueryView {
+            state: CachedQueryState::Ready,
+            generation,
+            resolved: Some(resolved),
+        }) = cache_entry
+        {
             let worker_request = WorkerRequest {
                 query_type: msg.query_type,
                 data: msg.data,
@@ -109,20 +114,32 @@ impl QueryCache {
                 CacheError::WorkerSend.into()
             })
         } else {
-            // Forward query to origin and load cache
+            // Cache miss or Loading - forward to origin
             msg.reply_tx
                 .send(CacheReply::Forward(msg.data))
                 .await
                 .map_err(|_| CacheError::Reply)?;
 
-            // Only register if not already in cache (state was None, not Loading)
-            if cache_state.is_none() {
-                // Fire-and-forget: send to writer, don't wait for response
+            // Register only if not already in cache (prevents duplicate registrations)
+            if cache_entry.is_none() {
+                // Insert Loading placeholder to prevent races
+                if let Ok(mut view) = self.state_view.write() {
+                    view.cached_queries.insert(
+                        fingerprint,
+                        CachedQueryView {
+                            state: CachedQueryState::Loading,
+                            generation: 0,
+                            resolved: None,
+                        },
+                    );
+                }
+
                 self.writer_tx
                     .send(WriterCommand::QueryRegister {
                         fingerprint,
                         cacheable_query: msg.cacheable_query,
                         search_path: msg.search_path,
+                        started_at: Instant::now(),
                     })
                     .map_err(|_| CacheError::WorkerSend)?;
 

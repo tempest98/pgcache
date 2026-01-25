@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use iddqd::BiHashMap;
 use postgres_protocol::escape;
@@ -122,10 +123,11 @@ impl CacheWriter {
                 fingerprint,
                 cacheable_query,
                 search_path,
+                started_at,
             } => {
                 let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
                 if let Err(e) = self
-                    .query_register(fingerprint, &cacheable_query, &search_path_refs)
+                    .query_register(fingerprint, &cacheable_query, &search_path_refs, started_at)
                     .await
                 {
                     error!("query register failed: {e}");
@@ -212,6 +214,7 @@ impl CacheWriter {
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
+        started_at: Instant,
     ) -> CacheResult<()> {
         let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
@@ -298,6 +301,7 @@ impl CacheWriter {
             resolved: resolved.clone(),
             constraints: query_constraints,
             cached_bytes: 0,
+            registration_started_at: Some(started_at),
         };
 
         self.cache.cached_queries.insert_overwrite(cached_query);
@@ -380,12 +384,20 @@ impl CacheWriter {
         {
             query.state = CachedQueryState::Ready;
             query.cached_bytes = cached_bytes;
-            Some((query.generation, query.resolved.clone()))
+            let started_at = query.registration_started_at.take();
+            Some((query.generation, query.resolved.clone(), started_at))
         } else {
             None
         };
 
-        if let Some((generation, resolved)) = update_info {
+        if let Some((generation, resolved, started_at)) = update_info {
+            // Record registration latency metric
+            if let Some(started) = started_at {
+                let latency = started.elapsed();
+                metrics::histogram!(names::QUERY_REGISTRATION_LATENCY_SECONDS)
+                    .record(latency.as_secs_f64());
+            }
+
             // Update shared state view
             self.state_view_update(fingerprint, CachedQueryState::Ready, generation, &resolved);
             trace!("cached query ready, cached_bytes={cached_bytes}");
@@ -725,7 +737,7 @@ impl CacheWriter {
                 CachedQueryView {
                     state,
                     generation,
-                    resolved: resolved.clone(),
+                    resolved: Some(resolved.clone()),
                 },
             );
         }
@@ -735,6 +747,13 @@ impl CacheWriter {
     fn state_gauges_update(&self) {
         metrics::gauge!(names::CACHE_QUERIES_REGISTERED)
             .set(self.cache.cached_queries.len() as f64);
+        let loading_count = self
+            .cache
+            .cached_queries
+            .iter()
+            .filter(|q| q.state == CachedQueryState::Loading)
+            .count();
+        metrics::gauge!(names::CACHE_QUERIES_LOADING).set(loading_count as f64);
         metrics::gauge!(names::CACHE_SIZE_BYTES).set(self.cache.current_size as f64);
         if let Some(limit) = self.cache.cache_size {
             metrics::gauge!(names::CACHE_SIZE_LIMIT_BYTES).set(limit as f64);
@@ -781,12 +800,11 @@ impl CacheWriter {
             // Try built-in types first (fast path), then discover custom types from origin
             let data_type = match Type::from_oid(type_oid) {
                 Some(t) => t,
-                None => {
-                    self.db_origin
-                        .get_type(type_oid)
-                        .await
-                        .map_into_report::<CacheError>()?
-                }
+                None => self
+                    .db_origin
+                    .get_type(type_oid)
+                    .await
+                    .map_into_report::<CacheError>()?,
             };
 
             let type_name = data_type.name().to_owned();
@@ -1441,6 +1459,7 @@ async fn population_task(
         .map_into_report::<CacheError>()?;
 
     let mut total_bytes: usize = 0;
+    let task_start = Instant::now();
 
     // Fetch and populate for each table
     for &table_oid in relation_oids {
@@ -1453,13 +1472,24 @@ async fn population_task(
             })?;
 
         // Fetch from origin
+        let fetch_start = Instant::now();
         let rows = population_fetch(&db_origin, table_oid, table, resolved).await?;
+        let fetch_elapsed = fetch_start.elapsed();
 
         // Populate cache
+        let insert_start = Instant::now();
         let bytes = population_insert(db_cache, table, &rows).await?;
+        let insert_elapsed = insert_start.elapsed();
 
         total_bytes += bytes;
+
+        trace!(
+            "population table {}.{} fetch={:?} insert={:?} bytes={bytes}",
+            table.schema, table.name, fetch_elapsed, insert_elapsed
+        );
     }
+
+    let task_elapsed = task_start.elapsed();
 
     // Reset generation
     db_cache
@@ -1467,7 +1497,10 @@ async fn population_task(
         .await
         .map_into_report::<CacheError>()?;
 
-    trace!("population complete for query {fingerprint}, bytes={total_bytes}");
+    trace!(
+        "population complete for query {fingerprint}, total_time={:?} bytes={total_bytes}",
+        task_elapsed
+    );
     Ok(total_bytes)
 }
 
@@ -1630,6 +1663,27 @@ pub fn writer_run(
                                     break;
                                 }
                             }
+                        }
+                    }
+
+                    // Drain available messages, but limit to avoid starving spawned tasks
+                    const MAX_DRAIN: usize = 100;
+                    for _ in 0..MAX_DRAIN {
+                        if let Ok(cmd) = writer_rx.try_recv() {
+                            if let Err(e) = writer.command_handle(cmd).await {
+                                error!("writer command failed: {e}");
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    for _ in 0..MAX_DRAIN {
+                        if let Ok(cmd) = internal_rx.try_recv() {
+                            if let Err(e) = writer.command_handle(cmd).await {
+                                error!("writer internal command failed: {e}");
+                            }
+                        } else {
+                            break;
                         }
                     }
                 }

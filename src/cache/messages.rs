@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_util::bytes::BytesMut;
 
@@ -158,6 +160,7 @@ pub enum WriterCommand {
         fingerprint: u64,
         cacheable_query: Box<CacheableQuery>,
         search_path: Vec<String>,
+        started_at: Instant,
     },
 
     /// Query population completed successfully

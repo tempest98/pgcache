@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::time::Instant;
 
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
@@ -30,6 +31,8 @@ pub struct CachedQuery {
     pub constraints: QueryConstraints,
     /// Estimated size of cached data in bytes (sum of raw value bytes)
     pub cached_bytes: usize,
+    /// Timestamp when registration started (for latency metrics)
+    pub registration_started_at: Option<Instant>,
 }
 
 impl BiHashItem for CachedQuery {
@@ -136,6 +139,8 @@ pub struct CacheStateView {
 #[derive(Debug, Clone)]
 pub struct CachedQueryView {
     pub state: CachedQueryState,
+    /// Generation number (0 for Loading placeholder before writer assigns real value)
     pub generation: u64,
-    pub resolved: ResolvedSelectStatement,
+    /// Resolved query (None for Loading placeholder before writer resolves)
+    pub resolved: Option<ResolvedSelectStatement>,
 }
