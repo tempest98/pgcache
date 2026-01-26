@@ -10,6 +10,7 @@ use crate::metrics::names;
 use crate::query::ast::ast_query_fingerprint;
 use crate::query::resolved::ResolvedSelectStatement;
 use crate::settings::Settings;
+use crate::timing::QueryTiming;
 
 use super::{
     CacheError, CacheResult,
@@ -34,6 +35,8 @@ pub struct QueryRequest {
     pub reply_tx: Sender<CacheReply>,
     /// Resolved search_path for schema resolution
     pub search_path: Vec<String>,
+    /// Per-query timing data
+    pub timing: QueryTiming,
 }
 
 /// Request sent to cache worker for executing cached queries.
@@ -47,6 +50,8 @@ pub struct WorkerRequest {
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
     pub reply_tx: Sender<CacheReply>,
+    /// Per-query timing data
+    pub timing: QueryTiming,
 }
 
 /// Query cache coordinator - routes queries and delegates writes to the writer thread.
@@ -100,6 +105,13 @@ impl QueryCache {
             resolved: Some(resolved),
         }) = cache_entry
         {
+            // Record lookup completion time
+            let timing = {
+                let mut t = msg.timing;
+                t.lookup_complete_at = Some(Instant::now());
+                t
+            };
+
             let worker_request = WorkerRequest {
                 query_type: msg.query_type,
                 data: msg.data,
@@ -108,6 +120,7 @@ impl QueryCache {
                 result_formats: msg.result_formats,
                 client_socket: msg.client_socket,
                 reply_tx: msg.reply_tx,
+                timing,
             };
             self.worker_tx.send(worker_request).map_err(|e| {
                 error!("worker send {e}");

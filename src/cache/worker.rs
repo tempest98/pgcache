@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::time::Instant;
 
 use tokio::io::AsyncWriteExt;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
@@ -84,6 +85,9 @@ impl CacheWorker {
             .await
             .map_into_report::<CacheError>()?;
 
+        // Record query completion time
+        msg.timing.query_done_at = Some(std::time::Instant::now());
+
         let [
             SimpleQueryMessage::CommandComplete(_),
             SimpleQueryMessage::RowDescription(desc),
@@ -147,6 +151,9 @@ impl CacheWorker {
             return Err(CacheError::Write.into());
         }
 
+        // Record response written time
+        msg.timing.response_written_at = Some(Instant::now());
+
         Ok(())
     }
 
@@ -168,6 +175,9 @@ impl CacheWorker {
             .query(&sql, &[])
             .await
             .map_into_report::<CacheError>()?;
+
+        // Record query completion time
+        msg.timing.query_done_at = Some(Instant::now());
 
         let mut buf = BytesMut::new();
         for row in &res {
@@ -204,6 +214,9 @@ impl CacheWorker {
             error!("no client");
             return Err(CacheError::Write.into());
         }
+
+        // Record response written time
+        msg.timing.response_written_at = Some(Instant::now());
 
         Ok(())
     }

@@ -1,5 +1,6 @@
 use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Instant;
 
 use tokio::{
     runtime::Builder,
@@ -34,6 +35,7 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
                 client_socket: proxy_msg.client_socket,
                 reply_tx: proxy_msg.reply_tx,
                 search_path: proxy_msg.search_path,
+                timing: proxy_msg.timing,
             };
             if let Err(e) = qcache.query_dispatch(request).await {
                 error!("query dispatch failed: {e}");
@@ -80,8 +82,11 @@ fn handle_cdc_message(writer_tx: &UnboundedSender<WriterCommand>, msg: CdcMessag
 async fn handle_worker_request(worker: CacheWorker, mut msg: WorkerRequest) {
     debug!("cache worker task spawn");
 
+    // Record worker start time
+    msg.timing.worker_start_at = Some(Instant::now());
+
     let reply = match worker.handle_cached_query(&mut msg).await {
-        Ok(_) => CacheReply::Complete(msg.data),
+        Ok(_) => CacheReply::Complete(msg.data, Some(msg.timing)),
         Err(e) => {
             error!("handle_cached_query failed: {e}");
             CacheReply::Error(msg.data)

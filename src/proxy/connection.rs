@@ -42,6 +42,7 @@ use crate::{
         },
     },
     settings::{Settings, SslMode},
+    timing::{QueryId, QueryTiming, timing_record},
     tls::{self},
 };
 
@@ -138,6 +139,9 @@ pub(super) struct ConnectionState {
 
     /// Start time of origin query (for origin latency tracking)
     origin_query_start: Option<Instant>,
+
+    /// Per-query timing data for the current query
+    current_timing: Option<QueryTiming>,
 }
 
 impl ConnectionState {
@@ -159,6 +163,7 @@ impl ConnectionState {
             first_ready_for_query: true,
             query_start: None,
             origin_query_start: None,
+            current_timing: None,
         }
     }
 }
@@ -195,6 +200,14 @@ impl ConnectionState {
                                 ProxyMode::Read
                             }
                             Ok(Action::CacheCheck(ast)) => {
+                                // Create timing with fingerprint from the cacheable query
+                                use crate::query::ast::ast_query_fingerprint;
+                                let fingerprint = ast_query_fingerprint(ast.statement());
+                                let query_id = QueryId::new(fingerprint);
+                                let received_at = self.query_start.unwrap_or_else(Instant::now);
+                                let mut timing = QueryTiming::new(query_id, received_at);
+                                timing.parsed_at = Some(Instant::now());
+                                self.current_timing = Some(timing);
                                 ProxyMode::CacheWrite(CacheMessage::Query(msg.data, ast))
                             }
                             Err(e) => {
@@ -391,13 +404,17 @@ impl ConnectionState {
                 // via CacheClientWriter, so this should not happen through the channel.
                 // No action needed - just wait for Complete.
             }
-            CacheReply::Complete(_) => {
+            CacheReply::Complete(_, timing) => {
                 metrics::counter!(names::QUERIES_CACHE_HIT).increment(1);
                 // Record query latency for cache hit
                 if let Some(start) = self.query_start.take() {
                     let duration = start.elapsed();
                     metrics::histogram!(names::QUERY_LATENCY_SECONDS)
                         .record(duration.as_secs_f64());
+                }
+                // Record per-stage timing breakdown
+                if let Some(timing) = timing {
+                    timing_record(&timing);
                 }
                 self.proxy_mode = ProxyMode::Read;
             }
@@ -453,7 +470,22 @@ impl ConnectionState {
         self.query_start = Some(Instant::now());
 
         self.proxy_mode = match self.try_cache_execute(&msg) {
-            Some(cache_msg) => ProxyMode::CacheWrite(cache_msg),
+            Some(cache_msg) => {
+                // Create timing with fingerprint from the cacheable query
+                use crate::query::ast::ast_query_fingerprint;
+                let fingerprint = match &cache_msg {
+                    CacheMessage::Query(_, ast)
+                    | CacheMessage::QueryParameterized(_, ast, _, _) => {
+                        ast_query_fingerprint(ast.statement())
+                    }
+                };
+                let query_id = QueryId::new(fingerprint);
+                let received_at = self.query_start.unwrap_or_else(Instant::now);
+                let mut timing = QueryTiming::new(query_id, received_at);
+                timing.parsed_at = Some(Instant::now());
+                self.current_timing = Some(timing);
+                ProxyMode::CacheWrite(cache_msg)
+            }
             None => {
                 metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
 
@@ -568,7 +600,10 @@ impl ConnectionState {
         };
         debug!("parsed statement insert {}", parsed.statement_name);
         // Only increment gauge if this is a new statement (not replacing)
-        if !self.prepared_statements.contains_key(&parsed.statement_name) {
+        if !self
+            .prepared_statements
+            .contains_key(&parsed.statement_name)
+        {
             metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).increment(1.0);
         }
         self.prepared_statements
@@ -883,11 +918,22 @@ async fn handle_connection(
 
                 let (reply_tx, reply_rx) = channel(10);
 
+                // Take timing from connection state and set dispatched_at
+                let timing = {
+                    let mut t = state.current_timing.take().unwrap_or_else(|| {
+                        // Fallback if timing wasn't set (shouldn't happen)
+                        QueryTiming::new(QueryId::new(0), Instant::now())
+                    });
+                    t.dispatched_at = Some(Instant::now());
+                    t
+                };
+
                 let proxy_msg = ProxyMessage {
                     message: msg,
                     client_socket,
                     reply_tx,
                     search_path: resolved_search_path,
+                    timing,
                 };
 
                 match cache_sender.send(proxy_msg).await {

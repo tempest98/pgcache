@@ -50,6 +50,16 @@ pub mod names {
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
     pub const PROTOCOL_EXTENDED_QUERIES: &str = "pgcache.protocol.extended_queries";
     pub const PROTOCOL_PREPARED_STATEMENTS: &str = "pgcache.protocol.prepared_statements";
+
+    // Per-stage timing histograms
+    pub const QUERY_STAGE_PARSE_SECONDS: &str = "pgcache.query.stage.parse_seconds";
+    pub const QUERY_STAGE_DISPATCH_SECONDS: &str = "pgcache.query.stage.dispatch_seconds";
+    pub const QUERY_STAGE_LOOKUP_SECONDS: &str = "pgcache.query.stage.lookup_seconds";
+    pub const QUERY_STAGE_ROUTING_SECONDS: &str = "pgcache.query.stage.routing_seconds";
+    pub const QUERY_STAGE_WORKER_EXEC_SECONDS: &str = "pgcache.query.stage.worker_exec_seconds";
+    pub const QUERY_STAGE_RESPONSE_WRITE_SECONDS: &str =
+        "pgcache.query.stage.response_write_seconds";
+    pub const QUERY_STAGE_TOTAL_SECONDS: &str = "pgcache.query.stage.total_seconds";
 }
 
 /// Install the Prometheus metrics recorder.
