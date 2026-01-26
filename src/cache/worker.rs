@@ -58,32 +58,12 @@ impl CacheWorker {
     pub async fn handle_cached_query(&self, msg: &mut WorkerRequest) -> CacheResult<()> {
         // Set generation before query execution (enables row tracking in pgcache_pgrx)
         debug!("message query generation {}", msg.generation);
-        if msg.generation > 0 {
-            let set_gen = format!("SET mem.query_generation = {}", msg.generation);
-            debug!("{}", set_gen);
-            self.db_cache
-                .simple_query(&set_gen)
-                .await
-                .map_into_report::<CacheError>()?;
-            debug!("done {}", set_gen);
-        }
 
         let rv = if msg.result_formats.first().is_none_or(|&f| f == 0) {
             self.handle_cached_query_text(msg).await
         } else {
             self.handle_cached_query_binary(msg).await
         };
-
-        debug!("rv {:?}", &rv);
-
-        // Reset generation after query (disables row tracking)
-        if msg.generation > 0 {
-            // Ignore errors on reset - query already succeeded/failed
-            let _ = self
-                .db_cache
-                .simple_query("SET mem.query_generation = 0")
-                .await;
-        }
 
         debug!("cache hit");
         rv
@@ -95,14 +75,17 @@ impl CacheWorker {
         let mut sql = String::new();
         msg.resolved.deparse(&mut sql);
 
+        let combined_sql = format!("SET mem.query_generation = {}; {};", msg.generation, &sql);
+
         // Execute query against cache database
         let res = self
             .db_cache
-            .simple_query(&sql)
+            .simple_query(&combined_sql)
             .await
             .map_into_report::<CacheError>()?;
 
         let [
+            SimpleQueryMessage::CommandComplete(_),
             SimpleQueryMessage::RowDescription(desc),
             data_rows @ ..,
             SimpleQueryMessage::CommandComplete(cnt),
@@ -172,6 +155,12 @@ impl CacheWorker {
         // Generate SQL query from resolved AST (with schema-qualified table names)
         let mut sql = String::new();
         msg.resolved.deparse(&mut sql);
+
+        let set_gen = format!("SET mem.query_generation = {}", msg.generation);
+        self.db_cache
+            .simple_query(&set_gen)
+            .await
+            .map_into_report::<CacheError>()?;
 
         // Execute query against cache database
         let res = self
