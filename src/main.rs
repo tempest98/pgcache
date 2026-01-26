@@ -22,7 +22,7 @@ fn main() -> Result<(), Report> {
         .expect("install crypto provider");
 
     #[cfg(feature = "hotpath")]
-    let _guard = hotpath::GuardBuilder::new("pgcache")
+    let _guard = hotpath::FunctionsGuardBuilder::new("pgcache")
         .percentiles(&[50, 95, 99])
         .format(hotpath::Format::Table)
         .build();
