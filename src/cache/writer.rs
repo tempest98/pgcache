@@ -463,12 +463,13 @@ impl CacheWriter {
     }
 
     /// Invalidate a specific cached query and purge its generation if safe.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn cache_query_invalidate(&mut self, fingerprint: u64) -> CacheResult<()> {
         let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
             return Ok(());
         };
 
-        trace!("invalidating query {fingerprint}");
+        info!("invalidating query {fingerprint}");
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
 
@@ -1212,6 +1213,7 @@ impl CacheWriter {
         Ok(sql)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn update_queries_sql_list(
         &self,
         relation_oid: u32,
@@ -1417,6 +1419,7 @@ impl CacheWriter {
     }
 
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn cache_delete_sql(
         &self,
         table_metadata: &TableMetadata,

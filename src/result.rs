@@ -99,7 +99,10 @@ impl<T, E> MapIntoReport<T, E> for Result<T, E> {
         E: Into<C>,
         C: std::error::Error + Send + Sync + 'static,
     {
-        self.map_err(|e| e.into().into())
+        match self {
+            Err(e) => Err(Report::new(e.into())),
+            Ok(v) => Ok(v),
+        }
     }
 }
 

@@ -80,10 +80,13 @@ fn is_supported_from(select: &SelectStatement) -> bool {
 }
 
 fn is_supported_join(join: &JoinNode) -> bool {
+    // Only INNER joins are cacheable
     if join.join_type != JoinType::Inner {
         return false;
     }
-    match &join.condition {
+
+    // Validate join condition: must be simple equality or absent
+    let condition_valid = match &join.condition {
         Some(WhereExpr::Binary(binary_expr)) => {
             binary_expr.op == ExprOp::Equal
                 && !join.condition.as_ref().is_some_and(|e| e.has_sublink())
@@ -97,7 +100,24 @@ fn is_supported_join(join: &JoinNode) -> bool {
             | WhereExpr::Subquery { .. },
         ) => false,
         None => true,
+    };
+
+    if !condition_valid {
+        return false;
     }
+
+    // Recursively validate nested joins
+    let left_valid = match join.left.as_ref() {
+        TableSource::Join(nested) => is_supported_join(nested),
+        TableSource::Table(_) | TableSource::Subquery(_) => true,
+    };
+
+    let right_valid = match join.right.as_ref() {
+        TableSource::Join(nested) => is_supported_join(nested),
+        TableSource::Table(_) | TableSource::Subquery(_) => true,
+    };
+
+    left_valid && right_valid
 }
 
 /// Check if a SELECT statement can be efficiently cached.
@@ -155,5 +175,107 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
         | WhereExpr::Multi(_)
         | WhereExpr::Function { .. }
         | WhereExpr::Subquery { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::ast::sql_query_convert;
+
+    #[test]
+    fn test_two_table_join_cacheable() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(result.is_ok(), "2-table inner join should be cacheable");
+    }
+
+    #[test]
+    fn test_three_table_join_cacheable() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(result.is_ok(), "3-table inner join should be cacheable");
+    }
+
+    #[test]
+    fn test_four_table_join_cacheable() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id JOIN d ON c.id = d.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(result.is_ok(), "4-table inner join should be cacheable");
+    }
+
+    #[test]
+    fn test_left_join_not_cacheable() {
+        let sql = "SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            "LEFT JOIN should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_mixed_join_types_not_cacheable() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            "Mixed join types (INNER + LEFT) should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_nested_left_join_not_cacheable() {
+        let sql =
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            "All LEFT JOINs should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_join_with_non_equality_condition_not_cacheable() {
+        let sql = "SELECT * FROM a JOIN b ON a.id > b.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            "Non-equality join condition should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_nested_join_with_non_equality_not_cacheable() {
+        let sql = "SELECT * FROM a JOIN b ON a.id > b.id JOIN c ON b.id = c.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            "Nested join with non-equality condition should not be cacheable"
+        );
     }
 }

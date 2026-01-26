@@ -627,7 +627,10 @@ fn resolved_column_expr_alias_update(
     }
 }
 
-//generate queries used to check if a dml statement applies to a given table
+/// Generate queries used to check if a DML statement applies to a given table.
+/// Returns one update query per table in the join - all queries use the same
+/// full SELECT statement (preserving the join structure) since we need to check
+/// if a change to any table affects the cached result.
 pub fn query_table_update_queries(
     cacheable_query: &CacheableQuery,
 ) -> Vec<(&TableNode, SelectStatement)> {
@@ -638,23 +641,12 @@ pub fn query_table_update_queries(
         expr: ColumnExpr::Literal(LiteralValue::Boolean(true)),
         alias: None,
     };
-
     let select_list = SelectColumns::Columns(vec![column]);
 
-    let mut queries = Vec::new();
-    match tables.as_slice() {
-        [table] => {
-            queries.push((*table, query_select_replace(select, select_list)));
-        }
-        [table1, table2] => {
-            //can use same query for both tables (CacheableQuery guarantees is_supported_from)
-            queries.push((*table1, query_select_replace(select, select_list.clone())));
-            queries.push((*table2, query_select_replace(select, select_list)));
-        }
-        _ => {}
-    }
-
-    queries
+    tables
+        .into_iter()
+        .map(|table| (table, query_select_replace(select, select_list.clone())))
+        .collect()
 }
 
 pub fn query_table_replace_with_values(
@@ -1012,6 +1004,56 @@ mod tests {
             update2,
             "SELECT true FROM users JOIN location ON location.user_id = users.user_id WHERE users.user_id = 1"
         );
+    }
+
+    #[test]
+    fn test_query_table_update_query_three_table_join() {
+        let original_query = "SELECT * FROM users \
+                            JOIN location ON location.user_id = users.user_id \
+                            JOIN orders ON orders.user_id = users.user_id \
+                            WHERE users.user_id = 1";
+        let ast = pg_query::parse(original_query).expect("to parse query");
+        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
+
+        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let result = query_table_update_queries(&cacheable_query);
+
+        assert_eq!(result.len(), 3, "Should have 3 update queries for 3 tables");
+
+        // All three queries should produce the same SQL (the full join query with SELECT true)
+        let mut update1 = String::new();
+        result[0].1.deparse(&mut update1);
+        assert!(update1.contains("SELECT true"));
+        assert!(update1.contains("JOIN"));
+
+        // Verify each table is associated with an update query
+        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"));
+        assert!(table_names.contains(&"location"));
+        assert!(table_names.contains(&"orders"));
+    }
+
+    #[test]
+    fn test_query_table_update_query_four_table_join() {
+        let original_query = "SELECT * FROM a \
+                            JOIN b ON a.id = b.id \
+                            JOIN c ON b.id = c.id \
+                            JOIN d ON c.id = d.id \
+                            WHERE a.id = 1";
+        let ast = pg_query::parse(original_query).expect("to parse query");
+        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
+
+        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let result = query_table_update_queries(&cacheable_query);
+
+        assert_eq!(result.len(), 4, "Should have 4 update queries for 4 tables");
+
+        // Verify each table is associated with an update query
+        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        assert!(table_names.contains(&"a"));
+        assert!(table_names.contains(&"b"));
+        assert!(table_names.contains(&"c"));
+        assert!(table_names.contains(&"d"));
     }
 
     // ==================== Text Format Parameter Tests ====================

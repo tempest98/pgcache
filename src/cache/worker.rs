@@ -5,7 +5,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
 use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_util::bytes::{BufMut, BytesMut};
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument};
 
 use crate::pg::protocol::encode::*;
 use crate::query::ast::Deparse;
@@ -79,7 +79,7 @@ pub async fn handle_cached_query(
         handle_cached_query_binary(client, return_tx, msg).await
     };
 
-    debug!("cache hit");
+    info!("cache hit");
     rv
 }
 
