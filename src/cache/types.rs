@@ -67,6 +67,8 @@ pub struct UpdateQuery {
     pub fingerprint: u64,
     /// Resolved AST query
     pub resolved: ResolvedSelectStatement,
+    /// Complexity score (lower = simpler = more likely to match = try first)
+    pub complexity: usize,
 }
 
 /// Collection of update queries for a specific relation

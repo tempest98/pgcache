@@ -6,7 +6,7 @@ use iddqd::BiHashMap;
 use postgres_protocol::escape;
 use rootcause::Report;
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::Row;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, types::Type};
@@ -36,6 +36,9 @@ use super::{
 /// Number of persistent population workers.
 const POPULATE_POOL_SIZE: usize = 3;
 
+/// Number of connections in the cache pool for concurrent CDC updates.
+const CACHE_POOL_SIZE: usize = 4;
+
 /// Work item for population worker pool.
 struct PopulationWork {
     fingerprint: u64,
@@ -56,6 +59,8 @@ pub struct CacheWriter {
     populate_txs: Vec<UnboundedSender<PopulationWork>>,
     /// Index for round-robin dispatch to population workers.
     populate_next: usize,
+    /// Pool of cache connections for concurrent CDC update execution.
+    cache_pool: Vec<Rc<Client>>,
 }
 
 impl CacheWriter {
@@ -116,6 +121,27 @@ impl CacheWriter {
             });
         }
 
+        // Create cache connection pool for concurrent CDC updates
+        let mut cache_pool = Vec::with_capacity(CACHE_POOL_SIZE);
+        for i in 0..CACHE_POOL_SIZE {
+            let (pool_conn, pool_conn_task) = Config::new()
+                .host(&settings.cache.host)
+                .port(settings.cache.port)
+                .user(&settings.cache.user)
+                .dbname(&settings.cache.database)
+                .connect(NoTls)
+                .await
+                .map_into_report::<CacheError>()?;
+
+            tokio::spawn(async move {
+                if let Err(e) = pool_conn_task.await {
+                    error!("cache pool connection {i} error: {e}");
+                }
+            });
+
+            cache_pool.push(Rc::new(pool_conn));
+        }
+
         Ok(Self {
             cache: Cache::new(settings),
             db_cache: cache_client,
@@ -123,6 +149,7 @@ impl CacheWriter {
             state_view,
             populate_txs,
             populate_next: 0,
+            cache_pool,
         })
     }
 
@@ -279,15 +306,21 @@ impl CacheWriter {
                     .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
                     .attach_loc("resolving update select statement")?;
 
+            let complexity = update_resolved.complexity();
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
+                complexity,
             };
 
             self.cache
                 .update_queries
                 .entry(relation_oid)
-                .and_modify(|mut queries| queries.queries.push(update_query.clone()))
+                .and_modify(|mut queries| {
+                    queries.queries.push(update_query.clone());
+                    // Keep queries sorted by complexity (ascending) so simpler queries are tried first
+                    queries.queries.sort_by_key(|q| q.complexity);
+                })
                 .or_insert_with(|| UpdateQueries {
                     relation_oid,
                     queries: vec![update_query],
@@ -559,22 +592,8 @@ impl CacheWriter {
             self.state_gauges_update();
         }
 
-        let sql_list = self
-            .update_queries_sql_list(relation_oid, &row_data)
-            .attach_loc("building update SQL")?;
-
-        for sql in sql_list {
-            let modified_cnt = self
-                .db_cache
-                .execute(sql.as_str(), &[])
-                .await
-                .map_into_report::<CacheError>()?;
-            if modified_cnt == 1 {
-                break;
-            } else if modified_cnt > 1 {
-                return Err(CacheError::TooManyModifiedRows.into());
-            }
-        }
+        self.update_queries_execute_concurrent(relation_oid, &row_data)
+            .await?;
 
         metrics::histogram!(names::CACHE_HANDLE_INSERT_SECONDS)
             .record(start.elapsed().as_secs_f64());
@@ -613,22 +632,9 @@ impl CacheWriter {
             self.state_gauges_update();
         }
 
-        let sql_list = self.update_queries_sql_list(relation_oid, &new_row_data)?;
-
-        let mut matched = false;
-        for sql in sql_list {
-            let modified_cnt = self
-                .db_cache
-                .execute(sql.as_str(), &[])
-                .await
-                .map_into_report::<CacheError>()?;
-            if modified_cnt == 1 {
-                matched = true;
-                break;
-            } else if modified_cnt > 1 {
-                return Err(CacheError::TooManyModifiedRows.into());
-            }
-        }
+        let matched = self
+            .update_queries_execute_concurrent(relation_oid, &new_row_data)
+            .await?;
 
         if !matched {
             let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
@@ -1214,48 +1220,6 @@ impl CacheWriter {
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    fn update_queries_sql_list(
-        &self,
-        relation_oid: u32,
-        row_data: &[Option<String>],
-    ) -> CacheResult<Vec<String>> {
-        let update_queries =
-            self.cache
-                .update_queries
-                .get(&relation_oid)
-                .ok_or(CacheError::UnknownTable {
-                    oid: Some(relation_oid),
-                    name: None,
-                })?;
-
-        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
-            error!("No table metadata found for relation_oid: {}", relation_oid);
-            return Err(CacheError::UnknownTable {
-                oid: Some(relation_oid),
-                name: None,
-            }
-            .into());
-        };
-
-        let mut sql_list = Vec::new();
-        for update_query in &update_queries.queries {
-            sql_list.push(
-                self.cache_upsert_with_predicate_sql(
-                    &update_query.resolved,
-                    table_metadata,
-                    row_data,
-                )
-                .attach_loc(format!(
-                    "building update SQL for query {}",
-                    update_query.fingerprint
-                ))?,
-            );
-        }
-
-        Ok(sql_list)
-    }
-
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn update_queries_check_invalidate(
         &self,
         relation_oid: u32,
@@ -1452,6 +1416,121 @@ impl CacheWriter {
         );
 
         Ok(sql)
+    }
+
+    /// Execute update queries concurrently with lazy SQL building.
+    /// Builds SQL only for each batch just before execution, avoiding
+    /// unnecessary work when a match is found early.
+    /// Returns true if any statement modified exactly 1 row.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    async fn update_queries_execute_concurrent(
+        &self,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) -> CacheResult<bool> {
+        let update_queries =
+            self.cache
+                .update_queries
+                .get(&relation_oid)
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(relation_oid),
+                    name: None,
+                })?;
+
+        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+            error!("No table metadata found for relation_oid: {}", relation_oid);
+            return Err(CacheError::UnknownTable {
+                oid: Some(relation_oid),
+                name: None,
+            }
+            .into());
+        };
+
+        let total_queries = update_queries.queries.len();
+        trace!("update_queries_execute_concurrent start [{total_queries}]");
+
+        if total_queries == 0 {
+            return Ok(false);
+        }
+
+        let pool_size = self.cache_pool.len();
+        let mut query_iter = update_queries.queries.iter().enumerate();
+        let mut total_executed = 0;
+
+        // Process in batches
+        loop {
+            let (tx, mut rx) =
+                mpsc::channel::<(u64, Result<u64, tokio_postgres::Error>)>(pool_size);
+
+            // Build SQL and spawn tasks inline, tracking batch count
+            let mut batch_count = 0;
+            for (idx, update_query) in query_iter.by_ref().take(pool_size) {
+                let fingerprint = update_query.fingerprint;
+                let sql = self.cache_upsert_with_predicate_sql(
+                    &update_query.resolved,
+                    table_metadata,
+                    row_data,
+                )?;
+
+                let conn = self
+                    .cache_pool
+                    .get(idx % pool_size)
+                    .map(Rc::clone)
+                    .ok_or(CacheError::Other)?;
+                let tx = tx.clone();
+
+                spawn_local(async move {
+                    let result = conn.execute(sql.as_str(), &[]).await;
+                    let _ = tx.send((fingerprint, result)).await;
+                });
+                batch_count += 1;
+            }
+            drop(tx); // Close sender so rx completes when all tasks finish
+
+            if batch_count == 0 {
+                break;
+            }
+
+            // Collect results from this batch
+            let mut batch_matched = false;
+            let mut batch_error: Option<CacheError> = None;
+
+            while let Some((fingerprint, result)) = rx.recv().await {
+                total_executed += 1;
+                match result {
+                    Ok(1) => {
+                        trace!("update_queries matched fingerprint {fingerprint}");
+                        batch_matched = true;
+                    }
+                    Ok(n) if n > 1 => {
+                        batch_error = Some(CacheError::TooManyModifiedRows);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("sql execution error for fingerprint {fingerprint}: {e}");
+                        batch_error = Some(CacheError::PgError(e));
+                    }
+                }
+            }
+
+            // Check for errors
+            if let Some(err) = batch_error {
+                return Err(err.into());
+            }
+
+            // If we found a match in this batch, we're done
+            if batch_matched {
+                trace!(
+                    "update_queries_execute_concurrent done [{total_executed}/{total_queries}] - matched"
+                );
+                return Ok(true);
+            }
+        }
+
+        trace!(
+            "update_queries_execute_concurrent done [{total_executed}/{total_queries}] - no match"
+        );
+        Ok(false)
     }
 }
 

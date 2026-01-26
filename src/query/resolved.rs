@@ -212,6 +212,42 @@ impl ResolvedWhereExpr {
         };
         current.chain(children)
     }
+
+    /// Count the number of leaf predicates (comparisons) in this expression.
+    /// AND/OR nodes are not counted themselves, only their leaf children.
+    pub fn predicate_count(&self) -> usize {
+        match self {
+            ResolvedWhereExpr::Binary(b) => match b.op {
+                ExprOp::And | ExprOp::Or => b.lexpr.predicate_count() + b.rexpr.predicate_count(),
+                ExprOp::Not
+                | ExprOp::Equal
+                | ExprOp::NotEqual
+                | ExprOp::LessThan
+                | ExprOp::LessThanOrEqual
+                | ExprOp::GreaterThan
+                | ExprOp::GreaterThanOrEqual
+                | ExprOp::Like
+                | ExprOp::ILike
+                | ExprOp::NotLike
+                | ExprOp::NotILike
+                | ExprOp::In
+                | ExprOp::NotIn
+                | ExprOp::Between
+                | ExprOp::NotBetween
+                | ExprOp::IsNull
+                | ExprOp::IsNotNull
+                | ExprOp::Any
+                | ExprOp::All
+                | ExprOp::Exists
+                | ExprOp::NotExists => 1,
+            },
+            ResolvedWhereExpr::Multi(m) => m.exprs.iter().map(|e| e.predicate_count()).sum(),
+            ResolvedWhereExpr::Unary(u) => u.expr.predicate_count(),
+            ResolvedWhereExpr::Function { .. } => 1, // Treat function calls as single predicate
+            ResolvedWhereExpr::Subquery { .. } => 1, // Treat subqueries as single predicate
+            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
+        }
+    }
 }
 
 impl Deparse for ResolvedWhereExpr {
@@ -586,6 +622,26 @@ impl ResolvedSelectStatement {
     /// Check if this SELECT statement references only a single table
     pub fn is_single_table(&self) -> bool {
         matches!(self.from.as_slice(), [ResolvedTableSource::Table(_)])
+    }
+
+    /// Compute a complexity score for this query.
+    /// Lower scores indicate simpler queries that are more likely to match any given row.
+    /// Used to sort update queries so simpler ones are tried first.
+    pub fn complexity(&self) -> usize {
+        // Count tables (each additional table beyond the first indicates a JOIN)
+        let table_count = self.nodes::<ResolvedTableNode>().count();
+        let join_count = table_count.saturating_sub(1);
+
+        // Count WHERE predicates
+        let predicate_count = self
+            .where_clause
+            .as_ref()
+            .map(|w| w.predicate_count())
+            .unwrap_or(0);
+
+        // JOINs are weighted more heavily than simple predicates
+        // because they're typically more selective
+        (join_count * 3) + predicate_count
     }
 }
 
@@ -1939,5 +1995,131 @@ mod tests {
         let hash2 = hasher2.finish();
 
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_complexity_single_table_no_where() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        // Single table, no predicates = complexity 0
+        assert_eq!(resolved.complexity(), 0);
+    }
+
+    #[test]
+    fn test_complexity_single_table_with_where() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users WHERE id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        // Single table, 1 predicate = complexity 1
+        assert_eq!(resolved.complexity(), 1);
+    }
+
+    #[test]
+    fn test_complexity_single_table_multiple_predicates() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users WHERE id = 1 AND name = 'john'";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        // Single table, 2 predicates = complexity 2
+        assert_eq!(resolved.complexity(), 2);
+    }
+
+    #[test]
+    fn test_complexity_join_no_where() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let sql = "SELECT * FROM users JOIN orders ON users.id = orders.id";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        // 2 tables (1 join) * 3 = 3, no WHERE predicates
+        assert_eq!(resolved.complexity(), 3);
+    }
+
+    #[test]
+    fn test_complexity_join_with_where() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let sql = "SELECT * FROM users JOIN orders ON users.id = orders.id WHERE users.id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        // 2 tables (1 join) * 3 = 3, plus 1 WHERE predicate = 4
+        assert_eq!(resolved.complexity(), 4);
+    }
+
+    #[test]
+    fn test_complexity_ordering() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        // Simple query: SELECT * FROM users
+        let sql1 = "SELECT * FROM users";
+        let ast1 = pg_query::parse(sql1).unwrap();
+        let sql_query1 = sql_query_convert(&ast1).unwrap();
+        let Statement::Select(stmt1) = &sql_query1.statement;
+        let resolved1 = select_statement_resolve(stmt1, &tables, &["public"]).unwrap();
+
+        // Query with WHERE: SELECT * FROM users WHERE id = 1
+        let sql2 = "SELECT * FROM users WHERE id = 1";
+        let ast2 = pg_query::parse(sql2).unwrap();
+        let sql_query2 = sql_query_convert(&ast2).unwrap();
+        let Statement::Select(stmt2) = &sql_query2.statement;
+        let resolved2 = select_statement_resolve(stmt2, &tables, &["public"]).unwrap();
+
+        // Query with JOIN: SELECT * FROM users JOIN orders ON ...
+        let sql3 = "SELECT * FROM users JOIN orders ON users.id = orders.id";
+        let ast3 = pg_query::parse(sql3).unwrap();
+        let sql_query3 = sql_query_convert(&ast3).unwrap();
+        let Statement::Select(stmt3) = &sql_query3.statement;
+        let resolved3 = select_statement_resolve(stmt3, &tables, &["public"]).unwrap();
+
+        // Verify ordering: simple < with_where < with_join
+        assert!(resolved1.complexity() < resolved2.complexity());
+        assert!(resolved2.complexity() < resolved3.complexity());
     }
 }
