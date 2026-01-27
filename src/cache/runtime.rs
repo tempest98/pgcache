@@ -4,10 +4,12 @@ use std::time::Instant;
 
 use tokio::{
     runtime::Builder,
-    sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{
+        Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+    },
     task::{LocalSet, spawn_local},
 };
-use tokio_postgres::{Config, NoTls};
+use tokio_postgres::{Client, Config, NoTls};
 use tracing::{debug, error, instrument};
 
 use crate::{
@@ -17,11 +19,13 @@ use crate::{
         messages::{CacheReply, CdcMessage, ProxyMessage, WriterCommand},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
         types::CacheStateView,
-        worker::CacheWorker,
+        worker::handle_cached_query,
         writer::writer_run,
     },
     settings::Settings,
 };
+
+const DEFAULT_POOL_SIZE: usize = 8;
 
 /// Handles a proxy message by converting it to a query request and dispatching it
 async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) {
@@ -79,13 +83,13 @@ fn handle_cdc_message(writer_tx: &UnboundedSender<WriterCommand>, msg: CdcMessag
 }
 
 /// Handles a worker request by executing the query and sending the reply
-async fn handle_worker_request(worker: CacheWorker, mut msg: WorkerRequest) {
+async fn handle_worker_request(client: Client, return_tx: Sender<Client>, mut msg: WorkerRequest) {
     debug!("cache worker task spawn");
 
     // Record worker start time
     msg.timing.worker_start_at = Some(Instant::now());
 
-    let reply = match worker.handle_cached_query(&mut msg).await {
+    let reply = match handle_cached_query(client, return_tx, &mut msg).await {
         Ok(_) => CacheReply::Complete(msg.data, Some(msg.timing)),
         Err(e) => {
             error!("handle_cached_query failed: {e}");
@@ -98,6 +102,49 @@ async fn handle_worker_request(worker: CacheWorker, mut msg: WorkerRequest) {
     }
 
     debug!("cache worker task done");
+}
+
+/// Creates database connections and returns them as a channel pair.
+/// Connections are immediately available in the receiver.
+async fn connection_pool_create(
+    settings: &Settings,
+    size: usize,
+) -> CacheResult<(Sender<Client>, Receiver<Client>)> {
+    let (tx, rx) = channel(size);
+
+    for i in 0..size {
+        debug!(
+            "Creating connection {}/{} to cache db at {}:{}",
+            i + 1,
+            size,
+            settings.cache.host,
+            settings.cache.port
+        );
+
+        let (client, connection) = Config::new()
+            .host(&settings.cache.host)
+            .port(settings.cache.port)
+            .user(&settings.cache.user)
+            .dbname(&settings.cache.database)
+            .connect(NoTls)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("creating connection")?;
+
+        // Spawn task to drive the connection
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                error!("Connection {} error: {e}", i);
+            }
+        });
+
+        tx.send(client)
+            .await
+            .map_err(|_| CacheError::NoConnection)?;
+    }
+
+    debug!("Created {} connections", size);
+    Ok((tx, rx))
 }
 
 /// Reset the cache database by dropping and recreating it
@@ -199,7 +246,7 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
         let state_view = Arc::new(RwLock::new(CacheStateView::default()));
 
         // Spawn writer thread (owns Cache, serializes all mutations)
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (writer_tx, writer_rx) = unbounded_channel();
         let state_view_writer = Arc::clone(&state_view);
         let settings_writer = settings.clone();
         let _writer_handle = thread::Builder::new()
@@ -211,7 +258,7 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
             .attach_loc("spawning writer thread")?;
 
         // Spawn worker thread (executes cached queries - read-only)
-        let (worker_tx, worker_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (worker_tx, worker_rx) = unbounded_channel();
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
             .spawn_scoped(scope, || worker_run(settings, worker_rx))
@@ -219,7 +266,7 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
             .attach_loc("spawning worker thread")?;
 
         // Spawn CDC thread
-        let (cdc_tx, mut cdc_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cdc_tx, mut cdc_rx) = unbounded_channel();
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
             .spawn_scoped(scope, move || cdc_run(settings, cdc_tx))
@@ -304,29 +351,48 @@ fn worker_run(
 
     debug!("worker loop");
     rt.block_on(async {
-        let worker = CacheWorker::new(settings)
+        let (conn_tx, mut conn_rx) = connection_pool_create(settings, DEFAULT_POOL_SIZE)
             .await
-            .attach_loc("creating cache worker")?;
+            .attach_loc("creating connection pool")?;
 
         LocalSet::new()
             .run_until(async move {
                 loop {
-                    // Block for at least one message
+                    // Block for at least one request
                     let Some(msg) = worker_rx.recv().await else {
                         break;
                     };
 
-                    // Process first message
-                    let w = worker.clone();
+                    // Wait for an available connection
+                    let client = if let Ok(client) = conn_rx.try_recv() {
+                        client
+                    } else {
+                        let Some(client) = conn_rx.recv().await else {
+                            return Err(CacheError::NoConnection.into());
+                        };
+                        client
+                    };
+
+                    // Spawn task with both the request and connection
+                    let return_tx = conn_tx.clone();
                     spawn_local(async move {
-                        handle_worker_request(w, msg).await;
+                        handle_worker_request(client, return_tx, msg).await;
                     });
 
-                    // Drain all immediately available messages without parking
+                    // Drain immediately available msg
                     while let Ok(msg) = worker_rx.try_recv() {
-                        let w = worker.clone();
+                        let client = if let Ok(client) = conn_rx.try_recv() {
+                            client
+                        } else {
+                            let Some(client) = conn_rx.recv().await else {
+                                return Err(CacheError::NoConnection.into());
+                            };
+                            client
+                        };
+
+                        let return_tx = conn_tx.clone();
                         spawn_local(async move {
-                            handle_worker_request(w, msg).await;
+                            handle_worker_request(client, return_tx, msg).await;
                         });
                     }
                 }
