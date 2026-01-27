@@ -57,7 +57,7 @@ impl CdcProcessor {
         settings: &Settings,
         cdc_tx: UnboundedSender<CdcMessage>,
     ) -> CacheResult<Self> {
-        let origin_cdc_client = connect_replication(&settings.origin, "CDC origin")
+        let origin_cdc_client = connect_replication(&settings.replication, "CDC replication")
             .await
             .map_into_report::<CacheError>()
             .attach_loc("connecting to origin for CDC")?;
