@@ -534,11 +534,15 @@ impl CacheWriter {
 
     /// Handle INSERT operation.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_insert(
         &mut self,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
+        let start = Instant::now();
+        metrics::counter!(names::CACHE_HANDLE_INSERTS).increment(1);
+
         let fp_list = self
             .update_queries_check_invalidate(relation_oid, &None, &row_data, None)
             .attach_loc("checking for query invalidations")?;
@@ -571,18 +575,24 @@ impl CacheWriter {
             }
         }
 
+        metrics::histogram!(names::CACHE_HANDLE_INSERT_SECONDS).record(start.elapsed().as_secs_f64());
         Ok(())
     }
 
     /// Handle UPDATE operation.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_update(
         &mut self,
         relation_oid: u32,
         key_data: Vec<Option<String>>,
         new_row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
+        let start = Instant::now();
+        metrics::counter!(names::CACHE_HANDLE_UPDATES).increment(1);
+
         let row_changes = self.query_row_changes(relation_oid, &new_row_data).await?;
+        trace!("row_changes {:?}", row_changes);
 
         let fp_list = self.update_queries_check_invalidate(
             relation_oid,
@@ -591,6 +601,8 @@ impl CacheWriter {
             Some(&key_data),
         )?;
         let invalidation_count = fp_list.len() as u64;
+        trace!("invalidation_count {}", invalidation_count);
+
         for fp in fp_list {
             self.cache_query_invalidate(fp).await?;
         }
@@ -650,6 +662,7 @@ impl CacheWriter {
                 .map_into_report::<CacheError>()?;
         }
 
+        metrics::histogram!(names::CACHE_HANDLE_UPDATE_SECONDS).record(start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -660,10 +673,14 @@ impl CacheWriter {
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
+        let start = Instant::now();
+        metrics::counter!(names::CACHE_HANDLE_DELETES).increment(1);
+
         let table_metadata = match self.cache.tables.get1(&relation_oid) {
             Some(metadata) => metadata,
             None => {
                 error!("No table metadata found for relation_oid: {}", relation_oid);
+                metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS).record(start.elapsed().as_secs_f64());
                 return Ok(());
             }
         };
@@ -674,6 +691,7 @@ impl CacheWriter {
             .await
             .map_into_report::<CacheError>()?;
 
+        metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS).record(start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -1013,6 +1031,7 @@ impl CacheWriter {
             })
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn query_row_changes(
         &self,
         relation_oid: u32,
@@ -1230,6 +1249,7 @@ impl CacheWriter {
         Ok(sql_list)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn update_queries_check_invalidate(
         &self,
         relation_oid: u32,

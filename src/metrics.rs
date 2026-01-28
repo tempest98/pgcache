@@ -38,6 +38,16 @@ pub mod names {
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
 
+    // CDC handler metrics (counters)
+    pub const CACHE_HANDLE_INSERTS: &str = "pgcache.cache.handle_inserts";
+    pub const CACHE_HANDLE_UPDATES: &str = "pgcache.cache.handle_updates";
+    pub const CACHE_HANDLE_DELETES: &str = "pgcache.cache.handle_deletes";
+
+    // CDC handler latency (histograms)
+    pub const CACHE_HANDLE_INSERT_SECONDS: &str = "pgcache.cache.handle_insert_seconds";
+    pub const CACHE_HANDLE_UPDATE_SECONDS: &str = "pgcache.cache.handle_update_seconds";
+    pub const CACHE_HANDLE_DELETE_SECONDS: &str = "pgcache.cache.handle_delete_seconds";
+
     // Cache state metrics
     pub const CACHE_QUERIES_REGISTERED: &str = "pgcache.cache.queries_registered";
     pub const CACHE_QUERIES_LOADING: &str = "pgcache.cache.queries_loading";
