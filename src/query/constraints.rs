@@ -19,6 +19,15 @@ pub struct ColumnEquivalence {
     pub right: ResolvedColumnNode,
 }
 
+impl ColumnEquivalence {
+    /// Returns true if this equivalence represents a join condition:
+    /// columns from different tables, or same table with different aliases (self-join)
+    pub fn is_join(&self) -> bool {
+        self.left.table != self.right.table
+            || self.left.table_alias != self.right.table_alias
+    }
+}
+
 /// Analysis results for a query showing all constant constraints
 #[derive(Debug, Clone)]
 pub struct QueryConstraints {
@@ -30,6 +39,24 @@ pub struct QueryConstraints {
 
     /// Constraints organized by table for quick lookup
     pub table_constraints: HashMap<String, Vec<(String, LiteralValue)>>, // table -> [(column, value)]
+}
+
+impl QueryConstraints {
+    /// Returns column names involved in join conditions for the given table
+    pub fn table_join_columns<'a>(&'a self, table_name: &'a str) -> impl Iterator<Item = &'a str> {
+        self.equivalences
+            .iter()
+            .filter(|eq| eq.is_join())
+            .filter_map(move |eq| {
+                if eq.left.table == table_name {
+                    Some(eq.left.column.as_str())
+                } else if eq.right.table == table_name {
+                    Some(eq.right.column.as_str())
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 /// Extract equality information from any resolved WHERE expression
@@ -140,12 +167,17 @@ fn propagate_constraints(
         constraints.insert(constraint.column, constraint.value);
     }
 
+    dbg!("===============================");
+    dbg!(&constraints);
+
     // Fixpoint iteration: propagate until no changes
     let mut changed = true;
     while changed {
         changed = false;
 
         for equiv in equivalences {
+            // dbg!(&equiv);
+
             // If left has constraint but right doesn't, propagate to right
             if let Some(value) = constraints.get(&equiv.left)
                 && !constraints.contains_key(&equiv.right)
@@ -154,10 +186,16 @@ fn propagate_constraints(
                 changed = true;
             }
 
+            dbg!(&equiv.right);
+            dbg!(constraints.get(&equiv.right));
+            dbg!(constraints.contains_key(&equiv.left));
+
             // If right has constraint but left doesn't, propagate to left
             if let Some(value) = constraints.get(&equiv.right)
                 && !constraints.contains_key(&equiv.left)
             {
+                dbg!("hihi=====");
+
                 constraints.insert(equiv.left.clone(), value.clone());
                 changed = true;
             }
@@ -166,6 +204,7 @@ fn propagate_constraints(
             // This would indicate an impossible query (empty result set)
         }
     }
+    dbg!("++===============================");
 
     constraints
 }
@@ -175,8 +214,13 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectStatement) -> QueryCon
     // Step 1: Collect all equality information (constraints + equivalences)
     let (constraints, equivalences) = collect_query_equalities(resolved);
 
+    dbg!(&constraints);
+    dbg!(&equivalences);
+
     // Step 2: Propagate constraints through equivalences
     let column_constraints = propagate_constraints(constraints, &equivalences);
+
+    dbg!(&column_constraints);
 
     // Step 3: Organize by table for quick lookup
     let mut table_constraints: HashMap<String, Vec<(String, LiteralValue)>> = HashMap::new();

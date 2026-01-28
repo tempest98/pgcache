@@ -494,8 +494,7 @@ impl Settings {
             config.cache.user = cache_user.unwrap_or(config.cache.user);
             config.cache.database = cache_database.unwrap_or(config.cache.database);
 
-            let cdc_publication_name =
-                cdc_publication_name.unwrap_or(config.cdc.publication_name);
+            let cdc_publication_name = cdc_publication_name.unwrap_or(config.cdc.publication_name);
             let cdc_slot_name = cdc_slot_name.unwrap_or(config.cdc.slot_name);
             let listen_socket = listen_socket.unwrap_or(config.listen.socket);
             let num_workers = num_workers.unwrap_or(config.num_workers);

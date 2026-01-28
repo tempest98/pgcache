@@ -23,6 +23,7 @@ async fn test_cache_constraint_invalidation() -> Result<(), Error> {
     update_entering_result_set(&mut ctx).await?;
     update_leaving_result_set(&mut ctx).await?;
     update_non_join_column(&mut ctx).await?;
+    update_where_column_entering_result_set(&mut ctx).await?;
 
     Ok(())
 }
@@ -341,6 +342,105 @@ async fn update_non_join_column(ctx: &mut TestContext) -> Result<(), Error> {
         &[("id", "1"), ("test_id", "1"), ("data", "alpha_updated")],
     )?;
     assert_row_at(&res, 2, &[("id", "2"), ("test_id", "1"), ("data", "beta")])?;
+
+    Ok(())
+}
+
+/// Test UPDATE where a WHERE column (not join column) changes to match the constraint.
+/// This should invalidate because a row is entering the result set via WHERE clause.
+///
+/// Scenario: SELECT * FROM orders JOIN users ON orders.user_id = users.id WHERE users.status = 'active'
+/// If users.status changes from 'inactive' to 'active', the user's orders should now appear.
+async fn update_where_column_entering_result_set(ctx: &mut TestContext) -> Result<(), Error> {
+    ctx.query(
+        "create table users_where (id integer primary key, status text)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "create table orders_where (id serial primary key, user_id integer, amount integer)",
+        &[],
+    )
+    .await?;
+
+    // Insert users: user 1 is active, user 2 is inactive
+    ctx.query(
+        "insert into users_where (id, status) values (1, 'active'), (2, 'inactive')",
+        &[],
+    )
+    .await?;
+
+    // Insert orders for both users
+    ctx.query(
+        "insert into orders_where (user_id, amount) values (1, 100), (1, 200), (2, 300), (2, 400)",
+        &[],
+    )
+    .await?;
+
+    // Prime the cache with join query filtering by users.status = 'active'
+    // Should only return orders for user 1 (amounts 100, 200)
+    let res = ctx
+        .simple_query(
+            "select o.id, o.user_id, o.amount, u.status \
+            from orders_where o join users_where u on o.user_id = u.id \
+            where u.status = 'active' \
+            order by o.id",
+        )
+        .await?;
+
+    // RowDescription + 2 data rows + CommandComplete = 4
+    assert_eq!(res.len(), 4);
+    assert_row_at(
+        &res,
+        1,
+        &[("user_id", "1"), ("amount", "100"), ("status", "active")],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[("user_id", "1"), ("amount", "200"), ("status", "active")],
+    )?;
+
+    // UPDATE: Change user 2's status from 'inactive' to 'active'
+    // This should invalidate the cache because user 2's orders should now appear
+    ctx.origin_query("update users_where set status = 'active' where id = 2", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    // Query should now return 4 orders (both users are active)
+    let res = ctx
+        .simple_query(
+            "select o.id, o.user_id, o.amount, u.status \
+            from orders_where o join users_where u on o.user_id = u.id \
+            where u.status = 'active' \
+            order by o.id",
+        )
+        .await?;
+
+    // RowDescription + 4 data rows + CommandComplete = 6
+    assert_eq!(res.len(), 6);
+    assert_row_at(
+        &res,
+        1,
+        &[("user_id", "1"), ("amount", "100"), ("status", "active")],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[("user_id", "1"), ("amount", "200"), ("status", "active")],
+    )?;
+    assert_row_at(
+        &res,
+        3,
+        &[("user_id", "2"), ("amount", "300"), ("status", "active")],
+    )?;
+    assert_row_at(
+        &res,
+        4,
+        &[("user_id", "2"), ("amount", "400"), ("status", "active")],
+    )?;
 
     Ok(())
 }

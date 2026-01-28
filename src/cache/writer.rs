@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -19,8 +18,7 @@ use crate::pg;
 use crate::query::ast::{Deparse, TableNode};
 use crate::query::constraints::analyze_query_constraints;
 use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectStatement, ResolvedTableNode,
-    select_statement_resolve,
+    ResolvedSelectStatement, ResolvedTableNode, select_statement_resolve,
 };
 use crate::query::transform::{query_table_update_queries, resolved_table_replace_with_values};
 use crate::settings::Settings;
@@ -586,6 +584,8 @@ impl CacheWriter {
     ) -> CacheResult<()> {
         let row_changes = self.query_row_changes(relation_oid, &new_row_data).await?;
 
+        trace!("key data {:?}", &key_data);
+
         let fp_list = self.update_queries_check_invalidate(
             relation_oid,
             &row_changes.first(),
@@ -1067,6 +1067,8 @@ impl CacheWriter {
             where_conditions.join(" AND ")
         );
 
+        trace!("{}", sql);
+
         self.db_cache
             .query(&sql, &[])
             .await
@@ -1237,6 +1239,8 @@ impl CacheWriter {
         row_changes: &Option<&Row>,
         row_data: &[Option<String>],
     ) -> CacheResult<Vec<u64>> {
+        trace!("row_changes: {:?}", row_changes);
+
         let update_queries =
             self.cache
                 .update_queries
@@ -1274,6 +1278,8 @@ impl CacheWriter {
                     continue;
                 }
 
+                trace!("row data {:?}", row_data);
+
                 if let Some(constraints) = cached_query
                     .constraints
                     .table_constraints
@@ -1302,73 +1308,43 @@ impl CacheWriter {
                 continue;
             }
 
-            let resolved = &update_query.resolved;
-            let tables = resolved
-                .nodes::<ResolvedTableNode>()
-                .flat_map(|t| {
-                    [
-                        (Some(t.name.as_str()), t.name.as_str()),
-                        (t.alias.as_deref(), t.name.as_str()),
-                    ]
-                })
-                .collect::<HashMap<_, _>>();
-            let joins = resolved.nodes::<ResolvedJoinNode>().collect::<Vec<_>>();
-
             let mut needs_invalidation = false;
 
-            for join in joins {
-                let columns = join
-                    .nodes::<ResolvedColumnNode>()
-                    .map(|c| (tables.get(&Some(c.table.as_str())), c.column.as_str()))
-                    .collect::<Vec<_>>();
+            for column in cached_query.constraints.table_join_columns(&table_metadata.name) {
+                let column_changed =
+                    row_changes.is_some_and(|row| row.get::<&str, bool>(column));
 
-                for (table, column) in columns {
-                    if table.is_none_or(|t| t != &table_metadata.name) {
-                        continue;
-                    }
+                if !column_changed {
+                    continue;
+                }
 
-                    let column_changed =
-                        row_changes.is_some_and(|row| row.get::<&str, bool>(column));
-
-                    if !column_changed {
-                        continue;
-                    }
-
-                    if let Some(constraints) = cached_query
-                        .constraints
-                        .table_constraints
-                        .get(&table_metadata.name)
-                    {
-                        let mut all_constraints_match = true;
-                        for (constraint_column, constraint_value) in constraints {
-                            if let Some(column_meta) =
-                                table_metadata.columns.get1(constraint_column.as_str())
+                if let Some(constraints) = cached_query
+                    .constraints
+                    .table_constraints
+                    .get(&table_metadata.name)
+                {
+                    let mut all_constraints_match = true;
+                    for (constraint_column, constraint_value) in constraints {
+                        if let Some(column_meta) =
+                            table_metadata.columns.get1(constraint_column.as_str())
+                        {
+                            let position = column_meta.position as usize - 1;
+                            if let Some(row_value) = row_data.get(position)
+                                && !constraint_value.matches(row_value)
                             {
-                                let position = column_meta.position as usize - 1;
-                                if let Some(row_value) = row_data.get(position)
-                                    && !constraint_value.matches(row_value)
-                                {
-                                    all_constraints_match = false;
-                                    break;
-                                }
+                                all_constraints_match = false;
+                                break;
                             }
                         }
+                    }
 
-                        if !all_constraints_match {
-                            continue;
-                        }
-
-                        needs_invalidation = true;
-                        break;
-                    } else {
-                        needs_invalidation = true;
-                        break;
+                    if !all_constraints_match {
+                        continue;
                     }
                 }
 
-                if needs_invalidation {
-                    break;
-                }
+                needs_invalidation = true;
+                break;
             }
 
             if needs_invalidation {
