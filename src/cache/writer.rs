@@ -540,7 +540,7 @@ impl CacheWriter {
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
         let fp_list = self
-            .update_queries_check_invalidate(relation_oid, &None, &row_data)
+            .update_queries_check_invalidate(relation_oid, &None, &row_data, None)
             .attach_loc("checking for query invalidations")?;
 
         let invalidation_count = fp_list.len() as u64;
@@ -584,12 +584,11 @@ impl CacheWriter {
     ) -> CacheResult<()> {
         let row_changes = self.query_row_changes(relation_oid, &new_row_data).await?;
 
-        trace!("key data {:?}", &key_data);
-
         let fp_list = self.update_queries_check_invalidate(
             relation_oid,
             &row_changes.first(),
             &new_row_data,
+            Some(&key_data),
         )?;
         let invalidation_count = fp_list.len() as u64;
         for fp in fp_list {
@@ -1067,8 +1066,6 @@ impl CacheWriter {
             where_conditions.join(" AND ")
         );
 
-        trace!("{}", sql);
-
         self.db_cache
             .query(&sql, &[])
             .await
@@ -1238,9 +1235,8 @@ impl CacheWriter {
         relation_oid: u32,
         row_changes: &Option<&Row>,
         row_data: &[Option<String>],
+        key_data: Option<&[Option<String>]>,
     ) -> CacheResult<Vec<u64>> {
-        trace!("row_changes: {:?}", row_changes);
-
         let update_queries =
             self.cache
                 .update_queries
@@ -1274,12 +1270,51 @@ impl CacheWriter {
                 })?;
 
             if row_changes.is_none() {
+                // Row not in cache - potentially entering result set.
+                // We need to determine if this update could affect the query result.
+
                 if update_query.resolved.is_single_table() {
                     continue;
                 }
 
-                trace!("row data {:?}", row_data);
+                let has_table_constraints = cached_query
+                    .constraints
+                    .table_constraints
+                    .contains_key(&table_metadata.name);
 
+                // If key_data is empty, PK didn't change. If all join columns are PK columns
+                // and there are no WHERE constraints for this table, the row's membership
+                // in the result set is unchanged - skip invalidation.
+                if !has_table_constraints {
+                    if let Some(key) = key_data {
+                        if key.is_empty() {
+                            let join_columns: Vec<&str> = cached_query
+                                .constraints
+                                .table_join_columns(&table_metadata.name)
+                                .collect();
+
+                            let all_join_cols_are_pk = !join_columns.is_empty()
+                                && join_columns.iter().all(|col| {
+                                    table_metadata
+                                        .primary_key_columns
+                                        .iter()
+                                        .any(|pk| pk == col)
+                                });
+
+                            if all_join_cols_are_pk {
+                                // PK didn't change, all join columns are PK, no WHERE constraints
+                                // Row membership is stable - skip invalidation
+                                continue;
+                            }
+                        }
+                    }
+
+                    // No constraints and couldn't prove stability - must invalidate
+                    fp_list.push(update_query.fingerprint);
+                    continue;
+                }
+
+                // Check if row matches table constraints
                 if let Some(constraints) = cached_query
                     .constraints
                     .table_constraints
@@ -1310,9 +1345,11 @@ impl CacheWriter {
 
             let mut needs_invalidation = false;
 
-            for column in cached_query.constraints.table_join_columns(&table_metadata.name) {
-                let column_changed =
-                    row_changes.is_some_and(|row| row.get::<&str, bool>(column));
+            for column in cached_query
+                .constraints
+                .table_join_columns(&table_metadata.name)
+            {
+                let column_changed = row_changes.is_some_and(|row| row.get::<&str, bool>(column));
 
                 if !column_changed {
                     continue;
