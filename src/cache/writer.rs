@@ -575,7 +575,8 @@ impl CacheWriter {
             }
         }
 
-        metrics::histogram!(names::CACHE_HANDLE_INSERT_SECONDS).record(start.elapsed().as_secs_f64());
+        metrics::histogram!(names::CACHE_HANDLE_INSERT_SECONDS)
+            .record(start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -662,7 +663,8 @@ impl CacheWriter {
                 .map_into_report::<CacheError>()?;
         }
 
-        metrics::histogram!(names::CACHE_HANDLE_UPDATE_SECONDS).record(start.elapsed().as_secs_f64());
+        metrics::histogram!(names::CACHE_HANDLE_UPDATE_SECONDS)
+            .record(start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -680,7 +682,8 @@ impl CacheWriter {
             Some(metadata) => metadata,
             None => {
                 error!("No table metadata found for relation_oid: {}", relation_oid);
-                metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS).record(start.elapsed().as_secs_f64());
+                metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS)
+                    .record(start.elapsed().as_secs_f64());
                 return Ok(());
             }
         };
@@ -691,7 +694,8 @@ impl CacheWriter {
             .await
             .map_into_report::<CacheError>()?;
 
-        metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS).record(start.elapsed().as_secs_f64());
+        metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS)
+            .record(start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -1306,26 +1310,26 @@ impl CacheWriter {
                 // and there are no WHERE constraints for this table, the row's membership
                 // in the result set is unchanged - skip invalidation.
                 if !has_table_constraints {
-                    if let Some(key) = key_data {
-                        if key.is_empty() {
-                            let join_columns: Vec<&str> = cached_query
-                                .constraints
-                                .table_join_columns(&table_metadata.name)
-                                .collect();
+                    if let Some(key) = key_data
+                        && key.is_empty()
+                    {
+                        let join_columns: Vec<&str> = cached_query
+                            .constraints
+                            .table_join_columns(&table_metadata.name)
+                            .collect();
 
-                            let all_join_cols_are_pk = !join_columns.is_empty()
-                                && join_columns.iter().all(|col| {
-                                    table_metadata
-                                        .primary_key_columns
-                                        .iter()
-                                        .any(|pk| pk == col)
-                                });
+                        let all_join_cols_are_pk = !join_columns.is_empty()
+                            && join_columns.iter().all(|col| {
+                                table_metadata
+                                    .primary_key_columns
+                                    .iter()
+                                    .any(|pk| pk == col)
+                            });
 
-                            if all_join_cols_are_pk {
-                                // PK didn't change, all join columns are PK, no WHERE constraints
-                                // Row membership is stable - skip invalidation
-                                continue;
-                            }
+                        if all_join_cols_are_pk {
+                            // PK didn't change, all join columns are PK, no WHERE constraints
+                            // Row membership is stable - skip invalidation
+                            continue;
                         }
                     }
 
@@ -1678,6 +1682,8 @@ async fn population_insert(
     Ok(cached_bytes)
 }
 
+const BATCH_SIZE_MAX: usize = 100;
+
 /// Main writer runtime - processes writer commands with LocalSet for spawned tasks.
 pub fn writer_run(
     settings: &Settings,
@@ -1731,7 +1737,7 @@ pub fn writer_run(
                         }
                     }
 
-                    for _ in 0..writer_rx.len() {
+                    for _ in 0..writer_rx.len().max(BATCH_SIZE_MAX) {
                         if let Ok(cmd) = writer_rx.try_recv() {
                             if let Err(e) = writer.command_handle(cmd).await {
                                 error!("writer command failed: {e}");
@@ -1739,9 +1745,10 @@ pub fn writer_run(
                         } else {
                             break;
                         }
+                        metrics::gauge!(names::CACHE_WRITER_QUEUE).set(writer_rx.len() as f64);
                     }
 
-                    for _ in 0..internal_rx.len() {
+                    for _ in 0..internal_rx.len().max(BATCH_SIZE_MAX) {
                         if let Ok(cmd) = internal_rx.try_recv() {
                             if let Err(e) = writer.command_handle(cmd).await {
                                 error!("writer internal command failed: {e}");
@@ -1749,6 +1756,8 @@ pub fn writer_run(
                         } else {
                             break;
                         }
+                        metrics::gauge!(names::CACHE_WRITER_INTERNAL_QUEUE)
+                            .set(internal_rx.len() as f64);
                     }
                 }
                 Ok(())
