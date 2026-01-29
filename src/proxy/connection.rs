@@ -878,6 +878,9 @@ async fn handle_connection(
                     .await
                 {
                     debug!("read error [{}]", err);
+                    // if matches!(err.current_context(), ConnectionError::CacheDead) {
+                    //     state.proxy_status = ProxyStatus::Degraded;
+                    // }
                     break;
                 }
             }
@@ -1022,26 +1025,24 @@ pub fn connection_run(
                             }
                         };
 
-                        match handle_connection(
+                        let res = handle_connection(
                             client_stream,
                             addrs,
                             ssl_mode,
                             &server_name,
                             cache_sender,
                         )
-                        .await
-                        .map_err(|e| e.into_current_context())
-                        {
-                            Err(ConnectionError::CacheDead) => {
+                        .await;
+
+                        if let Err(e) = res {
+                            error!("{}", e);
+                            metrics::counter!(names::CONNECTIONS_ERRORS).increment(1);
+                            if matches!(e.current_context(), ConnectionError::CacheDead) {
                                 debug!("connection closed in degraded mode");
                                 return Err(io::Error::other("cache dead"));
                             }
-                            Err(e) => {
-                                metrics::counter!(names::CONNECTIONS_ERRORS).increment(1);
-                                error!("{}", e);
-                            }
-                            Ok(_) => {}
                         }
+
                         debug!("task done");
                         Ok(())
                     });
