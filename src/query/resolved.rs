@@ -6,8 +6,8 @@ use rootcause::Report;
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
-    ColumnExpr, ColumnNode, Deparse, ExprOp, JoinType, LiteralValue, OrderDirection, SelectColumns,
-    SelectStatement, TableAlias, TableNode, TableSource, WhereExpr,
+    ColumnExpr, ColumnNode, Deparse, ExprOp, JoinType, LimitClause, LiteralValue, OrderDirection,
+    SelectColumns, SelectStatement, TableAlias, TableNode, TableSource, WhereExpr,
 };
 
 error_set! {
@@ -566,8 +566,8 @@ impl Deparse for ResolvedOrderByClause {
 /// Resolved LIMIT clause
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedLimitClause {
-    pub count: Option<i64>,
-    pub offset: Option<i64>,
+    pub count: Option<LiteralValue>,
+    pub offset: Option<LiteralValue>,
 }
 
 /// Fully resolved SELECT statement
@@ -712,13 +712,13 @@ impl Deparse for ResolvedSelectStatement {
             }
 
             if let Some(limit) = &self.limit {
-                if let Some(count) = limit.count {
+                if let Some(count) = &limit.count {
                     buf.push_str(" LIMIT ");
-                    buf.push_str(&count.to_string());
+                    count.deparse(buf);
                 }
-                if let Some(offset) = limit.offset {
+                if let Some(offset) = &limit.offset {
                     buf.push_str(" OFFSET ");
-                    buf.push_str(&offset.to_string());
+                    offset.deparse(buf);
                 }
             }
         }
@@ -1069,6 +1069,35 @@ fn order_by_resolve(
         .collect()
 }
 
+/// Resolve GROUP BY clauses
+fn group_by_resolve(
+    group_by: &[ColumnNode],
+    scope: &ResolutionScope,
+) -> ResolveResult<Vec<ResolvedColumnNode>> {
+    group_by
+        .iter()
+        .map(|col| column_resolve(col, scope))
+        .collect()
+}
+
+/// Resolve HAVING clause
+fn having_resolve(
+    having: Option<&WhereExpr>,
+    scope: &ResolutionScope,
+) -> ResolveResult<Option<ResolvedWhereExpr>> {
+    having.map(|h| where_expr_resolve(h, scope)).transpose()
+}
+
+/// Resolve LIMIT clause
+fn limit_resolve(limit: Option<&LimitClause>) -> Option<ResolvedLimitClause> {
+    let limit = limit?;
+
+    Some(ResolvedLimitClause {
+        count: limit.count.clone(),
+        offset: limit.offset.clone(),
+    })
+}
+
 /// Resolve a SELECT statement
 pub fn select_statement_resolve(
     stmt: &SelectStatement,
@@ -1097,15 +1126,23 @@ pub fn select_statement_resolve(
     // Resolve ORDER BY clause
     let resolved_order_by = order_by_resolve(&stmt.order_by, &scope)?;
 
-    // TODO: Resolve GROUP BY, HAVING, LIMIT
+    // Resolve GROUP BY clause
+    let resolved_group_by = group_by_resolve(&stmt.group_by, &scope)?;
+
+    // Resolve HAVING clause
+    let resolved_having = having_resolve(stmt.having.as_ref(), &scope)?;
+
+    // Resolve LIMIT clause
+    let resolved_limit = limit_resolve(stmt.limit.as_ref());
+
     Ok(ResolvedSelectStatement {
         columns: resolved_columns,
         from: resolved_from,
         where_clause: resolved_where,
-        group_by: Vec::new(), // TODO
-        having: None,         // TODO
+        group_by: resolved_group_by,
+        having: resolved_having,
         order_by: resolved_order_by,
-        limit: None, // TODO
+        limit: resolved_limit,
         distinct: stmt.distinct,
         values: stmt.values.clone(),
     })
@@ -2121,5 +2158,209 @@ mod tests {
         // Verify ordering: simple < with_where < with_join
         assert!(resolved1.complexity() < resolved2.complexity());
         assert!(resolved2.complexity() < resolved3.complexity());
+    }
+
+    #[test]
+    fn test_group_by_resolve_single_column() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT name FROM users GROUP BY name";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        assert_eq!(resolved.group_by.len(), 1);
+        assert_eq!(resolved.group_by[0].schema, "public");
+        assert_eq!(resolved.group_by[0].table, "users");
+        assert_eq!(resolved.group_by[0].column, "name");
+    }
+
+    #[test]
+    fn test_group_by_resolve_multiple_columns() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT id, name FROM users GROUP BY id, name";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        assert_eq!(resolved.group_by.len(), 2);
+        assert_eq!(resolved.group_by[0].column, "id");
+        assert_eq!(resolved.group_by[1].column, "name");
+    }
+
+    #[test]
+    fn test_group_by_resolve_qualified_column() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT u.name FROM users u GROUP BY u.name";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        assert_eq!(resolved.group_by.len(), 1);
+        assert_eq!(resolved.group_by[0].table, "users");
+        assert_eq!(resolved.group_by[0].table_alias, Some("u".to_owned()));
+        assert_eq!(resolved.group_by[0].column, "name");
+    }
+
+    #[test]
+    fn test_having_resolve() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT name FROM users GROUP BY name HAVING name = 'alice'";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        assert!(resolved.having.is_some());
+        if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.having {
+            if let ResolvedWhereExpr::Column(col) = &*binary.lexpr {
+                assert_eq!(col.column, "name");
+            } else {
+                panic!("Expected column in HAVING clause");
+            }
+        } else {
+            panic!("Expected binary expression in HAVING clause");
+        }
+    }
+
+    #[test]
+    fn test_limit_resolve_count_only() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users LIMIT 10";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let limit = resolved.limit.unwrap();
+        assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
+        assert_eq!(limit.offset, None);
+    }
+
+    #[test]
+    fn test_limit_resolve_offset_only() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users OFFSET 5";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let limit = resolved.limit.unwrap();
+        assert_eq!(limit.count, None);
+        assert_eq!(limit.offset, Some(LiteralValue::Integer(5)));
+    }
+
+    #[test]
+    fn test_limit_resolve_count_and_offset() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users LIMIT 10 OFFSET 20";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let limit = resolved.limit.unwrap();
+        assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
+        assert_eq!(limit.offset, Some(LiteralValue::Integer(20)));
+    }
+
+    #[test]
+    fn test_limit_resolve_parameterized() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users LIMIT $1 OFFSET $2";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        // Parameterized values are preserved through resolution
+        let limit = resolved.limit.unwrap();
+        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
+        assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".to_owned())));
+    }
+
+    #[test]
+    fn test_no_limit_clause() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        assert!(resolved.limit.is_none());
+    }
+
+    #[test]
+    fn test_combined_group_by_having_limit_resolve() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql =
+            "SELECT name FROM users GROUP BY name HAVING name != 'test' ORDER BY name LIMIT 10";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        assert_eq!(resolved.group_by.len(), 1);
+        assert!(resolved.having.is_some());
+        assert!(!resolved.order_by.is_empty());
+        assert!(resolved.limit.is_some());
+        assert_eq!(
+            resolved.limit.unwrap().count,
+            Some(LiteralValue::Integer(10))
+        );
     }
 }

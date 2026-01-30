@@ -1143,8 +1143,8 @@ impl TryFrom<SortByDir> for OrderDirection {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct LimitClause {
-    pub count: Option<i64>,
-    pub offset: Option<i64>,
+    pub count: Option<LiteralValue>,
+    pub offset: Option<LiteralValue>,
 }
 
 /// Convert a pg_query ParseResult into our simplified AST
@@ -1175,18 +1175,21 @@ fn select_statement_convert(select_stmt: &SelectStmt) -> Result<SelectStatement,
     let where_clause = select_stmt_parse_where(select_stmt)?;
     let values = value_list_convert(&select_stmt.values_lists)?;
     let order_by = order_by_clause_convert(&select_stmt.sort_clause)?;
-
-    // For now, only convert the features we need for basic caching
-    // TODO: Add GROUP BY, HAVING, LIMIT when needed
+    let group_by = group_by_clause_convert(&select_stmt.group_clause)?;
+    let having = having_clause_convert(select_stmt.having_clause.as_deref())?;
+    let limit = limit_clause_convert(
+        select_stmt.limit_count.as_deref(),
+        select_stmt.limit_offset.as_deref(),
+    )?;
 
     Ok(SelectStatement {
         columns,
         from,
         where_clause,
-        group_by: vec![], // TODO: Convert group_clause
-        having: None,     // TODO: Convert having_clause
+        group_by,
+        having,
         order_by,
-        limit: None, // TODO: Convert limit_count/limit_offset
+        limit,
         distinct: !select_stmt.distinct_clause.is_empty(),
         values,
     })
@@ -1521,6 +1524,69 @@ fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, A
     }
 
     Ok(order_by)
+}
+
+fn group_by_clause_convert(group_clause: &[Node]) -> Result<Vec<ColumnNode>, AstError> {
+    let mut group_by = Vec::new();
+    for node in group_clause {
+        if let Some(NodeEnum::ColumnRef(col_ref)) = &node.node {
+            group_by.push(column_ref_convert(col_ref)?);
+        } else {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("GROUP BY expression: {node:?}"),
+            });
+        }
+    }
+    Ok(group_by)
+}
+
+fn having_clause_convert(having_clause: Option<&Node>) -> Result<Option<WhereExpr>, AstError> {
+    match having_clause {
+        Some(node) => Ok(Some(node_convert_to_expr(node)?)),
+        None => Ok(None),
+    }
+}
+
+fn limit_clause_convert(
+    limit_count: Option<&Node>,
+    limit_offset: Option<&Node>,
+) -> Result<Option<LimitClause>, AstError> {
+    let count = limit_node_extract(limit_count)?;
+    let offset = limit_node_extract(limit_offset)?;
+
+    if count.is_none() && offset.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(LimitClause { count, offset }))
+}
+
+fn limit_node_extract(node: Option<&Node>) -> Result<Option<LiteralValue>, AstError> {
+    let Some(node) = node else { return Ok(None) };
+
+    match &node.node {
+        Some(NodeEnum::AConst(const_val)) => {
+            let value = const_value_extract(const_val)?;
+            match value {
+                LiteralValue::Integer(_) => Ok(Some(value)),
+                LiteralValue::String(_)
+                | LiteralValue::StringWithCast(..)
+                | LiteralValue::Float(_)
+                | LiteralValue::Boolean(_)
+                | LiteralValue::Null
+                | LiteralValue::Parameter(_) => Err(AstError::UnsupportedFeature {
+                    feature: format!("LIMIT/OFFSET value: {value:?}"),
+                }),
+            }
+        }
+        Some(NodeEnum::ParamRef(param_ref)) => Ok(Some(LiteralValue::Parameter(format!(
+            "${}",
+            param_ref.number
+        )))),
+        other => Err(AstError::UnsupportedFeature {
+            feature: format!("LIMIT/OFFSET expression: {other:?}"),
+        }),
+    }
 }
 
 /// Create a fingerprint hash for SQL query AST.
@@ -2819,5 +2885,156 @@ mod tests {
         // Should find columns in ORDER BY clause
         assert!(columns.iter().any(|c| c.column == "name"));
         assert!(columns.iter().any(|c| c.column == "age"));
+    }
+
+    #[test]
+    fn test_group_by_single_column() {
+        let sql = "SELECT status FROM orders GROUP BY status";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.group_by.len(), 1);
+        assert_eq!(select.group_by[0].column, "status");
+        assert_eq!(select.group_by[0].table, None);
+    }
+
+    #[test]
+    fn test_group_by_multiple_columns() {
+        let sql = "SELECT status, category FROM orders GROUP BY status, category";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.group_by.len(), 2);
+        assert_eq!(select.group_by[0].column, "status");
+        assert_eq!(select.group_by[1].column, "category");
+    }
+
+    #[test]
+    fn test_group_by_qualified_column() {
+        let sql = "SELECT o.status FROM orders o GROUP BY o.status";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.group_by.len(), 1);
+        assert_eq!(select.group_by[0].column, "status");
+        assert_eq!(select.group_by[0].table, Some("o".to_owned()));
+    }
+
+    #[test]
+    fn test_having_simple() {
+        let sql = "SELECT status FROM orders GROUP BY status HAVING status = 'active'";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(select.having.is_some());
+    }
+
+    #[test]
+    fn test_having_with_and() {
+        let sql = "SELECT category FROM sales GROUP BY category HAVING category = 'electronics' AND category != 'toys'";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(!select.group_by.is_empty());
+        assert!(select.having.is_some());
+    }
+
+    #[test]
+    fn test_limit_only() {
+        let sql = "SELECT * FROM users LIMIT 10";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let limit = select.limit.as_ref().unwrap();
+        assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
+        assert_eq!(limit.offset, None);
+    }
+
+    #[test]
+    fn test_offset_only() {
+        let sql = "SELECT * FROM users OFFSET 20";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let limit = select.limit.as_ref().unwrap();
+        assert_eq!(limit.count, None);
+        assert_eq!(limit.offset, Some(LiteralValue::Integer(20)));
+    }
+
+    #[test]
+    fn test_limit_and_offset() {
+        let sql = "SELECT * FROM users LIMIT 10 OFFSET 20";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let limit = select.limit.as_ref().unwrap();
+        assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
+        assert_eq!(limit.offset, Some(LiteralValue::Integer(20)));
+    }
+
+    #[test]
+    fn test_no_limit() {
+        let sql = "SELECT * FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(select.limit.is_none());
+    }
+
+    #[test]
+    fn test_no_group_by() {
+        let sql = "SELECT * FROM users WHERE id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(select.group_by.is_empty());
+        assert!(select.having.is_none());
+    }
+
+    #[test]
+    fn test_combined_group_by_having_limit() {
+        let sql = "SELECT status FROM orders GROUP BY status HAVING status != 'cancelled' ORDER BY status DESC LIMIT 10";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert_eq!(select.group_by.len(), 1);
+        assert!(select.having.is_some());
+        assert!(select.limit.is_some());
+        assert!(!select.order_by.is_empty());
+    }
+
+    #[test]
+    fn test_limit_parameterized() {
+        let sql = "SELECT * FROM users LIMIT $1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let limit = select.limit.as_ref().unwrap();
+        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
+        assert_eq!(limit.offset, None);
+    }
+
+    #[test]
+    fn test_limit_and_offset_parameterized() {
+        let sql = "SELECT * FROM users LIMIT $1 OFFSET $2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let limit = select.limit.as_ref().unwrap();
+        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
+        assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".to_owned())));
     }
 }

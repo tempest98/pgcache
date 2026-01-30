@@ -74,6 +74,16 @@ pub fn ast_parameters_replace(
         table_source_parameters_replace(table_source, parameters)?;
     }
 
+    // Replace parameters in LIMIT clause
+    if let Some(limit) = &mut new_stmt.limit {
+        if let Some(count) = &mut limit.count {
+            literal_value_parameters_replace(count, parameters)?;
+        }
+        if let Some(offset) = &mut limit.offset {
+            literal_value_parameters_replace(offset, parameters)?;
+        }
+    }
+
     Ok(new_stmt)
 }
 
@@ -151,6 +161,26 @@ fn where_expr_parameters_replace(
             // Subqueries would need their own parameter replacement
             // but we don't currently support subqueries with parameters
         }
+    }
+    Ok(())
+}
+
+/// Replace a parameter in a LiteralValue (mutates in place)
+fn literal_value_parameters_replace(
+    literal: &mut LiteralValue,
+    parameters: &QueryParameters,
+) -> AstTransformResult<()> {
+    if let LiteralValue::Parameter(placeholder) = literal {
+        let index = parameter_index_parse(placeholder)?;
+
+        let param = parameters.get(index).ok_or_else(|| {
+            Report::from(AstTransformError::ParameterOutOfBounds {
+                index,
+                count: parameters.len(),
+            })
+        })?;
+
+        *literal = parameter_to_literal(&param)?;
     }
     Ok(())
 }

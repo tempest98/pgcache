@@ -123,6 +123,16 @@ fn is_supported_join(join: &JoinNode) -> bool {
 /// Check if a SELECT statement can be efficiently cached.
 /// Currently supports: simple equality, AND of equalities, OR of equalities.
 fn is_cacheable_select(select: &SelectStatement) -> bool {
+    if !select.group_by.is_empty() {
+        return false;
+    }
+    if select.having.is_some() {
+        return false;
+    }
+    if select.limit.is_some() {
+        return false;
+    }
+
     match &select.where_clause {
         Some(where_expr) => is_cacheable_expr(where_expr),
         None => true, // No WHERE clause is always cacheable
