@@ -423,17 +423,31 @@ pub fn query_select_replace(
     new_stmt
 }
 
-/// Replace SELECT columns in a resolved statement.
+/// Replace SELECT columns in a resolved statement for cache population fetches.
 ///
-/// Similar to `query_select_replace` but operates on the resolved AST.
+/// This function is used when fetching raw rows from the origin database to populate
+/// the cache. It strips aggregation-related clauses (GROUP BY, HAVING) and result-limiting
+/// clauses (ORDER BY, LIMIT, DISTINCT) because:
+///
+/// - We want raw rows, not aggregated results
+/// - Aggregation is performed at cache retrieval time by the cache database
+/// - All matching rows should be cached, not a subset
 pub fn resolved_select_replace(
     resolved_statement: &ResolvedSelectStatement,
     columns: ResolvedSelectColumns,
 ) -> ResolvedSelectStatement {
-    let mut new_stmt = resolved_statement.clone();
-    new_stmt.columns = columns;
-
-    new_stmt
+    ResolvedSelectStatement {
+        columns,
+        from: resolved_statement.from.clone(),
+        where_clause: resolved_statement.where_clause.clone(),
+        // Strip aggregation-related clauses for raw row fetching
+        group_by: vec![],
+        having: None,
+        order_by: vec![],
+        limit: None,
+        distinct: false,
+        values: vec![],
+    }
 }
 
 /// Replace a table source with a VALUES clause in a resolved statement.
@@ -1377,5 +1391,181 @@ mod tests {
         result.deparse(&mut buf);
 
         assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
+    }
+
+    #[test]
+    fn test_resolved_select_replace_strips_group_by() {
+        use crate::catalog::ColumnMetadata;
+        use postgres_types::Type;
+        use crate::query::resolved::{
+            ResolvedColumnNode, ResolvedSelectColumns, ResolvedSelectStatement,
+        };
+
+        let col_meta = ColumnMetadata {
+            name: "status".to_owned(),
+            position: 1,
+            type_oid: 25,
+            data_type: Type::TEXT,
+            type_name: "text".to_owned(),
+            cache_type_name: "text".to_owned(),
+            is_primary_key: false,
+        };
+
+        let stmt = ResolvedSelectStatement {
+            group_by: vec![ResolvedColumnNode {
+                schema: "public".to_owned(),
+                table: "orders".to_owned(),
+                table_alias: None,
+                column: "status".to_owned(),
+                column_metadata: col_meta,
+            }],
+            ..Default::default()
+        };
+
+        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+
+        assert!(
+            result.group_by.is_empty(),
+            "resolved_select_replace should strip GROUP BY"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_replace_strips_having() {
+        use crate::query::ast::ExprOp;
+        use crate::query::resolved::{
+            ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectStatement, ResolvedWhereExpr,
+        };
+
+        let stmt = ResolvedSelectStatement {
+            having: Some(ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+                op: ExprOp::Equal,
+                lexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
+                rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
+            })),
+            ..Default::default()
+        };
+
+        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+
+        assert!(
+            result.having.is_none(),
+            "resolved_select_replace should strip HAVING"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_replace_strips_order_by() {
+        use crate::catalog::ColumnMetadata;
+        use postgres_types::Type;
+        use crate::query::ast::OrderDirection;
+        use crate::query::resolved::{
+            ResolvedColumnExpr, ResolvedColumnNode, ResolvedOrderByClause, ResolvedSelectColumns,
+            ResolvedSelectStatement,
+        };
+
+        let col_meta = ColumnMetadata {
+            name: "created_at".to_owned(),
+            position: 1,
+            type_oid: 1184,
+            data_type: Type::TIMESTAMP,
+            type_name: "timestamp".to_owned(),
+            cache_type_name: "timestamp".to_owned(),
+            is_primary_key: false,
+        };
+
+        let stmt = ResolvedSelectStatement {
+            order_by: vec![ResolvedOrderByClause {
+                expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
+                    schema: "public".to_owned(),
+                    table: "orders".to_owned(),
+                    table_alias: None,
+                    column: "created_at".to_owned(),
+                    column_metadata: col_meta,
+                }),
+                direction: OrderDirection::Asc,
+            }],
+            ..Default::default()
+        };
+
+        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+
+        assert!(
+            result.order_by.is_empty(),
+            "resolved_select_replace should strip ORDER BY"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_replace_strips_limit() {
+        use crate::query::resolved::{
+            ResolvedLimitClause, ResolvedSelectColumns, ResolvedSelectStatement,
+        };
+
+        let stmt = ResolvedSelectStatement {
+            limit: Some(ResolvedLimitClause {
+                count: Some(LiteralValue::Integer(10)),
+                offset: Some(LiteralValue::Integer(5)),
+            }),
+            ..Default::default()
+        };
+
+        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+
+        assert!(
+            result.limit.is_none(),
+            "resolved_select_replace should strip LIMIT"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_replace_preserves_where() {
+        use crate::query::ast::ExprOp;
+        use crate::query::resolved::{
+            ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectStatement, ResolvedWhereExpr,
+        };
+
+        let where_clause = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: ExprOp::Equal,
+            lexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
+            rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
+        });
+
+        let stmt = ResolvedSelectStatement {
+            where_clause: Some(where_clause),
+            ..Default::default()
+        };
+
+        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+
+        assert!(
+            result.where_clause.is_some(),
+            "resolved_select_replace should preserve WHERE clause"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_replace_preserves_from() {
+        use crate::query::resolved::{
+            ResolvedSelectColumns, ResolvedSelectStatement, ResolvedTableNode, ResolvedTableSource,
+        };
+
+        let stmt = ResolvedSelectStatement {
+            from: vec![ResolvedTableSource::Table(ResolvedTableNode {
+                schema: "public".to_owned(),
+                name: "orders".to_owned(),
+                alias: None,
+                relation_oid: 12345,
+            })],
+            ..Default::default()
+        };
+
+        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+
+        assert_eq!(
+            result.from.len(),
+            1,
+            "resolved_select_replace should preserve FROM clause"
+        );
     }
 }

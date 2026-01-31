@@ -121,14 +121,14 @@ fn is_supported_join(join: &JoinNode) -> bool {
 }
 
 /// Check if a SELECT statement can be efficiently cached.
-/// Currently supports: simple equality, AND of equalities, OR of equalities.
+///
+/// Supports:
+/// - Simple equality, AND of equalities, OR of equalities in WHERE
+/// - GROUP BY and HAVING (aggregation performed on cached rows at retrieval time)
+///
+/// Not yet supported:
+/// - LIMIT/OFFSET (subset caching has invalidation challenges)
 fn is_cacheable_select(select: &SelectStatement) -> bool {
-    if !select.group_by.is_empty() {
-        return false;
-    }
-    if select.having.is_some() {
-        return false;
-    }
     if select.limit.is_some() {
         return false;
     }
@@ -286,6 +286,79 @@ mod tests {
         assert!(
             matches!(result, Err(CacheabilityError::UnsupportedFrom)),
             "Nested join with non-equality condition should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_group_by_cacheable() {
+        let sql = "SELECT status FROM orders WHERE tenant_id = 1 GROUP BY status";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(result.is_ok(), "GROUP BY should be cacheable");
+    }
+
+    #[test]
+    fn test_group_by_multiple_columns_cacheable() {
+        let sql =
+            "SELECT status, category FROM orders WHERE tenant_id = 1 GROUP BY status, category";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            result.is_ok(),
+            "GROUP BY with multiple columns should be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_having_cacheable() {
+        let sql = "SELECT status FROM orders WHERE tenant_id = 1 GROUP BY status HAVING status = 'active'";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(result.is_ok(), "HAVING should be cacheable");
+    }
+
+    #[test]
+    fn test_limit_not_cacheable() {
+        let sql = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
+            "LIMIT should not be cacheable yet"
+        );
+    }
+
+    #[test]
+    fn test_offset_not_cacheable() {
+        let sql = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
+            "OFFSET should not be cacheable yet"
+        );
+    }
+
+    #[test]
+    fn test_group_by_with_limit_not_cacheable() {
+        let sql = "SELECT status FROM orders WHERE tenant_id = 1 GROUP BY status LIMIT 5";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
+            "GROUP BY with LIMIT should not be cacheable"
         );
     }
 }
