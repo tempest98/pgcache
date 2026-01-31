@@ -556,6 +556,11 @@ impl SelectStatement {
             return true;
         }
 
+        // Check FROM clause for subqueries
+        if self.from.iter().any(TableSource::has_sublink) {
+            return true;
+        }
+
         // Check WHERE clause for subqueries
         if let Some(where_clause) = &self.where_clause
             && where_clause.has_sublink()
@@ -580,7 +585,8 @@ impl SelectStatement {
                 .args
                 .iter()
                 .any(|arg| self.column_expr_has_sublink(arg)),
-            ColumnExpr::Column(_) | ColumnExpr::Literal(_) | ColumnExpr::Subquery(_) => false,
+            ColumnExpr::Subquery(_) => true,
+            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => false,
         }
     }
 }
@@ -856,6 +862,19 @@ impl TableSource {
             source: Some(self),
             join_iter: None,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Check if this table source contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        match self {
+            TableSource::Subquery(_) => true,
+            TableSource::Table(_) => false,
+            TableSource::Join(join) => {
+                join.left.has_sublink()
+                    || join.right.has_sublink()
+                    || join.condition.as_ref().is_some_and(|c| c.has_sublink())
+            }
         }
     }
 }
@@ -3036,5 +3055,70 @@ mod tests {
         let limit = select.limit.as_ref().unwrap();
         assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
         assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".to_owned())));
+    }
+
+    #[test]
+    fn test_has_sublink_in_select_list() {
+        let sql = "SELECT id, (SELECT x FROM other WHERE id = 1) as val FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(
+            select.has_sublink(),
+            "has_sublink() should detect subquery in SELECT list"
+        );
+    }
+
+    #[test]
+    fn test_has_sublink_in_from_clause() {
+        let sql = "SELECT * FROM (SELECT id FROM users) sub";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(
+            select.has_sublink(),
+            "has_sublink() should detect subquery in FROM clause"
+        );
+    }
+
+    #[test]
+    fn test_has_sublink_in_join() {
+        let sql = "SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(
+            select.has_sublink(),
+            "has_sublink() should detect subquery in JOIN"
+        );
+    }
+
+    #[test]
+    fn test_has_sublink_in_where_clause() {
+        let sql = "SELECT * FROM t WHERE id IN (SELECT id FROM other)";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(
+            select.has_sublink(),
+            "has_sublink() should detect subquery in WHERE clause"
+        );
+    }
+
+    #[test]
+    fn test_has_sublink_no_subquery() {
+        let sql = "SELECT id, name FROM users WHERE active = true";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(
+            !select.has_sublink(),
+            "has_sublink() should return false when no subquery exists"
+        );
     }
 }

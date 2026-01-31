@@ -661,15 +661,22 @@ mod tests {
         let result = parse_parse_message(&data).unwrap();
         assert_eq!(result.statement_name, "");
 
-        // Test that this SQL would NOT be cacheable (has subquery)
-        // Subqueries fail during AST conversion (WhereParseError::UnsupportedPattern)
-        use crate::query::ast::sql_query_convert;
+        // Test that this SQL parses but is NOT cacheable (has subquery)
+        use crate::cache::query::{CacheabilityError, CacheableQuery};
+        use crate::query::ast::{sql_query_convert, Statement};
 
         let ast = pg_query::parse(&result.sql).unwrap();
-        let query_result = sql_query_convert(&ast);
+        let query = sql_query_convert(&ast).expect("subquery should parse to AST");
+
+        // Verify has_sublink() detects the subquery
+        let Statement::Select(select) = &query.statement;
+        assert!(select.has_sublink(), "has_sublink() should detect subquery in WHERE");
+
+        // Verify cacheability check rejects it
+        let cacheable_result = CacheableQuery::try_from(&query);
         assert!(
-            query_result.is_err(),
-            "SELECT with subquery should not convert to AST"
+            matches!(cacheable_result, Err(CacheabilityError::HasSublink)),
+            "SELECT with subquery should not be cacheable"
         );
     }
 

@@ -8,7 +8,9 @@ use ordered_float::NotNan;
 use pg_query::protobuf::SelectStmt;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
-use pg_query::protobuf::{AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, ParamRef};
+use pg_query::protobuf::{
+    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, ParamRef, SubLink,
+};
 use pg_query::{NodeRef, ParseResult};
 
 use super::ast::{BinaryExpr, ColumnNode, ExprOp, LiteralValue, UnaryExpr, WhereExpr};
@@ -135,11 +137,24 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
             let value = param_ref_extract(param_ref);
             Ok(WhereExpr::Value(value))
         }
+        Some(NodeEnum::SubLink(sub_link)) => {
+            let query = sublink_query_extract(sub_link);
+            Ok(WhereExpr::Subquery { query })
+        }
         unsupported => {
             dbg!(unsupported);
             Err(WhereParseError::UnsupportedPattern)
         }
     }
+}
+
+/// Extract SQL string from a SubLink node for storage
+/// Note: We store a placeholder since subqueries are rejected for caching anyway.
+/// The important thing is that this parses successfully so has_sublink() can detect it.
+fn sublink_query_extract(sub_link: &SubLink) -> String {
+    // We can't easily deparse a single node, but we don't need to -
+    // the query string is just for debugging. Store a marker instead.
+    format!("<subquery at location {}>", sub_link.location)
 }
 
 /// Extract column reference from pg_query ColumnRef

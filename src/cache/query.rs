@@ -109,12 +109,14 @@ fn is_supported_join(join: &JoinNode) -> bool {
     // Recursively validate nested joins
     let left_valid = match join.left.as_ref() {
         TableSource::Join(nested) => is_supported_join(nested),
-        TableSource::Table(_) | TableSource::Subquery(_) => true,
+        TableSource::Table(_) => true,
+        TableSource::Subquery(_) => false,
     };
 
     let right_valid = match join.right.as_ref() {
         TableSource::Join(nested) => is_supported_join(nested),
-        TableSource::Table(_) | TableSource::Subquery(_) => true,
+        TableSource::Table(_) => true,
+        TableSource::Subquery(_) => false,
     };
 
     left_valid && right_valid
@@ -359,6 +361,63 @@ mod tests {
         assert!(
             matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
             "GROUP BY with LIMIT should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_subquery_in_select_not_cacheable() {
+        let sql = "SELECT id, (SELECT x FROM other WHERE id = 1) FROM t WHERE id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::HasSublink)),
+            "Subquery in SELECT list should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_subquery_in_from_not_cacheable() {
+        let sql = "SELECT * FROM (SELECT id FROM users) sub WHERE id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::HasSublink)),
+            "Subquery in FROM clause should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_subquery_in_join_not_cacheable() {
+        let sql = "SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id WHERE a.id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        // Note: Currently returns UnsupportedFrom because is_supported_from() runs first
+        // and rejects subqueries in joins. Both errors correctly reject the query.
+        assert!(
+            matches!(
+                result,
+                Err(CacheabilityError::HasSublink) | Err(CacheabilityError::UnsupportedFrom)
+            ),
+            "Subquery in JOIN should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_subquery_in_where_not_cacheable() {
+        let sql = "SELECT * FROM t WHERE id IN (SELECT id FROM other)";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(
+            matches!(result, Err(CacheabilityError::HasSublink)),
+            "Subquery in WHERE clause should not be cacheable"
         );
     }
 }
