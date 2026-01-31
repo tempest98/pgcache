@@ -8,7 +8,10 @@ use error_set::error_set;
 use ordered_float::NotNan;
 use pg_query::ParseResult;
 use pg_query::protobuf::{ColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum};
-use pg_query::protobuf::{JoinExpr, RangeSubselect, SortByDir};
+use pg_query::protobuf::{
+    AExpr, AExprKind, CoalesceExpr, FuncCall, JoinExpr, MinMaxExpr, MinMaxOp, RangeSubselect,
+    SortByDir,
+};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
@@ -798,6 +801,8 @@ impl Deparse for ColumnExpr {
 pub struct FunctionCall {
     pub name: String,
     pub args: Vec<ColumnExpr>,
+    pub agg_star: bool,     // COUNT(*)
+    pub agg_distinct: bool, // COUNT(DISTINCT col)
 }
 
 impl FunctionCall {
@@ -810,17 +815,22 @@ impl FunctionCall {
 
 impl Deparse for FunctionCall {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        buf.push(' ');
-        buf.push_str(self.name.as_str());
+        buf.push_str(&self.name.to_uppercase());
         buf.push('(');
-        let mut sep = "";
-        for col in &self.args {
-            buf.push_str(sep);
-            col.deparse(buf);
-            sep = ",";
+        if self.agg_distinct {
+            buf.push_str("DISTINCT ");
+        }
+        if self.agg_star {
+            buf.push('*');
+        } else {
+            let mut sep = "";
+            for arg in &self.args {
+                buf.push_str(sep);
+                arg.deparse(buf);
+                sep = ", ";
+            }
         }
         buf.push(')');
-
         buf
     }
 }
@@ -1294,7 +1304,43 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                         }
                     }
                 }
-                // TODO: Add support for function calls, literals, etc.
+                Some(NodeEnum::FuncCall(func_call)) => {
+                    let function = func_call_convert(func_call)?;
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Function(function),
+                        alias,
+                    });
+                }
+                Some(NodeEnum::AConst(const_val)) => {
+                    let value = const_value_extract(const_val)?;
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Literal(value),
+                        alias,
+                    });
+                }
+                Some(NodeEnum::CoalesceExpr(coalesce)) => {
+                    let function = coalesce_expr_convert(coalesce)?;
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Function(function),
+                        alias,
+                    });
+                }
+                Some(NodeEnum::MinMaxExpr(minmax)) => {
+                    let function = minmax_expr_convert(minmax)?;
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Function(function),
+                        alias,
+                    });
+                }
+                Some(NodeEnum::AExpr(aexpr))
+                    if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprNullif) =>
+                {
+                    let function = aexpr_nullif_convert(aexpr)?;
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Function(function),
+                        alias,
+                    });
+                }
                 other => {
                     return Err(AstError::UnsupportedSelectFeature {
                         feature: format!("Column expression: {other:?}"),
@@ -1510,11 +1556,119 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
                 }),
             }
         }
-        // TODO: Add support for function calls
+        Some(NodeEnum::FuncCall(func_call)) => {
+            let function = func_call_convert(func_call)?;
+            Ok(ColumnExpr::Function(function))
+        }
+        Some(NodeEnum::CoalesceExpr(coalesce)) => {
+            let function = coalesce_expr_convert(coalesce)?;
+            Ok(ColumnExpr::Function(function))
+        }
+        Some(NodeEnum::MinMaxExpr(minmax)) => {
+            let function = minmax_expr_convert(minmax)?;
+            Ok(ColumnExpr::Function(function))
+        }
+        Some(NodeEnum::AExpr(aexpr))
+            if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprNullif) =>
+        {
+            let function = aexpr_nullif_convert(aexpr)?;
+            Ok(ColumnExpr::Function(function))
+        }
         other => Err(AstError::UnsupportedFeature {
             feature: format!("Column expression node: {other:?}"),
         }),
     }
+}
+
+fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
+    // Extract function name - last component of qualified name (e.g., "pg_catalog.count" -> "count")
+    let name = func_call
+        .funcname
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
+        .ok_or_else(|| AstError::UnsupportedSelectFeature {
+            feature: "function with no name".to_owned(),
+        })?;
+
+    // Handle COUNT(*) - agg_star means no explicit args
+    let args = if func_call.agg_star {
+        vec![]
+    } else {
+        func_call
+            .args
+            .iter()
+            .map(node_convert_to_column_expr)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(FunctionCall {
+        name,
+        args,
+        agg_star: func_call.agg_star,
+        agg_distinct: func_call.agg_distinct,
+    })
+}
+
+fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstError> {
+    let args = coalesce
+        .args
+        .iter()
+        .map(node_convert_to_column_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(FunctionCall {
+        name: "coalesce".to_owned(),
+        args,
+        agg_star: false,
+        agg_distinct: false,
+    })
+}
+
+fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
+    let name = match MinMaxOp::try_from(minmax.op) {
+        Ok(MinMaxOp::IsGreatest) => "greatest",
+        Ok(MinMaxOp::IsLeast) => "least",
+        _ => {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("Unknown MinMaxOp: {}", minmax.op),
+            })
+        }
+    };
+
+    let args = minmax
+        .args
+        .iter()
+        .map(node_convert_to_column_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(FunctionCall {
+        name: name.to_owned(),
+        args,
+        agg_star: false,
+        agg_distinct: false,
+    })
+}
+
+fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
+    let mut args = Vec::new();
+
+    if let Some(lexpr) = &aexpr.lexpr {
+        args.push(node_convert_to_column_expr(lexpr)?);
+    }
+    if let Some(rexpr) = &aexpr.rexpr {
+        args.push(node_convert_to_column_expr(rexpr)?);
+    }
+
+    Ok(FunctionCall {
+        name: "nullif".to_owned(),
+        args,
+        agg_star: false,
+        agg_distinct: false,
+    })
 }
 
 fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, AstError> {
@@ -2635,14 +2789,14 @@ mod tests {
 
     #[test]
     fn test_function_call_nodes() {
-        // Note: FunctionCall support is limited in the current parser
-        // This test verifies the nodes() implementation works for the structure
         let func = FunctionCall {
             name: "COUNT".to_owned(),
             args: vec![ColumnExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_owned(),
             })],
+            agg_star: false,
+            agg_distinct: false,
         };
 
         // Test that FunctionCall::nodes() can extract ColumnNode from args
@@ -3120,5 +3274,282 @@ mod tests {
             !select.has_sublink(),
             "has_sublink() should return false when no subquery exists"
         );
+    }
+
+    #[test]
+    fn test_function_count_star() {
+        let sql = "SELECT COUNT(*) FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        assert_eq!(columns.len(), 1);
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "count");
+        assert!(func.agg_star);
+        assert!(func.args.is_empty());
+    }
+
+    #[test]
+    fn test_function_count_column() {
+        let sql = "SELECT COUNT(id) FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "count");
+        assert!(!func.agg_star);
+        assert_eq!(func.args.len(), 1);
+    }
+
+    #[test]
+    fn test_function_count_distinct() {
+        let sql = "SELECT COUNT(DISTINCT status) FROM orders";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "count");
+        assert!(func.agg_distinct);
+    }
+
+    #[test]
+    fn test_function_sum() {
+        let sql = "SELECT SUM(amount) FROM orders WHERE tenant_id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "sum");
+    }
+
+    #[test]
+    fn test_function_nested() {
+        // Use ROUND(AVG(...)) since COALESCE is parsed as a special CoalesceExpr
+        let sql = "SELECT ROUND(AVG(value)) FROM data";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "round");
+        assert_eq!(func.args.len(), 1);
+
+        // First arg should be AVG(value)
+        let ColumnExpr::Function(inner) = &func.args[0] else {
+            panic!("expected nested function");
+        };
+        assert_eq!(inner.name, "avg");
+    }
+
+    #[test]
+    fn test_function_with_alias() {
+        let sql = "SELECT COUNT(*) as total FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        assert_eq!(columns[0].alias, Some("total".to_owned()));
+    }
+
+    #[test]
+    fn test_function_mixed_with_columns() {
+        let sql = "SELECT id, name, COUNT(*) as cnt FROM users GROUP BY id, name";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        assert_eq!(columns.len(), 3);
+        assert!(matches!(columns[0].expr, ColumnExpr::Column(_)));
+        assert!(matches!(columns[1].expr, ColumnExpr::Column(_)));
+        assert!(matches!(columns[2].expr, ColumnExpr::Function(_)));
+    }
+
+    #[test]
+    fn test_literal_in_select() {
+        let sql = "SELECT 42 as answer, 'hello' as greeting FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        assert_eq!(columns.len(), 2);
+        assert!(matches!(
+            columns[0].expr,
+            ColumnExpr::Literal(LiteralValue::Integer(42))
+        ));
+        assert!(matches!(
+            &columns[1].expr,
+            ColumnExpr::Literal(LiteralValue::String(s)) if s == "hello"
+        ));
+    }
+
+    #[test]
+    fn test_function_deparse_count_star() {
+        let func = FunctionCall {
+            name: "count".to_owned(),
+            args: vec![],
+            agg_star: true,
+            agg_distinct: false,
+        };
+        let mut buf = String::new();
+        func.deparse(&mut buf);
+        assert_eq!(buf, "COUNT(*)");
+    }
+
+    #[test]
+    fn test_function_deparse_count_distinct() {
+        let func = FunctionCall {
+            name: "count".to_owned(),
+            args: vec![ColumnExpr::Column(ColumnNode {
+                table: None,
+                column: "status".to_owned(),
+            })],
+            agg_star: false,
+            agg_distinct: true,
+        };
+        let mut buf = String::new();
+        func.deparse(&mut buf);
+        assert_eq!(buf, "COUNT(DISTINCT status)");
+    }
+
+    #[test]
+    fn test_coalesce() {
+        let sql = "SELECT COALESCE(name, 'unknown') FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "coalesce");
+        assert_eq!(func.args.len(), 2);
+    }
+
+    #[test]
+    fn test_coalesce_nested_with_function() {
+        let sql = "SELECT COALESCE(MAX(value), 0) FROM data";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "coalesce");
+        assert_eq!(func.args.len(), 2);
+
+        // First arg should be MAX(value)
+        let ColumnExpr::Function(inner) = &func.args[0] else {
+            panic!("expected nested function");
+        };
+        assert_eq!(inner.name, "max");
+    }
+
+    #[test]
+    fn test_greatest() {
+        let sql = "SELECT GREATEST(a, b, c) FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "greatest");
+        assert_eq!(func.args.len(), 3);
+    }
+
+    #[test]
+    fn test_least() {
+        let sql = "SELECT LEAST(a, b) FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "least");
+        assert_eq!(func.args.len(), 2);
+    }
+
+    #[test]
+    fn test_nullif() {
+        let sql = "SELECT NULLIF(status, 'deleted') FROM items";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "nullif");
+        assert_eq!(func.args.len(), 2);
     }
 }

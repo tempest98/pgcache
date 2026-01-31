@@ -420,4 +420,14 @@ mod tests {
             "Subquery in WHERE clause should not be cacheable"
         );
     }
+
+    #[test]
+    fn test_function_in_select_cacheable() {
+        let sql = "SELECT COUNT(*), SUM(amount) FROM orders WHERE tenant_id = 1";
+        let ast = pg_query::parse(sql).expect("parse");
+        let sql_query = sql_query_convert(&ast).expect("convert");
+
+        let result = CacheableQuery::try_from(&sql_query);
+        assert!(result.is_ok(), "Functions in SELECT should be cacheable");
+    }
 }

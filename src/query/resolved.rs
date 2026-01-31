@@ -314,6 +314,8 @@ pub enum ResolvedColumnExpr {
     Function {
         name: String,
         args: Vec<ResolvedColumnExpr>,
+        agg_star: bool,
+        agg_distinct: bool,
     },
     /// Literal value
     Literal(LiteralValue),
@@ -341,14 +343,26 @@ impl Deparse for ResolvedColumnExpr {
         match self {
             ResolvedColumnExpr::Column(col) => col.deparse(buf),
             ResolvedColumnExpr::Literal(lit) => lit.deparse(buf),
-            ResolvedColumnExpr::Function { name, args } => {
+            ResolvedColumnExpr::Function {
+                name,
+                args,
+                agg_star,
+                agg_distinct,
+            } => {
                 buf.push_str(name);
                 buf.push('(');
-                let mut sep = "";
-                for arg in args {
-                    buf.push_str(sep);
-                    arg.deparse(buf);
-                    sep = ", ";
+                if *agg_distinct {
+                    buf.push_str("DISTINCT ");
+                }
+                if *agg_star {
+                    buf.push('*');
+                } else {
+                    let mut sep = "";
+                    for arg in args {
+                        buf.push_str(sep);
+                        arg.deparse(buf);
+                        sep = ", ";
+                    }
                 }
                 buf.push(')');
                 buf
@@ -1004,6 +1018,8 @@ fn column_expr_resolve(
             Ok(ResolvedColumnExpr::Function {
                 name: func.name.clone(),
                 args: resolved_args,
+                agg_star: func.agg_star,
+                agg_distinct: func.agg_distinct,
             })
         }
         ColumnExpr::Subquery(_) => {
@@ -1996,6 +2012,52 @@ mod tests {
         resolved.deparse(&mut buf);
 
         assert_eq!(buf, "SELECT u.id FROM public.users u ORDER BY u.name DESC");
+    }
+
+    #[test]
+    fn test_resolved_select_deparse_count_star() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT COUNT(*) FROM users WHERE id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT count(*) FROM public.users WHERE public.users.id = 1"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_deparse_count_distinct() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT COUNT(DISTINCT name) FROM users WHERE id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT count(DISTINCT public.users.name) FROM public.users WHERE public.users.id = 1"
+        );
     }
 
     #[test]
