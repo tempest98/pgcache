@@ -664,6 +664,18 @@ fn resolved_column_expr_alias_update(
                 resolved_column_expr_alias_update(arg, schema, table, alias);
             }
         }
+        ResolvedColumnExpr::Case(case) => {
+            if let Some(arg) = &mut case.arg {
+                resolved_column_expr_alias_update(arg, schema, table, alias);
+            }
+            for when in &mut case.whens {
+                resolved_where_column_alias_update(&mut when.condition, schema, table, alias);
+                resolved_column_expr_alias_update(&mut when.result, schema, table, alias);
+            }
+            if let Some(default) = &mut case.default {
+                resolved_column_expr_alias_update(default, schema, table, alias);
+            }
+        }
         ResolvedColumnExpr::Subquery(query) => {
             resolved_column_alias_update(query, schema, table, alias);
         }

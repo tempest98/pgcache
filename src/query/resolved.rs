@@ -319,8 +319,30 @@ pub enum ResolvedColumnExpr {
     },
     /// Literal value
     Literal(LiteralValue),
+    /// CASE expression
+    Case(ResolvedCaseExpr),
     /// Subquery (for future support)
     Subquery(Box<ResolvedSelectStatement>),
+}
+
+/// Resolved CASE expression
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedCaseExpr {
+    /// For simple CASE, the expression being tested
+    pub arg: Option<Box<ResolvedColumnExpr>>,
+    /// List of WHEN clauses
+    pub whens: Vec<ResolvedCaseWhen>,
+    /// ELSE result
+    pub default: Option<Box<ResolvedColumnExpr>>,
+}
+
+/// Resolved CASE WHEN clause
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedCaseWhen {
+    /// The condition (for searched CASE) or value (for simple CASE)
+    pub condition: ResolvedWhereExpr,
+    /// The result if condition is true/matches
+    pub result: ResolvedColumnExpr,
 }
 
 impl ResolvedColumnExpr {
@@ -332,9 +354,31 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Function { args, .. } => {
                 Box::new(args.iter().flat_map(|arg| arg.nodes()))
             }
+            ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
             ResolvedColumnExpr::Subquery(query) => Box::new(query.nodes()),
         };
         current.chain(children)
+    }
+}
+
+impl ResolvedCaseExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let arg_nodes = self.arg.iter().flat_map(|a| a.nodes());
+        let when_nodes = self.whens.iter().flat_map(|w| w.nodes());
+        let default_nodes = self.default.iter().flat_map(|d| d.nodes());
+        current
+            .chain(arg_nodes)
+            .chain(when_nodes)
+            .chain(default_nodes)
+    }
+}
+
+impl ResolvedCaseWhen {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let condition_nodes = self.condition.nodes();
+        let result_nodes = self.result.nodes();
+        condition_nodes.chain(result_nodes)
     }
 }
 
@@ -367,6 +411,7 @@ impl Deparse for ResolvedColumnExpr {
                 buf.push(')');
                 buf
             }
+            ResolvedColumnExpr::Case(case) => case.deparse(buf),
             ResolvedColumnExpr::Subquery(query) => {
                 buf.push('(');
                 query.deparse(buf);
@@ -374,6 +419,28 @@ impl Deparse for ResolvedColumnExpr {
                 buf
             }
         }
+    }
+}
+
+impl Deparse for ResolvedCaseExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str("CASE");
+        if let Some(arg) = &self.arg {
+            buf.push(' ');
+            arg.deparse(buf);
+        }
+        for when in &self.whens {
+            buf.push_str(" WHEN ");
+            when.condition.deparse(buf);
+            buf.push_str(" THEN ");
+            when.result.deparse(buf);
+        }
+        if let Some(default) = &self.default {
+            buf.push_str(" ELSE ");
+            default.deparse(buf);
+        }
+        buf.push_str(" END");
+        buf
     }
 }
 
@@ -1021,6 +1088,37 @@ fn column_expr_resolve(
                 agg_star: func.agg_star,
                 agg_distinct: func.agg_distinct,
             })
+        }
+        ColumnExpr::Case(case) => {
+            let arg = case
+                .arg
+                .as_ref()
+                .map(|a| column_expr_resolve(a, scope))
+                .transpose()?
+                .map(Box::new);
+
+            let whens = case
+                .whens
+                .iter()
+                .map(|w| {
+                    let condition = where_expr_resolve(&w.condition, scope)?;
+                    let result = column_expr_resolve(&w.result, scope)?;
+                    Ok(ResolvedCaseWhen { condition, result })
+                })
+                .collect::<ResolveResult<Vec<_>>>()?;
+
+            let default = case
+                .default
+                .as_ref()
+                .map(|d| column_expr_resolve(d, scope))
+                .transpose()?
+                .map(Box::new);
+
+            Ok(ResolvedColumnExpr::Case(ResolvedCaseExpr {
+                arg,
+                whens,
+                default,
+            }))
         }
         ColumnExpr::Subquery(_) => {
             // Subqueries not yet supported
@@ -2057,6 +2155,29 @@ mod tests {
         assert_eq!(
             buf,
             "SELECT count(DISTINCT public.users.name) FROM public.users WHERE public.users.id = 1"
+        );
+    }
+
+    #[test]
+    fn test_resolved_select_deparse_case() {
+        use crate::query::ast::{Statement, sql_query_convert};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT CASE WHEN name = 'admin' THEN 1 ELSE 0 END FROM users WHERE id = 1";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT CASE WHEN public.users.name = 'admin' THEN 1 ELSE 0 END FROM public.users WHERE public.users.id = 1"
         );
     }
 

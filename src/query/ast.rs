@@ -9,8 +9,8 @@ use ordered_float::NotNan;
 use pg_query::ParseResult;
 use pg_query::protobuf::{ColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum};
 use pg_query::protobuf::{
-    AExpr, AExprKind, CoalesceExpr, FuncCall, JoinExpr, MinMaxExpr, MinMaxOp, RangeSubselect,
-    SortByDir,
+    AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, FuncCall, JoinExpr, MinMaxExpr,
+    MinMaxOp, RangeSubselect, SortByDir,
 };
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
@@ -581,16 +581,8 @@ impl SelectStatement {
         false
     }
 
-    #[allow(clippy::only_used_in_recursion)]
     fn column_expr_has_sublink(&self, expr: &ColumnExpr) -> bool {
-        match expr {
-            ColumnExpr::Function(func) => func
-                .args
-                .iter()
-                .any(|arg| self.column_expr_has_sublink(arg)),
-            ColumnExpr::Subquery(_) => true,
-            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => false,
-        }
+        expr.has_sublink()
     }
 }
 
@@ -762,6 +754,7 @@ pub enum ColumnExpr {
     Column(ColumnNode),     // column_name, table.column_name
     Function(FunctionCall), // COUNT(*), SUM(col), etc.
     Literal(LiteralValue),  // Constant values
+    Case(CaseExpr),         // CASE WHEN ... THEN ... END
     Subquery(Box<SelectStatement>),
 }
 
@@ -774,10 +767,21 @@ impl ColumnExpr {
                     ColumnExpr::Column(col) => (col as &dyn Any).downcast_ref::<N>(),
                     ColumnExpr::Function(func) => (func as &dyn Any).downcast_ref::<N>(),
                     ColumnExpr::Literal(lit) => (lit as &dyn Any).downcast_ref::<N>(),
+                    ColumnExpr::Case(case) => (case as &dyn Any).downcast_ref::<N>(),
                     ColumnExpr::Subquery(select) => (select as &dyn Any).downcast_ref::<N>(),
                 }))
             .into_iter(),
         )
+    }
+
+    /// Check if this column expression contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        match self {
+            ColumnExpr::Function(func) => func.args.iter().any(|arg| arg.has_sublink()),
+            ColumnExpr::Case(case) => case.has_sublink(),
+            ColumnExpr::Subquery(_) => true,
+            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => false,
+        }
     }
 }
 
@@ -787,6 +791,7 @@ impl Deparse for ColumnExpr {
             ColumnExpr::Column(col) => col.deparse(buf),
             ColumnExpr::Function(func) => func.deparse(buf),
             ColumnExpr::Literal(lit) => lit.deparse(buf),
+            ColumnExpr::Case(case) => case.deparse(buf),
             ColumnExpr::Subquery(select) => {
                 buf.push('(');
                 select.deparse(buf);
@@ -832,6 +837,81 @@ impl Deparse for FunctionCall {
         }
         buf.push(')');
         buf
+    }
+}
+
+/// CASE expression: CASE [arg] WHEN condition THEN result [...] [ELSE default] END
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct CaseExpr {
+    /// For simple CASE (CASE expr WHEN val...), holds the expression being tested.
+    /// None for searched CASE (CASE WHEN condition...).
+    pub arg: Option<Box<ColumnExpr>>,
+    /// List of WHEN clauses
+    pub whens: Vec<CaseWhen>,
+    /// ELSE result (None means NULL if no WHEN matches)
+    pub default: Option<Box<ColumnExpr>>,
+}
+
+impl CaseExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let arg_nodes = self.arg.iter().flat_map(|a| a.nodes());
+        let when_nodes = self.whens.iter().flat_map(|w| w.nodes());
+        let default_nodes = self.default.iter().flat_map(|d| d.nodes());
+        current
+            .chain(arg_nodes)
+            .chain(when_nodes)
+            .chain(default_nodes)
+    }
+
+    /// Check if this CASE expression contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        self.arg.as_ref().is_some_and(|a| a.has_sublink())
+            || self.whens.iter().any(|w| w.has_sublink())
+            || self.default.as_ref().is_some_and(|d| d.has_sublink())
+    }
+}
+
+impl Deparse for CaseExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str("CASE");
+        if let Some(arg) = &self.arg {
+            buf.push(' ');
+            arg.deparse(buf);
+        }
+        for when in &self.whens {
+            buf.push_str(" WHEN ");
+            when.condition.deparse(buf);
+            buf.push_str(" THEN ");
+            when.result.deparse(buf);
+        }
+        if let Some(default) = &self.default {
+            buf.push_str(" ELSE ");
+            default.deparse(buf);
+        }
+        buf.push_str(" END");
+        buf
+    }
+}
+
+/// A single WHEN clause in a CASE expression
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct CaseWhen {
+    /// The condition (for searched CASE) or value (for simple CASE)
+    pub condition: WhereExpr,
+    /// The result if condition is true/matches
+    pub result: ColumnExpr,
+}
+
+impl CaseWhen {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let condition_nodes = self.condition.nodes();
+        let result_nodes = self.result.nodes();
+        condition_nodes.chain(result_nodes)
+    }
+
+    pub fn has_sublink(&self) -> bool {
+        self.condition.has_sublink() || self.result.has_sublink()
     }
 }
 
@@ -1341,6 +1421,13 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                         alias,
                     });
                 }
+                Some(NodeEnum::CaseExpr(case_expr)) => {
+                    let case = case_expr_convert(case_expr)?;
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Case(case),
+                        alias,
+                    });
+                }
                 other => {
                     return Err(AstError::UnsupportedSelectFeature {
                         feature: format!("Column expression: {other:?}"),
@@ -1574,6 +1661,10 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
             let function = aexpr_nullif_convert(aexpr)?;
             Ok(ColumnExpr::Function(function))
         }
+        Some(NodeEnum::CaseExpr(case_expr)) => {
+            let case = case_expr_convert(case_expr)?;
+            Ok(ColumnExpr::Case(case))
+        }
         other => Err(AstError::UnsupportedFeature {
             feature: format!("Column expression node: {other:?}"),
         }),
@@ -1669,6 +1760,59 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
         agg_star: false,
         agg_distinct: false,
     })
+}
+
+fn case_expr_convert(case_expr: &PgCaseExpr) -> Result<CaseExpr, AstError> {
+    // Convert optional arg (for simple CASE: CASE expr WHEN val...)
+    let arg = case_expr
+        .arg
+        .as_ref()
+        .map(|n| node_convert_to_column_expr(n))
+        .transpose()?
+        .map(Box::new);
+
+    // Convert WHEN clauses
+    let whens = case_expr
+        .args
+        .iter()
+        .map(case_when_convert)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Convert ELSE clause
+    let default = case_expr
+        .defresult
+        .as_ref()
+        .map(|n| node_convert_to_column_expr(n))
+        .transpose()?
+        .map(Box::new);
+
+    Ok(CaseExpr { arg, whens, default })
+}
+
+fn case_when_convert(node: &Node) -> Result<CaseWhen, AstError> {
+    let Some(NodeEnum::CaseWhen(case_when)) = &node.node else {
+        return Err(AstError::UnsupportedFeature {
+            feature: format!("Expected CaseWhen, got: {:?}", node.node),
+        });
+    };
+
+    let condition = case_when
+        .expr
+        .as_ref()
+        .ok_or_else(|| AstError::UnsupportedFeature {
+            feature: "CASE WHEN without condition".to_owned(),
+        })
+        .and_then(|n| node_convert_to_expr(n).map_err(AstError::from))?;
+
+    let result = case_when
+        .result
+        .as_ref()
+        .ok_or_else(|| AstError::UnsupportedFeature {
+            feature: "CASE WHEN without result".to_owned(),
+        })
+        .and_then(|n| node_convert_to_column_expr(n))?;
+
+    Ok(CaseWhen { condition, result })
 }
 
 fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, AstError> {
@@ -3551,5 +3695,87 @@ mod tests {
         };
         assert_eq!(func.name, "nullif");
         assert_eq!(func.args.len(), 2);
+    }
+
+    #[test]
+    fn test_case_searched() {
+        let sql = "SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Case(case) = &columns[0].expr else {
+            panic!("expected case expression");
+        };
+        assert!(case.arg.is_none(), "searched CASE should have no arg");
+        assert_eq!(case.whens.len(), 1);
+        assert!(case.default.is_some(), "should have ELSE clause");
+    }
+
+    #[test]
+    fn test_case_simple() {
+        let sql = "SELECT CASE status WHEN 'active' THEN 1 WHEN 'pending' THEN 2 ELSE 0 END FROM items";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Case(case) = &columns[0].expr else {
+            panic!("expected case expression");
+        };
+        assert!(case.arg.is_some(), "simple CASE should have arg");
+        assert_eq!(case.whens.len(), 2);
+        assert!(case.default.is_some(), "should have ELSE clause");
+    }
+
+    #[test]
+    fn test_case_no_else() {
+        let sql = "SELECT CASE WHEN x > 0 THEN 'positive' END FROM items";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Case(case) = &columns[0].expr else {
+            panic!("expected case expression");
+        };
+        assert!(case.arg.is_none());
+        assert_eq!(case.whens.len(), 1);
+        assert!(case.default.is_none(), "should have no ELSE clause");
+    }
+
+    #[test]
+    fn test_case_deparse() {
+        let sql = "SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items WHERE id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::new();
+        ast.deparse(&mut buf);
+        assert_eq!(
+            buf,
+            "SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items WHERE id = 1"
+        );
+    }
+
+    #[test]
+    fn test_case_has_sublink() {
+        // CASE with subquery in WHEN condition
+        let sql = "SELECT CASE WHEN id IN (SELECT id FROM other) THEN 1 ELSE 0 END FROM items";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        assert!(select.has_sublink(), "CASE with subquery should have sublink");
     }
 }
