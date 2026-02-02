@@ -7,8 +7,8 @@ use rootcause::Report;
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
     ArithmeticOp, BinaryOp, ColumnExpr, ColumnNode, Deparse, JoinType, LimitClause, LiteralValue,
-    MultiOp, OrderDirection, SelectColumns, SelectStatement, TableAlias, TableNode, TableSource,
-    UnaryOp, WhereExpr, WindowSpec,
+    MultiOp, OrderDirection, QueryBody, QueryExpr, SelectColumns, SelectNode, TableAlias,
+    TableNode, TableSource, UnaryOp, WhereExpr, WindowSpec,
 };
 
 error_set! {
@@ -194,7 +194,7 @@ pub enum ResolvedWhereExpr {
         args: Vec<ResolvedWhereExpr>,
     },
     /// Subquery (for future support)
-    Subquery { query: Box<ResolvedSelectStatement> },
+    Subquery { query: Box<ResolvedQueryExpr> },
 }
 
 impl ResolvedWhereExpr {
@@ -374,7 +374,7 @@ pub enum ResolvedColumnExpr {
     /// Arithmetic expression: `left op right`
     Arithmetic(ResolvedArithmeticExpr),
     /// Subquery (for future support)
-    Subquery(Box<ResolvedSelectStatement>),
+    Subquery(Box<ResolvedQueryExpr>),
 }
 
 /// Resolved window specification for OVER clause
@@ -676,22 +676,22 @@ impl Deparse for ResolvedTableSource {
 /// Resolved subquery table source
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedTableSubqueryNode {
-    pub select: Box<ResolvedSelectStatement>,
+    pub query: Box<ResolvedQueryExpr>,
     pub alias: TableAlias,
 }
 
 impl ResolvedTableSubqueryNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.select.nodes();
-        current.chain(children)
+        let children = self.query.nodes();
+        Box::new(current.chain(children))
     }
 }
 
 impl Deparse for ResolvedTableSubqueryNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push_str(" (");
-        self.select.deparse(buf);
+        self.query.deparse(buf);
         buf.push_str(") ");
         self.alias.deparse(buf);
         buf
@@ -775,45 +775,44 @@ pub struct ResolvedLimitClause {
     pub offset: Option<LiteralValue>,
 }
 
-/// Fully resolved SELECT statement
+// ============================================================================
+// New Resolved Query Type Hierarchy (parallel to QueryExpr/QueryBody/etc.)
+// ============================================================================
+
+use crate::query::ast::{SetOpType, ValuesClause};
+
+/// Resolved core SELECT (without ORDER BY/LIMIT - those go on ResolvedQueryExpr)
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedSelectStatement {
+pub struct ResolvedSelectNode {
+    pub distinct: bool,
     pub columns: ResolvedSelectColumns,
     pub from: Vec<ResolvedTableSource>,
     pub where_clause: Option<ResolvedWhereExpr>,
     pub group_by: Vec<ResolvedColumnNode>,
     pub having: Option<ResolvedWhereExpr>,
-    pub order_by: Vec<ResolvedOrderByClause>,
-    pub limit: Option<ResolvedLimitClause>,
-    pub distinct: bool,
-    pub values: Vec<Vec<LiteralValue>>,
 }
 
-impl Default for ResolvedSelectStatement {
+impl Default for ResolvedSelectNode {
     fn default() -> Self {
         Self {
+            distinct: false,
             columns: ResolvedSelectColumns::None,
             from: Vec::new(),
             where_clause: None,
             group_by: Vec::new(),
             having: None,
-            order_by: Vec::new(),
-            limit: None,
-            distinct: false,
-            values: vec![vec![]],
         }
     }
 }
 
-impl ResolvedSelectStatement {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+impl ResolvedSelectNode {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> + '_ {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let columns_nodes = self.columns.nodes();
         let from_nodes = self.from.iter().flat_map(|t| t.nodes());
         let where_nodes = self.where_clause.iter().flat_map(|w| w.nodes());
         let group_by_nodes = self.group_by.iter().flat_map(|c| c.nodes());
         let having_nodes = self.having.iter().flat_map(|h| h.nodes());
-        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
 
         current
             .chain(columns_nodes)
@@ -821,134 +820,232 @@ impl ResolvedSelectStatement {
             .chain(where_nodes)
             .chain(group_by_nodes)
             .chain(having_nodes)
-            .chain(order_by_nodes)
     }
 
-    /// Check if this SELECT statement references only a single table
+    /// Check if this SELECT references only a single table
     pub fn is_single_table(&self) -> bool {
         matches!(self.from.as_slice(), [ResolvedTableSource::Table(_)])
     }
 
     /// Compute a complexity score for this query.
-    /// Lower scores indicate simpler queries that are more likely to match any given row.
-    /// Used to sort update queries so simpler ones are tried first.
     pub fn complexity(&self) -> usize {
-        // Count tables (each additional table beyond the first indicates a JOIN)
         let table_count = self.nodes::<ResolvedTableNode>().count();
         let join_count = table_count.saturating_sub(1);
-
-        // Count WHERE predicates
         let predicate_count = self
             .where_clause
             .as_ref()
             .map(|w| w.predicate_count())
             .unwrap_or(0);
-
-        // JOINs are weighted more heavily than simple predicates
-        // because they're typically more selective
         (join_count * 3) + predicate_count
     }
 }
 
-impl Deparse for ResolvedSelectStatement {
+impl Deparse for ResolvedSelectNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        // If values is present, output VALUES clause
-        if !self.values.is_empty() {
-            buf.push_str("VALUES ");
-            let mut row_sep = "";
-            buf.push('(');
-            for row in &self.values {
-                buf.push_str(row_sep);
-                let mut sep = "";
-                for value in row {
-                    buf.push_str(sep);
-                    value.deparse(buf);
-                    sep = ", ";
-                }
-                row_sep = "), (";
-            }
-            buf.push(')');
-        } else {
-            buf.push_str("SELECT");
-            if self.distinct {
-                buf.push_str(" DISTINCT");
-            }
-            self.columns.deparse(buf);
+        buf.push_str("SELECT");
+        if self.distinct {
+            buf.push_str(" DISTINCT");
+        }
+        self.columns.deparse(buf);
 
-            if !self.from.is_empty() {
-                buf.push_str(" FROM");
-                let mut sep = "";
-                for table in &self.from {
-                    buf.push_str(sep);
-                    table.deparse(buf);
-                    sep = ",";
-                }
+        if !self.from.is_empty() {
+            buf.push_str(" FROM");
+            let mut sep = "";
+            for table in &self.from {
+                buf.push_str(sep);
+                table.deparse(buf);
+                sep = ",";
             }
+        }
 
-            if let Some(expr) = &self.where_clause {
-                buf.push_str(" WHERE ");
-                expr.deparse(buf);
-            }
+        if let Some(expr) = &self.where_clause {
+            buf.push_str(" WHERE ");
+            expr.deparse(buf);
+        }
 
-            if !self.group_by.is_empty() {
-                buf.push_str(" GROUP BY ");
-                let mut sep = "";
-                for col in &self.group_by {
-                    buf.push_str(sep);
-                    col.deparse(buf);
-                    sep = ", ";
-                }
+        if !self.group_by.is_empty() {
+            buf.push_str(" GROUP BY ");
+            let mut sep = "";
+            for col in &self.group_by {
+                buf.push_str(sep);
+                col.deparse(buf);
+                sep = ", ";
             }
+        }
 
-            if let Some(expr) = &self.having {
-                buf.push_str(" HAVING ");
-                expr.deparse(buf);
-            }
-
-            if !self.order_by.is_empty() {
-                buf.push_str(" ORDER BY");
-                let mut sep = "";
-                for order in &self.order_by {
-                    buf.push_str(sep);
-                    buf.push(' ');
-                    order.deparse(buf);
-                    sep = ",";
-                }
-            }
-
-            if let Some(limit) = &self.limit {
-                if let Some(count) = &limit.count {
-                    buf.push_str(" LIMIT ");
-                    count.deparse(buf);
-                }
-                if let Some(offset) = &limit.offset {
-                    buf.push_str(" OFFSET ");
-                    offset.deparse(buf);
-                }
-            }
+        if let Some(expr) = &self.having {
+            buf.push_str(" HAVING ");
+            expr.deparse(buf);
         }
 
         buf
     }
 }
 
-/// Resolved statement (only SELECT for now)
+/// Resolved set operation node
 #[derive(Debug, Clone, PartialEq)]
-pub enum ResolvedStatement {
-    Select(ResolvedSelectStatement),
+pub struct ResolvedSetOpNode {
+    pub op: SetOpType,
+    pub all: bool,
+    pub left: Box<ResolvedQueryExpr>,
+    pub right: Box<ResolvedQueryExpr>,
 }
 
-/// Fully resolved SQL query
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedSqlQuery {
-    pub statement: ResolvedStatement,
+impl ResolvedSetOpNode {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let left_nodes = self.left.nodes();
+        let right_nodes = self.right.nodes();
+        Box::new(current.chain(left_nodes).chain(right_nodes))
+    }
 }
 
-impl Deparse for ResolvedSqlQuery {
+impl Deparse for ResolvedSetOpNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        match &self.statement {
-            ResolvedStatement::Select(select) => select.deparse(buf),
+        self.left.deparse(buf);
+        buf.push(' ');
+        self.op.deparse(buf);
+        if self.all {
+            buf.push_str(" ALL");
         }
+        buf.push(' ');
+        self.right.deparse(buf);
+        buf
+    }
+}
+
+/// The body of a resolved query - SELECT, VALUES, or set operation
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedQueryBody {
+    Select(Box<ResolvedSelectNode>),
+    Values(ValuesClause), // No resolution needed for literals
+    SetOp(ResolvedSetOpNode),
+}
+
+impl ResolvedQueryBody {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children: Box<dyn Iterator<Item = &N> + '_> = match self {
+            ResolvedQueryBody::Select(select) => Box::new(select.nodes()),
+            ResolvedQueryBody::Values(values) => Box::new(values.nodes()),
+            ResolvedQueryBody::SetOp(set_op) => set_op.nodes(),
+        };
+        Box::new(current.chain(children))
+    }
+}
+
+impl Deparse for ResolvedQueryBody {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            ResolvedQueryBody::Select(select) => select.deparse(buf),
+            ResolvedQueryBody::Values(values) => values.deparse(buf),
+            ResolvedQueryBody::SetOp(set_op) => set_op.deparse(buf),
+        }
+    }
+}
+
+/// A complete resolved query expression with optional ordering/limiting
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedQueryExpr {
+    pub body: ResolvedQueryBody,
+    pub order_by: Vec<ResolvedOrderByClause>,
+    pub limit: Option<ResolvedLimitClause>,
+}
+
+impl Default for ResolvedQueryExpr {
+    fn default() -> Self {
+        Self {
+            body: ResolvedQueryBody::Values(ValuesClause::default()),
+            order_by: Vec::new(),
+            limit: None,
+        }
+    }
+}
+
+impl ResolvedQueryExpr {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let body_nodes = self.body.nodes();
+        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
+        Box::new(current.chain(body_nodes).chain(order_by_nodes))
+    }
+
+    /// Check if query only references a single table
+    pub fn is_single_table(&self) -> bool {
+        self.nodes::<ResolvedTableNode>().nth(1).is_none()
+    }
+
+    /// Check if query has a WHERE clause (only applies to SELECT bodies)
+    pub fn has_where_clause(&self) -> bool {
+        match &self.body {
+            ResolvedQueryBody::Select(select) => select.where_clause.is_some(),
+            ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => false,
+        }
+    }
+
+    /// Get the WHERE clause if it exists (only for SELECT bodies)
+    pub fn where_clause(&self) -> Option<&ResolvedWhereExpr> {
+        match &self.body {
+            ResolvedQueryBody::Select(select) => select.where_clause.as_ref(),
+            ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => None,
+        }
+    }
+
+    /// Get the SELECT body if this is a simple SELECT query
+    pub fn as_select(&self) -> Option<&ResolvedSelectNode> {
+        match &self.body {
+            ResolvedQueryBody::Select(select) => Some(select),
+            ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => None,
+        }
+    }
+
+    /// Get the SELECT body mutably if this is a simple SELECT query
+    pub fn as_select_mut(&mut self) -> Option<&mut ResolvedSelectNode> {
+        match &mut self.body {
+            ResolvedQueryBody::Select(select) => Some(select),
+            ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => None,
+        }
+    }
+
+    /// Compute a complexity score for this query.
+    pub fn complexity(&self) -> usize {
+        match &self.body {
+            ResolvedQueryBody::Select(select) => select.complexity(),
+            ResolvedQueryBody::Values(_) => 0,
+            ResolvedQueryBody::SetOp(set_op) => {
+                set_op.left.complexity() + set_op.right.complexity() + 1
+            }
+        }
+    }
+}
+
+impl Deparse for ResolvedQueryExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.body.deparse(buf);
+
+        if !self.order_by.is_empty() {
+            buf.push_str(" ORDER BY");
+            let mut sep = "";
+            for order in &self.order_by {
+                buf.push_str(sep);
+                buf.push(' ');
+                order.deparse(buf);
+                sep = ",";
+            }
+        }
+
+        if let Some(limit) = &self.limit {
+            if let Some(count) = &limit.count {
+                buf.push_str(" LIMIT ");
+                count.deparse(buf);
+            }
+            if let Some(offset) = &limit.offset {
+                buf.push_str(" OFFSET ");
+                offset.deparse(buf);
+            }
+        }
+
+        buf
     }
 }
 
@@ -1389,53 +1486,109 @@ fn limit_resolve(limit: Option<&LimitClause>) -> Option<ResolvedLimitClause> {
     })
 }
 
-/// Resolve a SELECT statement
-pub fn select_statement_resolve(
-    stmt: &SelectStatement,
+// ============================================================================
+// Resolution functions for new QueryExpr type hierarchy
+// ============================================================================
+
+/// Resolve a QueryExpr to a ResolvedQueryExpr
+pub fn query_expr_resolve(
+    query: &QueryExpr,
     tables: &BiHashMap<TableMetadata>,
     search_path: &[&str],
-) -> ResolveResult<ResolvedSelectStatement> {
+) -> ResolveResult<ResolvedQueryExpr> {
+    let body = query_body_resolve(&query.body, tables, search_path)?;
+
+    // ORDER BY resolution needs scope from the body
+    // For now, we create a fresh scope - this works for simple cases
+    // but set operations with ORDER BY referencing output columns need special handling
+    let order_by = if query.order_by.is_empty() {
+        vec![]
+    } else {
+        // Build scope from the body for ORDER BY resolution
+        let mut scope = ResolutionScope::new();
+        if let QueryBody::Select(select) = &query.body {
+            for table_source in &select.from {
+                let _ = table_source_resolve(table_source, tables, &mut scope, search_path);
+            }
+        }
+        order_by_resolve(&query.order_by, &scope)?
+    };
+
+    let limit = limit_resolve(query.limit.as_ref());
+
+    Ok(ResolvedQueryExpr {
+        body,
+        order_by,
+        limit,
+    })
+}
+
+/// Resolve a QueryBody to a ResolvedQueryBody
+fn query_body_resolve(
+    body: &QueryBody,
+    tables: &BiHashMap<TableMetadata>,
+    search_path: &[&str],
+) -> ResolveResult<ResolvedQueryBody> {
+    match body {
+        QueryBody::Select(select) => {
+            let resolved = select_node_resolve(select, tables, search_path)?;
+            Ok(ResolvedQueryBody::Select(Box::new(resolved)))
+        }
+        QueryBody::Values(values) => {
+            // VALUES clauses contain only literals, no resolution needed
+            Ok(ResolvedQueryBody::Values(values.clone()))
+        }
+        QueryBody::SetOp(set_op) => {
+            let left = query_expr_resolve(&set_op.left, tables, search_path)?;
+            let right = query_expr_resolve(&set_op.right, tables, search_path)?;
+            Ok(ResolvedQueryBody::SetOp(ResolvedSetOpNode {
+                op: set_op.op,
+                all: set_op.all,
+                left: Box::new(left),
+                right: Box::new(right),
+            }))
+        }
+    }
+}
+
+/// Resolve a SelectNode to a ResolvedSelectNode
+pub fn select_node_resolve(
+    select: &SelectNode,
+    tables: &BiHashMap<TableMetadata>,
+    search_path: &[&str],
+) -> ResolveResult<ResolvedSelectNode> {
     let mut scope = ResolutionScope::new();
 
     // First pass: resolve all table references and build scope
     let mut resolved_from = Vec::new();
-    for table_source in &stmt.from {
+    for table_source in &select.from {
         let resolved = table_source_resolve(table_source, tables, &mut scope, search_path)?;
         resolved_from.push(resolved);
     }
 
     // Resolve SELECT columns
-    let resolved_columns = select_columns_resolve(&stmt.columns, &scope)?;
+    let resolved_columns = select_columns_resolve(&select.columns, &scope)?;
 
     // Resolve WHERE clause
-    let resolved_where = stmt
+    let resolved_where = select
         .where_clause
         .as_ref()
         .map(|w| where_expr_resolve(w, &scope))
         .transpose()?;
 
-    // Resolve ORDER BY clause
-    let resolved_order_by = order_by_resolve(&stmt.order_by, &scope)?;
-
     // Resolve GROUP BY clause
-    let resolved_group_by = group_by_resolve(&stmt.group_by, &scope)?;
+    let resolved_group_by = group_by_resolve(&select.group_by, &scope)?;
 
     // Resolve HAVING clause
-    let resolved_having = having_resolve(stmt.having.as_ref(), &scope)?;
+    let resolved_having = having_resolve(select.having.as_ref(), &scope)?;
 
-    // Resolve LIMIT clause
-    let resolved_limit = limit_resolve(stmt.limit.as_ref());
-
-    Ok(ResolvedSelectStatement {
+    Ok(ResolvedSelectNode {
+        distinct: select.distinct,
         columns: resolved_columns,
         from: resolved_from,
         where_clause: resolved_where,
         group_by: resolved_group_by,
         having: resolved_having,
-        order_by: resolved_order_by,
-        limit: resolved_limit,
-        distinct: stmt.distinct,
-        values: stmt.values.clone(),
     })
 }
 
@@ -1443,10 +1596,36 @@ pub fn select_statement_resolve(
 mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::unwrap_used)]
+    #![allow(clippy::wildcard_enum_match_arm)]
 
     use tokio_postgres::types::Type;
 
     use super::*;
+
+    /// Parse SQL and return a SelectNode (for tests using new types)
+    fn parse_select_node(sql: &str) -> SelectNode {
+        use crate::query::ast::{QueryBody, query_expr_convert};
+        let ast = pg_query::parse(sql).expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        match query_expr.body {
+            QueryBody::Select(node) => node,
+            _ => panic!("expected SELECT"),
+        }
+    }
+
+    /// Parse SQL and resolve to ResolvedSelectNode
+    fn resolve_sql(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
+        let node = parse_select_node(sql);
+        select_node_resolve(&node, tables, &["public"]).expect("resolve")
+    }
+
+    /// Parse SQL and resolve to ResolvedQueryExpr (for ORDER BY/LIMIT tests)
+    fn resolve_query(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
+        use crate::query::ast::query_expr_convert;
+        let ast = pg_query::parse(sql).expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        query_expr_resolve(&query_expr, tables, &["public"]).expect("resolve")
+    }
 
     #[test]
     fn test_resolved_table_node_construction() {
@@ -1491,16 +1670,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_select_statement_default() {
-        let stmt = ResolvedSelectStatement::default();
-        assert!(matches!(stmt.columns, ResolvedSelectColumns::None));
-        assert!(stmt.from.is_empty());
-        assert!(stmt.where_clause.is_none());
-        assert!(stmt.group_by.is_empty());
-        assert!(stmt.having.is_none());
-        assert!(stmt.order_by.is_empty());
-        assert!(stmt.limit.is_none());
-        assert!(!stmt.distinct);
+    fn test_resolved_select_node_default() {
+        let node = ResolvedSelectNode::default();
+        assert!(matches!(node.columns, ResolvedSelectColumns::None));
+        assert!(node.from.is_empty());
+        assert!(node.where_clause.is_none());
+        assert!(node.group_by.is_empty());
+        assert!(node.having.is_none());
+        assert!(!node.distinct);
     }
 
     // Helper function to create test table metadata
@@ -1541,17 +1718,10 @@ mod tests {
 
     #[test]
     fn test_table_resolve_simple() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users", &tables);
 
         assert_eq!(resolved.from.len(), 1);
         if let ResolvedTableSource::Table(table) = &resolved.from[0] {
@@ -1566,17 +1736,10 @@ mod tests {
 
     #[test]
     fn test_table_resolve_with_alias() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users u";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users u", &tables);
 
         assert_eq!(resolved.from.len(), 1);
         if let ResolvedTableSource::Table(table) = &resolved.from[0] {
@@ -1591,16 +1754,9 @@ mod tests {
 
     #[test]
     fn test_table_resolve_not_found() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let tables = BiHashMap::new();
-
-        let sql = "SELECT * FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let result = select_statement_resolve(stmt, &tables, &["public"]);
+        let node = parse_select_node("SELECT * FROM users");
+        let result = select_node_resolve(&node, &tables, &["public"]);
 
         assert!(matches!(
             result.map_err(|e| e.into_current_context()),
@@ -1610,17 +1766,10 @@ mod tests {
 
     #[test]
     fn test_column_resolve_qualified() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users WHERE users.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users WHERE users.id = 1", &tables);
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
@@ -1639,17 +1788,10 @@ mod tests {
 
     #[test]
     fn test_column_resolve_with_alias() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users u WHERE u.name = 'john'";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users u WHERE u.name = 'john'", &tables);
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
@@ -1668,17 +1810,10 @@ mod tests {
 
     #[test]
     fn test_column_resolve_unqualified() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
@@ -1696,19 +1831,13 @@ mod tests {
 
     #[test]
     fn test_column_resolve_ambiguous() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
         // Both tables have 'id' column, unqualified reference is ambiguous
-        let sql = "SELECT * FROM users, orders WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let result = select_statement_resolve(stmt, &tables, &["public"]);
+        let node = parse_select_node("SELECT * FROM users, orders WHERE id = 1");
+        let result = select_node_resolve(&node, &tables, &["public"]);
 
         assert!(matches!(
             result.map_err(|e| e.into_current_context()),
@@ -1718,17 +1847,10 @@ mod tests {
 
     #[test]
     fn test_select_star_expansion() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users", &tables);
 
         // Check that SELECT * was expanded to all columns
         if let ResolvedSelectColumns::All(cols) = &resolved.columns {
@@ -1744,17 +1866,10 @@ mod tests {
 
     #[test]
     fn test_select_specific_columns() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT id, name FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT id, name FROM users", &tables);
 
         // Check that specific columns were resolved
         if let ResolvedSelectColumns::Columns(cols) = &resolved.columns {
@@ -1780,18 +1895,14 @@ mod tests {
 
     #[test]
     fn test_join_resolution() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
-        let sql = "SELECT * FROM users JOIN orders ON users.id = orders.id";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT * FROM users JOIN orders ON users.id = orders.id",
+            &tables,
+        );
 
         // Check that JOIN was resolved
         assert_eq!(resolved.from.len(), 1);
@@ -1832,18 +1943,14 @@ mod tests {
 
     #[test]
     fn test_join_with_aliases() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.id";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT * FROM users u JOIN orders o ON u.id = o.id",
+            &tables,
+        );
 
         // Check that JOIN with aliases was resolved
         if let ResolvedTableSource::Join(join) = &resolved.from[0] {
@@ -1883,17 +1990,13 @@ mod tests {
 
     #[test]
     fn test_where_expr_complex() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users WHERE id = 1 AND name = 'john'";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT * FROM users WHERE id = 1 AND name = 'john'",
+            &tables,
+        );
 
         // Check that complex WHERE was resolved
         if let Some(ResolvedWhereExpr::Binary(and_expr)) = &resolved.where_clause {
@@ -1925,17 +2028,10 @@ mod tests {
 
     #[test]
     fn test_order_by_simple() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users ORDER BY name ASC";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users ORDER BY name ASC", &tables);
 
         // Check ORDER BY was resolved
         assert_eq!(resolved.order_by.len(), 1);
@@ -1953,17 +2049,10 @@ mod tests {
 
     #[test]
     fn test_order_by_multiple_columns() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users ORDER BY name ASC, id DESC";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users ORDER BY name ASC, id DESC", &tables);
 
         // Check ORDER BY was resolved
         assert_eq!(resolved.order_by.len(), 2);
@@ -1989,17 +2078,10 @@ mod tests {
 
     #[test]
     fn test_order_by_qualified_column() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users u ORDER BY u.name DESC";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users u ORDER BY u.name DESC", &tables);
 
         // Check ORDER BY was resolved with qualified column
         assert_eq!(resolved.order_by.len(), 1);
@@ -2017,19 +2099,13 @@ mod tests {
 
     #[test]
     fn test_order_by_with_join() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
         let sql =
             "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query(sql, &tables);
 
         // Check ORDER BY was resolved across joined tables
         assert_eq!(resolved.order_by.len(), 2);
@@ -2053,17 +2129,10 @@ mod tests {
 
     #[test]
     fn test_order_by_unqualified_column() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users ORDER BY name";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users ORDER BY name", &tables);
 
         // Check unqualified ORDER BY column was resolved
         assert_eq!(resolved.order_by.len(), 1);
@@ -2077,17 +2146,16 @@ mod tests {
 
     #[test]
     fn test_order_by_column_not_found() {
-        use crate::query::ast::{Statement, sql_query_convert};
+        use crate::query::ast::query_expr_convert;
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         let sql = "SELECT * FROM users ORDER BY nonexistent_column ASC";
         let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
+        let query_expr = query_expr_convert(&ast).unwrap();
 
-        let Statement::Select(stmt) = &sql_query.statement;
-        let result = select_statement_resolve(stmt, &tables, &["public"]);
+        let result = query_expr_resolve(&query_expr, &tables, &["public"]);
 
         // Should fail with column not found error
         assert!(matches!(
@@ -2202,17 +2270,10 @@ mod tests {
 
     #[test]
     fn test_resolved_select_deparse_with_where() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
@@ -2223,17 +2284,10 @@ mod tests {
 
     #[test]
     fn test_resolved_select_deparse_with_alias() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT u.id, u.name FROM users u WHERE u.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT u.id, u.name FROM users u WHERE u.id = 1", &tables);
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
@@ -2247,18 +2301,14 @@ mod tests {
 
     #[test]
     fn test_resolved_select_deparse_join() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
-        let sql = "SELECT u.id, o.name FROM users u JOIN orders o ON u.id = o.id WHERE u.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT u.id, o.name FROM users u JOIN orders o ON u.id = o.id WHERE u.id = 1",
+            &tables,
+        );
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
@@ -2270,18 +2320,11 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_select_deparse_order_by() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
+    fn test_resolved_query_deparse_order_by() {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT id FROM users u ORDER BY name DESC";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT id FROM users u ORDER BY name DESC", &tables);
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
@@ -2291,17 +2334,10 @@ mod tests {
 
     #[test]
     fn test_resolved_select_deparse_count_star() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT COUNT(*) FROM users WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT COUNT(*) FROM users WHERE id = 1", &tables);
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
@@ -2314,17 +2350,13 @@ mod tests {
 
     #[test]
     fn test_resolved_select_deparse_count_distinct() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT COUNT(DISTINCT name) FROM users WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT COUNT(DISTINCT name) FROM users WHERE id = 1",
+            &tables,
+        );
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
@@ -2337,17 +2369,13 @@ mod tests {
 
     #[test]
     fn test_resolved_select_deparse_case() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT CASE WHEN name = 'admin' THEN 1 ELSE 0 END FROM users WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT CASE WHEN name = 'admin' THEN 1 ELSE 0 END FROM users WHERE id = 1",
+            &tables,
+        );
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
@@ -2396,17 +2424,10 @@ mod tests {
 
     #[test]
     fn test_complexity_single_table_no_where() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users", &tables);
 
         // Single table, no predicates = complexity 0
         assert_eq!(resolved.complexity(), 0);
@@ -2414,17 +2435,10 @@ mod tests {
 
     #[test]
     fn test_complexity_single_table_with_where() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
         // Single table, 1 predicate = complexity 1
         assert_eq!(resolved.complexity(), 1);
@@ -2432,17 +2446,13 @@ mod tests {
 
     #[test]
     fn test_complexity_single_table_multiple_predicates() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users WHERE id = 1 AND name = 'john'";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT * FROM users WHERE id = 1 AND name = 'john'",
+            &tables,
+        );
 
         // Single table, 2 predicates = complexity 2
         assert_eq!(resolved.complexity(), 2);
@@ -2450,18 +2460,14 @@ mod tests {
 
     #[test]
     fn test_complexity_join_no_where() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
-        let sql = "SELECT * FROM users JOIN orders ON users.id = orders.id";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT * FROM users JOIN orders ON users.id = orders.id",
+            &tables,
+        );
 
         // 2 tables (1 join) * 3 = 3, no WHERE predicates
         assert_eq!(resolved.complexity(), 3);
@@ -2469,18 +2475,14 @@ mod tests {
 
     #[test]
     fn test_complexity_join_with_where() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
-        let sql = "SELECT * FROM users JOIN orders ON users.id = orders.id WHERE users.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT * FROM users JOIN orders ON users.id = orders.id WHERE users.id = 1",
+            &tables,
+        );
 
         // 2 tables (1 join) * 3 = 3, plus 1 WHERE predicate = 4
         assert_eq!(resolved.complexity(), 4);
@@ -2488,32 +2490,21 @@ mod tests {
 
     #[test]
     fn test_complexity_ordering() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
         // Simple query: SELECT * FROM users
-        let sql1 = "SELECT * FROM users";
-        let ast1 = pg_query::parse(sql1).unwrap();
-        let sql_query1 = sql_query_convert(&ast1).unwrap();
-        let Statement::Select(stmt1) = &sql_query1.statement;
-        let resolved1 = select_statement_resolve(stmt1, &tables, &["public"]).unwrap();
+        let resolved1 = resolve_sql("SELECT * FROM users", &tables);
 
         // Query with WHERE: SELECT * FROM users WHERE id = 1
-        let sql2 = "SELECT * FROM users WHERE id = 1";
-        let ast2 = pg_query::parse(sql2).unwrap();
-        let sql_query2 = sql_query_convert(&ast2).unwrap();
-        let Statement::Select(stmt2) = &sql_query2.statement;
-        let resolved2 = select_statement_resolve(stmt2, &tables, &["public"]).unwrap();
+        let resolved2 = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
         // Query with JOIN: SELECT * FROM users JOIN orders ON ...
-        let sql3 = "SELECT * FROM users JOIN orders ON users.id = orders.id";
-        let ast3 = pg_query::parse(sql3).unwrap();
-        let sql_query3 = sql_query_convert(&ast3).unwrap();
-        let Statement::Select(stmt3) = &sql_query3.statement;
-        let resolved3 = select_statement_resolve(stmt3, &tables, &["public"]).unwrap();
+        let resolved3 = resolve_sql(
+            "SELECT * FROM users JOIN orders ON users.id = orders.id",
+            &tables,
+        );
 
         // Verify ordering: simple < with_where < with_join
         assert!(resolved1.complexity() < resolved2.complexity());
@@ -2522,17 +2513,10 @@ mod tests {
 
     #[test]
     fn test_group_by_resolve_single_column() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT name FROM users GROUP BY name";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT name FROM users GROUP BY name", &tables);
 
         assert_eq!(resolved.group_by.len(), 1);
         assert_eq!(resolved.group_by[0].schema, "public");
@@ -2542,17 +2526,10 @@ mod tests {
 
     #[test]
     fn test_group_by_resolve_multiple_columns() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT id, name FROM users GROUP BY id, name";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT id, name FROM users GROUP BY id, name", &tables);
 
         assert_eq!(resolved.group_by.len(), 2);
         assert_eq!(resolved.group_by[0].column, "id");
@@ -2561,17 +2538,10 @@ mod tests {
 
     #[test]
     fn test_group_by_resolve_qualified_column() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT u.name FROM users u GROUP BY u.name";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql("SELECT u.name FROM users u GROUP BY u.name", &tables);
 
         assert_eq!(resolved.group_by.len(), 1);
         assert_eq!(resolved.group_by[0].table, "users");
@@ -2581,17 +2551,13 @@ mod tests {
 
     #[test]
     fn test_having_resolve() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT name FROM users GROUP BY name HAVING name = 'alice'";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT name FROM users GROUP BY name HAVING name = 'alice'",
+            &tables,
+        );
 
         assert!(resolved.having.is_some());
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.having {
@@ -2607,17 +2573,10 @@ mod tests {
 
     #[test]
     fn test_limit_resolve_count_only() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users LIMIT 10";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users LIMIT 10", &tables);
 
         let limit = resolved.limit.unwrap();
         assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
@@ -2626,17 +2585,10 @@ mod tests {
 
     #[test]
     fn test_limit_resolve_offset_only() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users OFFSET 5";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users OFFSET 5", &tables);
 
         let limit = resolved.limit.unwrap();
         assert_eq!(limit.count, None);
@@ -2645,17 +2597,10 @@ mod tests {
 
     #[test]
     fn test_limit_resolve_count_and_offset() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users LIMIT 10 OFFSET 20";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users LIMIT 10 OFFSET 20", &tables);
 
         let limit = resolved.limit.unwrap();
         assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
@@ -2664,17 +2609,10 @@ mod tests {
 
     #[test]
     fn test_limit_resolve_parameterized() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users LIMIT $1 OFFSET $2";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users LIMIT $1 OFFSET $2", &tables);
 
         // Parameterized values are preserved through resolution
         let limit = resolved.limit.unwrap();
@@ -2684,38 +2622,31 @@ mod tests {
 
     #[test]
     fn test_no_limit_clause() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let sql = "SELECT * FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_query("SELECT * FROM users", &tables);
 
         assert!(resolved.limit.is_none());
     }
 
     #[test]
     fn test_combined_group_by_having_limit_resolve() {
-        use crate::query::ast::{Statement, sql_query_convert};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         let sql =
             "SELECT name FROM users GROUP BY name HAVING name != 'test' ORDER BY name LIMIT 10";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
+        let resolved = resolve_query(sql, &tables);
 
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        // GROUP BY and HAVING are on the select body
+        let ResolvedQueryBody::Select(select) = &resolved.body else {
+            panic!("Expected SELECT body");
+        };
+        assert_eq!(select.group_by.len(), 1);
+        assert!(select.having.is_some());
 
-        assert_eq!(resolved.group_by.len(), 1);
-        assert!(resolved.having.is_some());
+        // ORDER BY and LIMIT are on the QueryExpr
         assert!(!resolved.order_by.is_empty());
         assert!(resolved.limit.is_some());
         assert_eq!(
@@ -2726,18 +2657,14 @@ mod tests {
 
     #[test]
     fn test_resolved_window_function() {
-        use crate::query::ast::{sql_query_convert, Statement};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         // Use columns that exist in test_table_metadata: id, name
-        let sql = "SELECT sum(id) OVER (PARTITION BY name ORDER BY id) FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT sum(id) OVER (PARTITION BY name ORDER BY id) FROM users",
+            &tables,
+        );
 
         let ResolvedSelectColumns::Columns(columns) = &resolved.columns else {
             panic!("expected columns");
@@ -2761,24 +2688,28 @@ mod tests {
 
     #[test]
     fn test_resolved_window_function_deparse() {
-        use crate::query::ast::{sql_query_convert, Statement};
-
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         // Use columns that exist in test_table_metadata: id, name
-        let sql = "SELECT sum(id) OVER (ORDER BY name DESC) FROM users";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(
+            "SELECT sum(id) OVER (ORDER BY name DESC) FROM users",
+            &tables,
+        );
 
         let mut buf = String::new();
         resolved.deparse(&mut buf);
 
         // Should contain the window function with OVER clause
-        assert!(buf.contains("OVER"), "deparsed SQL should contain OVER: {}", buf);
-        assert!(buf.contains("ORDER BY"), "deparsed SQL should contain ORDER BY: {}", buf);
+        assert!(
+            buf.contains("OVER"),
+            "deparsed SQL should contain OVER: {}",
+            buf
+        );
+        assert!(
+            buf.contains("ORDER BY"),
+            "deparsed SQL should contain ORDER BY: {}",
+            buf
+        );
     }
 }

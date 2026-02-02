@@ -8,7 +8,7 @@ use tracing::trace;
 
 use crate::{
     cache::query::CacheableQuery,
-    query::ast::{AstError, sql_query_convert},
+    query::ast::{AstError, query_expr_convert},
 };
 
 use super::ParseError;
@@ -56,7 +56,7 @@ pub(super) async fn handle_query(
         None => {
             let ast = pg_query::parse(query)?;
 
-            match sql_query_convert(&ast) {
+            match query_expr_convert(&ast) {
                 Ok(query) => {
                     // Successfully parsed as SELECT
                     if let Ok(cacheable_query) = CacheableQuery::try_from(&query) {

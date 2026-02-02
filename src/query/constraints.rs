@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedSelectStatement, ResolvedTableSource, ResolvedWhereExpr,
+    ResolvedColumnNode, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
 };
 
 /// A constraint that a column equals a constant value
@@ -129,7 +129,7 @@ fn collect_from_table_source(
 
 /// Collect all equality constraints and equivalences from the entire query
 fn collect_query_equalities(
-    resolved: &ResolvedSelectStatement,
+    resolved: &ResolvedSelectNode,
 ) -> (HashSet<ColumnConstraint>, HashSet<ColumnEquivalence>) {
     let mut constraints = HashSet::new();
     let mut equivalences = HashSet::new();
@@ -190,7 +190,7 @@ fn propagate_constraints(
 }
 
 /// Analyze a resolved query to determine all constant constraints on columns
-pub fn analyze_query_constraints(resolved: &ResolvedSelectStatement) -> QueryConstraints {
+pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstraints {
     // Step 1: Collect all equality information (constraints + equivalences)
     let (constraints, equivalences) = collect_query_equalities(resolved);
 
@@ -222,10 +222,20 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use crate::catalog::{ColumnMetadata, TableMetadata};
-    use crate::query::ast::{Statement, sql_query_convert};
-    use crate::query::resolved::select_statement_resolve;
+    use crate::query::ast::{QueryBody, query_expr_convert};
+    use crate::query::resolved::select_node_resolve;
 
     use super::*;
+
+    // Helper function to parse SQL and resolve to ResolvedSelectNode
+    fn resolve_sql(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
+        let ast = pg_query::parse(sql).expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let QueryBody::Select(node) = query_expr.body else {
+            panic!("expected SELECT");
+        };
+        select_node_resolve(&node, tables, &["public"]).expect("resolve")
+    }
 
     // Helper function to create test table metadata
     fn test_table_metadata(name: &str, relation_oid: u32) -> TableMetadata {
@@ -267,10 +277,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         let sql = "SELECT * FROM users WHERE id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -290,10 +297,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("test_map", 1002));
 
         let sql = "SELECT * FROM test t JOIN test_map tm ON tm.id = t.id WHERE t.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -346,10 +350,7 @@ mod tests {
 
         // Use parentheses to avoid parser issues with nested JOINs
         let sql = "SELECT * FROM (a JOIN b ON a.id = b.id) JOIN c ON b.id = c.id WHERE a.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -376,10 +377,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         let sql = "SELECT * FROM users WHERE id = 1 AND name = 'john'";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -407,10 +405,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("b", 1002));
 
         let sql = "SELECT * FROM a, b WHERE a.id = b.id AND a.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -432,10 +427,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         let sql = "SELECT * FROM users WHERE id = 1 OR id = 2";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -450,10 +442,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("test", 1001));
 
         let sql = "SELECT * FROM test t1 JOIN test t2 ON t1.id = t2.id WHERE t1.id = 1";
-        let ast = pg_query::parse(sql).unwrap();
-        let sql_query = sql_query_convert(&ast).unwrap();
-        let Statement::Select(stmt) = &sql_query.statement;
-        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+        let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 

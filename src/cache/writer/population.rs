@@ -9,7 +9,7 @@ use tracing::{debug, error, trace};
 
 use crate::catalog::TableMetadata;
 use crate::query::ast::Deparse;
-use crate::query::resolved::{ResolvedSelectStatement, ResolvedTableNode};
+use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
 
 use super::super::{CacheError, CacheResult, MapIntoReport, messages::WriterCommand};
 use super::PopulationWork;
@@ -77,7 +77,7 @@ async fn population_task(
     generation: u64,
     relation_oids: &[u32],
     table_metadata: &[TableMetadata],
-    resolved: &ResolvedSelectStatement,
+    resolved: &ResolvedSelectNode,
     db_origin: Rc<Client>,
     db_cache: &Client,
 ) -> CacheResult<usize> {
@@ -139,7 +139,7 @@ async fn population_fetch(
     db_origin: &Client,
     relation_oid: u32,
     table: &TableMetadata,
-    resolved: &ResolvedSelectStatement,
+    resolved: &ResolvedSelectNode,
 ) -> CacheResult<Vec<SimpleQueryMessage>> {
     let maybe_alias = resolved
         .nodes::<ResolvedTableNode>()
@@ -150,8 +150,8 @@ async fn population_fetch(
     let select_columns = table.resolved_select_columns(maybe_alias);
 
     // Build query with table columns
-    use crate::query::transform::resolved_select_replace;
-    let new_ast = resolved_select_replace(resolved, select_columns);
+    use crate::query::transform::resolved_select_node_replace;
+    let new_ast = resolved_select_node_replace(resolved, select_columns);
     let mut buf = String::with_capacity(1024);
     new_ast.deparse(&mut buf);
 

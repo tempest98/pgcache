@@ -8,12 +8,12 @@ use crate::{
     cache::{QueryParameter, QueryParameters, query::CacheableQuery},
     catalog::TableMetadata,
     query::ast::{
-        ColumnExpr, LiteralValue, SelectColumn, SelectColumns, SelectStatement, TableAlias,
-        TableNode, TableSource, TableSubqueryNode, WhereExpr,
+        ColumnExpr, LiteralValue, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode,
+        TableAlias, TableNode, TableSource, ValuesClause, WhereExpr,
     },
     query::resolved::{
-        ResolvedSelectColumns, ResolvedSelectStatement, ResolvedTableSource,
-        ResolvedTableSubqueryNode,
+        ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns, ResolvedSelectNode,
+        ResolvedTableSource, ResolvedTableSubqueryNode,
     },
 };
 
@@ -36,46 +36,21 @@ error_set! {
 /// Result type with location-tracking error reports for AST transform operations.
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
-/// Replace parameter placeholders ($1, $2, etc.) in a SelectStatement with actual values.
+/// Replace parameter placeholders ($1, $2, etc.) in a QueryExpr with actual values.
 ///
 /// This function traverses the AST and replaces all `LiteralValue::Parameter` nodes
 /// with appropriate typed `LiteralValue` nodes based on the provided parameter values.
-///
-/// # Arguments
-/// * `select_statement` - The SELECT statement containing parameter placeholders
-/// * `parameters` - The parameter values, indexed from 0 (for $1, $2, etc.)
-///
-/// # Returns
-/// A new `SelectStatement` with parameters replaced by literal values
-///
-/// # Errors
-/// Returns `AstTransformError` if:
-/// - A parameter index is out of bounds
-/// - A parameter placeholder format is invalid
-/// - Parameter value contains invalid UTF-8
-pub fn ast_parameters_replace(
-    select_statement: &SelectStatement,
+pub fn query_expr_parameters_replace(
+    query_expr: &QueryExpr,
     parameters: &QueryParameters,
-) -> AstTransformResult<SelectStatement> {
-    let mut new_stmt = select_statement.clone();
+) -> AstTransformResult<QueryExpr> {
+    let mut new_query = query_expr.clone();
 
-    // Replace parameters in WHERE clause
-    if let Some(where_clause) = &mut new_stmt.where_clause {
-        where_expr_parameters_replace(where_clause, parameters)?;
-    }
-
-    // Replace parameters in HAVING clause
-    if let Some(having) = &mut new_stmt.having {
-        where_expr_parameters_replace(having, parameters)?;
-    }
-
-    // Replace parameters in JOIN conditions
-    for table_source in &mut new_stmt.from {
-        table_source_parameters_replace(table_source, parameters)?;
-    }
+    // Replace parameters in body
+    query_body_parameters_replace(&mut new_query.body, parameters)?;
 
     // Replace parameters in LIMIT clause
-    if let Some(limit) = &mut new_stmt.limit {
+    if let Some(limit) = &mut new_query.limit {
         if let Some(count) = &mut limit.count {
             literal_value_parameters_replace(count, parameters)?;
         }
@@ -84,7 +59,67 @@ pub fn ast_parameters_replace(
         }
     }
 
-    Ok(new_stmt)
+    Ok(new_query)
+}
+
+/// Replace parameters in a QueryBody
+fn query_body_parameters_replace(
+    body: &mut QueryBody,
+    parameters: &QueryParameters,
+) -> AstTransformResult<()> {
+    match body {
+        QueryBody::Select(select_node) => {
+            select_node_parameters_replace(select_node, parameters)?;
+        }
+        QueryBody::Values(_) => {
+            // Values clauses contain literals, no parameters to replace
+        }
+        QueryBody::SetOp(set_op) => {
+            query_expr_parameters_replace_mut(&mut set_op.left, parameters)?;
+            query_expr_parameters_replace_mut(&mut set_op.right, parameters)?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace parameters in a QueryExpr (mutable version for recursive calls)
+fn query_expr_parameters_replace_mut(
+    query_expr: &mut QueryExpr,
+    parameters: &QueryParameters,
+) -> AstTransformResult<()> {
+    query_body_parameters_replace(&mut query_expr.body, parameters)?;
+    if let Some(limit) = &mut query_expr.limit {
+        if let Some(count) = &mut limit.count {
+            literal_value_parameters_replace(count, parameters)?;
+        }
+        if let Some(offset) = &mut limit.offset {
+            literal_value_parameters_replace(offset, parameters)?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace parameters in a SelectNode (mutates in place)
+pub fn select_node_parameters_replace(
+    select_node: &mut SelectNode,
+    parameters: &QueryParameters,
+) -> AstTransformResult<()> {
+    // Replace parameters in WHERE clause
+    if let Some(where_clause) = &mut select_node.where_clause {
+        where_expr_parameters_replace(where_clause, parameters)?;
+    }
+
+    // Replace parameters in HAVING clause
+    if let Some(having) = &mut select_node.having {
+        where_expr_parameters_replace(having, parameters)?;
+    }
+
+    // Replace parameters in JOIN conditions
+    for table_source in &mut select_node.from {
+        table_source_parameters_replace(table_source, parameters)?;
+    }
+
+    Ok(())
 }
 
 /// Replace parameters in a TableSource (recursively handles JOINs)
@@ -104,7 +139,7 @@ fn table_source_parameters_replace(
         }
         TableSource::Subquery(subquery) => {
             // Replace parameters in subquery
-            *subquery.select = ast_parameters_replace(&subquery.select, parameters)?;
+            query_expr_parameters_replace_mut(&mut subquery.query, parameters)?;
         }
         TableSource::Table(_) => {
             // No parameters in simple table references
@@ -413,56 +448,44 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Lit
     }
 }
 
-pub fn query_select_replace(
-    select_statement: &SelectStatement,
-    columns: SelectColumns,
-) -> SelectStatement {
-    let mut new_stmt = select_statement.clone();
-    new_stmt.columns = columns;
-
-    new_stmt
-}
-
-/// Replace SELECT columns in a resolved statement for cache population fetches.
-///
-/// This function is used when fetching raw rows from the origin database to populate
-/// the cache. It strips aggregation-related clauses (GROUP BY, HAVING) and result-limiting
-/// clauses (ORDER BY, LIMIT, DISTINCT) because:
-///
-/// - We want raw rows, not aggregated results
-/// - Aggregation is performed at cache retrieval time by the cache database
-/// - All matching rows should be cached, not a subset
-pub fn resolved_select_replace(
-    resolved_statement: &ResolvedSelectStatement,
-    columns: ResolvedSelectColumns,
-) -> ResolvedSelectStatement {
-    ResolvedSelectStatement {
+/// Replace SELECT columns in a SelectNode.
+pub fn select_node_columns_replace(node: &SelectNode, columns: SelectColumns) -> SelectNode {
+    SelectNode {
+        distinct: node.distinct,
         columns,
-        from: resolved_statement.from.clone(),
-        where_clause: resolved_statement.where_clause.clone(),
-        // Strip aggregation-related clauses for raw row fetching
-        group_by: vec![],
-        having: None,
-        order_by: vec![],
-        limit: None,
-        distinct: false,
-        values: vec![],
+        from: node.from.clone(),
+        where_clause: node.where_clause.clone(),
+        group_by: node.group_by.clone(),
+        having: node.having.clone(),
     }
 }
 
-/// Replace a table source with a VALUES clause in a resolved statement.
+/// Replace SELECT columns in a ResolvedSelectNode for cache population fetches.
 ///
-/// Similar to `query_table_replace_with_values` but operates on the resolved AST.
-/// Finds the table matching `table_metadata.relation_oid` and replaces it with a subquery
-/// containing a VALUES clause built from `row_data`.
+/// This strips aggregation-related clauses (GROUP BY, HAVING) and DISTINCT because
+/// we want raw rows for caching, with aggregation performed at cache retrieval time.
+pub fn resolved_select_node_replace(
+    resolved: &ResolvedSelectNode,
+    columns: ResolvedSelectColumns,
+) -> ResolvedSelectNode {
+    ResolvedSelectNode {
+        distinct: false,
+        columns,
+        from: resolved.from.clone(),
+        where_clause: resolved.where_clause.clone(),
+        group_by: vec![],
+        having: None,
+    }
+}
+
+/// Replace a table source with a VALUES clause in a ResolvedSelectNode.
 ///
-/// Also updates all column references for the replaced table to use the subquery alias
-/// instead of the fully qualified schema.table reference.
-pub fn resolved_table_replace_with_values(
-    resolved: &ResolvedSelectStatement,
+/// Similar to `resolved_table_replace_with_values` but operates on the new ResolvedSelectNode type.
+pub fn resolved_select_node_table_replace_with_values(
+    resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
     row_data: &[Option<String>],
-) -> AstTransformResult<ResolvedSelectStatement> {
+) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
     let relation_oid = table_metadata.relation_oid;
 
@@ -497,7 +520,7 @@ pub fn resolved_table_replace_with_values(
     };
 
     // Update all column references for this table to use the alias
-    resolved_column_alias_update(
+    resolved_select_node_column_alias_update(
         &mut resolved_new,
         &table_metadata.schema,
         &table_metadata.name,
@@ -545,9 +568,10 @@ pub fn resolved_table_replace_with_values(
     }
 
     *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-        select: Box::new(ResolvedSelectStatement {
-            values: vec![values],
-            ..Default::default()
+        query: Box::new(ResolvedQueryExpr {
+            body: ResolvedQueryBody::Values(ValuesClause { rows: vec![values] }),
+            order_by: vec![],
+            limit: None,
         }),
         alias: TableAlias {
             name: alias,
@@ -558,12 +582,9 @@ pub fn resolved_table_replace_with_values(
     Ok(resolved_new)
 }
 
-/// Update all column references for a specific table to use an alias.
-///
-/// This is needed when replacing a table with a VALUES subquery - the column
-/// references need to use just the alias instead of schema.table.
-fn resolved_column_alias_update(
-    resolved: &mut ResolvedSelectStatement,
+/// Update all column references for a specific table to use an alias in a ResolvedSelectNode.
+fn resolved_select_node_column_alias_update(
+    resolved: &mut ResolvedSelectNode,
     schema: &str,
     table: &str,
     alias: &str,
@@ -572,12 +593,36 @@ fn resolved_column_alias_update(
     if let Some(where_clause) = &mut resolved.where_clause {
         resolved_where_column_alias_update(where_clause, schema, table, alias);
     }
-
     // Update SELECT columns
     resolved_select_columns_alias_update(&mut resolved.columns, schema, table, alias);
+}
 
-    // Update ORDER BY columns
-    for order_by in &mut resolved.order_by {
+/// Update column aliases in a ResolvedQueryExpr
+fn resolved_query_expr_column_alias_update(
+    query: &mut ResolvedQueryExpr,
+    schema: &str,
+    table: &str,
+    alias: &str,
+) {
+    match &mut query.body {
+        ResolvedQueryBody::Select(select_node) => {
+            // Update WHERE clause columns
+            if let Some(where_clause) = &mut select_node.where_clause {
+                resolved_where_column_alias_update(where_clause, schema, table, alias);
+            }
+            // Update SELECT columns
+            resolved_select_columns_alias_update(&mut select_node.columns, schema, table, alias);
+        }
+        ResolvedQueryBody::Values(_) => {
+            // VALUES clauses don't have column references to update
+        }
+        ResolvedQueryBody::SetOp(set_op) => {
+            resolved_query_expr_column_alias_update(&mut set_op.left, schema, table, alias);
+            resolved_query_expr_column_alias_update(&mut set_op.right, schema, table, alias);
+        }
+    }
+    // Update ORDER BY columns at query level
+    for order_by in &mut query.order_by {
         resolved_column_expr_alias_update(&mut order_by.expr, schema, table, alias);
     }
 }
@@ -614,7 +659,7 @@ fn resolved_where_column_alias_update(
             }
         }
         ResolvedWhereExpr::Subquery { query } => {
-            resolved_column_alias_update(query, schema, table, alias);
+            resolved_query_expr_column_alias_update(query, schema, table, alias);
         }
         ResolvedWhereExpr::Value(_) => {}
     }
@@ -697,7 +742,7 @@ fn resolved_column_expr_alias_update(
             resolved_column_expr_alias_update(&mut arith.right, schema, table, alias);
         }
         ResolvedColumnExpr::Subquery(query) => {
-            resolved_column_alias_update(query, schema, table, alias);
+            resolved_query_expr_column_alias_update(query, schema, table, alias);
         }
         ResolvedColumnExpr::Literal(_) => {}
     }
@@ -709,9 +754,9 @@ fn resolved_column_expr_alias_update(
 /// if a change to any table affects the cached result.
 pub fn query_table_update_queries(
     cacheable_query: &CacheableQuery,
-) -> Vec<(&TableNode, SelectStatement)> {
-    let select = cacheable_query.statement();
-    let tables = select.nodes::<TableNode>().collect::<Vec<_>>();
+) -> Vec<(&TableNode, SelectNode)> {
+    let select_node = &cacheable_query.node;
+    let tables = select_node.nodes::<TableNode>().collect::<Vec<_>>();
 
     let column = SelectColumn {
         expr: ColumnExpr::Literal(LiteralValue::Boolean(true)),
@@ -721,91 +766,8 @@ pub fn query_table_update_queries(
 
     tables
         .into_iter()
-        .map(|table| (table, query_select_replace(select, select_list.clone())))
+        .map(|table| (table, select_node_columns_replace(select_node, select_list.clone())))
         .collect()
-}
-
-pub fn query_table_replace_with_values(
-    select: &SelectStatement,
-    table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
-) -> AstTransformResult<SelectStatement> {
-    let mut select_new = select.clone();
-
-    //find first matching table source
-    let Some(first_from) = select_new.from.first_mut() else {
-        return Err(AstTransformError::MissingTable.into());
-    };
-    let mut frontier = vec![first_from];
-    let mut source_node: Option<&mut TableSource> = None;
-    while let Some(cur) = frontier.pop() {
-        match cur {
-            TableSource::Join(join) => {
-                frontier.push(&mut join.left);
-                frontier.push(&mut join.right);
-            }
-            TableSource::Table(table) => {
-                if table.name == table_metadata.name {
-                    source_node = Some(cur);
-                    break;
-                }
-            }
-            _ => (),
-        }
-    }
-
-    let Some(source_node) = source_node else {
-        return Err(AstTransformError::MissingTable.into());
-    };
-    let TableSource::Table(table_node) = source_node else {
-        return Err(AstTransformError::MissingTable.into());
-    };
-
-    let mut column_names = Vec::new();
-    let mut values = Vec::new();
-
-    for column_meta in &table_metadata.columns {
-        let position = column_meta.position as usize - 1;
-        if let Some(row_value) = row_data.get(position) {
-            let value = row_value.as_deref().map_or(LiteralValue::Null, |v| {
-                //some ugly casting
-                LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone())
-            });
-
-            column_names.push(column_meta.name.as_str());
-            values.push(value);
-        }
-    }
-
-    let alias = if let Some(table_alias) = &table_node.alias {
-        let mut alias = table_alias.clone();
-        if table_alias.columns.is_empty() {
-            for name in column_names {
-                alias.columns.push(name.to_owned());
-            }
-        }
-        alias
-    } else {
-        let mut alias = TableAlias {
-            name: table_metadata.name.clone(),
-            columns: Vec::new(),
-        };
-        for name in column_names {
-            alias.columns.push(name.to_owned());
-        }
-        alias
-    };
-
-    *source_node = TableSource::Subquery(TableSubqueryNode {
-        lateral: false,
-        select: Box::new(SelectStatement {
-            values: vec![values],
-            ..Default::default()
-        }),
-        alias: Some(alias),
-    });
-
-    Ok(select_new)
 }
 
 #[cfg(test)]
@@ -813,9 +775,16 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::wildcard_enum_match_arm)]
 
-    use crate::query::ast::{Deparse, Statement, sql_query_convert};
+    use crate::query::ast::{Deparse, query_expr_convert};
 
     use super::*;
+
+    /// Helper to parse SQL and return a CacheableQuery
+    fn parse_cacheable(sql: &str) -> CacheableQuery {
+        let ast = pg_query::parse(sql).expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        CacheableQuery::try_from(&query_expr).expect("query to be cacheable")
+    }
 
     /// Helper to create QueryParameters for text format with TEXT OID
     fn text_params(values: Vec<Option<&[u8]>>) -> QueryParameters {
@@ -855,40 +824,43 @@ mod tests {
         }
     }
 
+    /// Parse SQL and return a SelectNode (for tests using new types)
+    fn parse_select_node(sql: &str) -> SelectNode {
+        use crate::query::ast::{query_expr_convert, QueryBody};
+        let ast = pg_query::parse(sql).expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        match query_expr.body {
+            QueryBody::Select(node) => node,
+            _ => panic!("expected SELECT"),
+        }
+    }
+
     #[test]
     fn test_ast_parameters_replace_simple() {
-        let query = "SELECT id FROM users WHERE id = $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
 
         // Replace $1 with value "42"
         let params = text_params(vec![Some(b"42")]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         // Deparse to verify
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert_eq!(buf, "SELECT id FROM users WHERE id = '42'");
     }
 
     #[test]
     fn test_ast_parameters_replace_multiple_params() {
-        let query = "SELECT id FROM users WHERE id = $1 AND name = $2";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1 AND name = $2");
 
         // Replace $1 with "42", $2 with "alice"
         let params = text_params(vec![Some(b"42"), Some(b"alice")]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         // Deparse to verify
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert_eq!(
             buf,
@@ -898,34 +870,26 @@ mod tests {
 
     #[test]
     fn test_ast_parameters_replace_null() {
-        let query = "SELECT id FROM users WHERE name = $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE name = $1");
 
         // Replace $1 with NULL
         let params = text_params(vec![None]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         // Deparse to verify
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert_eq!(buf, "SELECT id FROM users WHERE name = NULL");
     }
 
     #[test]
     fn test_ast_parameters_replace_out_of_bounds() {
-        let query = "SELECT id FROM users WHERE id = $2";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE id = $2");
 
         // Only provide 1 parameter, but query uses $2
         let params = text_params(vec![Some(b"42")]);
-        let result = ast_parameters_replace(stmt, &params);
+        let result = select_node_parameters_replace(&mut node, &params);
 
         assert!(result.is_err());
         match result.map_err(|e| e.into_current_context()) {
@@ -939,19 +903,17 @@ mod tests {
 
     #[test]
     fn test_ast_parameters_replace_in_join() {
-        let query = "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node(
+            "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > $1",
+        );
 
         // Replace $1 with "100"
         let params = text_params(vec![Some(b"100")]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         // Deparse to verify
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert!(buf.contains("WHERE o.total > '100'"));
     }
@@ -959,12 +921,8 @@ mod tests {
     #[test]
     fn test_query_select_replace() {
         // Test replacing specific columns with SELECT *
-        let original_query = "SELECT id, name, email FROM users WHERE id = 1";
-        let ast = pg_query::parse(original_query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let result = query_select_replace(stmt, SelectColumns::All);
+        let node = parse_select_node("SELECT id, name, email FROM users WHERE id = 1");
+        let result = select_node_columns_replace(&node, SelectColumns::All);
 
         // Deparse to verify the transformation
         let mut buf = String::new();
@@ -992,13 +950,10 @@ mod tests {
     #[test]
     fn test_query_select_replace_with_complex_where() {
         // Test with more complex query
-        let original_query =
-            "SELECT a.id, b.data FROM table_a a WHERE a.status = 'active' AND b.enabled = true";
-        let ast = pg_query::parse(original_query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
-        let result = query_select_replace(stmt, SelectColumns::All);
+        let node = parse_select_node(
+            "SELECT a.id, b.data FROM table_a a WHERE a.status = 'active' AND b.enabled = true",
+        );
+        let result = select_node_columns_replace(&node, SelectColumns::All);
 
         // Deparse to verify the transformation
         let mut buf = String::new();
@@ -1040,10 +995,7 @@ mod tests {
     #[test]
     fn test_query_table_update_query_simple_select() {
         let original_query = "SELECT id, name, email FROM users WHERE id = 1";
-        let ast = pg_query::parse(original_query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let cacheable_query = parse_cacheable(original_query);
         let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 1);
@@ -1059,10 +1011,7 @@ mod tests {
         let original_query = "SELECT id, name, email FROM users \
                             JOIN location ON location.user_id = users.user_id \
                             WHERE users.user_id = 1";
-        let ast = pg_query::parse(original_query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let cacheable_query = parse_cacheable(original_query);
         let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 2);
@@ -1088,10 +1037,7 @@ mod tests {
                             JOIN location ON location.user_id = users.user_id \
                             JOIN orders ON orders.user_id = users.user_id \
                             WHERE users.user_id = 1";
-        let ast = pg_query::parse(original_query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let cacheable_query = parse_cacheable(original_query);
         let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 3, "Should have 3 update queries for 3 tables");
@@ -1116,10 +1062,7 @@ mod tests {
                             JOIN c ON b.id = c.id \
                             JOIN d ON c.id = d.id \
                             WHERE a.id = 1";
-        let ast = pg_query::parse(original_query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let cacheable_query = CacheableQuery::try_from(&sql_query).expect("query to be cacheable");
+        let cacheable_query = parse_cacheable(original_query);
         let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 4, "Should have 4 update queries for 4 tables");
@@ -1136,18 +1079,14 @@ mod tests {
 
     #[test]
     fn test_text_parameter_integer() {
-        let query = "SELECT id FROM users WHERE id = $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
 
         // Integer type should produce integer literal
         let params = typed_text_params(vec![(Some(b"42"), PgType::INT4)]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         // Integer literal renders without quotes
         assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
@@ -1155,35 +1094,27 @@ mod tests {
 
     #[test]
     fn test_text_parameter_boolean() {
-        let query = "SELECT id FROM users WHERE active = $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE active = $1");
 
         // Boolean 't' -> true
         let params = typed_text_params(vec![(Some(b"t"), PgType::BOOL)]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert_eq!(buf, "SELECT id FROM users WHERE active = true");
     }
 
     #[test]
     fn test_text_parameter_float() {
-        let query = "SELECT id FROM users WHERE score > $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE score > $1");
 
         let params = typed_text_params(vec![(Some(b"3.14"), PgType::FLOAT8)]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert_eq!(buf, "SELECT id FROM users WHERE score > 3.14");
     }
@@ -1205,20 +1136,16 @@ mod tests {
 
     #[test]
     fn test_text_parameter_uuid() {
-        let query = "SELECT id FROM users WHERE uuid = $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE uuid = $1");
 
         let params = typed_text_params(vec![(
             Some(b"550e8400-e29b-41d4-a716-446655440000"),
             PgType::UUID,
         )]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert_eq!(
             buf,
@@ -1409,28 +1336,24 @@ mod tests {
 
     #[test]
     fn test_binary_int4_in_query() {
-        let query = "SELECT id FROM users WHERE id = $1";
-        let ast = pg_query::parse(query).expect("to parse query");
-        let sql_query = sql_query_convert(&ast).expect("to convert to SqlQuery");
-
-        let Statement::Select(stmt) = &sql_query.statement;
+        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
 
         // Binary INT4: 42 in big-endian
         let params = binary_params(vec![(Some(&[0x00, 0x00, 0x00, 0x2A]), PgType::INT4)]);
-        let result = ast_parameters_replace(stmt, &params).expect("to replace parameters");
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         let mut buf = String::new();
-        result.deparse(&mut buf);
+        node.deparse(&mut buf);
 
         assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
     }
 
     #[test]
-    fn test_resolved_select_replace_strips_group_by() {
+    fn test_resolved_select_node_replace_strips_group_by() {
         use crate::catalog::ColumnMetadata;
         use postgres_types::Type;
         use crate::query::resolved::{
-            ResolvedColumnNode, ResolvedSelectColumns, ResolvedSelectStatement,
+            ResolvedColumnNode, ResolvedSelectColumns, ResolvedSelectNode,
         };
 
         let col_meta = ColumnMetadata {
@@ -1443,7 +1366,7 @@ mod tests {
             is_primary_key: false,
         };
 
-        let stmt = ResolvedSelectStatement {
+        let node = ResolvedSelectNode {
             group_by: vec![ResolvedColumnNode {
                 schema: "public".to_owned(),
                 table: "orders".to_owned(),
@@ -1454,22 +1377,22 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+        let result = resolved_select_node_replace(&node, ResolvedSelectColumns::None);
 
         assert!(
             result.group_by.is_empty(),
-            "resolved_select_replace should strip GROUP BY"
+            "resolved_select_node_replace should strip GROUP BY"
         );
     }
 
     #[test]
-    fn test_resolved_select_replace_strips_having() {
+    fn test_resolved_select_node_replace_strips_having() {
         use crate::query::ast::BinaryOp;
         use crate::query::resolved::{
-            ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectStatement, ResolvedWhereExpr,
+            ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectNode, ResolvedWhereExpr,
         };
 
-        let stmt = ResolvedSelectStatement {
+        let node = ResolvedSelectNode {
             having: Some(ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
@@ -1478,83 +1401,23 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+        let result = resolved_select_node_replace(&node, ResolvedSelectColumns::None);
 
         assert!(
             result.having.is_none(),
-            "resolved_select_replace should strip HAVING"
+            "resolved_select_node_replace should strip HAVING"
         );
     }
 
-    #[test]
-    fn test_resolved_select_replace_strips_order_by() {
-        use crate::catalog::ColumnMetadata;
-        use postgres_types::Type;
-        use crate::query::ast::OrderDirection;
-        use crate::query::resolved::{
-            ResolvedColumnExpr, ResolvedColumnNode, ResolvedOrderByClause, ResolvedSelectColumns,
-            ResolvedSelectStatement,
-        };
-
-        let col_meta = ColumnMetadata {
-            name: "created_at".to_owned(),
-            position: 1,
-            type_oid: 1184,
-            data_type: Type::TIMESTAMP,
-            type_name: "timestamp".to_owned(),
-            cache_type_name: "timestamp".to_owned(),
-            is_primary_key: false,
-        };
-
-        let stmt = ResolvedSelectStatement {
-            order_by: vec![ResolvedOrderByClause {
-                expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
-                    schema: "public".to_owned(),
-                    table: "orders".to_owned(),
-                    table_alias: None,
-                    column: "created_at".to_owned(),
-                    column_metadata: col_meta,
-                }),
-                direction: OrderDirection::Asc,
-            }],
-            ..Default::default()
-        };
-
-        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
-
-        assert!(
-            result.order_by.is_empty(),
-            "resolved_select_replace should strip ORDER BY"
-        );
-    }
+    // Note: ORDER BY and LIMIT tests removed - these fields are now on ResolvedQueryExpr,
+    // not ResolvedSelectNode. The resolved_select_node_replace function only operates on
+    // ResolvedSelectNode which doesn't have order_by or limit fields.
 
     #[test]
-    fn test_resolved_select_replace_strips_limit() {
-        use crate::query::resolved::{
-            ResolvedLimitClause, ResolvedSelectColumns, ResolvedSelectStatement,
-        };
-
-        let stmt = ResolvedSelectStatement {
-            limit: Some(ResolvedLimitClause {
-                count: Some(LiteralValue::Integer(10)),
-                offset: Some(LiteralValue::Integer(5)),
-            }),
-            ..Default::default()
-        };
-
-        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
-
-        assert!(
-            result.limit.is_none(),
-            "resolved_select_replace should strip LIMIT"
-        );
-    }
-
-    #[test]
-    fn test_resolved_select_replace_preserves_where() {
+    fn test_resolved_select_node_replace_preserves_where() {
         use crate::query::ast::BinaryOp;
         use crate::query::resolved::{
-            ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectStatement, ResolvedWhereExpr,
+            ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectNode, ResolvedWhereExpr,
         };
 
         let where_clause = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
@@ -1563,26 +1426,26 @@ mod tests {
             rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
         });
 
-        let stmt = ResolvedSelectStatement {
+        let node = ResolvedSelectNode {
             where_clause: Some(where_clause),
             ..Default::default()
         };
 
-        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+        let result = resolved_select_node_replace(&node, ResolvedSelectColumns::None);
 
         assert!(
             result.where_clause.is_some(),
-            "resolved_select_replace should preserve WHERE clause"
+            "resolved_select_node_replace should preserve WHERE clause"
         );
     }
 
     #[test]
-    fn test_resolved_select_replace_preserves_from() {
+    fn test_resolved_select_node_replace_preserves_from() {
         use crate::query::resolved::{
-            ResolvedSelectColumns, ResolvedSelectStatement, ResolvedTableNode, ResolvedTableSource,
+            ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableNode, ResolvedTableSource,
         };
 
-        let stmt = ResolvedSelectStatement {
+        let node = ResolvedSelectNode {
             from: vec![ResolvedTableSource::Table(ResolvedTableNode {
                 schema: "public".to_owned(),
                 name: "orders".to_owned(),
@@ -1592,12 +1455,12 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolved_select_replace(&stmt, ResolvedSelectColumns::None);
+        let result = resolved_select_node_replace(&node, ResolvedSelectColumns::None);
 
         assert_eq!(
             result.from.len(),
             1,
-            "resolved_select_replace should preserve FROM clause"
+            "resolved_select_node_replace should preserve FROM clause"
         );
     }
 }

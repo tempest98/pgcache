@@ -201,8 +201,8 @@ impl ConnectionState {
                             }
                             Ok(Action::CacheCheck(ast)) => {
                                 // Create timing with fingerprint from the cacheable query
-                                use crate::query::ast::ast_query_fingerprint;
-                                let fingerprint = ast_query_fingerprint(ast.statement());
+                                use crate::query::ast::select_node_fingerprint;
+                                let fingerprint = select_node_fingerprint(&ast.node);
                                 let query_id = QueryId::new(fingerprint);
                                 let received_at = self.query_start.unwrap_or_else(Instant::now);
                                 let mut timing = QueryTiming::new(query_id, received_at);
@@ -440,7 +440,7 @@ impl ConnectionState {
         if let Ok(parsed) = parse_parse_message(&msg.data) {
             // Analyze SQL type (regardless of transaction state - deferred to Execute)
             let sql_type = match pg_query::parse(&parsed.sql) {
-                Ok(ast) => match crate::query::ast::sql_query_convert(&ast) {
+                Ok(ast) => match crate::query::ast::query_expr_convert(&ast) {
                     Ok(query) => match CacheableQuery::try_from(&query) {
                         Ok(cacheable_query) => StatementType::Cacheable(Box::new(cacheable_query)),
                         Err(_) => StatementType::UncacheableSelect,
@@ -472,11 +472,11 @@ impl ConnectionState {
         self.proxy_mode = match self.try_cache_execute(&msg) {
             Some(cache_msg) => {
                 // Create timing with fingerprint from the cacheable query
-                use crate::query::ast::ast_query_fingerprint;
+                use crate::query::ast::select_node_fingerprint;
                 let fingerprint = match &cache_msg {
                     CacheMessage::Query(_, ast)
                     | CacheMessage::QueryParameterized(_, ast, _, _) => {
-                        ast_query_fingerprint(ast.statement())
+                        select_node_fingerprint(&ast.node)
                     }
                 };
                 let query_id = QueryId::new(fingerprint);

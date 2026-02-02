@@ -634,10 +634,10 @@ mod tests {
 
         // Test that this SQL would be cacheable
         use crate::cache::query::CacheableQuery;
-        use crate::query::ast::sql_query_convert;
+        use crate::query::ast::query_expr_convert;
 
         let ast = pg_query::parse(&result.sql).unwrap();
-        let query = sql_query_convert(&ast).unwrap();
+        let query = query_expr_convert(&ast).unwrap();
         let cacheable = CacheableQuery::try_from(&query);
         assert!(
             cacheable.is_ok(),
@@ -663,13 +663,15 @@ mod tests {
 
         // Test that this SQL parses but is NOT cacheable (has subquery)
         use crate::cache::query::{CacheabilityError, CacheableQuery};
-        use crate::query::ast::{sql_query_convert, Statement};
+        use crate::query::ast::{QueryBody, query_expr_convert};
 
         let ast = pg_query::parse(&result.sql).unwrap();
-        let query = sql_query_convert(&ast).expect("subquery should parse to AST");
+        let query = query_expr_convert(&ast).expect("subquery should parse to AST");
 
         // Verify has_sublink() detects the subquery
-        let Statement::Select(select) = &query.statement;
+        let QueryBody::Select(select) = &query.body else {
+            panic!("expected SELECT");
+        };
         assert!(select.has_sublink(), "has_sublink() should detect subquery in WHERE");
 
         // Verify cacheability check rejects it
@@ -695,10 +697,10 @@ mod tests {
         let result = parse_parse_message(&data).unwrap();
 
         // Test that INSERT is not cacheable (not a SELECT)
-        use crate::query::ast::sql_query_convert;
+        use crate::query::ast::query_expr_convert;
 
         let ast = pg_query::parse(&result.sql).unwrap();
-        let cacheable_result = sql_query_convert(&ast);
+        let cacheable_result = query_expr_convert(&ast);
         assert!(
             cacheable_result.is_err(),
             "INSERT should not convert to cacheable query"

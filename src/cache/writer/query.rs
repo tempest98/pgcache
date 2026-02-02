@@ -3,12 +3,11 @@ use std::time::Instant;
 use rootcause::Report;
 use tracing::{debug, error, info, instrument, trace};
 
-use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::query::ast::TableNode;
 use crate::query::constraints::analyze_query_constraints;
-use crate::query::resolved::select_statement_resolve;
 use crate::query::transform::query_table_update_queries;
+use crate::{catalog::TableMetadata, query::resolved::select_node_resolve};
 
 use super::super::{
     CacheError, CacheResult, ReportExt,
@@ -74,11 +73,9 @@ impl CacheWriter {
         search_path: &[&str],
         started_at: Instant,
     ) -> CacheResult<()> {
-        let select_statement = cacheable_query.statement();
         let mut relation_oids = Vec::new();
 
-        // Ensure all tables are registered in the cache
-        for table_node in select_statement.nodes::<TableNode>() {
+        for table_node in cacheable_query.node.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
             let schema = self
                 .table_schema_resolve(table_name, table_node.schema.as_deref(), search_path)
@@ -94,8 +91,7 @@ impl CacheWriter {
             }
         }
 
-        // Resolve the query using catalog metadata
-        let resolved = select_statement_resolve(select_statement, &self.cache.tables, search_path)
+        let resolved = select_node_resolve(&cacheable_query.node, &self.cache.tables, search_path)
             .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
             .attach_loc("resolving select statement")?;
 
@@ -121,7 +117,7 @@ impl CacheWriter {
                 .relation_oid;
 
             let update_resolved =
-                select_statement_resolve(&update_select, &self.cache.tables, search_path)
+                select_node_resolve(&update_select, &self.cache.tables, search_path)
                     .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
                     .attach_loc("resolving update select statement")?;
 
@@ -147,7 +143,9 @@ impl CacheWriter {
             fingerprint,
             generation,
             relation_oids: relation_oids.clone(),
-            select_statement: select_statement.clone(),
+            select_node: cacheable_query.node.clone(),
+            order_by: cacheable_query.order_by.clone(),
+            limit: cacheable_query.limit.clone(),
             resolved: resolved.clone(),
             constraints: query_constraints,
             cached_bytes: 0,
@@ -156,14 +154,6 @@ impl CacheWriter {
 
         self.cache.cached_queries.insert_overwrite(cached_query);
         trace!("cached query loading");
-
-        // Update shared state view with Loading state
-        self.state_view_update(
-            fingerprint,
-            CachedQueryState::Loading,
-            generation,
-            &resolved,
-        );
 
         // Collect table metadata needed for population
         let table_metadata: Vec<TableMetadata> = relation_oids

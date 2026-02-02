@@ -3,8 +3,20 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use pgcache_lib::query::ast::{TableNode, sql_query_convert};
+use pgcache_lib::query::ast::{
+    QueryBody, SelectColumns, SelectNode, TableNode, query_expr_convert,
+};
 use pgcache_lib::query::parse::query_where_clause_parse;
+
+/// Helper to extract SelectNode from a SQL string
+fn parse_select_node(sql: &str) -> SelectNode {
+    let pg_ast = pg_query::parse(sql).expect("SQL should parse");
+    let query_expr = query_expr_convert(&pg_ast).unwrap();
+    match query_expr.body {
+        QueryBody::Select(node) => node,
+        QueryBody::Values(_) | QueryBody::SetOp(_) => panic!("expected SELECT"),
+    }
+}
 
 fn ast_conversion_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("AST Conversion");
@@ -49,9 +61,9 @@ fn ast_conversion_benchmarks(c: &mut Criterion) {
         let pg_ast = pg_query::parse(sql).expect("SQL should parse");
 
         group.bench_with_input(
-            BenchmarkId::new("sql_query_convert", name),
+            BenchmarkId::new("query_expr_convert", name),
             &pg_ast,
-            |b, ast| b.iter(|| black_box(sql_query_convert(black_box(ast)).unwrap())),
+            |b, ast| b.iter(|| black_box(query_expr_convert(black_box(ast)).unwrap())),
         );
     }
 
@@ -85,26 +97,28 @@ fn ast_helper_methods_benchmarks(c: &mut Criterion) {
     ];
 
     for (sql, name) in &test_cases {
-        let pg_ast = pg_query::parse(sql).expect("SQL should parse");
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let node = parse_select_node(sql);
 
-        // Benchmark helper methods
-        group.bench_with_input(BenchmarkId::new("is_single_table", name), &ast, |b, ast| {
-            b.iter(|| black_box(ast.is_single_table()))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("is_single_table", name),
+            &node,
+            |b, node| b.iter(|| black_box(node.is_single_table())),
+        );
 
         group.bench_with_input(
             BenchmarkId::new("has_where_clause", name),
-            &ast,
-            |b, ast| b.iter(|| black_box(ast.has_where_clause())),
+            &node,
+            |b, node| b.iter(|| black_box(node.where_clause.is_some())),
         );
 
-        group.bench_with_input(BenchmarkId::new("is_select_star", name), &ast, |b, ast| {
-            b.iter(|| black_box(ast.is_select_star()))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("is_select_star", name),
+            &node,
+            |b, node| b.iter(|| black_box(matches!(node.columns, SelectColumns::All))),
+        );
 
-        group.bench_with_input(BenchmarkId::new("tables", name), &ast, |b, ast| {
-            b.iter(|| black_box(ast.nodes::<TableNode>()))
+        group.bench_with_input(BenchmarkId::new("tables", name), &node, |b, node| {
+            b.iter(|| black_box(node.nodes::<TableNode>()))
         });
     }
 
@@ -140,29 +154,28 @@ fn ast_cloning_benchmarks(c: &mut Criterion) {
     ];
 
     for (name, sql) in &test_cases {
-        let pg_ast = pg_query::parse(sql).expect("SQL should parse");
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let node = parse_select_node(sql);
 
-        // Benchmark cloning our AST
-        group.bench_with_input(BenchmarkId::new("ast_clone", name), &ast, |b, ast| {
-            b.iter(|| black_box(ast.clone()))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("select_node_clone", name),
+            &node,
+            |b, node| b.iter(|| black_box(node.clone())),
+        );
     }
 
     // Test deep vs shallow operations with a simpler but still complex query
     let complex_sql =
         "SELECT u.id, u.name FROM users u WHERE u.active = true AND u.verified = true";
-    let complex_pg_ast = pg_query::parse(complex_sql).expect("SQL should parse");
-    let complex_ast = sql_query_convert(&complex_pg_ast).unwrap();
+    let complex_node = parse_select_node(complex_sql);
 
-    group.bench_function("complex_ast_clone", |b| {
-        b.iter(|| black_box(complex_ast.clone()))
+    group.bench_function("complex_select_node_clone", |b| {
+        b.iter(|| black_box(complex_node.clone()))
     });
 
     // Test partial cloning scenarios that might be common
-    group.bench_function("ast_where_clause_clone", |b| {
+    group.bench_function("where_clause_clone", |b| {
         b.iter(|| {
-            if let Some(where_clause) = complex_ast.where_clause() {
+            if let Some(where_clause) = &complex_node.where_clause {
                 black_box(where_clause.clone());
             }
         })

@@ -5,7 +5,7 @@ use postgres_protocol::escape;
 use tokio::sync::mpsc;
 use tokio::task::spawn_local;
 use tokio_postgres::Row;
-use tracing::{error, info, instrument, trace};
+use tracing::{debug, error, instrument, trace};
 
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
@@ -198,7 +198,7 @@ impl CacheWriter {
             return Ok(());
         };
 
-        info!("invalidating query {fingerprint}");
+        debug!("invalidating query {fingerprint}");
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
 
@@ -597,7 +597,7 @@ impl CacheWriter {
 
     pub(super) fn cache_upsert_with_predicate_sql(
         &self,
-        resolved: &crate::query::resolved::ResolvedSelectStatement,
+        resolved: &crate::query::resolved::ResolvedSelectNode,
         table_metadata: &crate::catalog::TableMetadata,
         row_data: &[Option<String>],
     ) -> CacheResult<String> {
@@ -616,7 +616,7 @@ impl CacheWriter {
             }
         }
 
-        let value_select = crate::query::transform::resolved_table_replace_with_values(
+        let value_select = crate::query::transform::resolved_select_node_table_replace_with_values(
             resolved,
             table_metadata,
             row_data,

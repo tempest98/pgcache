@@ -7,10 +7,12 @@ use std::marker::PhantomData;
 use error_set::error_set;
 use ordered_float::NotNan;
 use pg_query::ParseResult;
-use pg_query::protobuf::{ColumnRef, Node, RangeVar, SelectStmt, node::Node as NodeEnum};
 use pg_query::protobuf::{
     AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, FuncCall, JoinExpr, MinMaxExpr,
     MinMaxOp, RangeSubselect, SortByDir,
+};
+use pg_query::protobuf::{
+    ColumnRef, Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum,
 };
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
@@ -461,150 +463,116 @@ impl Deparse for WhereExpr {
     }
 }
 
-/// Simplified SQL AST focused on caching use cases
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub struct SqlQuery {
-    pub statement: Statement,
+// ============================================================================
+// New Query Type Hierarchy (for UNION/INTERSECT/EXCEPT support)
+// ============================================================================
+
+/// Set operation type for UNION/INTERSECT/EXCEPT
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetOpType {
+    Union,
+    Intersect,
+    Except,
 }
 
-impl SqlQuery {
-    /// Get all nodes of the given type
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        match &self.statement {
-            Statement::Select(select) => select.nodes(),
-        }
-    }
-
-    /// Check if query only references a single table
-    pub fn is_single_table(&self) -> bool {
-        self.nodes::<TableNode>().nth(1).is_none()
-    }
-
-    /// Check if query has a WHERE clause
-    pub fn has_where_clause(&self) -> bool {
-        match &self.statement {
-            Statement::Select(select) => select.where_clause.is_some(),
-        }
-    }
-
-    /// Get the WHERE clause if it exists
-    pub fn where_clause(&self) -> Option<&WhereExpr> {
-        match &self.statement {
-            Statement::Select(select) => select.where_clause.as_ref(),
-        }
-    }
-
-    /// Check if this is a SELECT * query
-    pub fn is_select_star(&self) -> bool {
-        match &self.statement {
-            Statement::Select(select) => matches!(select.columns, SelectColumns::All),
-        }
-    }
-}
-
-impl Deparse for SqlQuery {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.statement.deparse(buf)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub enum Statement {
-    Select(SelectStatement),
-    // Future: Insert, Update, Delete for CDC
-}
-
-impl Statement {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        match self {
-            Statement::Select(select) => select.nodes(),
-        }
-    }
-}
-
-impl Deparse for Statement {
+impl Deparse for SetOpType {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
-            Statement::Select(select) => select.deparse(buf),
-        };
-
+            SetOpType::Union => buf.push_str("UNION"),
+            SetOpType::Intersect => buf.push_str("INTERSECT"),
+            SetOpType::Except => buf.push_str("EXCEPT"),
+        }
         buf
     }
 }
 
+/// VALUES clause with typed rows - represents `VALUES (1, 'a'), (2, 'b')`
+#[derive(Debug, Clone, PartialEq, Hash, Default)]
+pub struct ValuesClause {
+    pub rows: Vec<Vec<LiteralValue>>,
+}
+
+impl ValuesClause {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        self.rows
+            .iter()
+            .flat_map(|row| row.iter().flat_map(|v| v.nodes()))
+    }
+
+    pub fn has_sublink(&self) -> bool {
+        false // VALUES clauses contain only literals
+    }
+}
+
+impl Deparse for ValuesClause {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str("VALUES ");
+        let mut row_sep = "";
+        buf.push('(');
+        for row in &self.rows {
+            buf.push_str(row_sep);
+            let mut sep = "";
+            for value in row {
+                buf.push_str(sep);
+                value.deparse(buf);
+                sep = ", ";
+            }
+            row_sep = "), (";
+        }
+        buf.push(')');
+        buf
+    }
+}
+
+/// Core SELECT without ORDER BY/LIMIT (those go on the parent query)
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub struct SelectStatement {
+pub struct SelectNode {
+    pub distinct: bool,
     pub columns: SelectColumns,
     pub from: Vec<TableSource>,
     pub where_clause: Option<WhereExpr>,
     pub group_by: Vec<ColumnNode>,
     pub having: Option<WhereExpr>,
-    pub order_by: Vec<OrderByClause>,
-    pub limit: Option<LimitClause>,
-    pub distinct: bool,
-    pub values: Vec<Vec<LiteralValue>>,
 }
 
-impl Default for SelectStatement {
+impl Default for SelectNode {
     fn default() -> Self {
         Self {
+            distinct: false,
             columns: SelectColumns::None,
             from: Vec::new(),
             where_clause: None,
             group_by: Vec::new(),
             having: None,
-            order_by: Vec::new(),
-            limit: None,
-            distinct: false,
-            values: vec![vec![]],
         }
     }
 }
 
-impl SelectStatement {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+impl SelectNode {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> + '_ {
         let columns_nodes = self.columns.nodes();
-
-        let from_nodes = {
-            let mut iter = self.from.iter();
-            let table_iter = iter.next().map(|t| t.nodes());
-            SelectStatementNodeIter {
-                iter,
-                table_iter,
-                _phantom: PhantomData,
-            }
-        };
-
+        let from_nodes = self.from.iter().flat_map(|t| t.nodes());
         let where_nodes = self.where_clause.iter().flat_map(|w| w.nodes());
         let group_by_nodes = self.group_by.iter().flat_map(|c| c.nodes());
         let having_nodes = self.having.iter().flat_map(|h| h.nodes());
-        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
-        let values_nodes = self
-            .values
-            .iter()
-            .flat_map(|row| row.iter().flat_map(|v| v.nodes()));
 
         columns_nodes
             .chain(from_nodes)
             .chain(where_nodes)
             .chain(group_by_nodes)
             .chain(having_nodes)
-            .chain(order_by_nodes)
-            .chain(values_nodes)
     }
 
-    /// Check if this SELECT statement references only a single table
+    /// Check if this SELECT references only a single table
     pub fn is_single_table(&self) -> bool {
         matches!(self.from.as_slice(), [TableSource::Table(_)])
     }
 
-    /// Check if this SELECT statement contains sublinks/subqueries
+    /// Check if this SELECT contains sublinks/subqueries
     pub fn has_sublink(&self) -> bool {
         // Check columns for subqueries
         if let SelectColumns::Columns(columns) = &self.columns
-            && columns
-                .iter()
-                .any(|col| self.column_expr_has_sublink(&col.expr))
+            && columns.iter().any(|col| col.expr.has_sublink())
         {
             return true;
         }
@@ -630,107 +598,235 @@ impl SelectStatement {
 
         false
     }
-
-    fn column_expr_has_sublink(&self, expr: &ColumnExpr) -> bool {
-        expr.has_sublink()
-    }
 }
 
-impl Deparse for SelectStatement {
+impl Deparse for SelectNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        //if values is present, ignore the rest (would be nice to represent this in the type system)
-        if !self.values.is_empty() {
-            buf.push_str("VALUES ");
-            let mut row_sep = "";
-            buf.push('(');
-            for row in &self.values {
-                buf.push_str(row_sep);
-                let mut sep = "";
-                for value in row {
-                    buf.push_str(sep);
-                    value.deparse(buf);
-                    sep = ", ";
-                }
-                row_sep = "), (";
-            }
-            buf.push(')');
-        } else {
-            buf.push_str("SELECT");
-            if self.distinct {
-                buf.push_str(" DISTINCT")
-            }
-            self.columns.deparse(buf);
+        buf.push_str("SELECT");
+        if self.distinct {
+            buf.push_str(" DISTINCT");
+        }
+        self.columns.deparse(buf);
 
-            if !self.from.is_empty() {
-                buf.push_str(" FROM");
-                let mut sep = "";
-                for table in &self.from {
-                    buf.push_str(sep);
-                    table.deparse(buf);
-                    sep = ",";
-                }
+        if !self.from.is_empty() {
+            buf.push_str(" FROM");
+            let mut sep = "";
+            for table in &self.from {
+                buf.push_str(sep);
+                table.deparse(buf);
+                sep = ",";
             }
+        }
 
-            if let Some(expr) = &self.where_clause {
-                buf.push_str(" WHERE ");
-                expr.deparse(buf);
-            }
+        if let Some(expr) = &self.where_clause {
+            buf.push_str(" WHERE ");
+            expr.deparse(buf);
+        }
 
-            if !self.group_by.is_empty() {
-                todo!();
+        if !self.group_by.is_empty() {
+            buf.push_str(" GROUP BY ");
+            let mut sep = "";
+            for col in &self.group_by {
+                buf.push_str(sep);
+                col.deparse(buf);
+                sep = ", ";
             }
+        }
 
-            if let Some(expr) = &self.having {
-                buf.push_str(" HAVING");
-                expr.deparse(buf);
-            }
-
-            if !self.order_by.is_empty() {
-                buf.push_str(" ORDER BY");
-                let mut sep = "";
-                for order in &self.order_by {
-                    buf.push_str(sep);
-                    buf.push(' ');
-                    order.deparse(buf);
-                    sep = ",";
-                }
-            }
-
-            if let Some(_limit) = &self.limit {
-                todo!();
-            }
+        if let Some(expr) = &self.having {
+            buf.push_str(" HAVING ");
+            expr.deparse(buf);
         }
 
         buf
     }
 }
 
-struct SelectStatementNodeIter<'a, N> {
-    iter: std::slice::Iter<'a, TableSource>,
-    table_iter: Option<TableSourceNodeIter<'a, N>>,
-    _phantom: PhantomData<N>,
+/// Set operation node: `left UNION/INTERSECT/EXCEPT [ALL] right`
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct SetOpNode {
+    pub op: SetOpType,
+    pub all: bool,
+    pub left: Box<QueryExpr>,
+    pub right: Box<QueryExpr>,
 }
 
-impl<'a, N: Any> Iterator for SelectStatementNodeIter<'a, N> {
-    type Item = &'a N;
+impl SetOpNode {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let left_nodes = self.left.nodes();
+        let right_nodes = self.right.nodes();
+        Box::new(current.chain(left_nodes).chain(right_nodes))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match &mut self.table_iter {
-                Some(table_iter) => {
-                    if let Some(node) = table_iter.next() {
-                        return Some(node);
-                    }
-                    // Current iterator is exhausted, try the next table source
-                    self.table_iter = self.iter.next().map(|t| t.nodes());
-                }
-                None => {
-                    // No current iterator, start with the first table source
-                    self.table_iter = self.iter.next().map(|t| t.nodes());
-                    self.table_iter.as_ref()?;
-                }
+    pub fn has_sublink(&self) -> bool {
+        self.left.has_sublink() || self.right.has_sublink()
+    }
+}
+
+impl Deparse for SetOpNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.left.deparse(buf);
+        buf.push(' ');
+        self.op.deparse(buf);
+        if self.all {
+            buf.push_str(" ALL");
+        }
+        buf.push(' ');
+        self.right.deparse(buf);
+        buf
+    }
+}
+
+/// The body of a query - SELECT, VALUES, or set operation
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub enum QueryBody {
+    Select(SelectNode),
+    Values(ValuesClause),
+    SetOp(SetOpNode),
+}
+
+impl QueryBody {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children: Box<dyn Iterator<Item = &N> + '_> = match self {
+            QueryBody::Select(select) => Box::new(select.nodes()),
+            QueryBody::Values(values) => Box::new(values.nodes()),
+            QueryBody::SetOp(set_op) => set_op.nodes(),
+        };
+        Box::new(current.chain(children))
+    }
+
+    pub fn has_sublink(&self) -> bool {
+        match self {
+            QueryBody::Select(select) => select.has_sublink(),
+            QueryBody::Values(values) => values.has_sublink(),
+            QueryBody::SetOp(set_op) => set_op.has_sublink(),
+        }
+    }
+}
+
+impl Deparse for QueryBody {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            QueryBody::Select(select) => select.deparse(buf),
+            QueryBody::Values(values) => values.deparse(buf),
+            QueryBody::SetOp(set_op) => set_op.deparse(buf),
+        }
+    }
+}
+
+/// A complete query expression with optional ordering/limiting
+///
+/// This represents a complete query that can be:
+/// - A simple SELECT
+/// - A VALUES clause
+/// - A set operation (UNION/INTERSECT/EXCEPT)
+///
+/// ORDER BY and LIMIT apply to the entire query expression.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct QueryExpr {
+    pub body: QueryBody,
+    pub order_by: Vec<OrderByClause>,
+    pub limit: Option<LimitClause>,
+}
+
+impl Default for QueryExpr {
+    fn default() -> Self {
+        Self {
+            body: QueryBody::Values(ValuesClause::default()),
+            order_by: Vec::new(),
+            limit: None,
+        }
+    }
+}
+
+impl QueryExpr {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let body_nodes = self.body.nodes();
+        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
+        Box::new(current.chain(body_nodes).chain(order_by_nodes))
+    }
+
+    /// Check if query only references a single table
+    pub fn is_single_table(&self) -> bool {
+        self.nodes::<TableNode>().nth(1).is_none()
+    }
+
+    /// Check if query has a WHERE clause (only applies to SELECT bodies)
+    pub fn has_where_clause(&self) -> bool {
+        match &self.body {
+            QueryBody::Select(select) => select.where_clause.is_some(),
+            QueryBody::Values(_) | QueryBody::SetOp(_) => false,
+        }
+    }
+
+    /// Get the WHERE clause if it exists (only for SELECT bodies)
+    pub fn where_clause(&self) -> Option<&WhereExpr> {
+        match &self.body {
+            QueryBody::Select(select) => select.where_clause.as_ref(),
+            QueryBody::Values(_) | QueryBody::SetOp(_) => None,
+        }
+    }
+
+    /// Check if this is a SELECT * query (only for SELECT bodies)
+    pub fn is_select_star(&self) -> bool {
+        match &self.body {
+            QueryBody::Select(select) => matches!(select.columns, SelectColumns::All),
+            QueryBody::Values(_) | QueryBody::SetOp(_) => false,
+        }
+    }
+
+    /// Check if this query contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        self.body.has_sublink() || self.order_by.iter().any(|o| o.expr.has_sublink())
+    }
+
+    /// Get the SELECT body if this is a simple SELECT query
+    pub fn as_select(&self) -> Option<&SelectNode> {
+        match &self.body {
+            QueryBody::Select(select) => Some(select),
+            QueryBody::Values(_) | QueryBody::SetOp(_) => None,
+        }
+    }
+
+    /// Get the SELECT body mutably if this is a simple SELECT query
+    pub fn as_select_mut(&mut self) -> Option<&mut SelectNode> {
+        match &mut self.body {
+            QueryBody::Select(select) => Some(select),
+            QueryBody::Values(_) | QueryBody::SetOp(_) => None,
+        }
+    }
+}
+
+impl Deparse for QueryExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.body.deparse(buf);
+
+        if !self.order_by.is_empty() {
+            buf.push_str(" ORDER BY");
+            let mut sep = "";
+            for order in &self.order_by {
+                buf.push_str(sep);
+                buf.push(' ');
+                order.deparse(buf);
+                sep = ",";
             }
         }
+
+        if let Some(limit) = &self.limit {
+            if let Some(count) = &limit.count {
+                buf.push_str(" LIMIT ");
+                count.deparse(buf);
+            }
+            if let Some(offset) = &limit.offset {
+                buf.push_str(" OFFSET ");
+                offset.deparse(buf);
+            }
+        }
+
+        buf
     }
 }
 
@@ -853,7 +949,7 @@ pub enum ColumnExpr {
     Literal(LiteralValue),      // Constant values
     Case(CaseExpr),             // CASE WHEN ... THEN ... END
     Arithmetic(ArithmeticExpr), // amount * -1, price + tax
-    Subquery(Box<SelectStatement>),
+    Subquery(Box<QueryExpr>),
 }
 
 impl ColumnExpr {
@@ -907,10 +1003,10 @@ impl Deparse for ColumnExpr {
 pub struct FunctionCall {
     pub name: String,
     pub args: Vec<ColumnExpr>,
-    pub agg_star: bool,     // COUNT(*)
-    pub agg_distinct: bool, // COUNT(DISTINCT col)
+    pub agg_star: bool,                // COUNT(*)
+    pub agg_distinct: bool,            // COUNT(DISTINCT col)
     pub agg_order: Vec<OrderByClause>, // ORDER BY inside aggregate: string_agg(x, ',' ORDER BY x)
-    pub over: Option<WindowSpec>, // Window function OVER clause
+    pub over: Option<WindowSpec>,      // Window function OVER clause
 }
 
 impl FunctionCall {
@@ -1251,15 +1347,15 @@ impl Deparse for TableNode {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct TableSubqueryNode {
     pub lateral: bool,
-    pub select: Box<SelectStatement>,
+    pub query: Box<QueryExpr>,
     pub alias: Option<TableAlias>,
 }
 
 impl TableSubqueryNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.select.nodes();
-        current.chain(children)
+        let children = self.query.nodes();
+        Box::new(current.chain(children))
     }
 }
 
@@ -1271,7 +1367,7 @@ impl Deparse for TableSubqueryNode {
         }
 
         buf.push('(');
-        self.select.deparse(buf);
+        self.query.deparse(buf);
         buf.push(')');
 
         if let Some(alias) = &self.alias {
@@ -1437,8 +1533,8 @@ pub struct LimitClause {
     pub offset: Option<LiteralValue>,
 }
 
-/// Convert a pg_query ParseResult into our simplified AST
-pub fn sql_query_convert(ast: &ParseResult) -> Result<SqlQuery, AstError> {
+/// Convert a pg_query ParseResult into a QueryExpr
+pub fn query_expr_convert(ast: &ParseResult) -> Result<QueryExpr, AstError> {
     let [raw_stmt] = ast.protobuf.stmts.as_slice() else {
         return Err(AstError::MultipleStatements);
     };
@@ -1446,12 +1542,7 @@ pub fn sql_query_convert(ast: &ParseResult) -> Result<SqlQuery, AstError> {
     let stmt_node = raw_stmt.stmt.as_ref().ok_or(AstError::MissingStatement)?;
 
     match stmt_node.node.as_ref() {
-        Some(NodeEnum::SelectStmt(select_stmt)) => {
-            let statement = select_statement_convert(select_stmt)?;
-            Ok(SqlQuery {
-                statement: Statement::Select(statement),
-            })
-        }
+        Some(NodeEnum::SelectStmt(select_stmt)) => select_stmt_to_query_expr(select_stmt),
         Some(other) => Err(AstError::UnsupportedStatement {
             statement_type: format!("{other:?}"),
         }),
@@ -1459,29 +1550,86 @@ pub fn sql_query_convert(ast: &ParseResult) -> Result<SqlQuery, AstError> {
     }
 }
 
-fn select_statement_convert(select_stmt: &SelectStmt) -> Result<SelectStatement, AstError> {
-    let columns = select_columns_convert(&select_stmt.target_list)?;
-    let from = from_clause_convert(&select_stmt.from_clause)?;
-    let where_clause = select_stmt_parse_where(select_stmt)?;
-    let values = value_list_convert(&select_stmt.values_lists)?;
+/// Convert a SelectStmt to a QueryExpr, handling set operations
+fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, AstError> {
+    let set_op = SetOperation::try_from(select_stmt.op).unwrap_or(SetOperation::Undefined);
+
+    // ORDER BY and LIMIT apply to the whole query expression
     let order_by = order_by_clause_convert(&select_stmt.sort_clause)?;
-    let group_by = group_by_clause_convert(&select_stmt.group_clause)?;
-    let having = having_clause_convert(select_stmt.having_clause.as_deref())?;
     let limit = limit_clause_convert(
         select_stmt.limit_count.as_deref(),
         select_stmt.limit_offset.as_deref(),
     )?;
 
-    Ok(SelectStatement {
+    let body = match set_op {
+        SetOperation::SetopNone | SetOperation::Undefined => {
+            // Check if this is a VALUES clause or a SELECT
+            if !select_stmt.values_lists.is_empty() {
+                let rows = value_list_convert(&select_stmt.values_lists)?;
+                QueryBody::Values(ValuesClause { rows })
+            } else {
+                let select_node = select_stmt_to_select_node(select_stmt)?;
+                QueryBody::Select(select_node)
+            }
+        }
+        SetOperation::SetopUnion | SetOperation::SetopIntersect | SetOperation::SetopExcept => {
+            // Parse left and right arguments
+            let larg = select_stmt
+                .larg
+                .as_ref()
+                .ok_or_else(|| AstError::UnsupportedFeature {
+                    feature: "SET operation without left argument".to_owned(),
+                })?;
+            let rarg = select_stmt
+                .rarg
+                .as_ref()
+                .ok_or_else(|| AstError::UnsupportedFeature {
+                    feature: "SET operation without right argument".to_owned(),
+                })?;
+
+            // Recursively convert left and right
+            let left = select_stmt_to_query_expr(larg)?;
+            let right = select_stmt_to_query_expr(rarg)?;
+
+            let op_type = match set_op {
+                SetOperation::SetopUnion => SetOpType::Union,
+                SetOperation::SetopIntersect => SetOpType::Intersect,
+                SetOperation::SetopExcept => SetOpType::Except,
+                // SetopNone and Undefined are handled in the outer match
+                SetOperation::SetopNone | SetOperation::Undefined => unreachable!(),
+            };
+
+            QueryBody::SetOp(SetOpNode {
+                op: op_type,
+                all: select_stmt.all,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+    };
+
+    Ok(QueryExpr {
+        body,
+        order_by,
+        limit,
+    })
+}
+
+/// Convert a SelectStmt to a SelectNode (without ORDER BY/LIMIT)
+fn select_stmt_to_select_node(select_stmt: &SelectStmt) -> Result<SelectNode, AstError> {
+    let columns = select_columns_convert(&select_stmt.target_list)?;
+    let from = from_clause_convert(&select_stmt.from_clause)?;
+    let where_clause = select_stmt_parse_where(select_stmt)?;
+    let group_by = group_by_clause_convert(&select_stmt.group_clause)?;
+    let having = having_clause_convert(select_stmt.having_clause.as_deref())?;
+
+    Ok(SelectNode {
+        distinct: !select_stmt.distinct_clause.is_empty(),
         columns,
         from,
         where_clause,
         group_by,
         having,
-        order_by,
-        limit,
-        distinct: !select_stmt.distinct_clause.is_empty(),
-        values,
     })
 }
 
@@ -1552,9 +1700,9 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                 Some(NodeEnum::SubLink(sub_link)) => {
                     match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
                         Some(NodeEnum::SelectStmt(select_stmt)) => {
-                            let statement = select_statement_convert(select_stmt)?;
+                            let query = select_stmt_to_query_expr(select_stmt)?;
                             columns.push(SelectColumn {
-                                expr: ColumnExpr::Subquery(Box::new(statement)),
+                                expr: ColumnExpr::Subquery(Box::new(query)),
                                 alias,
                             });
                         }
@@ -1761,7 +1909,7 @@ fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<Table
         });
     };
 
-    let select = select_statement_convert(select_stmt)?;
+    let query = select_stmt_to_query_expr(select_stmt)?;
 
     let alias = range_subselect.alias.as_ref().map(|alias_node| TableAlias {
         name: alias_node.aliasname.clone(),
@@ -1780,7 +1928,7 @@ fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<Table
 
     Ok(TableSource::Subquery(TableSubqueryNode {
         lateral: range_subselect.lateral,
-        select: Box::new(select),
+        query: Box::new(query),
         alias,
     }))
 }
@@ -1825,8 +1973,8 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
         Some(NodeEnum::SubLink(sub_link)) => {
             match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
                 Some(NodeEnum::SelectStmt(select_stmt)) => {
-                    let statement = select_statement_convert(select_stmt)?;
-                    Ok(ColumnExpr::Subquery(Box::new(statement)))
+                    let query = select_stmt_to_query_expr(select_stmt)?;
+                    Ok(ColumnExpr::Subquery(Box::new(query)))
                 }
                 other => Err(AstError::UnsupportedFeature {
                     feature: format!("Sublink type: {other:?}"),
@@ -1913,9 +2061,7 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
 }
 
 /// Convert a pg_query WindowDef to our WindowSpec
-fn window_def_convert(
-    win_def: &pg_query::protobuf::WindowDef,
-) -> Result<WindowSpec, AstError> {
+fn window_def_convert(win_def: &pg_query::protobuf::WindowDef) -> Result<WindowSpec, AstError> {
     // Convert PARTITION BY columns
     let partition_by = win_def
         .partition_clause
@@ -1955,7 +2101,7 @@ fn window_order_by_convert(
                 _ => {
                     return Err(AstError::UnsupportedFeature {
                         feature: format!("ORDER BY direction: {}", sort_by.sortby_dir),
-                    })
+                    });
                 }
             };
 
@@ -1994,7 +2140,7 @@ fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
         _ => {
             return Err(AstError::UnsupportedFeature {
                 feature: format!("Unknown MinMaxOp: {}", minmax.op),
-            })
+            });
         }
     };
 
@@ -2108,7 +2254,11 @@ fn case_expr_convert(case_expr: &PgCaseExpr) -> Result<CaseExpr, AstError> {
         .transpose()?
         .map(Box::new);
 
-    Ok(CaseExpr { arg, whens, default })
+    Ok(CaseExpr {
+        arg,
+        whens,
+        default,
+    })
 }
 
 fn case_when_convert(node: &Node) -> Result<CaseWhen, AstError> {
@@ -2228,10 +2378,11 @@ fn limit_node_extract(node: Option<&Node>) -> Result<Option<LiteralValue>, AstEr
     }
 }
 
-/// Create a fingerprint hash for SQL query AST.
-pub fn ast_query_fingerprint(select_statement: &SelectStatement) -> u64 {
+/// Generate a fingerprint hash for a SelectNode.
+/// This is used for cache key generation.
+pub fn select_node_fingerprint(node: &SelectNode) -> u64 {
     let mut hasher = DefaultHasher::new();
-    select_statement.hash(&mut hasher);
+    node.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -2239,16 +2390,30 @@ pub fn ast_query_fingerprint(select_statement: &SelectStatement) -> u64 {
 mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::unwrap_used)]
+    #![allow(clippy::wildcard_enum_match_arm)]
 
     use std::{collections::HashSet, panic};
 
     use super::*;
 
+    /// Parse SQL and return a QueryExpr (new type)
+    fn parse_query(sql: &str) -> QueryExpr {
+        let pg_ast = pg_query::parse(sql).expect("parse SQL");
+        query_expr_convert(&pg_ast).expect("convert to QueryExpr")
+    }
+
+    /// Parse SQL and return a SelectNode (for tests that need direct access)
+    fn parse_select(sql: &str) -> SelectNode {
+        let query = parse_query(sql);
+        match query.body {
+            QueryBody::Select(node) => node,
+            _ => panic!("expected SELECT"),
+        }
+    }
+
     #[test]
-    fn test_sql_query_convert_simple_select() {
-        let sql = "SELECT id, name FROM users WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_convert_simple_select() {
+        let ast = parse_query("SELECT id, name FROM users WHERE id = 1");
 
         assert!(ast.is_single_table());
         assert!(ast.has_where_clause());
@@ -2262,10 +2427,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_convert_select_star() {
-        let sql = "SELECT * FROM products";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_convert_select_star() {
+        let ast = parse_query("SELECT * FROM products");
 
         assert!(ast.is_single_table());
         assert!(!ast.has_where_clause());
@@ -2279,10 +2442,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_convert_where_clause() {
-        let sql = "SELECT * FROM users WHERE name = 'john' AND active = true";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_convert_where_clause() {
+        let ast = parse_query("SELECT * FROM users WHERE name = 'john' AND active = true");
 
         assert!(ast.has_where_clause());
         let where_clause = ast.where_clause().unwrap();
@@ -2293,17 +2454,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_convert_table_schema() {
-        let sql = "SELECT id, name FROM test.users WHERE active = true";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_convert_table_schema() {
+        let select = parse_select("SELECT id, name FROM test.users WHERE active = true");
 
-        // Check table alias
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.from.len(), 1);
 
         let TableSource::Table(table) = &select.from[0] else {
-            panic!("exepected table");
+            panic!("expected table");
         };
 
         assert_eq!(table.schema, Some("test".to_owned()));
@@ -2329,17 +2486,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_convert_table_alias() {
-        let sql = "SELECT u.id, u.name FROM users u WHERE u.active = true";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_convert_table_alias() {
+        let select = parse_select("SELECT u.id, u.name FROM users u WHERE u.active = true");
 
-        // Check table alias
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.from.len(), 1);
 
         let TableSource::Table(table) = &select.from[0] else {
-            panic!("exepected table");
+            panic!("expected table");
         };
 
         assert_eq!(table.name, "users");
@@ -2365,12 +2518,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_convert_column_alias() {
-        let sql = "SELECT id as user_id, name as full_name FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_convert_column_alias() {
+        let select = parse_select("SELECT id as user_id, name as full_name FROM users");
 
-        let Statement::Select(select) = &ast.statement;
         if let SelectColumns::Columns(columns) = &select.columns {
             assert_eq!(columns.len(), 2);
 
@@ -2389,16 +2539,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_convert_no_alias() {
-        let sql = "SELECT id, name FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_convert_no_alias() {
+        let select = parse_select("SELECT id, name FROM users");
 
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.from.len(), 1);
 
         let TableSource::Table(table) = &select.from[0] else {
-            panic!("exepected table");
+            panic!("expected table");
         };
 
         // Table should have no alias
@@ -2412,10 +2559,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_join() {
-        let sql = "SELECT * FROM invoice JOIN product p ON p.id = invoice.product_id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_join() {
+        let ast = parse_query("SELECT * FROM invoice JOIN product p ON p.id = invoice.product_id");
 
         assert_eq!(
             ast.nodes::<TableNode>()
@@ -2436,10 +2581,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_multiple_joins_two_tables() {
-        let sql = "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id WHERE a.id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_multiple_joins_two_tables() {
+        let ast = parse_query(
+            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id WHERE a.id = 1",
+        );
 
         // Should parse successfully with three tables
         let tables: Vec<&TableNode> = ast.nodes().collect();
@@ -2467,11 +2612,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_multiple_joins_three_tables() {
-        let sql =
-            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id JOIN d ON c.id = d.id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_multiple_joins_three_tables() {
+        let ast = parse_query(
+            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id JOIN d ON c.id = d.id",
+        );
 
         // Should parse successfully with four tables
         let tables: Vec<&TableNode> = ast.nodes().collect();
@@ -2488,10 +2632,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_mixed_join_types() {
-        let sql = "SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id LEFT JOIN payments p ON o.id = p.order_id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_mixed_join_types() {
+        let ast = parse_query(
+            "SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id LEFT JOIN payments p ON o.id = p.order_id",
+        );
 
         // Should parse successfully with three tables
         let tables: Vec<&TableNode> = ast.nodes().collect();
@@ -2511,29 +2655,25 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_multiple_joins_deparse() {
-        let sql = "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_multiple_joins_deparse() {
+        let ast = parse_query("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id");
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
 
         // Parse the deparsed SQL to verify it's valid
-        let pg_ast2 = pg_query::parse(&buf).unwrap();
-        let ast2 = sql_query_convert(&pg_ast2).unwrap();
+        let ast2 = parse_query(&buf);
 
         // Should produce identical AST
         assert_eq!(ast, ast2);
     }
 
     #[test]
-    fn test_sql_query_select_subquery() {
-        let sql = "SELECT invoice.id, (SELECT x.data FROM x WHERE 1 = 1) as one FROM invoice";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_select_subquery() {
+        let select = parse_select(
+            "SELECT invoice.id, (SELECT x.data FROM x WHERE 1 = 1) as one FROM invoice",
+        );
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!();
         };
@@ -2554,16 +2694,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_table_subquery() {
-        let sql = "SELECT * FROM (SELECT * FROM invoice WHERE id = 2) inv";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_table_subquery() {
+        let select = parse_select("SELECT * FROM (SELECT * FROM invoice WHERE id = 2) inv");
 
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.from.len(), 1);
 
         let TableSource::Subquery(subquery) = &select.from[0] else {
-            panic!("exepected subquery");
+            panic!("expected subquery");
         };
 
         assert!(!subquery.lateral);
@@ -2572,31 +2709,30 @@ mod tests {
     }
 
     #[test]
-    fn test_sql_query_values() {
-        let sql = "SELECT * FROM (VALUES(1, 2, 'test'), (3, 4, 'a')) v";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_expr_values() {
+        let select = parse_select("SELECT * FROM (VALUES(1, 2, 'test'), (3, 4, 'a')) v");
 
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.from.len(), 1);
 
         let TableSource::Subquery(subquery) = &select.from[0] else {
-            panic!("exepected subquery");
+            panic!("expected subquery");
         };
 
         assert!(!subquery.lateral);
         assert_eq!(subquery.alias.as_ref().unwrap().name, "v".to_owned());
 
-        assert_eq!(subquery.select.values.len(), 2);
-        assert_eq!(subquery.select.values[0].len(), 3);
-        assert_eq!(subquery.select.values[1].len(), 3);
+        let QueryBody::Values(values_clause) = &subquery.query.body else {
+            panic!("expected VALUES clause in subquery");
+        };
+        assert_eq!(values_clause.rows.len(), 2);
+        assert_eq!(values_clause.rows[0].len(), 3);
+        assert_eq!(values_clause.rows[1].len(), 3);
     }
 
     #[test]
-    fn test_sql_query_deparse_simple() {
+    fn test_query_expr_deparse_simple() {
         let sql = "SELECT id, name FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -2897,8 +3033,7 @@ mod tests {
     #[test]
     fn test_select_deparse_with_where() {
         let sql = "SELECT * FROM users WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -2908,8 +3043,7 @@ mod tests {
     #[test]
     fn test_select_deparse_distinct() {
         let sql = "SELECT DISTINCT name FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -2919,8 +3053,7 @@ mod tests {
     #[test]
     fn test_select_deparse_multiple_tables() {
         let sql = "SELECT * FROM users, orders";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -2930,8 +3063,7 @@ mod tests {
     #[test]
     fn test_select_deparse_schema_qualified() {
         let sql = "SELECT * FROM public.users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -2943,8 +3075,7 @@ mod tests {
         let sql = "SELECT first_name, last_name, film_id FROM actor a \
                 JOIN film_actor fa ON a.actor_id = fa.actor_id \
                 WHERE a.actor_id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -2956,8 +3087,7 @@ mod tests {
         let sql = "SELECT fa.actor_id \
             FROM (VALUES ('1', '2'), ('3', '4')) fa(actor_id, film_id) \
             WHERE a.actor_id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -2968,16 +3098,20 @@ mod tests {
     fn test_round_trip() {
         fn round_trip(sql: &str) {
             // Parse original
-            let pg_ast1 = pg_query::parse(sql).unwrap();
-            let ast1 = sql_query_convert(&pg_ast1).unwrap();
+            let ast1 = {
+                let pg_ast1 = pg_query::parse(sql).unwrap();
+                query_expr_convert(&pg_ast1).unwrap()
+            };
 
             // Deparse to string
             let mut deparsed = String::with_capacity(1024);
             ast1.deparse(&mut deparsed);
 
             // Parse deparsed version
-            let pg_ast2 = pg_query::parse(&deparsed).unwrap();
-            let ast2 = sql_query_convert(&pg_ast2).unwrap();
+            let ast2 = {
+                let pg_ast2 = pg_query::parse(&deparsed).unwrap();
+                query_expr_convert(&pg_ast2).unwrap()
+            };
 
             // Should be equivalent
             assert_eq!(ast1, ast2);
@@ -2999,8 +3133,7 @@ mod tests {
     #[test]
     fn test_parameterized_query_single_param() {
         let sql = "SELECT * FROM users WHERE id = $1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         // Verify the WHERE clause contains a parameter
         let where_clause = ast.where_clause().unwrap();
@@ -3017,8 +3150,7 @@ mod tests {
     #[test]
     fn test_parameterized_query_multiple_params() {
         let sql = "SELECT * FROM users WHERE name = $1 AND age > $2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         // Verify the WHERE clause contains both parameters
         let where_clause = ast.where_clause().unwrap();
@@ -3036,8 +3168,7 @@ mod tests {
     #[test]
     fn test_parameterized_query_mixed_params_and_literals() {
         let sql = "SELECT * FROM users WHERE name = $1 AND active = true";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         // Verify the WHERE clause contains parameter and boolean literal
         let where_clause = ast.where_clause().unwrap();
@@ -3077,12 +3208,12 @@ mod tests {
 
     #[test]
     fn test_nodes_table_extraction() {
-        let sql = "SELECT first_name, last_name, film_id \
+        let ast = parse_query(
+            "SELECT first_name, last_name, film_id \
                     FROM actor a \
                     JOIN public.film_actor fa ON a.actor_id = fa.actor_id \
-                    WHERE a.actor_id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+                    WHERE a.actor_id = 1",
+        );
 
         // Test extracting TableNode instances using the generic nodes function
         let tables = ast.nodes::<TableNode>().collect::<Vec<_>>();
@@ -3112,9 +3243,7 @@ mod tests {
 
     #[test]
     fn test_nodes_table_nodes() {
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users u JOIN orders o ON u.id = o.user_id");
 
         // Test getting TableNode instances using the nodes function
         let table_nodes: Vec<&TableNode> = ast.nodes().collect();
@@ -3129,9 +3258,7 @@ mod tests {
 
     #[test]
     fn test_nodes_join_nodes() {
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users u JOIN orders o ON u.id = o.user_id");
 
         // Test getting JoinNode instances using the nodes function
         let join_nodes: Vec<&JoinNode> = ast.nodes().collect();
@@ -3143,9 +3270,7 @@ mod tests {
 
     #[test]
     fn test_nodes_mixed_types() {
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users u JOIN orders o ON u.id = o.user_id");
 
         // Should find both table nodes and join nodes independently
         let table_nodes: Vec<&TableNode> = ast.nodes().collect();
@@ -3162,9 +3287,7 @@ mod tests {
 
     #[test]
     fn test_where_expr_nodes_column() {
-        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users WHERE name = 'john' AND age > 25");
 
         let where_clause = ast.where_clause().unwrap();
         let columns: Vec<&ColumnNode> = where_clause.nodes().collect();
@@ -3176,9 +3299,8 @@ mod tests {
 
     #[test]
     fn test_where_expr_nodes_literal() {
-        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25 AND active = true";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast =
+            parse_query("SELECT * FROM users WHERE name = 'john' AND age > 25 AND active = true");
 
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
@@ -3191,9 +3313,7 @@ mod tests {
 
     #[test]
     fn test_where_expr_nodes_binary() {
-        let sql = "SELECT * FROM users WHERE name = 'john' AND age > 25";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users WHERE name = 'john' AND age > 25");
 
         let where_clause = ast.where_clause().unwrap();
         let binary_exprs: Vec<&BinaryExpr> = where_clause.nodes().collect();
@@ -3206,9 +3326,7 @@ mod tests {
 
     #[test]
     fn test_where_expr_nodes_whole_expr() {
-        let sql = "SELECT * FROM users WHERE name = 'john'";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users WHERE name = 'john'");
 
         let where_clause = ast.where_clause().unwrap();
         let where_exprs: Vec<&WhereExpr> = where_clause.nodes().collect();
@@ -3219,9 +3337,8 @@ mod tests {
 
     #[test]
     fn test_where_expr_nodes_nested() {
-        let sql = "SELECT * FROM users WHERE (name = 'john' OR name = 'jane') AND age > 18";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast =
+            parse_query("SELECT * FROM users WHERE (name = 'john' OR name = 'jane') AND age > 18");
 
         let where_clause = ast.where_clause().unwrap();
         let columns: Vec<&ColumnNode> = where_clause.nodes().collect();
@@ -3235,9 +3352,7 @@ mod tests {
 
     #[test]
     fn test_join_condition_nodes() {
-        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users u JOIN orders o ON u.id = o.user_id");
 
         // Get the join node from the query
         let join_nodes: Vec<&JoinNode> = ast.nodes().collect();
@@ -3260,22 +3375,18 @@ mod tests {
     }
 
     #[test]
-    fn test_statement_nodes() {
-        let sql = "SELECT * FROM users WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+    fn test_query_body_nodes() {
+        let ast = parse_query("SELECT * FROM users WHERE id = 1");
 
-        // Test that Statement::nodes() delegates to SelectStatement
-        let tables: Vec<&TableNode> = ast.statement.nodes().collect();
+        // Test that QueryBody::nodes() delegates to SelectNode
+        let tables: Vec<&TableNode> = ast.body.nodes().collect();
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "users");
     }
 
     #[test]
     fn test_select_columns_nodes() {
-        let sql = "SELECT id, name FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT id, name FROM users");
 
         // Test that we can extract ColumnNode through SelectColumns
         let columns: Vec<&ColumnNode> = ast.nodes().collect();
@@ -3286,9 +3397,7 @@ mod tests {
 
     #[test]
     fn test_column_expr_nodes() {
-        let sql = "SELECT id, name FROM users WHERE active = true";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT id, name FROM users WHERE active = true");
 
         // Test that ColumnExpr::nodes() can traverse through to ColumnNode
         let columns: Vec<&ColumnNode> = ast.nodes().collect();
@@ -3320,9 +3429,7 @@ mod tests {
 
     #[test]
     fn test_table_node_nodes() {
-        let sql = "SELECT * FROM public.users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM public.users");
 
         // Test that TableNode::nodes() returns itself as a leaf node
         let tables: Vec<&TableNode> = ast.nodes().collect();
@@ -3333,9 +3440,7 @@ mod tests {
 
     #[test]
     fn test_table_subquery_node_nodes() {
-        let sql = "SELECT * FROM (SELECT id FROM users) sub";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM (SELECT id FROM users) sub");
 
         // Note: TableSource::Subquery iteration is not fully implemented yet
         // So we can't extract nodes from within subqueries via TableSource
@@ -3346,9 +3451,7 @@ mod tests {
 
     #[test]
     fn test_unary_expr_nodes() {
-        let sql = "SELECT * FROM users WHERE NOT active";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users WHERE NOT active");
 
         // Test that UnaryExpr::nodes() returns itself
         let unary_exprs: Vec<&UnaryExpr> = ast.nodes().collect();
@@ -3358,9 +3461,7 @@ mod tests {
 
     #[test]
     fn test_binary_expr_nodes() {
-        let sql = "SELECT * FROM users WHERE name = 'john'";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users WHERE name = 'john'");
 
         // Test that BinaryExpr::nodes() returns itself
         let binary_exprs: Vec<&BinaryExpr> = ast.nodes().collect();
@@ -3436,11 +3537,8 @@ mod tests {
     #[test]
     fn test_in_clause_parse_and_deparse() {
         // Test that IN clause round-trips through parse and deparse
-        let sql = "SELECT * FROM t WHERE status IN ('active', 'pending')";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT * FROM t WHERE status IN ('active', 'pending')");
 
-        let Statement::Select(select) = &ast.statement;
         let where_clause = select.where_clause.as_ref().unwrap();
 
         let mut buf = String::new();
@@ -3450,15 +3548,12 @@ mod tests {
 
     #[test]
     fn test_order_by_simple_asc() {
-        let sql = "SELECT * FROM users ORDER BY name ASC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users ORDER BY name ASC");
 
-        let Statement::Select(select) = &ast.statement;
-        assert_eq!(select.order_by.len(), 1);
-        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
+        assert_eq!(ast.order_by.len(), 1);
+        assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
 
-        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.column, "name");
             assert_eq!(col.table, None);
         } else {
@@ -3468,15 +3563,12 @@ mod tests {
 
     #[test]
     fn test_order_by_simple_desc() {
-        let sql = "SELECT * FROM users ORDER BY age DESC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users ORDER BY age DESC");
 
-        let Statement::Select(select) = &ast.statement;
-        assert_eq!(select.order_by.len(), 1);
-        assert_eq!(select.order_by[0].direction, OrderDirection::Desc);
+        assert_eq!(ast.order_by.len(), 1);
+        assert_eq!(ast.order_by[0].direction, OrderDirection::Desc);
 
-        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.column, "age");
         } else {
             panic!("Expected column expression");
@@ -3485,36 +3577,30 @@ mod tests {
 
     #[test]
     fn test_order_by_default_direction() {
-        let sql = "SELECT * FROM users ORDER BY name";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users ORDER BY name");
 
-        let Statement::Select(select) = &ast.statement;
-        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(ast.order_by.len(), 1);
         // Default direction should be ASC
-        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
+        assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
     }
 
     #[test]
     fn test_order_by_multiple_columns() {
-        let sql = "SELECT * FROM users ORDER BY last_name ASC, first_name DESC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users ORDER BY last_name ASC, first_name DESC");
 
-        let Statement::Select(select) = &ast.statement;
-        assert_eq!(select.order_by.len(), 2);
+        assert_eq!(ast.order_by.len(), 2);
 
         // First ORDER BY clause
-        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
-        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+        assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
+        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.column, "last_name");
         } else {
             panic!("Expected column expression");
         }
 
         // Second ORDER BY clause
-        assert_eq!(select.order_by[1].direction, OrderDirection::Desc);
-        if let ColumnExpr::Column(col) = &select.order_by[1].expr {
+        assert_eq!(ast.order_by[1].direction, OrderDirection::Desc);
+        if let ColumnExpr::Column(col) = &ast.order_by[1].expr {
             assert_eq!(col.column, "first_name");
         } else {
             panic!("Expected column expression");
@@ -3523,14 +3609,11 @@ mod tests {
 
     #[test]
     fn test_order_by_qualified_column() {
-        let sql = "SELECT * FROM users u ORDER BY u.name ASC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users u ORDER BY u.name ASC");
 
-        let Statement::Select(select) = &ast.statement;
-        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(ast.order_by.len(), 1);
 
-        if let ColumnExpr::Column(col) = &select.order_by[0].expr {
+        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.table, Some("u".to_owned()));
             assert_eq!(col.column, "name");
         } else {
@@ -3540,21 +3623,17 @@ mod tests {
 
     #[test]
     fn test_order_by_with_where() {
-        let sql = "SELECT * FROM users WHERE active = true ORDER BY name ASC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users WHERE active = true ORDER BY name ASC");
 
-        let Statement::Select(select) = &ast.statement;
-        assert!(select.where_clause.is_some());
-        assert_eq!(select.order_by.len(), 1);
-        assert_eq!(select.order_by[0].direction, OrderDirection::Asc);
+        assert!(ast.has_where_clause());
+        assert_eq!(ast.order_by.len(), 1);
+        assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
     }
 
     #[test]
     fn test_order_by_deparse_asc() {
         let sql = "SELECT * FROM users ORDER BY name ASC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -3564,8 +3643,7 @@ mod tests {
     #[test]
     fn test_order_by_deparse_desc() {
         let sql = "SELECT * FROM users ORDER BY age DESC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -3575,8 +3653,7 @@ mod tests {
     #[test]
     fn test_order_by_deparse_multiple() {
         let sql = "SELECT * FROM users ORDER BY last_name ASC, first_name DESC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);
         ast.deparse(&mut buf);
@@ -3594,16 +3671,14 @@ mod tests {
 
         for sql in queries {
             // Parse original
-            let pg_ast1 = pg_query::parse(sql).unwrap();
-            let ast1 = sql_query_convert(&pg_ast1).unwrap();
+            let ast1 = parse_query(sql);
 
             // Deparse to string
             let mut deparsed = String::with_capacity(1024);
             ast1.deparse(&mut deparsed);
 
             // Parse deparsed version
-            let pg_ast2 = pg_query::parse(&deparsed).unwrap();
-            let ast2 = sql_query_convert(&pg_ast2).unwrap();
+            let ast2 = parse_query(&deparsed);
 
             // Should be equivalent
             assert_eq!(ast1, ast2, "Round trip failed for: {sql}");
@@ -3612,9 +3687,7 @@ mod tests {
 
     #[test]
     fn test_order_by_nodes_extraction() {
-        let sql = "SELECT * FROM users ORDER BY u.name ASC, age DESC";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users ORDER BY u.name ASC, age DESC");
 
         // Extract OrderByClause nodes
         let order_clauses: Vec<&OrderByClause> = ast.nodes().collect();
@@ -3629,11 +3702,8 @@ mod tests {
 
     #[test]
     fn test_group_by_single_column() {
-        let sql = "SELECT status FROM orders GROUP BY status";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT status FROM orders GROUP BY status");
 
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.group_by.len(), 1);
         assert_eq!(select.group_by[0].column, "status");
         assert_eq!(select.group_by[0].table, None);
@@ -3641,11 +3711,8 @@ mod tests {
 
     #[test]
     fn test_group_by_multiple_columns() {
-        let sql = "SELECT status, category FROM orders GROUP BY status, category";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT status, category FROM orders GROUP BY status, category");
 
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.group_by.len(), 2);
         assert_eq!(select.group_by[0].column, "status");
         assert_eq!(select.group_by[1].column, "category");
@@ -3653,11 +3720,8 @@ mod tests {
 
     #[test]
     fn test_group_by_qualified_column() {
-        let sql = "SELECT o.status FROM orders o GROUP BY o.status";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT o.status FROM orders o GROUP BY o.status");
 
-        let Statement::Select(select) = &ast.statement;
         assert_eq!(select.group_by.len(), 1);
         assert_eq!(select.group_by[0].column, "status");
         assert_eq!(select.group_by[0].table, Some("o".to_owned()));
@@ -3665,126 +3729,102 @@ mod tests {
 
     #[test]
     fn test_having_simple() {
-        let sql = "SELECT status FROM orders GROUP BY status HAVING status = 'active'";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select =
+            parse_select("SELECT status FROM orders GROUP BY status HAVING status = 'active'");
 
-        let Statement::Select(select) = &ast.statement;
         assert!(select.having.is_some());
     }
 
     #[test]
     fn test_having_with_and() {
-        let sql = "SELECT category FROM sales GROUP BY category HAVING category = 'electronics' AND category != 'toys'";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(
+            "SELECT category FROM sales GROUP BY category HAVING category = 'electronics' AND category != 'toys'",
+        );
 
-        let Statement::Select(select) = &ast.statement;
         assert!(!select.group_by.is_empty());
         assert!(select.having.is_some());
     }
 
     #[test]
     fn test_limit_only() {
-        let sql = "SELECT * FROM users LIMIT 10";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users LIMIT 10");
 
-        let Statement::Select(select) = &ast.statement;
-        let limit = select.limit.as_ref().unwrap();
+        let limit = ast.limit.as_ref().unwrap();
         assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
         assert_eq!(limit.offset, None);
     }
 
     #[test]
     fn test_offset_only() {
-        let sql = "SELECT * FROM users OFFSET 20";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users OFFSET 20");
 
-        let Statement::Select(select) = &ast.statement;
-        let limit = select.limit.as_ref().unwrap();
+        let limit = ast.limit.as_ref().unwrap();
         assert_eq!(limit.count, None);
         assert_eq!(limit.offset, Some(LiteralValue::Integer(20)));
     }
 
     #[test]
     fn test_limit_and_offset() {
-        let sql = "SELECT * FROM users LIMIT 10 OFFSET 20";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users LIMIT 10 OFFSET 20");
 
-        let Statement::Select(select) = &ast.statement;
-        let limit = select.limit.as_ref().unwrap();
+        let limit = ast.limit.as_ref().unwrap();
         assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
         assert_eq!(limit.offset, Some(LiteralValue::Integer(20)));
     }
 
     #[test]
     fn test_no_limit() {
-        let sql = "SELECT * FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users");
 
-        let Statement::Select(select) = &ast.statement;
-        assert!(select.limit.is_none());
+        assert!(ast.limit.is_none());
     }
 
     #[test]
     fn test_no_group_by() {
-        let sql = "SELECT * FROM users WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT * FROM users WHERE id = 1");
 
-        let Statement::Select(select) = &ast.statement;
         assert!(select.group_by.is_empty());
         assert!(select.having.is_none());
     }
 
     #[test]
     fn test_combined_group_by_having_limit() {
-        let sql = "SELECT status FROM orders GROUP BY status HAVING status != 'cancelled' ORDER BY status DESC LIMIT 10";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(
+            "SELECT status FROM orders GROUP BY status HAVING status != 'cancelled' ORDER BY status DESC LIMIT 10",
+        );
 
-        let Statement::Select(select) = &ast.statement;
+        let select = match &ast.body {
+            QueryBody::Select(s) => s,
+            _ => panic!("expected SELECT"),
+        };
         assert_eq!(select.group_by.len(), 1);
         assert!(select.having.is_some());
-        assert!(select.limit.is_some());
-        assert!(!select.order_by.is_empty());
+        assert!(ast.limit.is_some());
+        assert!(!ast.order_by.is_empty());
     }
 
     #[test]
     fn test_limit_parameterized() {
-        let sql = "SELECT * FROM users LIMIT $1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users LIMIT $1");
 
-        let Statement::Select(select) = &ast.statement;
-        let limit = select.limit.as_ref().unwrap();
+        let limit = ast.limit.as_ref().unwrap();
         assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
         assert_eq!(limit.offset, None);
     }
 
     #[test]
     fn test_limit_and_offset_parameterized() {
-        let sql = "SELECT * FROM users LIMIT $1 OFFSET $2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query("SELECT * FROM users LIMIT $1 OFFSET $2");
 
-        let Statement::Select(select) = &ast.statement;
-        let limit = select.limit.as_ref().unwrap();
+        let limit = ast.limit.as_ref().unwrap();
         assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
         assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".to_owned())));
     }
 
     #[test]
     fn test_has_sublink_in_select_list() {
-        let sql = "SELECT id, (SELECT x FROM other WHERE id = 1) as val FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT id, (SELECT x FROM other WHERE id = 1) as val FROM t");
 
-        let Statement::Select(select) = &ast.statement;
         assert!(
             select.has_sublink(),
             "has_sublink() should detect subquery in SELECT list"
@@ -3793,11 +3833,8 @@ mod tests {
 
     #[test]
     fn test_has_sublink_in_from_clause() {
-        let sql = "SELECT * FROM (SELECT id FROM users) sub";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT * FROM (SELECT id FROM users) sub");
 
-        let Statement::Select(select) = &ast.statement;
         assert!(
             select.has_sublink(),
             "has_sublink() should detect subquery in FROM clause"
@@ -3806,11 +3843,8 @@ mod tests {
 
     #[test]
     fn test_has_sublink_in_join() {
-        let sql = "SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id");
 
-        let Statement::Select(select) = &ast.statement;
         assert!(
             select.has_sublink(),
             "has_sublink() should detect subquery in JOIN"
@@ -3819,11 +3853,8 @@ mod tests {
 
     #[test]
     fn test_has_sublink_in_where_clause() {
-        let sql = "SELECT * FROM t WHERE id IN (SELECT id FROM other)";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT * FROM t WHERE id IN (SELECT id FROM other)");
 
-        let Statement::Select(select) = &ast.statement;
         assert!(
             select.has_sublink(),
             "has_sublink() should detect subquery in WHERE clause"
@@ -3832,11 +3863,8 @@ mod tests {
 
     #[test]
     fn test_has_sublink_no_subquery() {
-        let sql = "SELECT id, name FROM users WHERE active = true";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT id, name FROM users WHERE active = true");
 
-        let Statement::Select(select) = &ast.statement;
         assert!(
             !select.has_sublink(),
             "has_sublink() should return false when no subquery exists"
@@ -3845,11 +3873,8 @@ mod tests {
 
     #[test]
     fn test_function_count_star() {
-        let sql = "SELECT COUNT(*) FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT COUNT(*) FROM users");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -3865,11 +3890,8 @@ mod tests {
 
     #[test]
     fn test_function_count_column() {
-        let sql = "SELECT COUNT(id) FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT COUNT(id) FROM users");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -3884,11 +3906,8 @@ mod tests {
 
     #[test]
     fn test_function_count_distinct() {
-        let sql = "SELECT COUNT(DISTINCT status) FROM orders";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT COUNT(DISTINCT status) FROM orders");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -3902,11 +3921,8 @@ mod tests {
 
     #[test]
     fn test_function_sum() {
-        let sql = "SELECT SUM(amount) FROM orders WHERE tenant_id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT SUM(amount) FROM orders WHERE tenant_id = 1");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -3920,11 +3936,8 @@ mod tests {
     #[test]
     fn test_function_nested() {
         // Use ROUND(AVG(...)) since COALESCE is parsed as a special CoalesceExpr
-        let sql = "SELECT ROUND(AVG(value)) FROM data";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT ROUND(AVG(value)) FROM data");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -3944,11 +3957,8 @@ mod tests {
 
     #[test]
     fn test_function_with_alias() {
-        let sql = "SELECT COUNT(*) as total FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT COUNT(*) as total FROM users");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -3958,11 +3968,8 @@ mod tests {
 
     #[test]
     fn test_function_mixed_with_columns() {
-        let sql = "SELECT id, name, COUNT(*) as cnt FROM users GROUP BY id, name";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT id, name, COUNT(*) as cnt FROM users GROUP BY id, name");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -3975,11 +3982,8 @@ mod tests {
 
     #[test]
     fn test_literal_in_select() {
-        let sql = "SELECT 42 as answer, 'hello' as greeting FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT 42 as answer, 'hello' as greeting FROM t");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4030,11 +4034,8 @@ mod tests {
 
     #[test]
     fn test_coalesce() {
-        let sql = "SELECT COALESCE(name, 'unknown') FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT COALESCE(name, 'unknown') FROM users");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4048,11 +4049,8 @@ mod tests {
 
     #[test]
     fn test_coalesce_nested_with_function() {
-        let sql = "SELECT COALESCE(MAX(value), 0) FROM data";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT COALESCE(MAX(value), 0) FROM data");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4072,11 +4070,8 @@ mod tests {
 
     #[test]
     fn test_greatest() {
-        let sql = "SELECT GREATEST(a, b, c) FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT GREATEST(a, b, c) FROM t");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4090,11 +4085,8 @@ mod tests {
 
     #[test]
     fn test_least() {
-        let sql = "SELECT LEAST(a, b) FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT LEAST(a, b) FROM t");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4108,11 +4100,8 @@ mod tests {
 
     #[test]
     fn test_nullif() {
-        let sql = "SELECT NULLIF(status, 'deleted') FROM items";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT NULLIF(status, 'deleted') FROM items");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4126,11 +4115,9 @@ mod tests {
 
     #[test]
     fn test_case_searched() {
-        let sql = "SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select =
+            parse_select("SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4145,11 +4132,10 @@ mod tests {
 
     #[test]
     fn test_case_simple() {
-        let sql = "SELECT CASE status WHEN 'active' THEN 1 WHEN 'pending' THEN 2 ELSE 0 END FROM items";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(
+            "SELECT CASE status WHEN 'active' THEN 1 WHEN 'pending' THEN 2 ELSE 0 END FROM items",
+        );
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4164,11 +4150,8 @@ mod tests {
 
     #[test]
     fn test_case_no_else() {
-        let sql = "SELECT CASE WHEN x > 0 THEN 'positive' END FROM items";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT CASE WHEN x > 0 THEN 'positive' END FROM items");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4184,8 +4167,7 @@ mod tests {
     #[test]
     fn test_case_deparse() {
         let sql = "SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::new();
         ast.deparse(&mut buf);
@@ -4198,21 +4180,20 @@ mod tests {
     #[test]
     fn test_case_has_sublink() {
         // CASE with subquery in WHEN condition
-        let sql = "SELECT CASE WHEN id IN (SELECT id FROM other) THEN 1 ELSE 0 END FROM items";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(
+            "SELECT CASE WHEN id IN (SELECT id FROM other) THEN 1 ELSE 0 END FROM items",
+        );
 
-        let Statement::Select(select) = &ast.statement;
-        assert!(select.has_sublink(), "CASE with subquery should have sublink");
+        assert!(
+            select.has_sublink(),
+            "CASE with subquery should have sublink"
+        );
     }
 
     #[test]
     fn test_window_function_simple() {
-        let sql = "SELECT sum(amount) OVER (ORDER BY date) FROM orders";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT sum(amount) OVER (ORDER BY date) FROM orders");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4230,11 +4211,10 @@ mod tests {
 
     #[test]
     fn test_window_function_with_partition() {
-        let sql = "SELECT sum(amount) OVER (PARTITION BY category ORDER BY date) FROM orders";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(
+            "SELECT sum(amount) OVER (PARTITION BY category ORDER BY date) FROM orders",
+        );
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4251,11 +4231,8 @@ mod tests {
 
     #[test]
     fn test_window_function_row_number() {
-        let sql = "SELECT row_number() OVER (ORDER BY id) FROM users";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select("SELECT row_number() OVER (ORDER BY id) FROM users");
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4295,16 +4272,17 @@ mod tests {
         };
         let mut buf = String::new();
         func.deparse(&mut buf);
-        assert_eq!(buf, "SUM(amount) OVER (PARTITION BY category ORDER BY date ASC)");
+        assert_eq!(
+            buf,
+            "SUM(amount) OVER (PARTITION BY category ORDER BY date ASC)"
+        );
     }
 
     #[test]
     fn test_window_function_multiple_order_by() {
         let sql = "SELECT sum(x) OVER (ORDER BY a ASC, b DESC) FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4322,10 +4300,8 @@ mod tests {
     #[test]
     fn test_aggregate_order_by_parse() {
         let sql = "SELECT string_agg(name, ', ' ORDER BY name) FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4342,22 +4318,22 @@ mod tests {
     #[test]
     fn test_aggregate_order_by_deparse() {
         let sql = "SELECT string_agg(name, ', ' ORDER BY name ASC) FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let ast = parse_query(sql);
 
         let mut buf = String::new();
         ast.deparse(&mut buf);
         assert!(buf.contains("ORDER BY"), "deparsed should contain ORDER BY");
-        assert!(buf.contains("STRING_AGG"), "deparsed should contain STRING_AGG");
+        assert!(
+            buf.contains("STRING_AGG"),
+            "deparsed should contain STRING_AGG"
+        );
     }
 
     #[test]
     fn test_aggregate_distinct_and_order_by() {
         let sql = "SELECT string_agg(DISTINCT name, ', ' ORDER BY name) FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4373,10 +4349,8 @@ mod tests {
     #[test]
     fn test_aggregate_multiple_order_by() {
         let sql = "SELECT array_agg(x ORDER BY y ASC, z DESC) FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4421,10 +4395,8 @@ mod tests {
     #[test]
     fn test_arithmetic_multiply_parse() {
         let sql = "SELECT amount * 2 FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4439,10 +4411,8 @@ mod tests {
     #[test]
     fn test_arithmetic_multiply_negative() {
         let sql = "SELECT amount * -1 FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4462,10 +4432,8 @@ mod tests {
     #[test]
     fn test_arithmetic_add() {
         let sql = "SELECT price + tax FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4480,10 +4448,8 @@ mod tests {
     #[test]
     fn test_arithmetic_subtract() {
         let sql = "SELECT total - discount FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4498,10 +4464,8 @@ mod tests {
     #[test]
     fn test_arithmetic_divide() {
         let sql = "SELECT total / count FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4532,10 +4496,8 @@ mod tests {
     fn test_arithmetic_nested() {
         // (a + b) * c
         let sql = "SELECT (a + b) * c FROM t";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let ast = sql_query_convert(&pg_ast).unwrap();
+        let select = parse_select(sql);
 
-        let Statement::Select(select) = &ast.statement;
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
@@ -4551,5 +4513,211 @@ mod tests {
             panic!("expected nested arithmetic expression");
         };
         assert_eq!(inner.op, ArithmeticOp::Add);
+    }
+
+    // ========================================================================
+    // QueryExpr (new type hierarchy) tests
+    // ========================================================================
+
+    #[test]
+    fn test_query_expr_simple_select() {
+        let sql = "SELECT id, name FROM users WHERE id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        assert!(query_expr.is_single_table());
+        assert!(query_expr.has_where_clause());
+        assert!(!query_expr.is_select_star());
+
+        let select = query_expr.as_select().unwrap();
+        assert_eq!(select.from.len(), 1);
+        assert!(matches!(select.columns, SelectColumns::Columns(_)));
+    }
+
+    #[test]
+    fn test_query_expr_select_star() {
+        let sql = "SELECT * FROM products";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        assert!(query_expr.is_single_table());
+        assert!(!query_expr.has_where_clause());
+        assert!(query_expr.is_select_star());
+    }
+
+    #[test]
+    fn test_query_expr_values_clause() {
+        let sql = "VALUES (1, 'a'), (2, 'b')";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let QueryBody::Values(values) = &query_expr.body else {
+            panic!("expected VALUES clause");
+        };
+
+        assert_eq!(values.rows.len(), 2);
+        assert_eq!(values.rows[0].len(), 2);
+        assert_eq!(values.rows[1].len(), 2);
+
+        // Check first row values
+        assert!(matches!(values.rows[0][0], LiteralValue::Integer(1)));
+        assert!(matches!(&values.rows[0][1], LiteralValue::String(s) if s == "a"));
+    }
+
+    #[test]
+    fn test_query_expr_union() {
+        let sql = "SELECT a FROM t1 UNION SELECT b FROM t2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let QueryBody::SetOp(set_op) = &query_expr.body else {
+            panic!("expected set operation");
+        };
+
+        assert_eq!(set_op.op, SetOpType::Union);
+        assert!(!set_op.all);
+
+        // Check left side is a SELECT
+        assert!(set_op.left.as_select().is_some());
+        // Check right side is a SELECT
+        assert!(set_op.right.as_select().is_some());
+    }
+
+    #[test]
+    fn test_query_expr_union_all() {
+        let sql = "SELECT a FROM t1 UNION ALL SELECT b FROM t2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let QueryBody::SetOp(set_op) = &query_expr.body else {
+            panic!("expected set operation");
+        };
+
+        assert_eq!(set_op.op, SetOpType::Union);
+        assert!(set_op.all);
+    }
+
+    #[test]
+    fn test_query_expr_union_with_order_by() {
+        let sql = "SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        // ORDER BY should be at the top level
+        assert_eq!(query_expr.order_by.len(), 1);
+
+        let QueryBody::SetOp(set_op) = &query_expr.body else {
+            panic!("expected set operation");
+        };
+        assert_eq!(set_op.op, SetOpType::Union);
+
+        // Sub-queries should not have ORDER BY
+        assert!(set_op.left.order_by.is_empty());
+        assert!(set_op.right.order_by.is_empty());
+    }
+
+    #[test]
+    fn test_query_expr_intersect() {
+        let sql = "SELECT a FROM t1 INTERSECT SELECT b FROM t2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let QueryBody::SetOp(set_op) = &query_expr.body else {
+            panic!("expected set operation");
+        };
+
+        assert_eq!(set_op.op, SetOpType::Intersect);
+    }
+
+    #[test]
+    fn test_query_expr_except() {
+        let sql = "SELECT a FROM t1 EXCEPT SELECT b FROM t2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let QueryBody::SetOp(set_op) = &query_expr.body else {
+            panic!("expected set operation");
+        };
+
+        assert_eq!(set_op.op, SetOpType::Except);
+    }
+
+    #[test]
+    fn test_query_expr_chained_union() {
+        let sql = "SELECT a FROM t1 UNION SELECT b FROM t2 UNION SELECT c FROM t3";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let QueryBody::SetOp(outer_set_op) = &query_expr.body else {
+            panic!("expected set operation");
+        };
+        assert_eq!(outer_set_op.op, SetOpType::Union);
+
+        // The nested structure: (t1 UNION t2) UNION t3
+        let QueryBody::SetOp(inner_set_op) = &outer_set_op.left.body else {
+            panic!("expected nested set operation");
+        };
+        assert_eq!(inner_set_op.op, SetOpType::Union);
+
+        // Right side of outer should be simple SELECT
+        assert!(outer_set_op.right.as_select().is_some());
+    }
+
+    #[test]
+    fn test_query_expr_deparse_simple_select() {
+        let sql = "SELECT id FROM users WHERE id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let mut buf = String::new();
+        query_expr.deparse(&mut buf);
+        assert_eq!(buf, "SELECT id FROM users WHERE id = 1");
+    }
+
+    #[test]
+    fn test_query_expr_deparse_values() {
+        let sql = "VALUES (1, 'a')";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let mut buf = String::new();
+        query_expr.deparse(&mut buf);
+        assert_eq!(buf, "VALUES (1, 'a')");
+    }
+
+    #[test]
+    fn test_query_expr_deparse_union() {
+        let sql = "SELECT a FROM t1 UNION SELECT b FROM t2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let mut buf = String::new();
+        query_expr.deparse(&mut buf);
+        assert_eq!(buf, "SELECT a FROM t1 UNION SELECT b FROM t2");
+    }
+
+    #[test]
+    fn test_query_expr_deparse_union_all() {
+        let sql = "SELECT a FROM t1 UNION ALL SELECT b FROM t2";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let mut buf = String::new();
+        query_expr.deparse(&mut buf);
+        assert_eq!(buf, "SELECT a FROM t1 UNION ALL SELECT b FROM t2");
+    }
+
+    #[test]
+    fn test_query_expr_order_by_limit() {
+        let sql = "SELECT a FROM t ORDER BY a LIMIT 10";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        assert_eq!(query_expr.order_by.len(), 1);
+        assert!(query_expr.limit.is_some());
+
+        let mut buf = String::new();
+        query_expr.deparse(&mut buf);
+        assert_eq!(buf, "SELECT a FROM t ORDER BY a ASC LIMIT 10");
     }
 }

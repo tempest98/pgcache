@@ -11,7 +11,7 @@ use tracing::{debug, error, trace};
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::pg;
-use crate::query::resolved::ResolvedSelectStatement;
+use crate::query::resolved::ResolvedSelectNode;
 use crate::settings::Settings;
 
 use super::super::{
@@ -33,7 +33,7 @@ pub struct PopulationWork {
     pub generation: u64,
     pub relation_oids: Vec<u32>,
     pub table_metadata: Vec<TableMetadata>,
-    pub resolved: ResolvedSelectStatement,
+    pub resolved: ResolvedSelectNode,
 }
 
 /// Cache writer that owns the Cache and serializes all mutations.
@@ -246,7 +246,7 @@ impl CacheWriter {
         fingerprint: u64,
         state: CachedQueryState,
         generation: u64,
-        resolved: &ResolvedSelectStatement,
+        resolved: &ResolvedSelectNode,
     ) {
         if let Ok(mut view) = self.state_view.write() {
             view.cached_queries.insert(
