@@ -320,8 +320,37 @@ impl MultiExpr {
 }
 
 impl Deparse for MultiExpr {
-    fn deparse<'b>(&self, _buf: &'b mut String) -> &'b mut String {
-        todo!();
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        // MultiExpr format: [column, value1, value2, ...]
+        // Output: column IN (value1, value2, ...) or column NOT IN (...)
+        let [first, rest @ ..] = self.exprs.as_slice() else {
+            return buf;
+        };
+
+        // First expression is the column/left side
+        first.deparse(buf);
+
+        // Wildcard is intentional - provides extensible fallback for future multi-ops
+        #[expect(clippy::wildcard_enum_match_arm)]
+        match self.op {
+            ExprOp::In => buf.push_str(" IN ("),
+            ExprOp::NotIn => buf.push_str(" NOT IN ("),
+            _ => {
+                buf.push(' ');
+                self.op.deparse(buf);
+                buf.push_str(" (");
+            }
+        }
+
+        // Remaining expressions are the values
+        let mut sep = "";
+        for expr in rest {
+            buf.push_str(sep);
+            expr.deparse(buf);
+            sep = ", ";
+        }
+        buf.push(')');
+        buf
     }
 }
 
@@ -3158,6 +3187,60 @@ mod tests {
         let columns: Vec<&ColumnNode> = multi.nodes().collect();
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].column, "id");
+    }
+
+    #[test]
+    fn test_multi_expr_in_deparse() {
+        let multi = MultiExpr {
+            op: ExprOp::In,
+            exprs: vec![
+                WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "status".to_owned(),
+                }),
+                WhereExpr::Value(LiteralValue::String("active".to_owned())),
+                WhereExpr::Value(LiteralValue::String("pending".to_owned())),
+            ],
+        };
+
+        let mut buf = String::new();
+        multi.deparse(&mut buf);
+        assert_eq!(buf, "status IN ('active', 'pending')");
+    }
+
+    #[test]
+    fn test_multi_expr_not_in_deparse() {
+        let multi = MultiExpr {
+            op: ExprOp::NotIn,
+            exprs: vec![
+                WhereExpr::Column(ColumnNode {
+                    table: None,
+                    column: "id".to_owned(),
+                }),
+                WhereExpr::Value(LiteralValue::Integer(1)),
+                WhereExpr::Value(LiteralValue::Integer(2)),
+                WhereExpr::Value(LiteralValue::Integer(3)),
+            ],
+        };
+
+        let mut buf = String::new();
+        multi.deparse(&mut buf);
+        assert_eq!(buf, "id NOT IN (1, 2, 3)");
+    }
+
+    #[test]
+    fn test_in_clause_parse_and_deparse() {
+        // Test that IN clause round-trips through parse and deparse
+        let sql = "SELECT * FROM t WHERE status IN ('active', 'pending')";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let where_clause = select.where_clause.as_ref().unwrap();
+
+        let mut buf = String::new();
+        where_clause.deparse(&mut buf);
+        assert_eq!(buf, "status IN ('active', 'pending')");
     }
 
     #[test]

@@ -144,7 +144,9 @@ fn is_cacheable_select(select: &SelectStatement) -> bool {
 /// Determine if a WHERE expression can be efficiently cached.
 /// Step 2: Support simple equality, AND of equalities, OR of equalities.
 fn is_cacheable_expr(expr: &WhereExpr) -> bool {
-    match expr {
+    dbg!(&expr);
+
+    let rv = match expr {
         WhereExpr::Binary(binary_expr) => {
             match binary_expr.op {
                 ExprOp::Equal
@@ -156,12 +158,7 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
                     // Simple comparison: column op value
                     is_simple_comparison(binary_expr)
                 }
-                ExprOp::And => {
-                    // AND: both sides must be cacheable
-                    is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
-                }
-                ExprOp::Or => {
-                    // OR: both sides must be cacheable
+                ExprOp::And | ExprOp::Or | ExprOp::In | ExprOp::NotIn => {
                     is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
                 }
                 ExprOp::Not
@@ -169,8 +166,6 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
                 | ExprOp::ILike
                 | ExprOp::NotLike
                 | ExprOp::NotILike
-                | ExprOp::In
-                | ExprOp::NotIn
                 | ExprOp::Between
                 | ExprOp::NotBetween
                 | ExprOp::IsNull
@@ -181,13 +176,14 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
                 | ExprOp::NotExists => false,
             }
         }
-        WhereExpr::Value(_)
-        | WhereExpr::Column(_)
-        | WhereExpr::Unary(_)
-        | WhereExpr::Multi(_)
-        | WhereExpr::Function { .. }
-        | WhereExpr::Subquery { .. } => false,
-    }
+        WhereExpr::Value(_) => true,
+        WhereExpr::Column(_) => true,
+        WhereExpr::Multi(multi_expr) => multi_expr.exprs.iter().all(|e| is_cacheable_expr(e)),
+        WhereExpr::Unary(_) | WhereExpr::Function { .. } | WhereExpr::Subquery { .. } => false,
+    };
+
+    dbg!(rv);
+    rv
 }
 
 #[cfg(test)]

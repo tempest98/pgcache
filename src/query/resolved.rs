@@ -271,15 +271,40 @@ impl Deparse for ResolvedWhereExpr {
             }
             #[allow(clippy::wildcard_enum_match_arm)]
             ResolvedWhereExpr::Multi(multi) => {
-                let mut sep = "";
-                for expr in &multi.exprs {
-                    buf.push_str(sep);
-                    expr.deparse(buf);
-                    sep = match multi.op {
-                        ExprOp::And => " AND ",
-                        ExprOp::Or => " OR ",
-                        _ => ", ",
-                    };
+                match multi.op {
+                    ExprOp::In | ExprOp::NotIn => {
+                        // Format: column IN (value1, value2, ...)
+                        if let [first, rest @ ..] = multi.exprs.as_slice() {
+                            // First expression is the column/left side
+                            first.deparse(buf);
+                            if multi.op == ExprOp::In {
+                                buf.push_str(" IN (");
+                            } else {
+                                buf.push_str(" NOT IN (");
+                            }
+                            // Remaining expressions are the values
+                            let mut sep = "";
+                            for expr in rest {
+                                buf.push_str(sep);
+                                expr.deparse(buf);
+                                sep = ", ";
+                            }
+                            buf.push(')');
+                        }
+                    }
+                    _ => {
+                        // Generic multi-expression (AND, OR chains)
+                        let mut sep = "";
+                        for expr in &multi.exprs {
+                            buf.push_str(sep);
+                            expr.deparse(buf);
+                            sep = match multi.op {
+                                ExprOp::And => " AND ",
+                                ExprOp::Or => " OR ",
+                                _ => ", ",
+                            };
+                        }
+                    }
                 }
                 buf
             }

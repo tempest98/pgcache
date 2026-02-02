@@ -13,7 +13,7 @@ use pg_query::protobuf::{
 };
 use pg_query::{NodeRef, ParseResult};
 
-use super::ast::{BinaryExpr, ColumnNode, ExprOp, LiteralValue, UnaryExpr, WhereExpr};
+use super::ast::{BinaryExpr, ColumnNode, ExprOp, LiteralValue, MultiExpr, UnaryExpr, WhereExpr};
 
 error_set! {
     ParseError := WhereParseError || SqlError
@@ -238,6 +238,32 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
                 rexpr: Box::new(node_convert_to_expr(rexpr)?),
             }))
         }
+        AExprKind::AexprIn => {
+            // Handle IN / NOT IN expressions
+            // name: ["="] for IN, ["<>"] for NOT IN
+            let op = in_operator_extract(&expr.name)?;
+
+            let lexpr = expr
+                .lexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+            let rexpr = expr
+                .rexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+
+            // Left side is the column/expression being tested
+            let left_expr = node_convert_to_expr(lexpr)?;
+
+            // Right side is a List of values
+            let values = in_list_extract(rexpr)?;
+
+            // Build MultiExpr: [column, value1, value2, ...]
+            let mut exprs = vec![left_expr];
+            exprs.extend(values);
+
+            Ok(WhereExpr::Multi(MultiExpr { op, exprs }))
+        }
         unsupported_kind => {
             dbg!(unsupported_kind);
             Err(WhereParseError::UnsupportedAExpr {
@@ -245,6 +271,43 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
             })
         }
     }
+}
+
+/// Extract IN/NOT IN operator from name nodes
+fn in_operator_extract(name_nodes: &[pg_query::Node]) -> Result<ExprOp, WhereParseError> {
+    let [name_node] = name_nodes else {
+        return Err(WhereParseError::Other {
+            error: "IN operator: expected single name node".to_owned(),
+        });
+    };
+
+    let Some(NodeEnum::String(name_str)) = &name_node.node else {
+        return Err(WhereParseError::Other {
+            error: "IN operator: expected string node".to_owned(),
+        });
+    };
+
+    match name_str.sval.as_str() {
+        "=" => Ok(ExprOp::In),
+        "<>" => Ok(ExprOp::NotIn),
+        other => Err(WhereParseError::UnsupportedOperator {
+            operator: format!("IN with operator '{other}'"),
+        }),
+    }
+}
+
+/// Extract values from IN list (pg_query List node)
+fn in_list_extract(node: &pg_query::Node) -> Result<Vec<WhereExpr>, WhereParseError> {
+    let Some(NodeEnum::List(list)) = &node.node else {
+        return Err(WhereParseError::Other {
+            error: "IN clause: expected List on right side".to_owned(),
+        });
+    };
+
+    list.items
+        .iter()
+        .map(node_convert_to_expr)
+        .collect()
 }
 
 /// Extract operator from pg_query operator name nodes
@@ -900,5 +963,100 @@ mod tests {
             })),
         }));
         assert_eq!(where_clause, expected);
+    }
+
+    #[test]
+    fn where_clause_in_with_strings() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')")
+                .unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr, got {:?}", where_clause);
+        };
+
+        assert_eq!(multi.op, ExprOp::In);
+        assert_eq!(multi.exprs.len(), 4); // column + 3 values
+
+        // First element should be the column
+        let WhereExpr::Column(col) = &multi.exprs[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "status");
+
+        // Remaining elements should be string values
+        let WhereExpr::Value(LiteralValue::String(v1)) = &multi.exprs[1] else {
+            panic!("expected string value");
+        };
+        assert_eq!(v1, "active");
+    }
+
+    #[test]
+    fn where_clause_not_in() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT * FROM t WHERE id NOT IN (1, 2, 3)").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, ExprOp::NotIn);
+        assert_eq!(multi.exprs.len(), 4); // column + 3 values
+    }
+
+    #[test]
+    fn where_clause_in_with_integers() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT * FROM t WHERE id IN (1, 2, 3)").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, ExprOp::In);
+
+        // Check that values are integers
+        let WhereExpr::Value(LiteralValue::Integer(v1)) = &multi.exprs[1] else {
+            panic!("expected integer value");
+        };
+        assert_eq!(*v1, 1);
+    }
+
+    #[test]
+    fn where_clause_in_combined_with_and() {
+        let result = query_where_clause_parse(
+            &pg_query::parse(
+                "SELECT * FROM t WHERE tenant_id = 1 AND status IN ('active', 'pending')",
+            )
+            .unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        // Should be AND(tenant_id = 1, status IN (...))
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, ExprOp::And);
+
+        // Right side should be the IN clause
+        let WhereExpr::Multi(multi) = binary.rexpr.as_ref() else {
+            panic!("expected MultiExpr on right side");
+        };
+        assert_eq!(multi.op, ExprOp::In);
     }
 }
