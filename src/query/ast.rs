@@ -808,13 +808,21 @@ pub struct FunctionCall {
     pub args: Vec<ColumnExpr>,
     pub agg_star: bool,     // COUNT(*)
     pub agg_distinct: bool, // COUNT(DISTINCT col)
+    pub over: Option<WindowSpec>, // Window function OVER clause
 }
 
 impl FunctionCall {
     pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.args.iter().flat_map(|arg| arg.nodes());
-        current.chain(children)
+        let arg_children = self.args.iter().flat_map(|arg| arg.nodes());
+        let over_children = self.over.iter().flat_map(|w| w.nodes());
+        current.chain(arg_children).chain(over_children)
+    }
+
+    /// Check if this function call contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        self.args.iter().any(|arg| arg.has_sublink())
+            || self.over.as_ref().is_some_and(|w| w.has_sublink())
     }
 }
 
@@ -832,6 +840,63 @@ impl Deparse for FunctionCall {
             for arg in &self.args {
                 buf.push_str(sep);
                 arg.deparse(buf);
+                sep = ", ";
+            }
+        }
+        buf.push(')');
+        if let Some(over) = &self.over {
+            buf.push_str(" OVER ");
+            over.deparse(buf);
+        }
+        buf
+    }
+}
+
+/// Window specification for OVER clause: OVER (PARTITION BY ... ORDER BY ...)
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct WindowSpec {
+    /// PARTITION BY columns
+    pub partition_by: Vec<ColumnExpr>,
+    /// ORDER BY clauses
+    pub order_by: Vec<OrderByClause>,
+}
+
+impl WindowSpec {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let partition_children = self.partition_by.iter().flat_map(|p| p.nodes());
+        let order_children = self.order_by.iter().flat_map(|o| o.nodes());
+        current.chain(partition_children).chain(order_children)
+    }
+
+    /// Check if this window spec contains sublinks/subqueries
+    pub fn has_sublink(&self) -> bool {
+        self.partition_by.iter().any(|p| p.has_sublink())
+            || self.order_by.iter().any(|o| o.expr.has_sublink())
+    }
+}
+
+impl Deparse for WindowSpec {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push('(');
+        if !self.partition_by.is_empty() {
+            buf.push_str("PARTITION BY ");
+            let mut sep = "";
+            for col in &self.partition_by {
+                buf.push_str(sep);
+                col.deparse(buf);
+                sep = ", ";
+            }
+        }
+        if !self.order_by.is_empty() {
+            if !self.partition_by.is_empty() {
+                buf.push(' ');
+            }
+            buf.push_str("ORDER BY ");
+            let mut sep = "";
+            for clause in &self.order_by {
+                buf.push_str(sep);
+                clause.deparse(buf);
                 sep = ", ";
             }
         }
@@ -1696,12 +1761,78 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
             .collect::<Result<Vec<_>, _>>()?
     };
 
+    // Parse OVER clause for window functions
+    let over = func_call
+        .over
+        .as_ref()
+        .map(|win_def| window_def_convert(win_def))
+        .transpose()?;
+
     Ok(FunctionCall {
         name,
         args,
         agg_star: func_call.agg_star,
         agg_distinct: func_call.agg_distinct,
+        over,
     })
+}
+
+/// Convert a pg_query WindowDef to our WindowSpec
+fn window_def_convert(
+    win_def: &pg_query::protobuf::WindowDef,
+) -> Result<WindowSpec, AstError> {
+    // Convert PARTITION BY columns
+    let partition_by = win_def
+        .partition_clause
+        .iter()
+        .map(node_convert_to_column_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Convert ORDER BY clauses
+    let order_by = window_order_by_convert(&win_def.order_clause)?;
+
+    Ok(WindowSpec {
+        partition_by,
+        order_by,
+    })
+}
+
+/// Convert window ORDER BY clause (similar to regular ORDER BY but from window context)
+fn window_order_by_convert(
+    order_clause: &[pg_query::protobuf::Node],
+) -> Result<Vec<OrderByClause>, AstError> {
+    let mut order_by = Vec::new();
+
+    for sort_node in order_clause {
+        if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
+            let expr = sort_by
+                .node
+                .as_ref()
+                .ok_or_else(|| AstError::UnsupportedFeature {
+                    feature: "ORDER BY with no expression".to_owned(),
+                })
+                .and_then(|n| node_convert_to_column_expr(n))?;
+
+            let direction = match SortByDir::try_from(sort_by.sortby_dir) {
+                Ok(SortByDir::SortbyAsc) => OrderDirection::Asc,
+                Ok(SortByDir::SortbyDesc) => OrderDirection::Desc,
+                Ok(SortByDir::SortbyDefault) => OrderDirection::Asc, // Default is ASC
+                _ => {
+                    return Err(AstError::UnsupportedFeature {
+                        feature: format!("ORDER BY direction: {}", sort_by.sortby_dir),
+                    })
+                }
+            };
+
+            order_by.push(OrderByClause { expr, direction });
+        } else {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("Window ORDER BY node type: {sort_node:?}"),
+            });
+        }
+    }
+
+    Ok(order_by)
 }
 
 fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstError> {
@@ -1716,6 +1847,7 @@ fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstErr
         args,
         agg_star: false,
         agg_distinct: false,
+        over: None,
     })
 }
 
@@ -1741,6 +1873,7 @@ fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
         args,
         agg_star: false,
         agg_distinct: false,
+        over: None,
     })
 }
 
@@ -1759,6 +1892,7 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
         args,
         agg_star: false,
         agg_distinct: false,
+        over: None,
     })
 }
 
@@ -2941,6 +3075,7 @@ mod tests {
             })],
             agg_star: false,
             agg_distinct: false,
+            over: None,
         };
 
         // Test that FunctionCall::nodes() can extract ColumnNode from args
@@ -3579,6 +3714,7 @@ mod tests {
             args: vec![],
             agg_star: true,
             agg_distinct: false,
+            over: None,
         };
         let mut buf = String::new();
         func.deparse(&mut buf);
@@ -3595,6 +3731,7 @@ mod tests {
             })],
             agg_star: false,
             agg_distinct: true,
+            over: None,
         };
         let mut buf = String::new();
         func.deparse(&mut buf);
@@ -3777,5 +3914,117 @@ mod tests {
 
         let Statement::Select(select) = &ast.statement;
         assert!(select.has_sublink(), "CASE with subquery should have sublink");
+    }
+
+    #[test]
+    fn test_window_function_simple() {
+        let sql = "SELECT sum(amount) OVER (ORDER BY date) FROM orders";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "sum");
+        assert!(func.over.is_some(), "should have OVER clause");
+
+        let over = func.over.as_ref().unwrap();
+        assert!(over.partition_by.is_empty(), "no PARTITION BY");
+        assert_eq!(over.order_by.len(), 1, "one ORDER BY clause");
+    }
+
+    #[test]
+    fn test_window_function_with_partition() {
+        let sql = "SELECT sum(amount) OVER (PARTITION BY category ORDER BY date) FROM orders";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert!(func.over.is_some(), "should have OVER clause");
+
+        let over = func.over.as_ref().unwrap();
+        assert_eq!(over.partition_by.len(), 1, "one PARTITION BY column");
+        assert_eq!(over.order_by.len(), 1, "one ORDER BY clause");
+    }
+
+    #[test]
+    fn test_window_function_row_number() {
+        let sql = "SELECT row_number() OVER (ORDER BY id) FROM users";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+        assert_eq!(func.name, "row_number");
+        assert!(func.args.is_empty(), "row_number has no args");
+        assert!(func.over.is_some(), "should have OVER clause");
+    }
+
+    #[test]
+    fn test_window_function_deparse() {
+        let func = FunctionCall {
+            name: "sum".to_owned(),
+            args: vec![ColumnExpr::Column(ColumnNode {
+                table: None,
+                column: "amount".to_owned(),
+            })],
+            agg_star: false,
+            agg_distinct: false,
+            over: Some(WindowSpec {
+                partition_by: vec![ColumnExpr::Column(ColumnNode {
+                    table: None,
+                    column: "category".to_owned(),
+                })],
+                order_by: vec![OrderByClause {
+                    expr: ColumnExpr::Column(ColumnNode {
+                        table: None,
+                        column: "date".to_owned(),
+                    }),
+                    direction: OrderDirection::Asc,
+                }],
+            }),
+        };
+        let mut buf = String::new();
+        func.deparse(&mut buf);
+        assert_eq!(buf, "SUM(amount) OVER (PARTITION BY category ORDER BY date ASC)");
+    }
+
+    #[test]
+    fn test_window_function_multiple_order_by() {
+        let sql = "SELECT sum(x) OVER (ORDER BY a ASC, b DESC) FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+
+        let over = func.over.as_ref().unwrap();
+        assert_eq!(over.order_by.len(), 2, "two ORDER BY clauses");
+        assert_eq!(over.order_by[0].direction, OrderDirection::Asc);
+        assert_eq!(over.order_by[1].direction, OrderDirection::Desc);
     }
 }

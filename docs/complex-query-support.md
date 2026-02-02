@@ -431,7 +431,7 @@ limit 100 offset 0;
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Subqueries in FROM | Yes | `table_subquery_node_convert` handles `(select ...) alias` |
+| Subqueries in FROM | **Partial** | Parsed via `table_subquery_node_convert`, but **resolution not implemented** |
 | INNER JOINs | Yes | Multiple joins with equality conditions |
 | LEFT JOINs | Yes | Parsed but marked non-cacheable |
 | Basic WHERE (=, >=, <=, AND) | Yes | Simple comparisons work |
@@ -439,45 +439,43 @@ limit 100 offset 0;
 | GROUP BY columns | Yes | Recently added, marks query non-cacheable |
 | LIMIT/OFFSET | Yes | Recently added, marks query non-cacheable |
 | ORDER BY | Yes | `OrderByClause` exists |
+| CASE expressions | Yes | Both searched (`CASE WHEN...`) and simple (`CASE expr WHEN...`) forms |
+| Aggregate functions | Yes | `FunctionCall` with `agg_star` and `agg_distinct` |
+| COUNT(*) | Yes | Properly parsed and deparsed via `agg_star` field |
+| COUNT(DISTINCT col) | Yes | Properly parsed and deparsed via `agg_distinct` field |
+| Literal values in SELECT | Yes | NULL, booleans, integers, strings supported |
+| Function calls in SELECT | Yes | `FunctionCall` struct handles named functions |
+| Window functions | Yes | `sum(...) OVER (PARTITION BY ... ORDER BY ...)` |
 
 ### Not Supported (Blocking)
 
 | Priority | Feature | Example | Impact |
 |----------|---------|---------|--------|
+| **P0** | **Subquery resolution** | `SELECT * FROM (SELECT ...) sub` | Resolution fails with `InvalidTableRef` |
 | P0 | UNION | `select ... union select ...` | Query won't parse |
-| P1 | Aggregate functions | `count(...)`, `sum(...)`, `string_agg(...)` | Columns won't parse |
-| P1 | Window functions | `sum(...) over (order by ...)` | Columns won't parse |
-| P1 | CASE expressions | `case when ... then ... else ... end` | Won't parse |
-| P1 | Function calls in SELECT | `date_trunc('day', now())` | Won't parse |
-| P2 | Boolean literals in SELECT | `false as bool_col` | Not handled in `select_columns_convert` |
-| P2 | NULL literals in SELECT | `null as nullable_col` | Not handled |
-| P2 | Integer literals in SELECT | `123 as int_col` | Not handled |
-| P2 | String literals in SELECT | `'literal' as str_col` | Not handled |
+| ~~P1~~ | ~~Aggregate functions~~ | ~~`count(...)`, `sum(...)`, `string_agg(...)`~~ | ✅ Implemented |
+| ~~P1~~ | ~~Window functions~~ | ~~`sum(...) over (order by ...)`~~ | ✅ Implemented |
+| ~~P1~~ | ~~CASE expressions~~ | ~~`case when ... then ... else ... end`~~ | ✅ Implemented |
+| ~~P1~~ | ~~Function calls in SELECT~~ | ~~`date_trunc('day', now())`~~ | ✅ Implemented |
+| ~~P2~~ | ~~Boolean literals in SELECT~~ | ~~`false as bool_col`~~ | ✅ Implemented |
+| ~~P2~~ | ~~NULL literals in SELECT~~ | ~~`null as nullable_col`~~ | ✅ Implemented |
+| ~~P2~~ | ~~Integer literals in SELECT~~ | ~~`123 as int_col`~~ | ✅ Implemented |
+| ~~P2~~ | ~~String literals in SELECT~~ | ~~`'literal' as str_col`~~ | ✅ Implemented |
 | P2 | Arithmetic expressions | `amount * -1` | Won't parse |
 | P2 | IS NULL in WHERE | `deleted_at is null` | `ExprOp::IsNull` exists but needs WHERE support |
 | P2 | IN clause | `status in ('A', 'B')` | `ExprOp::In` exists but needs conversion |
-| P3 | DISTINCT in aggregates | `count(distinct ...)` | Part of aggregate support |
+| ~~P3~~ | ~~DISTINCT in aggregates~~ | ~~`count(distinct ...)`~~ | ✅ Implemented via `agg_distinct` |
 | P3 | ORDER BY in aggregates | `string_agg(... order by ...)` | Part of aggregate support |
 
 ## Implementation Plan
 
 ### Phase 1: Parse the Query
 
-#### Step 1.1: Add literal support to SELECT columns
+#### Step 1.1: Add literal support to SELECT columns ✅ DONE
 
 **File:** `src/query/ast.rs`
 
-In `select_columns_convert`, handle `NodeEnum::AConst` for literals:
-
-```rust
-Some(NodeEnum::AConst(const_val)) => {
-    let literal = const_value_extract(const_val)?;
-    columns.push(SelectColumn {
-        expr: ColumnExpr::Literal(literal),
-        alias,
-    });
-}
-```
+Literals (NULL, booleans, integers, strings) are now handled via `NodeEnum::AConst` in `select_columns_convert`.
 
 **Test query:**
 ```sql
@@ -560,90 +558,97 @@ Handle IN expressions (typically `NodeEnum::AExpr` with specific kind):
 SELECT * FROM t WHERE status IN ('A', 'B', 'C')
 ```
 
-#### Step 1.5: Add function calls to SELECT columns
+#### Step 1.5: Add function calls to SELECT columns ✅ DONE
 
 **File:** `src/query/ast.rs`
 
-Handle `NodeEnum::FuncCall` in `select_columns_convert`:
-
-```rust
-Some(NodeEnum::FuncCall(func_call)) => {
-    let function = function_call_convert(func_call)?;
-    columns.push(SelectColumn {
-        expr: ColumnExpr::Function(function),
-        alias,
-    });
-}
-```
-
-Enhance `FunctionCall` struct:
+`FunctionCall` struct is implemented with:
 ```rust
 pub struct FunctionCall {
     pub name: String,
     pub args: Vec<ColumnExpr>,
-    pub distinct: bool,           // For COUNT(DISTINCT ...)
-    pub order_by: Vec<OrderByClause>, // For string_agg(... ORDER BY ...)
-    pub filter: Option<WhereExpr>,    // For aggregate FILTER clause
+    pub agg_star: bool,     // For COUNT(*)
+    pub agg_distinct: bool, // For COUNT(DISTINCT ...)
 }
 ```
+
+Still TODO for future enhancement:
+- `order_by: Vec<OrderByClause>` - For `string_agg(... ORDER BY ...)`
+- `filter: Option<WhereExpr>` - For aggregate FILTER clause
 
 **Test query:**
 ```sql
 SELECT count(*), sum(amount), count(distinct category) FROM t
 ```
 
-#### Step 1.6: Add window function support
+#### Step 1.6: Add window function support ✅ DONE
 
-**File:** `src/query/ast.rs`
+**File:** `src/query/ast.rs`, `src/query/resolved.rs`
 
-Add window specification to `FunctionCall` or create new type:
+Implemented structures:
 
 ```rust
+// In ast.rs
 pub struct WindowSpec {
     pub partition_by: Vec<ColumnExpr>,
     pub order_by: Vec<OrderByClause>,
-    pub frame: Option<WindowFrame>,
 }
 
-// Extend FunctionCall or create WindowFunction
 pub struct FunctionCall {
-    // ... existing fields
-    pub over: Option<WindowSpec>,
+    pub name: String,
+    pub args: Vec<ColumnExpr>,
+    pub agg_star: bool,
+    pub agg_distinct: bool,
+    pub over: Option<WindowSpec>,  // Window function OVER clause
+}
+
+// In resolved.rs
+pub struct ResolvedWindowSpec {
+    pub partition_by: Vec<ResolvedColumnExpr>,
+    pub order_by: Vec<ResolvedOrderByClause>,
 }
 ```
+
+Supports PARTITION BY and ORDER BY clauses. Frame specification (`ROWS BETWEEN...`) not yet implemented.
 
 **Test query:**
 ```sql
 SELECT id, sum(amount) OVER (ORDER BY date ASC) as running_total FROM t
+SELECT sum(amount) OVER (PARTITION BY category ORDER BY date) FROM orders
 ```
 
-#### Step 1.7: Add CASE expression support
+#### Step 1.7: Add CASE expression support ✅ DONE
 
-**File:** `src/query/ast.rs`
+**File:** `src/query/ast.rs`, `src/query/resolved.rs`
 
-Add new `ColumnExpr` variant:
+Implemented structures:
 
 ```rust
-pub enum ColumnExpr {
-    // ... existing variants
-    Case(CaseExpr),
-}
-
+// In ast.rs
 pub struct CaseExpr {
-    pub operand: Option<Box<ColumnExpr>>,  // For CASE expr WHEN ...
-    pub when_clauses: Vec<WhenClause>,
-    pub else_result: Option<Box<ColumnExpr>>,
+    pub arg: Option<Box<ColumnExpr>>,  // For simple CASE (CASE expr WHEN val...)
+    pub whens: Vec<CaseWhen>,
+    pub default: Option<Box<ColumnExpr>>,  // ELSE clause
 }
 
-pub struct WhenClause {
-    pub condition: WhereExpr,  // or ColumnExpr for simple CASE
+pub struct CaseWhen {
+    pub condition: WhereExpr,  // Uses WhereExpr for full boolean expression support
     pub result: ColumnExpr,
 }
+
+// In resolved.rs - corresponding resolved types
+pub struct ResolvedCaseExpr { ... }
+pub struct ResolvedCaseWhen { ... }
 ```
 
-**Test query:**
+Both searched CASE (`CASE WHEN condition...`) and simple CASE (`CASE expr WHEN value...`) are supported.
+The implementation uses `WhereExpr` for conditions, enabling complex boolean expressions.
+Includes `has_sublink()` detection for cacheability analysis.
+
+**Test queries:**
 ```sql
 SELECT CASE WHEN status = 'A' THEN 1 WHEN status = 'B' THEN 2 ELSE 0 END FROM t
+SELECT CASE status WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 0 END FROM t
 ```
 
 #### Step 1.8: Add arithmetic expressions
@@ -678,15 +683,60 @@ pub enum ArithmeticOp {
 SELECT amount * -1, price + tax, total / count FROM t
 ```
 
+#### Step 1.9: Add subquery resolution (P0 - BLOCKING)
+
+**File:** `src/query/resolved.rs`
+
+Currently, subqueries are parsed but resolution fails with `InvalidTableRef`. Need to implement:
+
+1. **Subquery in FROM clause** - `table_source_resolve` for `TableSource::Subquery`:
+   - Recursively resolve the inner SELECT statement
+   - Build a virtual schema from the subquery's SELECT columns
+   - Register the subquery alias in the resolution scope
+   - Allow outer query to reference `alias.column`
+
+2. **Schema inference from subquery**:
+   - Each SELECT column in the subquery defines a "virtual column"
+   - Column names come from aliases or derived from expressions
+   - These become available to the outer query via the subquery alias
+
+3. **Subquery in SELECT/WHERE** - Lower priority, already detected via `has_sublink()`
+
+```rust
+TableSource::Subquery(subquery) => {
+    // 1. Resolve the inner select statement
+    let resolved_select = select_statement_resolve(&subquery.select, tables, search_path)?;
+
+    // 2. Build virtual schema from SELECT columns
+    let virtual_columns = resolved_select.columns.iter().map(|col| {
+        // Extract column name from alias or expression
+    }).collect();
+
+    // 3. Register alias in scope for outer query resolution
+    scope.register_subquery_alias(&subquery.alias, virtual_columns);
+
+    Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
+        select: Box::new(resolved_select),
+        alias: subquery.alias.clone(),
+    }))
+}
+```
+
+**Test query:**
+```sql
+SELECT sub.id, sub.name FROM (SELECT id, name FROM users WHERE active = true) sub WHERE sub.id > 10
+```
+
 ### Phase 2: Resolution Support
 
 **File:** `src/query/resolved.rs`
 
 Add resolution functions for all new AST types:
-- `set_operation_resolve`
-- `case_expr_resolve`
-- `window_spec_resolve`
-- Enhanced `function_call_resolve`
+- `set_operation_resolve` - TODO
+- `case_expr_resolve` - ✅ DONE (integrated into `column_expr_resolve`)
+- `window_spec_resolve` - ✅ DONE
+- `subquery_table_source_resolve` - TODO (P0)
+- Enhanced `function_call_resolve` - ✅ DONE (handles `agg_star`, `agg_distinct`, `over`)
 
 ### Phase 3: Cacheability
 
@@ -700,14 +750,15 @@ Add checks to mark queries as non-cacheable:
 
 ## Progress Tracking
 
-- [ ] Step 1.1: Literal support in SELECT
+- [x] Step 1.1: Literal support in SELECT
 - [ ] Step 1.2: UNION support
 - [ ] Step 1.3: IS NULL in WHERE
 - [ ] Step 1.4: IN clause
-- [ ] Step 1.5: Function calls in SELECT
-- [ ] Step 1.6: Window functions
-- [ ] Step 1.7: CASE expressions
+- [x] Step 1.5: Function calls in SELECT (including COUNT(*), COUNT(DISTINCT))
+- [x] Step 1.6: Window functions (PARTITION BY, ORDER BY)
+- [x] Step 1.7: CASE expressions (searched and simple forms)
 - [ ] Step 1.8: Arithmetic expressions
-- [ ] Phase 2: Resolution support
+- [ ] **Step 1.9: Subquery resolution** (P0 - blocks target query)
+- [x] Phase 2: Resolution support (for implemented features)
 - [ ] Phase 3: Cacheability checks
 - [ ] Full test query parses successfully

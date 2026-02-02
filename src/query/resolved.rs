@@ -7,7 +7,7 @@ use rootcause::Report;
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
     ColumnExpr, ColumnNode, Deparse, ExprOp, JoinType, LimitClause, LiteralValue, OrderDirection,
-    SelectColumns, SelectStatement, TableAlias, TableNode, TableSource, WhereExpr,
+    SelectColumns, SelectStatement, TableAlias, TableNode, TableSource, WhereExpr, WindowSpec,
 };
 
 error_set! {
@@ -310,12 +310,13 @@ impl Deparse for ResolvedWhereExpr {
 pub enum ResolvedColumnExpr {
     /// Fully qualified column reference
     Column(ResolvedColumnNode),
-    /// Function call (for future support)
+    /// Function call (including window functions)
     Function {
         name: String,
         args: Vec<ResolvedColumnExpr>,
         agg_star: bool,
         agg_distinct: bool,
+        over: Option<ResolvedWindowSpec>,
     },
     /// Literal value
     Literal(LiteralValue),
@@ -323,6 +324,53 @@ pub enum ResolvedColumnExpr {
     Case(ResolvedCaseExpr),
     /// Subquery (for future support)
     Subquery(Box<ResolvedSelectStatement>),
+}
+
+/// Resolved window specification for OVER clause
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedWindowSpec {
+    /// PARTITION BY columns
+    pub partition_by: Vec<ResolvedColumnExpr>,
+    /// ORDER BY clauses
+    pub order_by: Vec<ResolvedOrderByClause>,
+}
+
+impl ResolvedWindowSpec {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let partition_children = self.partition_by.iter().flat_map(|p| p.nodes());
+        let order_children = self.order_by.iter().flat_map(|o| o.nodes());
+        current.chain(partition_children).chain(order_children)
+    }
+}
+
+impl Deparse for ResolvedWindowSpec {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push('(');
+        if !self.partition_by.is_empty() {
+            buf.push_str("PARTITION BY ");
+            let mut sep = "";
+            for col in &self.partition_by {
+                buf.push_str(sep);
+                col.deparse(buf);
+                sep = ", ";
+            }
+        }
+        if !self.order_by.is_empty() {
+            if !self.partition_by.is_empty() {
+                buf.push(' ');
+            }
+            buf.push_str("ORDER BY ");
+            let mut sep = "";
+            for clause in &self.order_by {
+                buf.push_str(sep);
+                clause.deparse(buf);
+                sep = ", ";
+            }
+        }
+        buf.push(')');
+        buf
+    }
 }
 
 /// Resolved CASE expression
@@ -351,8 +399,10 @@ impl ResolvedColumnExpr {
         let children: Box<dyn Iterator<Item = &'_ N>> = match self {
             ResolvedColumnExpr::Column(col) => Box::new(col.nodes()),
             ResolvedColumnExpr::Literal(lit) => Box::new(lit.nodes()),
-            ResolvedColumnExpr::Function { args, .. } => {
-                Box::new(args.iter().flat_map(|arg| arg.nodes()))
+            ResolvedColumnExpr::Function { args, over, .. } => {
+                let arg_nodes = args.iter().flat_map(|arg| arg.nodes());
+                let over_nodes = over.iter().flat_map(|w| w.nodes());
+                Box::new(arg_nodes.chain(over_nodes))
             }
             ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
             ResolvedColumnExpr::Subquery(query) => Box::new(query.nodes()),
@@ -392,6 +442,7 @@ impl Deparse for ResolvedColumnExpr {
                 args,
                 agg_star,
                 agg_distinct,
+                over,
             } => {
                 buf.push_str(name);
                 buf.push('(');
@@ -409,6 +460,10 @@ impl Deparse for ResolvedColumnExpr {
                     }
                 }
                 buf.push(')');
+                if let Some(window_spec) = over {
+                    buf.push_str(" OVER ");
+                    window_spec.deparse(buf);
+                }
                 buf
             }
             ResolvedColumnExpr::Case(case) => case.deparse(buf),
@@ -1082,11 +1137,20 @@ fn column_expr_resolve(
                 .iter()
                 .map(|arg| column_expr_resolve(arg, scope))
                 .collect::<ResolveResult<Vec<_>>>()?;
+
+            // Resolve window specification if present
+            let resolved_over = func
+                .over
+                .as_ref()
+                .map(|w| window_spec_resolve(w, scope))
+                .transpose()?;
+
             Ok(ResolvedColumnExpr::Function {
                 name: func.name.clone(),
                 args: resolved_args,
                 agg_star: func.agg_star,
                 agg_distinct: func.agg_distinct,
+                over: resolved_over,
             })
         }
         ColumnExpr::Case(case) => {
@@ -1125,6 +1189,37 @@ fn column_expr_resolve(
             Err(ResolveError::InvalidTableRef.into())
         }
     }
+}
+
+/// Resolve a window specification
+fn window_spec_resolve(
+    window_spec: &WindowSpec,
+    scope: &ResolutionScope,
+) -> ResolveResult<ResolvedWindowSpec> {
+    // Resolve PARTITION BY columns
+    let partition_by = window_spec
+        .partition_by
+        .iter()
+        .map(|col| column_expr_resolve(col, scope))
+        .collect::<ResolveResult<Vec<_>>>()?;
+
+    // Resolve ORDER BY clauses
+    let order_by = window_spec
+        .order_by
+        .iter()
+        .map(|clause| {
+            let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
+            Ok(ResolvedOrderByClause {
+                expr: resolved_expr,
+                direction: clause.direction.clone(),
+            })
+        })
+        .collect::<ResolveResult<Vec<_>>>()?;
+
+    Ok(ResolvedWindowSpec {
+        partition_by,
+        order_by,
+    })
 }
 
 /// Resolve SELECT columns
@@ -2545,5 +2640,63 @@ mod tests {
             resolved.limit.unwrap().count,
             Some(LiteralValue::Integer(10))
         );
+    }
+
+    #[test]
+    fn test_resolved_window_function() {
+        use crate::query::ast::{sql_query_convert, Statement};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        // Use columns that exist in test_table_metadata: id, name
+        let sql = "SELECT sum(id) OVER (PARTITION BY name ORDER BY id) FROM users";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let ResolvedSelectColumns::Columns(columns) = &resolved.columns else {
+            panic!("expected columns");
+        };
+
+        let ResolvedSelectColumn {
+            expr: ResolvedColumnExpr::Function { name, over, .. },
+            ..
+        } = &columns[0]
+        else {
+            panic!("expected function");
+        };
+
+        assert_eq!(name, "sum");
+        assert!(over.is_some(), "should have OVER clause");
+
+        let window_spec = over.as_ref().unwrap();
+        assert_eq!(window_spec.partition_by.len(), 1);
+        assert_eq!(window_spec.order_by.len(), 1);
+    }
+
+    #[test]
+    fn test_resolved_window_function_deparse() {
+        use crate::query::ast::{sql_query_convert, Statement};
+
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        // Use columns that exist in test_table_metadata: id, name
+        let sql = "SELECT sum(id) OVER (ORDER BY name DESC) FROM users";
+        let ast = pg_query::parse(sql).unwrap();
+        let sql_query = sql_query_convert(&ast).unwrap();
+
+        let Statement::Select(stmt) = &sql_query.statement;
+        let resolved = select_statement_resolve(stmt, &tables, &["public"]).unwrap();
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+
+        // Should contain the window function with OVER clause
+        assert!(buf.contains("OVER"), "deparsed SQL should contain OVER: {}", buf);
+        assert!(buf.contains("ORDER BY"), "deparsed SQL should contain ORDER BY: {}", buf);
     }
 }
