@@ -282,10 +282,20 @@ impl UnaryExpr {
 
 impl Deparse for UnaryExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.op.deparse(buf);
-        buf.push(' ');
-        self.expr.deparse(buf);
-
+        match self.op {
+            UnaryOp::IsNull | UnaryOp::IsNotNull => {
+                // Postfix operators: expr IS NULL
+                self.expr.deparse(buf);
+                buf.push(' ');
+                self.op.deparse(buf);
+            }
+            UnaryOp::Not | UnaryOp::Exists | UnaryOp::NotExists => {
+                // Prefix operators: NOT expr
+                self.op.deparse(buf);
+                buf.push(' ');
+                self.expr.deparse(buf);
+            }
+        }
         buf
     }
 }
@@ -2707,7 +2717,7 @@ mod tests {
     fn test_unary_expr_deparse() {
         let mut buf = String::new();
 
-        // NOT active
+        // NOT active (prefix operator)
         let expr = UnaryExpr {
             op: UnaryOp::Not,
             expr: Box::new(WhereExpr::Column(ColumnNode {
@@ -2718,6 +2728,32 @@ mod tests {
 
         expr.deparse(&mut buf);
         assert_eq!(buf, "NOT active");
+        buf.clear();
+
+        // deleted_at IS NULL (postfix operator)
+        let expr = UnaryExpr {
+            op: UnaryOp::IsNull,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "deleted_at".to_owned(),
+            })),
+        };
+
+        expr.deparse(&mut buf);
+        assert_eq!(buf, "deleted_at IS NULL");
+        buf.clear();
+
+        // name IS NOT NULL (postfix operator)
+        let expr = UnaryExpr {
+            op: UnaryOp::IsNotNull,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "name".to_owned(),
+            })),
+        };
+
+        expr.deparse(&mut buf);
+        assert_eq!(buf, "name IS NOT NULL");
     }
 
     #[test]

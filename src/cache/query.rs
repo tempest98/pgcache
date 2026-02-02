@@ -3,7 +3,7 @@ use crate::{
     query::{
         ast::{
             BinaryOp, JoinNode, JoinType, MultiOp, SelectStatement, SqlQuery, Statement,
-            TableSource, WhereExpr,
+            TableSource, UnaryOp, WhereExpr,
         },
         evaluate::is_simple_comparison,
         transform::{AstTransformResult, ast_parameters_replace},
@@ -144,9 +144,7 @@ fn is_cacheable_select(select: &SelectStatement) -> bool {
 /// Determine if a WHERE expression can be efficiently cached.
 /// Step 2: Support simple equality, AND of equalities, OR of equalities.
 fn is_cacheable_expr(expr: &WhereExpr) -> bool {
-    dbg!(&expr);
-
-    let rv = match expr {
+    match expr {
         WhereExpr::Binary(binary_expr) => match binary_expr.op {
             BinaryOp::Equal
             | BinaryOp::NotEqual
@@ -168,11 +166,13 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
             MultiOp::In | MultiOp::NotIn => multi_expr.exprs.iter().all(is_cacheable_expr),
             MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => false,
         },
-        WhereExpr::Unary(_) | WhereExpr::Function { .. } | WhereExpr::Subquery { .. } => false,
-    };
-
-    dbg!(rv);
-    rv
+        WhereExpr::Unary(unary_expr) => match unary_expr.op {
+            UnaryOp::IsNull | UnaryOp::IsNotNull => is_cacheable_expr(&unary_expr.expr),
+            UnaryOp::Not => is_cacheable_expr(&unary_expr.expr),
+            UnaryOp::Exists | UnaryOp::NotExists => false,
+        },
+        WhereExpr::Function { .. } | WhereExpr::Subquery { .. } => false,
+    }
 }
 
 #[cfg(test)]

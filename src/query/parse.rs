@@ -9,7 +9,8 @@ use pg_query::protobuf::SelectStmt;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{
-    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, ParamRef, SubLink,
+    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, NullTest, NullTestType, ParamRef,
+    SubLink,
 };
 use pg_query::{NodeRef, ParseResult};
 
@@ -144,6 +145,7 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
             let query = sublink_query_extract(sub_link);
             Ok(WhereExpr::Subquery { query })
         }
+        Some(NodeEnum::NullTest(null_test)) => null_test_convert(null_test),
         unsupported => {
             dbg!(unsupported);
             Err(WhereParseError::UnsupportedPattern)
@@ -158,6 +160,29 @@ fn sublink_query_extract(sub_link: &SubLink) -> String {
     // We can't easily deparse a single node, but we don't need to -
     // the query string is just for debugging. Store a marker instead.
     format!("<subquery at location {}>", sub_link.location)
+}
+
+/// Convert pg_query NullTest to WhereExpr (IS NULL / IS NOT NULL)
+fn null_test_convert(null_test: &NullTest) -> Result<WhereExpr, WhereParseError> {
+    let arg = null_test
+        .arg
+        .as_ref()
+        .ok_or(WhereParseError::MissingExpression)?;
+
+    let op = match null_test.nulltesttype() {
+        NullTestType::IsNull => UnaryOp::IsNull,
+        NullTestType::IsNotNull => UnaryOp::IsNotNull,
+        NullTestType::Undefined => {
+            return Err(WhereParseError::UnsupportedAExpr {
+                expr: "Undefined NullTest type".to_owned(),
+            })
+        }
+    };
+
+    Ok(WhereExpr::Unary(UnaryExpr {
+        op,
+        expr: Box::new(node_convert_to_expr(arg)?),
+    }))
 }
 
 /// Extract column reference from pg_query ColumnRef
@@ -1061,5 +1086,70 @@ mod tests {
             panic!("expected MultiExpr on right side");
         };
         assert_eq!(multi.op, MultiOp::In);
+    }
+
+    #[test]
+    fn where_clause_is_null() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE deleted_at IS NULL").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        assert_eq!(unary.op, UnaryOp::IsNull);
+
+        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "deleted_at");
+    }
+
+    #[test]
+    fn where_clause_is_not_null() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT id FROM test WHERE name IS NOT NULL").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        assert_eq!(unary.op, UnaryOp::IsNotNull);
+
+        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "name");
+    }
+
+    #[test]
+    fn where_clause_is_null_combined_with_and() {
+        let result = query_where_clause_parse(
+            &pg_query::parse("SELECT * FROM t WHERE id = 1 AND deleted_at IS NULL").unwrap(),
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        // Should be AND(id = 1, deleted_at IS NULL)
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::And);
+
+        // Right side should be IS NULL
+        let WhereExpr::Unary(unary) = binary.rexpr.as_ref() else {
+            panic!("expected UnaryExpr on right side");
+        };
+        assert_eq!(unary.op, UnaryOp::IsNull);
     }
 }

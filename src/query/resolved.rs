@@ -248,9 +248,20 @@ impl Deparse for ResolvedWhereExpr {
             ResolvedWhereExpr::Value(lit) => lit.deparse(buf),
             ResolvedWhereExpr::Column(col) => col.deparse(buf),
             ResolvedWhereExpr::Unary(unary) => {
-                unary.op.deparse(buf);
-                buf.push(' ');
-                unary.expr.deparse(buf);
+                match unary.op {
+                    UnaryOp::IsNull | UnaryOp::IsNotNull => {
+                        // Postfix operators: expr IS NULL
+                        unary.expr.deparse(buf);
+                        buf.push(' ');
+                        unary.op.deparse(buf);
+                    }
+                    UnaryOp::Not | UnaryOp::Exists | UnaryOp::NotExists => {
+                        // Prefix operators: NOT expr
+                        unary.op.deparse(buf);
+                        buf.push(' ');
+                        unary.expr.deparse(buf);
+                    }
+                }
                 buf
             }
             ResolvedWhereExpr::Binary(binary) => {

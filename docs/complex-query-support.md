@@ -462,8 +462,8 @@ limit 100 offset 0;
 | ~~P2~~ | ~~Integer literals in SELECT~~ | ~~`123 as int_col`~~ | ✅ Implemented |
 | ~~P2~~ | ~~String literals in SELECT~~ | ~~`'literal' as str_col`~~ | ✅ Implemented |
 | P2 | Arithmetic expressions | `amount * -1` | Won't parse |
-| P2 | IS NULL in WHERE | `deleted_at is null` | `ExprOp::IsNull` exists but needs WHERE support |
-| P2 | IN clause | `status in ('A', 'B')` | `ExprOp::In` exists but needs conversion |
+| ~~P2~~ | ~~IS NULL in WHERE~~ | ~~`deleted_at is null`~~ | ✅ Implemented via `UnaryOp::IsNull/IsNotNull` |
+| ~~P2~~ | ~~IN clause~~ | ~~`status in ('A', 'B')`~~ | ✅ Implemented via `MultiOp::In` |
 | ~~P3~~ | ~~DISTINCT in aggregates~~ | ~~`count(distinct ...)`~~ | ✅ Implemented via `agg_distinct` |
 | P3 | ORDER BY in aggregates | `string_agg(... order by ...)` | Part of aggregate support |
 
@@ -521,41 +521,31 @@ pub enum SelectBody {
 SELECT id, name FROM table_a UNION SELECT id, name FROM table_b
 ```
 
-#### Step 1.3: Add IS NULL support in WHERE
+#### Step 1.3: Add IS NULL support in WHERE ✅ DONE
 
 **File:** `src/query/parse.rs`
 
-Handle `NodeEnum::NullTest` in `node_convert_to_expr`:
+Implemented via `null_test_convert()` function that handles `NodeEnum::NullTest`. Creates `UnaryExpr` with `UnaryOp::IsNull` or `UnaryOp::IsNotNull`.
 
-```rust
-Some(NodeEnum::NullTest(null_test)) => {
-    let arg = node_convert_to_expr(null_test.arg.as_ref().unwrap())?;
-    let op = if null_test.nulltesttype() == NullTestType::IsNull {
-        ExprOp::IsNull
-    } else {
-        ExprOp::IsNotNull
-    };
-    Ok(WhereExpr::Unary(UnaryExpr {
-        op,
-        expr: Box::new(arg),
-    }))
-}
-```
+Note: IS NULL uses postfix syntax (`expr IS NULL`), so `UnaryExpr::deparse` was updated to handle both prefix operators (NOT, EXISTS) and postfix operators (IS NULL, IS NOT NULL).
 
-**Test query:**
+**Test queries:**
 ```sql
 SELECT * FROM t WHERE deleted_at IS NULL
+SELECT * FROM t WHERE name IS NOT NULL
+SELECT * FROM t WHERE id = 1 AND deleted_at IS NULL
 ```
 
-#### Step 1.4: Add IN clause support
+#### Step 1.4: Add IN clause support ✅ DONE
 
 **File:** `src/query/parse.rs`
 
-Handle IN expressions (typically `NodeEnum::AExpr` with specific kind):
+Implemented via `AExprKind::AexprIn` handling in `a_expr_convert()`. Uses `MultiExpr` with `MultiOp::In` or `MultiOp::NotIn`.
 
 **Test query:**
 ```sql
 SELECT * FROM t WHERE status IN ('A', 'B', 'C')
+SELECT * FROM t WHERE id NOT IN (1, 2, 3)
 ```
 
 #### Step 1.5: Add function calls to SELECT columns ✅ DONE
@@ -752,8 +742,8 @@ Add checks to mark queries as non-cacheable:
 
 - [x] Step 1.1: Literal support in SELECT
 - [ ] Step 1.2: UNION support
-- [ ] Step 1.3: IS NULL in WHERE
-- [ ] Step 1.4: IN clause
+- [x] Step 1.3: IS NULL in WHERE (via `UnaryOp::IsNull/IsNotNull`)
+- [x] Step 1.4: IN clause (via `MultiOp::In`, `MultiOp::NotIn`)
 - [x] Step 1.5: Function calls in SELECT (including COUNT(*), COUNT(DISTINCT))
 - [x] Step 1.6: Window functions (PARTITION BY, ORDER BY)
 - [x] Step 1.7: CASE expressions (searched and simple forms)
