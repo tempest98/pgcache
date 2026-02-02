@@ -6,8 +6,9 @@ use rootcause::Report;
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
-    ColumnExpr, ColumnNode, Deparse, ExprOp, JoinType, LimitClause, LiteralValue, OrderDirection,
-    SelectColumns, SelectStatement, TableAlias, TableNode, TableSource, WhereExpr, WindowSpec,
+    BinaryOp, ColumnExpr, ColumnNode, Deparse, JoinType, LimitClause, LiteralValue, MultiOp,
+    OrderDirection, SelectColumns, SelectStatement, TableAlias, TableNode, TableSource, UnaryOp,
+    WhereExpr, WindowSpec,
 };
 
 error_set! {
@@ -131,7 +132,7 @@ impl Deparse for ResolvedColumnNode {
 /// Resolved unary expression
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedUnaryExpr {
-    pub op: ExprOp,
+    pub op: UnaryOp,
     pub expr: Box<ResolvedWhereExpr>,
 }
 
@@ -146,7 +147,7 @@ impl ResolvedUnaryExpr {
 /// Resolved binary expression
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedBinaryExpr {
-    pub op: ExprOp,
+    pub op: BinaryOp,
     pub lexpr: Box<ResolvedWhereExpr>,
     pub rexpr: Box<ResolvedWhereExpr>,
 }
@@ -162,7 +163,7 @@ impl ResolvedBinaryExpr {
 /// Resolved multi-operand expression
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedMultiExpr {
-    pub op: ExprOp,
+    pub op: MultiOp,
     pub exprs: Vec<ResolvedWhereExpr>,
 }
 
@@ -218,30 +219,21 @@ impl ResolvedWhereExpr {
     pub fn predicate_count(&self) -> usize {
         match self {
             ResolvedWhereExpr::Binary(b) => match b.op {
-                ExprOp::And | ExprOp::Or => b.lexpr.predicate_count() + b.rexpr.predicate_count(),
-                ExprOp::Not
-                | ExprOp::Equal
-                | ExprOp::NotEqual
-                | ExprOp::LessThan
-                | ExprOp::LessThanOrEqual
-                | ExprOp::GreaterThan
-                | ExprOp::GreaterThanOrEqual
-                | ExprOp::Like
-                | ExprOp::ILike
-                | ExprOp::NotLike
-                | ExprOp::NotILike
-                | ExprOp::In
-                | ExprOp::NotIn
-                | ExprOp::Between
-                | ExprOp::NotBetween
-                | ExprOp::IsNull
-                | ExprOp::IsNotNull
-                | ExprOp::Any
-                | ExprOp::All
-                | ExprOp::Exists
-                | ExprOp::NotExists => 1,
+                BinaryOp::And | BinaryOp::Or => {
+                    b.lexpr.predicate_count() + b.rexpr.predicate_count()
+                }
+                BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::LessThan
+                | BinaryOp::LessThanOrEqual
+                | BinaryOp::GreaterThan
+                | BinaryOp::GreaterThanOrEqual
+                | BinaryOp::Like
+                | BinaryOp::ILike
+                | BinaryOp::NotLike
+                | BinaryOp::NotILike => 1,
             },
-            ResolvedWhereExpr::Multi(m) => m.exprs.iter().map(|e| e.predicate_count()).sum(),
+            ResolvedWhereExpr::Multi(_) => 1, // Multi ops (IN, BETWEEN, etc.) are single predicates
             ResolvedWhereExpr::Unary(u) => u.expr.predicate_count(),
             ResolvedWhereExpr::Function { .. } => 1, // Treat function calls as single predicate
             ResolvedWhereExpr::Subquery { .. } => 1, // Treat subqueries as single predicate
@@ -269,43 +261,33 @@ impl Deparse for ResolvedWhereExpr {
                 binary.rexpr.deparse(buf);
                 buf
             }
-            #[allow(clippy::wildcard_enum_match_arm)]
             ResolvedWhereExpr::Multi(multi) => {
+                // Format: column IN (value1, value2, ...) or column NOT IN (...)
+                let [first, rest @ ..] = multi.exprs.as_slice() else {
+                    return buf;
+                };
+
+                // First expression is the column/left side
+                first.deparse(buf);
+
                 match multi.op {
-                    ExprOp::In | ExprOp::NotIn => {
-                        // Format: column IN (value1, value2, ...)
-                        if let [first, rest @ ..] = multi.exprs.as_slice() {
-                            // First expression is the column/left side
-                            first.deparse(buf);
-                            if multi.op == ExprOp::In {
-                                buf.push_str(" IN (");
-                            } else {
-                                buf.push_str(" NOT IN (");
-                            }
-                            // Remaining expressions are the values
-                            let mut sep = "";
-                            for expr in rest {
-                                buf.push_str(sep);
-                                expr.deparse(buf);
-                                sep = ", ";
-                            }
-                            buf.push(')');
-                        }
-                    }
-                    _ => {
-                        // Generic multi-expression (AND, OR chains)
-                        let mut sep = "";
-                        for expr in &multi.exprs {
-                            buf.push_str(sep);
-                            expr.deparse(buf);
-                            sep = match multi.op {
-                                ExprOp::And => " AND ",
-                                ExprOp::Or => " OR ",
-                                _ => ", ",
-                            };
-                        }
+                    MultiOp::In => buf.push_str(" IN ("),
+                    MultiOp::NotIn => buf.push_str(" NOT IN ("),
+                    MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => {
+                        buf.push(' ');
+                        multi.op.deparse(buf);
+                        buf.push_str(" (");
                     }
                 }
+
+                // Remaining expressions are the values
+                let mut sep = "";
+                for expr in rest {
+                    buf.push_str(sep);
+                    expr.deparse(buf);
+                    sep = ", ";
+                }
+                buf.push(')');
                 buf
             }
             ResolvedWhereExpr::Function { name, args } => {
@@ -1840,11 +1822,11 @@ mod tests {
 
         // Check that complex WHERE was resolved
         if let Some(ResolvedWhereExpr::Binary(and_expr)) = &resolved.where_clause {
-            assert_eq!(and_expr.op, ExprOp::And);
+            assert_eq!(and_expr.op, BinaryOp::And);
 
             // Left side: id = 1
             if let ResolvedWhereExpr::Binary(left_binary) = &*and_expr.lexpr {
-                assert_eq!(left_binary.op, ExprOp::Equal);
+                assert_eq!(left_binary.op, BinaryOp::Equal);
                 if let ResolvedWhereExpr::Column(col) = &*left_binary.lexpr {
                     assert_eq!(col.column, "id");
                 }
@@ -1854,7 +1836,7 @@ mod tests {
 
             // Right side: name = 'john'
             if let ResolvedWhereExpr::Binary(right_binary) = &*and_expr.rexpr {
-                assert_eq!(right_binary.op, ExprOp::Equal);
+                assert_eq!(right_binary.op, BinaryOp::Equal);
                 if let ResolvedWhereExpr::Column(col) = &*right_binary.lexpr {
                     assert_eq!(col.column, "name");
                 }

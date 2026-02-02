@@ -1452,14 +1452,14 @@ mod tests {
 
     #[test]
     fn test_resolved_select_replace_strips_having() {
-        use crate::query::ast::ExprOp;
+        use crate::query::ast::BinaryOp;
         use crate::query::resolved::{
             ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectStatement, ResolvedWhereExpr,
         };
 
         let stmt = ResolvedSelectStatement {
             having: Some(ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
-                op: ExprOp::Equal,
+                op: BinaryOp::Equal,
                 lexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
                 rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
             })),
@@ -1540,13 +1540,13 @@ mod tests {
 
     #[test]
     fn test_resolved_select_replace_preserves_where() {
-        use crate::query::ast::ExprOp;
+        use crate::query::ast::BinaryOp;
         use crate::query::resolved::{
             ResolvedBinaryExpr, ResolvedSelectColumns, ResolvedSelectStatement, ResolvedWhereExpr,
         };
 
         let where_clause = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
-            op: ExprOp::Equal,
+            op: BinaryOp::Equal,
             lexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
             rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
         });

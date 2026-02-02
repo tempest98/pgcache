@@ -188,16 +188,35 @@ impl Deparse for ColumnNode {
     }
 }
 
-// Operators for WHERE expressions
-#[derive(Debug, Clone, Copy, PartialEq, Hash, AsRefStr)]
+// Unary operators (prefix operators on single expression)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
 #[strum(serialize_all = "UPPERCASE")]
-pub enum ExprOp {
-    // Logical operators
+pub enum UnaryOp {
+    Not,
+    #[strum(to_string = "IS NULL")]
+    IsNull,
+    #[strum(to_string = "IS NOT NULL")]
+    IsNotNull,
+    Exists,
+    #[strum(to_string = "NOT EXISTS")]
+    NotExists,
+}
+
+impl Deparse for UnaryOp {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str(self.as_ref());
+        buf
+    }
+}
+
+// Binary operators (infix operators between two expressions)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
+#[strum(serialize_all = "UPPERCASE")]
+pub enum BinaryOp {
+    // Logical
     And,
     Or,
-    Not,
-
-    // Comparison operators
+    // Comparison
     #[strum(to_string = "=")]
     Equal,
     #[strum(to_string = "!=")]
@@ -210,7 +229,6 @@ pub enum ExprOp {
     GreaterThan,
     #[strum(to_string = ">=")]
     GreaterThanOrEqual,
-
     // Pattern matching
     Like,
     ILike,
@@ -218,44 +236,39 @@ pub enum ExprOp {
     NotLike,
     #[strum(to_string = "NOT ILIKE")]
     NotILike,
+}
 
-    // Set operations
+impl Deparse for BinaryOp {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str(self.as_ref());
+        buf
+    }
+}
+
+// Multi-operand operators (one subject with multiple values)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
+#[strum(serialize_all = "UPPERCASE")]
+pub enum MultiOp {
     In,
     #[strum(to_string = "NOT IN")]
     NotIn,
-
-    // Range operations
     Between,
     #[strum(to_string = "NOT BETWEEN")]
     NotBetween,
-
-    // Null checks
-    #[strum(to_string = "IS NULL")]
-    IsNull,
-    #[strum(to_string = "IS NOT NULL")]
-    IsNotNull,
-
-    // Array operations
     Any,
     All,
-
-    // Existence checks
-    Exists,
-    #[strum(to_string = "NOT EXISTS")]
-    NotExists,
 }
 
-impl Deparse for ExprOp {
+impl Deparse for MultiOp {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push_str(self.as_ref());
-
         buf
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct UnaryExpr {
-    pub op: ExprOp,
+    pub op: UnaryOp,
     pub expr: Box<WhereExpr>,
 }
 
@@ -279,7 +292,7 @@ impl Deparse for UnaryExpr {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BinaryExpr {
-    pub op: ExprOp,
+    pub op: BinaryOp,
     pub lexpr: Box<WhereExpr>, // left expression
     pub rexpr: Box<WhereExpr>, // right expression
 }
@@ -307,7 +320,7 @@ impl Deparse for BinaryExpr {
 // Multi-operand expressions (for IN, BETWEEN, etc.)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct MultiExpr {
-    pub op: ExprOp,
+    pub op: MultiOp,
     pub exprs: Vec<WhereExpr>,
 }
 
@@ -330,12 +343,10 @@ impl Deparse for MultiExpr {
         // First expression is the column/left side
         first.deparse(buf);
 
-        // Wildcard is intentional - provides extensible fallback for future multi-ops
-        #[expect(clippy::wildcard_enum_match_arm)]
         match self.op {
-            ExprOp::In => buf.push_str(" IN ("),
-            ExprOp::NotIn => buf.push_str(" NOT IN ("),
-            _ => {
+            MultiOp::In => buf.push_str(" IN ("),
+            MultiOp::NotIn => buf.push_str(" NOT IN ("),
+            MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => {
                 buf.push(' ');
                 self.op.deparse(buf);
                 buf.push_str(" (");
@@ -2594,51 +2605,70 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_op_deparse() {
+    fn test_unary_op_deparse() {
         let mut buf = String::new();
 
-        // Comparison operators
-        ExprOp::Equal.deparse(&mut buf);
-        assert_eq!(buf, "=");
+        UnaryOp::Not.deparse(&mut buf);
+        assert_eq!(buf, "NOT");
         buf.clear();
 
-        ExprOp::NotEqual.deparse(&mut buf);
-        assert_eq!(buf, "!=");
-        buf.clear();
-
-        ExprOp::LessThan.deparse(&mut buf);
-        assert_eq!(buf, "<");
-        buf.clear();
-
-        ExprOp::GreaterThanOrEqual.deparse(&mut buf);
-        assert_eq!(buf, ">=");
-        buf.clear();
-
-        // Null checks (test the fix)
-        ExprOp::IsNull.deparse(&mut buf);
+        UnaryOp::IsNull.deparse(&mut buf);
         assert_eq!(buf, "IS NULL");
         buf.clear();
 
-        ExprOp::IsNotNull.deparse(&mut buf);
+        UnaryOp::IsNotNull.deparse(&mut buf);
         assert_eq!(buf, "IS NOT NULL");
+    }
+
+    #[test]
+    fn test_binary_op_deparse() {
+        let mut buf = String::new();
+
+        // Comparison operators
+        BinaryOp::Equal.deparse(&mut buf);
+        assert_eq!(buf, "=");
+        buf.clear();
+
+        BinaryOp::NotEqual.deparse(&mut buf);
+        assert_eq!(buf, "!=");
+        buf.clear();
+
+        BinaryOp::LessThan.deparse(&mut buf);
+        assert_eq!(buf, "<");
+        buf.clear();
+
+        BinaryOp::GreaterThanOrEqual.deparse(&mut buf);
+        assert_eq!(buf, ">=");
         buf.clear();
 
         // Pattern matching
-        ExprOp::Like.deparse(&mut buf);
+        BinaryOp::Like.deparse(&mut buf);
         assert_eq!(buf, "LIKE");
         buf.clear();
 
-        ExprOp::NotLike.deparse(&mut buf);
+        BinaryOp::NotLike.deparse(&mut buf);
         assert_eq!(buf, "NOT LIKE");
         buf.clear();
 
         // Logical operators
-        ExprOp::And.deparse(&mut buf);
+        BinaryOp::And.deparse(&mut buf);
         assert_eq!(buf, "AND");
         buf.clear();
 
-        ExprOp::Or.deparse(&mut buf);
+        BinaryOp::Or.deparse(&mut buf);
         assert_eq!(buf, "OR");
+    }
+
+    #[test]
+    fn test_multi_op_deparse() {
+        let mut buf = String::new();
+
+        MultiOp::In.deparse(&mut buf);
+        assert_eq!(buf, "IN");
+        buf.clear();
+
+        MultiOp::NotIn.deparse(&mut buf);
+        assert_eq!(buf, "NOT IN");
     }
 
     #[test]
@@ -2647,7 +2677,7 @@ mod tests {
 
         // Simple equality: id = 1
         let expr = BinaryExpr {
-            op: ExprOp::Equal,
+            op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "id".to_owned(),
@@ -2661,7 +2691,7 @@ mod tests {
 
         // Complex expression: users.name = 'john'
         let expr = BinaryExpr {
-            op: ExprOp::Equal,
+            op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: Some("users".to_owned()),
                 column: "name".to_owned(),
@@ -2679,7 +2709,7 @@ mod tests {
 
         // NOT active
         let expr = UnaryExpr {
-            op: ExprOp::Not,
+            op: UnaryOp::Not,
             expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
                 column: "active".to_owned(),
@@ -2995,9 +3025,9 @@ mod tests {
         let binary_exprs: Vec<&BinaryExpr> = where_clause.nodes().collect();
 
         assert_eq!(binary_exprs.len(), 3); // AND, =, >
-        assert_eq!(binary_exprs[0].op, ExprOp::And);
-        assert_eq!(binary_exprs[1].op, ExprOp::Equal);
-        assert_eq!(binary_exprs[2].op, ExprOp::GreaterThan);
+        assert_eq!(binary_exprs[0].op, BinaryOp::And);
+        assert_eq!(binary_exprs[1].op, BinaryOp::Equal);
+        assert_eq!(binary_exprs[2].op, BinaryOp::GreaterThan);
     }
 
     #[test]
@@ -3148,7 +3178,7 @@ mod tests {
         // Test that UnaryExpr::nodes() returns itself
         let unary_exprs: Vec<&UnaryExpr> = ast.nodes().collect();
         assert_eq!(unary_exprs.len(), 1);
-        assert_eq!(unary_exprs[0].op, ExprOp::Not);
+        assert_eq!(unary_exprs[0].op, UnaryOp::Not);
     }
 
     #[test]
@@ -3160,14 +3190,14 @@ mod tests {
         // Test that BinaryExpr::nodes() returns itself
         let binary_exprs: Vec<&BinaryExpr> = ast.nodes().collect();
         assert_eq!(binary_exprs.len(), 1);
-        assert_eq!(binary_exprs[0].op, ExprOp::Equal);
+        assert_eq!(binary_exprs[0].op, BinaryOp::Equal);
     }
 
     #[test]
     fn test_multi_expr_nodes() {
         // Test MultiExpr::nodes() with a manually constructed MultiExpr
         let multi = MultiExpr {
-            op: ExprOp::In,
+            op: MultiOp::In,
             exprs: vec![
                 WhereExpr::Column(ColumnNode {
                     table: None,
@@ -3181,7 +3211,7 @@ mod tests {
         // Test that MultiExpr::nodes() returns itself
         let multi_exprs: Vec<&MultiExpr> = multi.nodes().collect();
         assert_eq!(multi_exprs.len(), 1);
-        assert_eq!(multi_exprs[0].op, ExprOp::In);
+        assert_eq!(multi_exprs[0].op, MultiOp::In);
 
         // Test that it can extract child nodes
         let columns: Vec<&ColumnNode> = multi.nodes().collect();
@@ -3192,7 +3222,7 @@ mod tests {
     #[test]
     fn test_multi_expr_in_deparse() {
         let multi = MultiExpr {
-            op: ExprOp::In,
+            op: MultiOp::In,
             exprs: vec![
                 WhereExpr::Column(ColumnNode {
                     table: None,
@@ -3211,7 +3241,7 @@ mod tests {
     #[test]
     fn test_multi_expr_not_in_deparse() {
         let multi = MultiExpr {
-            op: ExprOp::NotIn,
+            op: MultiOp::NotIn,
             exprs: vec![
                 WhereExpr::Column(ColumnNode {
                     table: None,

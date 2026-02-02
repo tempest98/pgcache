@@ -2,8 +2,8 @@ use crate::{
     cache::QueryParameters,
     query::{
         ast::{
-            ExprOp, JoinNode, JoinType, SelectStatement, SqlQuery, Statement, TableSource,
-            WhereExpr,
+            BinaryOp, JoinNode, JoinType, MultiOp, SelectStatement, SqlQuery, Statement,
+            TableSource, WhereExpr,
         },
         evaluate::is_simple_comparison,
         transform::{AstTransformResult, ast_parameters_replace},
@@ -88,7 +88,7 @@ fn is_supported_join(join: &JoinNode) -> bool {
     // Validate join condition: must be simple equality or absent
     let condition_valid = match &join.condition {
         Some(WhereExpr::Binary(binary_expr)) => {
-            binary_expr.op == ExprOp::Equal
+            binary_expr.op == BinaryOp::Equal
                 && !join.condition.as_ref().is_some_and(|e| e.has_sublink())
         }
         Some(
@@ -147,38 +147,27 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
     dbg!(&expr);
 
     let rv = match expr {
-        WhereExpr::Binary(binary_expr) => {
-            match binary_expr.op {
-                ExprOp::Equal
-                | ExprOp::NotEqual
-                | ExprOp::LessThan
-                | ExprOp::LessThanOrEqual
-                | ExprOp::GreaterThan
-                | ExprOp::GreaterThanOrEqual => {
-                    // Simple comparison: column op value
-                    is_simple_comparison(binary_expr)
-                }
-                ExprOp::And | ExprOp::Or | ExprOp::In | ExprOp::NotIn => {
-                    is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
-                }
-                ExprOp::Not
-                | ExprOp::Like
-                | ExprOp::ILike
-                | ExprOp::NotLike
-                | ExprOp::NotILike
-                | ExprOp::Between
-                | ExprOp::NotBetween
-                | ExprOp::IsNull
-                | ExprOp::IsNotNull
-                | ExprOp::Any
-                | ExprOp::All
-                | ExprOp::Exists
-                | ExprOp::NotExists => false,
+        WhereExpr::Binary(binary_expr) => match binary_expr.op {
+            BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual => {
+                // Simple comparison: column op value
+                is_simple_comparison(binary_expr)
             }
-        }
+            BinaryOp::And | BinaryOp::Or => {
+                is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
+            }
+            BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => false,
+        },
         WhereExpr::Value(_) => true,
         WhereExpr::Column(_) => true,
-        WhereExpr::Multi(multi_expr) => multi_expr.exprs.iter().all(|e| is_cacheable_expr(e)),
+        WhereExpr::Multi(multi_expr) => match multi_expr.op {
+            MultiOp::In | MultiOp::NotIn => multi_expr.exprs.iter().all(is_cacheable_expr),
+            MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => false,
+        },
         WhereExpr::Unary(_) | WhereExpr::Function { .. } | WhereExpr::Subquery { .. } => false,
     };
 

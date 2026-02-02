@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::query::ast::{ExprOp, LiteralValue};
+use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedSelectStatement, ResolvedTableSource, ResolvedWhereExpr,
 };
@@ -65,7 +65,7 @@ fn analyze_equality_expr(
     equivalences: &mut HashSet<ColumnEquivalence>,
 ) {
     match expr {
-        ResolvedWhereExpr::Binary(binary) if binary.op == ExprOp::Equal => {
+        ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::Equal => {
             match (&*binary.lexpr, &*binary.rexpr) {
                 // column = literal
                 (ResolvedWhereExpr::Column(col), ResolvedWhereExpr::Value(val)) => {
@@ -93,19 +93,12 @@ fn analyze_equality_expr(
         }
 
         // AND: recursively analyze both sides
-        ResolvedWhereExpr::Binary(binary) if binary.op == ExprOp::And => {
+        ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::And => {
             analyze_equality_expr(&binary.lexpr, constraints, equivalences);
             analyze_equality_expr(&binary.rexpr, constraints, equivalences);
         }
 
-        // Multi-operand AND
-        ResolvedWhereExpr::Multi(multi) if multi.op == ExprOp::And => {
-            for expr in &multi.exprs {
-                analyze_equality_expr(expr, constraints, equivalences);
-            }
-        }
-
-        // OR, other operators: cannot propagate
+        // OR, other operators: cannot propagate equality constraints
         ResolvedWhereExpr::Value(_)
         | ResolvedWhereExpr::Column(_)
         | ResolvedWhereExpr::Unary(_)
