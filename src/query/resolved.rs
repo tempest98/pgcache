@@ -334,6 +334,7 @@ pub enum ResolvedColumnExpr {
         args: Vec<ResolvedColumnExpr>,
         agg_star: bool,
         agg_distinct: bool,
+        agg_order: Vec<ResolvedOrderByClause>,
         over: Option<ResolvedWindowSpec>,
     },
     /// Literal value
@@ -417,10 +418,16 @@ impl ResolvedColumnExpr {
         let children: Box<dyn Iterator<Item = &'_ N>> = match self {
             ResolvedColumnExpr::Column(col) => Box::new(col.nodes()),
             ResolvedColumnExpr::Literal(lit) => Box::new(lit.nodes()),
-            ResolvedColumnExpr::Function { args, over, .. } => {
+            ResolvedColumnExpr::Function {
+                args,
+                agg_order,
+                over,
+                ..
+            } => {
                 let arg_nodes = args.iter().flat_map(|arg| arg.nodes());
+                let agg_order_nodes = agg_order.iter().flat_map(|o| o.nodes());
                 let over_nodes = over.iter().flat_map(|w| w.nodes());
-                Box::new(arg_nodes.chain(over_nodes))
+                Box::new(arg_nodes.chain(agg_order_nodes).chain(over_nodes))
             }
             ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
             ResolvedColumnExpr::Subquery(query) => Box::new(query.nodes()),
@@ -460,6 +467,7 @@ impl Deparse for ResolvedColumnExpr {
                 args,
                 agg_star,
                 agg_distinct,
+                agg_order,
                 over,
             } => {
                 buf.push_str(name);
@@ -474,6 +482,15 @@ impl Deparse for ResolvedColumnExpr {
                     for arg in args {
                         buf.push_str(sep);
                         arg.deparse(buf);
+                        sep = ", ";
+                    }
+                }
+                if !agg_order.is_empty() {
+                    buf.push_str(" ORDER BY ");
+                    let mut sep = "";
+                    for clause in agg_order {
+                        buf.push_str(sep);
+                        clause.deparse(buf);
                         sep = ", ";
                     }
                 }
@@ -1156,6 +1173,9 @@ fn column_expr_resolve(
                 .map(|arg| column_expr_resolve(arg, scope))
                 .collect::<ResolveResult<Vec<_>>>()?;
 
+            // Resolve aggregate ORDER BY clauses
+            let resolved_agg_order = order_by_resolve(&func.agg_order, scope)?;
+
             // Resolve window specification if present
             let resolved_over = func
                 .over
@@ -1168,6 +1188,7 @@ fn column_expr_resolve(
                 args: resolved_args,
                 agg_star: func.agg_star,
                 agg_distinct: func.agg_distinct,
+                agg_order: resolved_agg_order,
                 over: resolved_over,
             })
         }

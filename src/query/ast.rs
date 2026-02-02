@@ -858,6 +858,7 @@ pub struct FunctionCall {
     pub args: Vec<ColumnExpr>,
     pub agg_star: bool,     // COUNT(*)
     pub agg_distinct: bool, // COUNT(DISTINCT col)
+    pub agg_order: Vec<OrderByClause>, // ORDER BY inside aggregate: string_agg(x, ',' ORDER BY x)
     pub over: Option<WindowSpec>, // Window function OVER clause
 }
 
@@ -865,13 +866,18 @@ impl FunctionCall {
     pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let arg_children = self.args.iter().flat_map(|arg| arg.nodes());
+        let agg_order_children = self.agg_order.iter().flat_map(|o| o.nodes());
         let over_children = self.over.iter().flat_map(|w| w.nodes());
-        current.chain(arg_children).chain(over_children)
+        current
+            .chain(arg_children)
+            .chain(agg_order_children)
+            .chain(over_children)
     }
 
     /// Check if this function call contains sublinks/subqueries
     pub fn has_sublink(&self) -> bool {
         self.args.iter().any(|arg| arg.has_sublink())
+            || self.agg_order.iter().any(|o| o.expr.has_sublink())
             || self.over.as_ref().is_some_and(|w| w.has_sublink())
     }
 }
@@ -890,6 +896,15 @@ impl Deparse for FunctionCall {
             for arg in &self.args {
                 buf.push_str(sep);
                 arg.deparse(buf);
+                sep = ", ";
+            }
+        }
+        if !self.agg_order.is_empty() {
+            buf.push_str(" ORDER BY ");
+            let mut sep = "";
+            for clause in &self.agg_order {
+                buf.push_str(sep);
+                clause.deparse(buf);
                 sep = ", ";
             }
         }
@@ -1811,6 +1826,9 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
             .collect::<Result<Vec<_>, _>>()?
     };
 
+    // Parse aggregate ORDER BY (same structure as window ORDER BY)
+    let agg_order = window_order_by_convert(&func_call.agg_order)?;
+
     // Parse OVER clause for window functions
     let over = func_call
         .over
@@ -1823,6 +1841,7 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
         args,
         agg_star: func_call.agg_star,
         agg_distinct: func_call.agg_distinct,
+        agg_order,
         over,
     })
 }
@@ -1897,6 +1916,7 @@ fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstErr
         args,
         agg_star: false,
         agg_distinct: false,
+        agg_order: vec![],
         over: None,
     })
 }
@@ -1923,6 +1943,7 @@ fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
         args,
         agg_star: false,
         agg_distinct: false,
+        agg_order: vec![],
         over: None,
     })
 }
@@ -1942,6 +1963,7 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
         args,
         agg_star: false,
         agg_distinct: false,
+        agg_order: vec![],
         over: None,
     })
 }
@@ -3170,6 +3192,7 @@ mod tests {
             })],
             agg_star: false,
             agg_distinct: false,
+            agg_order: vec![],
             over: None,
         };
 
@@ -3863,6 +3886,7 @@ mod tests {
             args: vec![],
             agg_star: true,
             agg_distinct: false,
+            agg_order: vec![],
             over: None,
         };
         let mut buf = String::new();
@@ -3880,6 +3904,7 @@ mod tests {
             })],
             agg_star: false,
             agg_distinct: true,
+            agg_order: vec![],
             over: None,
         };
         let mut buf = String::new();
@@ -4137,6 +4162,7 @@ mod tests {
             })],
             agg_star: false,
             agg_distinct: false,
+            agg_order: vec![],
             over: Some(WindowSpec {
                 partition_by: vec![ColumnExpr::Column(ColumnNode {
                     table: None,
@@ -4175,5 +4201,104 @@ mod tests {
         assert_eq!(over.order_by.len(), 2, "two ORDER BY clauses");
         assert_eq!(over.order_by[0].direction, OrderDirection::Asc);
         assert_eq!(over.order_by[1].direction, OrderDirection::Desc);
+    }
+
+    #[test]
+    fn test_aggregate_order_by_parse() {
+        let sql = "SELECT string_agg(name, ', ' ORDER BY name) FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+
+        assert_eq!(func.name, "string_agg");
+        assert_eq!(func.agg_order.len(), 1, "should have one ORDER BY clause");
+        assert_eq!(func.agg_order[0].direction, OrderDirection::Asc);
+    }
+
+    #[test]
+    fn test_aggregate_order_by_deparse() {
+        let sql = "SELECT string_agg(name, ', ' ORDER BY name ASC) FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let mut buf = String::new();
+        ast.deparse(&mut buf);
+        assert!(buf.contains("ORDER BY"), "deparsed should contain ORDER BY");
+        assert!(buf.contains("STRING_AGG"), "deparsed should contain STRING_AGG");
+    }
+
+    #[test]
+    fn test_aggregate_distinct_and_order_by() {
+        let sql = "SELECT string_agg(DISTINCT name, ', ' ORDER BY name) FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+
+        assert!(func.agg_distinct, "should have DISTINCT");
+        assert_eq!(func.agg_order.len(), 1, "should have ORDER BY");
+    }
+
+    #[test]
+    fn test_aggregate_multiple_order_by() {
+        let sql = "SELECT array_agg(x ORDER BY y ASC, z DESC) FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+
+        assert_eq!(func.name, "array_agg");
+        assert_eq!(func.agg_order.len(), 2, "should have two ORDER BY clauses");
+        assert_eq!(func.agg_order[0].direction, OrderDirection::Asc);
+        assert_eq!(func.agg_order[1].direction, OrderDirection::Desc);
+    }
+
+    #[test]
+    fn test_aggregate_order_by_deparse_roundtrip() {
+        let func = FunctionCall {
+            name: "string_agg".to_owned(),
+            args: vec![
+                ColumnExpr::Column(ColumnNode {
+                    table: None,
+                    column: "name".to_owned(),
+                }),
+                ColumnExpr::Literal(LiteralValue::String(", ".to_owned())),
+            ],
+            agg_star: false,
+            agg_distinct: false,
+            agg_order: vec![OrderByClause {
+                expr: ColumnExpr::Column(ColumnNode {
+                    table: None,
+                    column: "name".to_owned(),
+                }),
+                direction: OrderDirection::Asc,
+            }],
+            over: None,
+        };
+        let mut buf = String::new();
+        func.deparse(&mut buf);
+        assert_eq!(buf, "STRING_AGG(name, ', ' ORDER BY name ASC)");
     }
 }

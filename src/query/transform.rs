@@ -659,9 +659,17 @@ fn resolved_column_expr_alias_update(
                 col.table_alias = Some(alias.to_owned());
             }
         }
-        ResolvedColumnExpr::Function { args, over, .. } => {
+        ResolvedColumnExpr::Function {
+            args,
+            agg_order,
+            over,
+            ..
+        } => {
             for arg in args {
                 resolved_column_expr_alias_update(arg, schema, table, alias);
+            }
+            for clause in agg_order {
+                resolved_column_expr_alias_update(&mut clause.expr, schema, table, alias);
             }
             if let Some(window_spec) = over {
                 for col in &mut window_spec.partition_by {
