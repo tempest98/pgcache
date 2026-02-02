@@ -692,6 +692,10 @@ fn resolved_column_expr_alias_update(
                 resolved_column_expr_alias_update(default, schema, table, alias);
             }
         }
+        ResolvedColumnExpr::Arithmetic(arith) => {
+            resolved_column_expr_alias_update(&mut arith.left, schema, table, alias);
+            resolved_column_expr_alias_update(&mut arith.right, schema, table, alias);
+        }
         ResolvedColumnExpr::Subquery(query) => {
             resolved_column_alias_update(query, schema, table, alias);
         }

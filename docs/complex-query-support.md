@@ -440,7 +440,7 @@ limit 100 offset 0;
 | LIMIT/OFFSET | Yes | Recently added, marks query non-cacheable |
 | ORDER BY | Yes | `OrderByClause` exists |
 | CASE expressions | Yes | Both searched (`CASE WHEN...`) and simple (`CASE expr WHEN...`) forms |
-| Aggregate functions | Yes | `FunctionCall` with `agg_star` and `agg_distinct` |
+| Aggregate functions | Yes | `FunctionCall` with `agg_star`, `agg_distinct`, and `agg_order` |
 | COUNT(*) | Yes | Properly parsed and deparsed via `agg_star` field |
 | COUNT(DISTINCT col) | Yes | Properly parsed and deparsed via `agg_distinct` field |
 | Literal values in SELECT | Yes | NULL, booleans, integers, strings supported |
@@ -453,6 +453,7 @@ limit 100 offset 0;
 |----------|---------|---------|--------|
 | **P0** | **Subquery resolution** | `SELECT * FROM (SELECT ...) sub` | Resolution fails with `InvalidTableRef` |
 | P0 | UNION | `select ... union select ...` | Query won't parse |
+| P0 | LIMIT/OFFSET cacheability | `LIMIT 100 OFFSET 0` | Currently marks query non-cacheable |
 | ~~P1~~ | ~~Aggregate functions~~ | ~~`count(...)`, `sum(...)`, `string_agg(...)`~~ | ✅ Implemented |
 | ~~P1~~ | ~~Window functions~~ | ~~`sum(...) over (order by ...)`~~ | ✅ Implemented |
 | ~~P1~~ | ~~CASE expressions~~ | ~~`case when ... then ... else ... end`~~ | ✅ Implemented |
@@ -461,11 +462,12 @@ limit 100 offset 0;
 | ~~P2~~ | ~~NULL literals in SELECT~~ | ~~`null as nullable_col`~~ | ✅ Implemented |
 | ~~P2~~ | ~~Integer literals in SELECT~~ | ~~`123 as int_col`~~ | ✅ Implemented |
 | ~~P2~~ | ~~String literals in SELECT~~ | ~~`'literal' as str_col`~~ | ✅ Implemented |
-| P2 | Arithmetic expressions | `amount * -1` | Won't parse |
+| ~~P2~~ | ~~Arithmetic expressions~~ | ~~`amount * -1`~~ | ✅ Implemented via `ArithmeticExpr` |
 | ~~P2~~ | ~~IS NULL in WHERE~~ | ~~`deleted_at is null`~~ | ✅ Implemented via `UnaryOp::IsNull/IsNotNull` |
 | ~~P2~~ | ~~IN clause~~ | ~~`status in ('A', 'B')`~~ | ✅ Implemented via `MultiOp::In` |
 | ~~P3~~ | ~~DISTINCT in aggregates~~ | ~~`count(distinct ...)`~~ | ✅ Implemented via `agg_distinct` |
-| P3 | ORDER BY in aggregates | `string_agg(... order by ...)` | Part of aggregate support |
+| ~~P2~~ | ~~Arithmetic expressions~~ | ~~`amount * -1`~~ | ✅ Implemented via `ArithmeticExpr` |
+| ~~P3~~ | ~~ORDER BY in aggregates~~ | ~~`string_agg(... order by ...)`~~ | ✅ Implemented via `agg_order` field |
 
 ## Implementation Plan
 
@@ -559,11 +561,12 @@ pub struct FunctionCall {
     pub args: Vec<ColumnExpr>,
     pub agg_star: bool,     // For COUNT(*)
     pub agg_distinct: bool, // For COUNT(DISTINCT ...)
+    pub agg_order: Vec<OrderByClause>, // For string_agg(... ORDER BY ...)
+    pub over: Option<WindowSpec>, // For window functions
 }
 ```
 
 Still TODO for future enhancement:
-- `order_by: Vec<OrderByClause>` - For `string_agg(... ORDER BY ...)`
 - `filter: Option<WhereExpr>` - For aggregate FILTER clause
 
 **Test query:**
@@ -641,36 +644,50 @@ SELECT CASE WHEN status = 'A' THEN 1 WHEN status = 'B' THEN 2 ELSE 0 END FROM t
 SELECT CASE status WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 0 END FROM t
 ```
 
-#### Step 1.8: Add arithmetic expressions
+#### Step 1.8: Add arithmetic expressions ✅ DONE
 
-**File:** `src/query/ast.rs`
+**Files:** `src/query/ast.rs`, `src/query/resolved.rs`, `src/query/transform.rs`
 
-Add binary operation support:
+Implemented structures:
 
 ```rust
-pub enum ColumnExpr {
-    // ... existing variants
-    BinaryOp(BinaryOpExpr),
-    UnaryOp(UnaryOpExpr),
+// In ast.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
+pub enum ArithmeticOp {
+    Add,      // +
+    Subtract, // -
+    Multiply, // *
+    Divide,   // /
 }
 
-pub struct BinaryOpExpr {
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct ArithmeticExpr {
     pub left: Box<ColumnExpr>,
     pub op: ArithmeticOp,
     pub right: Box<ColumnExpr>,
 }
 
-pub enum ArithmeticOp {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
+pub enum ColumnExpr {
+    // ... existing variants
+    Arithmetic(ArithmeticExpr),
+}
+
+// In resolved.rs - corresponding resolved types
+pub struct ResolvedArithmeticExpr { ... }
+pub enum ResolvedColumnExpr {
+    // ... existing variants
+    Arithmetic(ResolvedArithmeticExpr),
 }
 ```
 
-**Test query:**
+Parsing handled in `select_columns_convert` and `node_convert_to_column_expr` via `AExprKind::AexprOp`.
+
+**Test queries:**
 ```sql
-SELECT amount * -1, price + tax, total / count FROM t
+SELECT amount * -1 FROM t
+SELECT price + tax FROM t
+SELECT total / count FROM t
+SELECT (a + b) * c FROM t  -- nested expressions
 ```
 
 #### Step 1.9: Add subquery resolution (P0 - BLOCKING)
@@ -747,7 +764,7 @@ Add checks to mark queries as non-cacheable:
 - [x] Step 1.5: Function calls in SELECT (including COUNT(*), COUNT(DISTINCT))
 - [x] Step 1.6: Window functions (PARTITION BY, ORDER BY)
 - [x] Step 1.7: CASE expressions (searched and simple forms)
-- [ ] Step 1.8: Arithmetic expressions
+- [x] Step 1.8: Arithmetic expressions (`+`, `-`, `*`, `/`)
 - [ ] **Step 1.9: Subquery resolution** (P0 - blocks target query)
 - [x] Phase 2: Resolution support (for implemented features)
 - [ ] Phase 3: Cacheability checks

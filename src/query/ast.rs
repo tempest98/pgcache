@@ -799,12 +799,60 @@ impl Deparse for SelectColumn {
     }
 }
 
+/// Arithmetic operators for expressions like `amount * 2`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
+pub enum ArithmeticOp {
+    #[strum(to_string = "+")]
+    Add,
+    #[strum(to_string = "-")]
+    Subtract,
+    #[strum(to_string = "*")]
+    Multiply,
+    #[strum(to_string = "/")]
+    Divide,
+}
+
+/// Arithmetic expression: `left op right` (e.g., `amount * -1`)
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct ArithmeticExpr {
+    pub left: Box<ColumnExpr>,
+    pub op: ArithmeticOp,
+    pub right: Box<ColumnExpr>,
+}
+
+impl ArithmeticExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let left_children = self.left.nodes();
+        let right_children = self.right.nodes();
+        current.chain(left_children).chain(right_children)
+    }
+
+    pub fn has_sublink(&self) -> bool {
+        self.left.has_sublink() || self.right.has_sublink()
+    }
+}
+
+impl Deparse for ArithmeticExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push('(');
+        self.left.deparse(buf);
+        buf.push(' ');
+        buf.push_str(self.op.as_ref());
+        buf.push(' ');
+        self.right.deparse(buf);
+        buf.push(')');
+        buf
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ColumnExpr {
-    Column(ColumnNode),     // column_name, table.column_name
-    Function(FunctionCall), // COUNT(*), SUM(col), etc.
-    Literal(LiteralValue),  // Constant values
-    Case(CaseExpr),         // CASE WHEN ... THEN ... END
+    Column(ColumnNode),         // column_name, table.column_name
+    Function(FunctionCall),     // COUNT(*), SUM(col), etc.
+    Literal(LiteralValue),      // Constant values
+    Case(CaseExpr),             // CASE WHEN ... THEN ... END
+    Arithmetic(ArithmeticExpr), // amount * -1, price + tax
     Subquery(Box<SelectStatement>),
 }
 
@@ -818,6 +866,7 @@ impl ColumnExpr {
                     ColumnExpr::Function(func) => (func as &dyn Any).downcast_ref::<N>(),
                     ColumnExpr::Literal(lit) => (lit as &dyn Any).downcast_ref::<N>(),
                     ColumnExpr::Case(case) => (case as &dyn Any).downcast_ref::<N>(),
+                    ColumnExpr::Arithmetic(arith) => (arith as &dyn Any).downcast_ref::<N>(),
                     ColumnExpr::Subquery(select) => (select as &dyn Any).downcast_ref::<N>(),
                 }))
             .into_iter(),
@@ -827,8 +876,9 @@ impl ColumnExpr {
     /// Check if this column expression contains sublinks/subqueries
     pub fn has_sublink(&self) -> bool {
         match self {
-            ColumnExpr::Function(func) => func.args.iter().any(|arg| arg.has_sublink()),
+            ColumnExpr::Function(func) => func.has_sublink(),
             ColumnExpr::Case(case) => case.has_sublink(),
+            ColumnExpr::Arithmetic(arith) => arith.has_sublink(),
             ColumnExpr::Subquery(_) => true,
             ColumnExpr::Column(_) | ColumnExpr::Literal(_) => false,
         }
@@ -842,6 +892,7 @@ impl Deparse for ColumnExpr {
             ColumnExpr::Function(func) => func.deparse(buf),
             ColumnExpr::Literal(lit) => lit.deparse(buf),
             ColumnExpr::Case(case) => case.deparse(buf),
+            ColumnExpr::Arithmetic(arith) => arith.deparse(buf),
             ColumnExpr::Subquery(select) => {
                 buf.push('(');
                 select.deparse(buf);
@@ -1551,6 +1602,15 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                         alias,
                     });
                 }
+                Some(NodeEnum::AExpr(aexpr))
+                    if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprOp) =>
+                {
+                    let arith = aexpr_arithmetic_convert(aexpr)?;
+                    columns.push(SelectColumn {
+                        expr: ColumnExpr::Arithmetic(arith),
+                        alias,
+                    });
+                }
                 Some(NodeEnum::CaseExpr(case_expr)) => {
                     let case = case_expr_convert(case_expr)?;
                     columns.push(SelectColumn {
@@ -1791,6 +1851,12 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
             let function = aexpr_nullif_convert(aexpr)?;
             Ok(ColumnExpr::Function(function))
         }
+        Some(NodeEnum::AExpr(aexpr))
+            if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprOp) =>
+        {
+            let arith = aexpr_arithmetic_convert(aexpr)?;
+            Ok(ColumnExpr::Arithmetic(arith))
+        }
         Some(NodeEnum::CaseExpr(case_expr)) => {
             let case = case_expr_convert(case_expr)?;
             Ok(ColumnExpr::Case(case))
@@ -1966,6 +2032,56 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
         agg_order: vec![],
         over: None,
     })
+}
+
+fn aexpr_arithmetic_convert(aexpr: &AExpr) -> Result<ArithmeticExpr, AstError> {
+    // Extract operator from name field
+    let op = arithmetic_op_extract(&aexpr.name)?;
+
+    let left = aexpr
+        .lexpr
+        .as_ref()
+        .ok_or_else(|| AstError::UnsupportedFeature {
+            feature: "arithmetic expression without left operand".to_owned(),
+        })
+        .and_then(|n| node_convert_to_column_expr(n))?;
+
+    let right = aexpr
+        .rexpr
+        .as_ref()
+        .ok_or_else(|| AstError::UnsupportedFeature {
+            feature: "arithmetic expression without right operand".to_owned(),
+        })
+        .and_then(|n| node_convert_to_column_expr(n))?;
+
+    Ok(ArithmeticExpr {
+        left: Box::new(left),
+        op,
+        right: Box::new(right),
+    })
+}
+
+fn arithmetic_op_extract(name_nodes: &[pg_query::Node]) -> Result<ArithmeticOp, AstError> {
+    let [name_node] = name_nodes else {
+        return Err(AstError::UnsupportedFeature {
+            feature: "multi-part operator names in arithmetic".to_owned(),
+        });
+    };
+
+    match name_node.node.as_ref() {
+        Some(NodeEnum::String(s)) => match s.sval.as_str() {
+            "+" => Ok(ArithmeticOp::Add),
+            "-" => Ok(ArithmeticOp::Subtract),
+            "*" => Ok(ArithmeticOp::Multiply),
+            "/" => Ok(ArithmeticOp::Divide),
+            op => Err(AstError::UnsupportedFeature {
+                feature: format!("arithmetic operator: {op}"),
+            }),
+        },
+        _ => Err(AstError::UnsupportedFeature {
+            feature: "invalid operator name format".to_owned(),
+        }),
+    }
 }
 
 fn case_expr_convert(case_expr: &PgCaseExpr) -> Result<CaseExpr, AstError> {
@@ -4300,5 +4416,140 @@ mod tests {
         let mut buf = String::new();
         func.deparse(&mut buf);
         assert_eq!(buf, "STRING_AGG(name, ', ' ORDER BY name ASC)");
+    }
+
+    #[test]
+    fn test_arithmetic_multiply_parse() {
+        let sql = "SELECT amount * 2 FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+            panic!("expected arithmetic expression");
+        };
+
+        assert_eq!(arith.op, ArithmeticOp::Multiply);
+    }
+
+    #[test]
+    fn test_arithmetic_multiply_negative() {
+        let sql = "SELECT amount * -1 FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+            panic!("expected arithmetic expression");
+        };
+
+        assert_eq!(arith.op, ArithmeticOp::Multiply);
+        // Right side should be -1 (negative literal)
+        assert!(matches!(
+            arith.right.as_ref(),
+            ColumnExpr::Literal(LiteralValue::Integer(-1))
+        ));
+    }
+
+    #[test]
+    fn test_arithmetic_add() {
+        let sql = "SELECT price + tax FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+            panic!("expected arithmetic expression");
+        };
+
+        assert_eq!(arith.op, ArithmeticOp::Add);
+    }
+
+    #[test]
+    fn test_arithmetic_subtract() {
+        let sql = "SELECT total - discount FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+            panic!("expected arithmetic expression");
+        };
+
+        assert_eq!(arith.op, ArithmeticOp::Subtract);
+    }
+
+    #[test]
+    fn test_arithmetic_divide() {
+        let sql = "SELECT total / count FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+            panic!("expected arithmetic expression");
+        };
+
+        assert_eq!(arith.op, ArithmeticOp::Divide);
+    }
+
+    #[test]
+    fn test_arithmetic_deparse() {
+        let arith = ArithmeticExpr {
+            left: Box::new(ColumnExpr::Column(ColumnNode {
+                table: None,
+                column: "amount".to_owned(),
+            })),
+            op: ArithmeticOp::Multiply,
+            right: Box::new(ColumnExpr::Literal(LiteralValue::Integer(-1))),
+        };
+        let mut buf = String::new();
+        arith.deparse(&mut buf);
+        assert_eq!(buf, "(amount * -1)");
+    }
+
+    #[test]
+    fn test_arithmetic_nested() {
+        // (a + b) * c
+        let sql = "SELECT (a + b) * c FROM t";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let ast = sql_query_convert(&pg_ast).unwrap();
+
+        let Statement::Select(select) = &ast.statement;
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Arithmetic(outer) = &columns[0].expr else {
+            panic!("expected arithmetic expression");
+        };
+
+        assert_eq!(outer.op, ArithmeticOp::Multiply);
+
+        // Left side should be another arithmetic expression (a + b)
+        let ColumnExpr::Arithmetic(inner) = outer.left.as_ref() else {
+            panic!("expected nested arithmetic expression");
+        };
+        assert_eq!(inner.op, ArithmeticOp::Add);
     }
 }

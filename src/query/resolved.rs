@@ -6,9 +6,9 @@ use rootcause::Report;
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
-    BinaryOp, ColumnExpr, ColumnNode, Deparse, JoinType, LimitClause, LiteralValue, MultiOp,
-    OrderDirection, SelectColumns, SelectStatement, TableAlias, TableNode, TableSource, UnaryOp,
-    WhereExpr, WindowSpec,
+    ArithmeticOp, BinaryOp, ColumnExpr, ColumnNode, Deparse, JoinType, LimitClause, LiteralValue,
+    MultiOp, OrderDirection, SelectColumns, SelectStatement, TableAlias, TableNode, TableSource,
+    UnaryOp, WhereExpr, WindowSpec,
 };
 
 error_set! {
@@ -323,6 +323,36 @@ impl Deparse for ResolvedWhereExpr {
     }
 }
 
+/// Resolved arithmetic expression: `left op right`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedArithmeticExpr {
+    pub left: Box<ResolvedColumnExpr>,
+    pub op: ArithmeticOp,
+    pub right: Box<ResolvedColumnExpr>,
+}
+
+impl ResolvedArithmeticExpr {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let left_children = self.left.nodes();
+        let right_children = self.right.nodes();
+        current.chain(left_children).chain(right_children)
+    }
+}
+
+impl Deparse for ResolvedArithmeticExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push('(');
+        self.left.deparse(buf);
+        buf.push(' ');
+        buf.push_str(self.op.as_ref());
+        buf.push(' ');
+        self.right.deparse(buf);
+        buf.push(')');
+        buf
+    }
+}
+
 /// Resolved column expression in SELECT list
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedColumnExpr {
@@ -341,6 +371,8 @@ pub enum ResolvedColumnExpr {
     Literal(LiteralValue),
     /// CASE expression
     Case(ResolvedCaseExpr),
+    /// Arithmetic expression: `left op right`
+    Arithmetic(ResolvedArithmeticExpr),
     /// Subquery (for future support)
     Subquery(Box<ResolvedSelectStatement>),
 }
@@ -430,6 +462,7 @@ impl ResolvedColumnExpr {
                 Box::new(arg_nodes.chain(agg_order_nodes).chain(over_nodes))
             }
             ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
+            ResolvedColumnExpr::Arithmetic(arith) => Box::new(arith.nodes()),
             ResolvedColumnExpr::Subquery(query) => Box::new(query.nodes()),
         };
         current.chain(children)
@@ -502,6 +535,7 @@ impl Deparse for ResolvedColumnExpr {
                 buf
             }
             ResolvedColumnExpr::Case(case) => case.deparse(buf),
+            ResolvedColumnExpr::Arithmetic(arith) => arith.deparse(buf),
             ResolvedColumnExpr::Subquery(query) => {
                 buf.push('(');
                 query.deparse(buf);
@@ -1221,6 +1255,15 @@ fn column_expr_resolve(
                 arg,
                 whens,
                 default,
+            }))
+        }
+        ColumnExpr::Arithmetic(arith) => {
+            let left = column_expr_resolve(&arith.left, scope)?;
+            let right = column_expr_resolve(&arith.right, scope)?;
+            Ok(ResolvedColumnExpr::Arithmetic(ResolvedArithmeticExpr {
+                left: Box::new(left),
+                op: arith.op,
+                right: Box::new(right),
             }))
         }
         ColumnExpr::Subquery(_) => {
