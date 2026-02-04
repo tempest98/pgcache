@@ -66,6 +66,7 @@ impl CacheWriter {
     /// Registers a query in the cache and spawns background population.
     /// Registration is synchronous (updates Cache state), population is async.
     #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
@@ -139,7 +140,6 @@ impl CacheWriter {
 
         // Create CachedQuery entry with Loading state
         let cached_query = CachedQuery {
-            state: CachedQueryState::Loading,
             fingerprint,
             generation,
             relation_oids: relation_oids.clone(),
@@ -176,10 +176,11 @@ impl CacheWriter {
     }
 
     /// Mark a query as ready after successful population.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn query_ready_mark(&mut self, fingerprint: u64, cached_bytes: usize) {
+        trace!("query_ready_mark {fingerprint}");
         let update_info = if let Some(mut query) = self.cache.cached_queries.get1_mut(&fingerprint)
         {
-            query.state = CachedQueryState::Ready;
             query.cached_bytes = cached_bytes;
             let started_at = query.registration_started_at.take();
             Some((query.generation, query.resolved.clone(), started_at))
@@ -197,12 +198,13 @@ impl CacheWriter {
 
             // Update shared state view
             self.state_view_update(fingerprint, CachedQueryState::Ready, generation, &resolved);
-            trace!("cached query ready, cached_bytes={cached_bytes}");
+            trace!("cached query ready, cached_bytes={cached_bytes} {fingerprint}");
         }
     }
 
     /// Clean up after a failed population.
     pub fn query_failed_cleanup(&mut self, fingerprint: u64) {
+        trace!("query_failed_cleanup {fingerprint}");
         if let Some(query) = self.cache.cached_queries.remove1(&fingerprint) {
             // Remove generation from active set
             self.cache.generations.remove(&query.generation);

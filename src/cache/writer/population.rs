@@ -11,7 +11,7 @@ use crate::catalog::TableMetadata;
 use crate::query::ast::Deparse;
 use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
 
-use super::super::{CacheError, CacheResult, MapIntoReport, messages::WriterCommand};
+use super::super::{CacheError, CacheResult, MapIntoReport, messages::QueryCommand};
 use super::PopulationWork;
 
 /// Persistent population worker that processes work items from a channel.
@@ -21,7 +21,7 @@ pub async fn population_worker(
     mut rx: UnboundedReceiver<PopulationWork>,
     db_origin: Rc<Client>,
     db_cache: Client,
-    writer_tx: UnboundedSender<WriterCommand>,
+    query_tx: UnboundedSender<QueryCommand>,
 ) {
     debug!("population worker {id} started");
 
@@ -39,8 +39,8 @@ pub async fn population_worker(
 
         match result {
             Ok(cached_bytes) => {
-                if writer_tx
-                    .send(WriterCommand::QueryReady {
+                if query_tx
+                    .send(QueryCommand::Ready {
                         fingerprint: work.fingerprint,
                         cached_bytes,
                     })
@@ -54,8 +54,8 @@ pub async fn population_worker(
                     "population worker {id}: population failed for query {}: {e}",
                     work.fingerprint
                 );
-                if writer_tx
-                    .send(WriterCommand::QueryFailed {
+                if query_tx
+                    .send(QueryCommand::Failed {
                         fingerprint: work.fingerprint,
                     })
                     .is_err()

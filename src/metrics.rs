@@ -38,8 +38,9 @@ pub mod names {
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
 
-    // CDC handler metrics (counters)
-    pub const CACHE_WRITER_QUEUE: &str = "pgcache.cache.writer_queue";
+    // Writer queue depth gauges
+    pub const CACHE_WRITER_QUERY_QUEUE: &str = "pgcache.cache.writer_query_queue";
+    pub const CACHE_WRITER_CDC_QUEUE: &str = "pgcache.cache.writer_cdc_queue";
     pub const CACHE_WRITER_INTERNAL_QUEUE: &str = "pgcache.cache.writer_internal_queue";
     pub const CACHE_HANDLE_INSERTS: &str = "pgcache.cache.handle_inserts";
     pub const CACHE_HANDLE_UPDATES: &str = "pgcache.cache.handle_updates";

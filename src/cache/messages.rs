@@ -155,11 +155,11 @@ pub struct ProxyMessage {
     pub timing: QueryTiming,
 }
 
-/// Commands sent to the cache writer thread for serialized cache mutations
+/// Commands for query registration lifecycle, sent to the writer thread
 #[derive(Debug)]
-pub enum WriterCommand {
+pub enum QueryCommand {
     /// Register a new query and spawn background population (fire-and-forget)
-    QueryRegister {
+    Register {
         fingerprint: u64,
         cacheable_query: Box<CacheableQuery>,
         search_path: Vec<String>,
@@ -167,38 +167,42 @@ pub enum WriterCommand {
     },
 
     /// Query population completed successfully
-    QueryReady {
+    Ready {
         fingerprint: u64,
         cached_bytes: usize,
     },
 
     /// Query population failed
-    QueryFailed { fingerprint: u64 },
+    Failed { fingerprint: u64 },
+}
 
+/// Commands for CDC mutations and relation tracking, sent to the writer thread
+#[derive(Debug)]
+pub enum CdcCommand {
     /// Register table metadata from CDC
     TableRegister(TableMetadata),
 
     /// CDC Insert operation
-    CdcInsert {
+    Insert {
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     },
 
     /// CDC Update operation
-    CdcUpdate {
+    Update {
         relation_oid: u32,
         key_data: Vec<Option<String>>,
         row_data: Vec<Option<String>>,
     },
 
     /// CDC Delete operation
-    CdcDelete {
+    Delete {
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     },
 
     /// CDC Truncate operation
-    CdcTruncate { relation_oids: Vec<u32> },
+    Truncate { relation_oids: Vec<u32> },
 
     /// Check if any cached queries reference a relation (for CDC filtering)
     RelationCheck {

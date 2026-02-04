@@ -23,7 +23,6 @@ pub enum CachedQueryState {
 /// A cached query with its metadata and state
 #[derive(Debug)]
 pub struct CachedQuery {
-    pub state: CachedQueryState,
     pub fingerprint: u64,
     /// Generation number assigned when query was registered (monotonically increasing)
     pub generation: u64,

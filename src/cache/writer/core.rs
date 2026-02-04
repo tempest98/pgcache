@@ -16,7 +16,7 @@ use crate::settings::Settings;
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::WriterCommand,
+    messages::{CdcCommand, QueryCommand},
     types::{Cache, CacheStateView, CachedQueryState, CachedQueryView},
 };
 use super::population::population_worker;
@@ -55,7 +55,7 @@ impl CacheWriter {
     pub async fn new(
         settings: &Settings,
         state_view: Arc<RwLock<CacheStateView>>,
-        writer_tx: UnboundedSender<WriterCommand>,
+        query_tx: UnboundedSender<QueryCommand>,
     ) -> CacheResult<Self> {
         let (cache_client, cache_connection) = Config::new()
             .host(&settings.cache.host)
@@ -102,10 +102,10 @@ impl CacheWriter {
             populate_txs.push(tx);
 
             let worker_db_origin = Rc::clone(&db_origin);
-            let worker_writer_tx = writer_tx.clone();
+            let worker_query_tx = query_tx.clone();
 
             spawn_local(async move {
-                population_worker(i, rx, worker_db_origin, cache_conn, worker_writer_tx).await;
+                population_worker(i, rx, worker_db_origin, cache_conn, worker_query_tx).await;
             });
         }
 
@@ -141,25 +141,25 @@ impl CacheWriter {
         })
     }
 
-    /// Handle a writer command, dispatching to the appropriate method.
-    pub async fn command_handle(&mut self, cmd: WriterCommand) -> CacheResult<()> {
+    /// Handle a query command, dispatching to the appropriate method.
+    pub async fn query_command_handle(&mut self, cmd: QueryCommand) -> CacheResult<()> {
         match cmd {
-            WriterCommand::QueryRegister {
+            QueryCommand::Register {
                 fingerprint,
                 cacheable_query,
                 search_path,
                 started_at,
             } => {
+                trace!("command query register {fingerprint}");
                 let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
                 if let Err(e) = self
                     .query_register(fingerprint, &cacheable_query, &search_path_refs, started_at)
                     .await
                 {
-                    error!("query register failed: {e}");
+                    error!("query register failed: {e} {fingerprint}");
                 }
-                self.state_gauges_update();
             }
-            WriterCommand::QueryReady {
+            QueryCommand::Ready {
                 fingerprint,
                 cached_bytes,
             } => {
@@ -179,18 +179,24 @@ impl CacheWriter {
                         self.cache_query_invalidate(query.fingerprint).await?;
                     }
                 }
-                self.state_gauges_update();
             }
-            WriterCommand::QueryFailed { fingerprint } => {
+            QueryCommand::Failed { fingerprint } => {
                 self.query_failed_cleanup(fingerprint);
             }
-            WriterCommand::TableRegister(table_metadata) => {
+        }
+        self.state_gauges_update();
+        Ok(())
+    }
+
+    /// Handle a CDC command, dispatching to the appropriate method.
+    pub async fn cdc_command_handle(&mut self, cmd: CdcCommand) -> CacheResult<()> {
+        match cmd {
+            CdcCommand::TableRegister(table_metadata) => {
                 if let Err(e) = self.cache_table_register(table_metadata).await {
                     error!("table register failed: {e}");
                 }
-                self.state_gauges_update();
             }
-            WriterCommand::CdcInsert {
+            CdcCommand::Insert {
                 relation_oid,
                 row_data,
             } => {
@@ -198,7 +204,7 @@ impl CacheWriter {
                     error!("cdc insert failed: {e}");
                 }
             }
-            WriterCommand::CdcUpdate {
+            CdcCommand::Update {
                 relation_oid,
                 key_data,
                 row_data,
@@ -207,7 +213,7 @@ impl CacheWriter {
                     error!("cdc update failed: {e}");
                 }
             }
-            WriterCommand::CdcDelete {
+            CdcCommand::Delete {
                 relation_oid,
                 row_data,
             } => {
@@ -215,12 +221,12 @@ impl CacheWriter {
                     error!("cdc delete failed: {e}");
                 }
             }
-            WriterCommand::CdcTruncate { relation_oids } => {
+            CdcCommand::Truncate { relation_oids } => {
                 if let Err(e) = self.handle_truncate(&relation_oids).await {
                     error!("cdc truncate failed: {e}");
                 }
             }
-            WriterCommand::RelationCheck {
+            CdcCommand::RelationCheck {
                 relation_oid,
                 response_tx,
             } => {
@@ -228,6 +234,7 @@ impl CacheWriter {
                 let _ = response_tx.send(exists);
             }
         }
+        self.state_gauges_update();
         Ok(())
     }
 
@@ -261,16 +268,20 @@ impl CacheWriter {
     }
 
     /// Update cache state gauges with current values.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn state_gauges_update(&self) {
         metrics::gauge!(names::CACHE_QUERIES_REGISTERED)
             .set(self.cache.cached_queries.len() as f64);
-        let loading_count = self
-            .cache
-            .cached_queries
-            .iter()
-            .filter(|q| q.state == CachedQueryState::Loading)
-            .count();
-        metrics::gauge!(names::CACHE_QUERIES_LOADING).set(loading_count as f64);
+
+        if let Ok(view) = self.state_view.read() {
+            let loading_count = view
+                .cached_queries
+                .values()
+                .filter(|&q| q.state == CachedQueryState::Loading)
+                .count();
+            metrics::gauge!(names::CACHE_QUERIES_LOADING).set(loading_count as f64);
+        }
+
         metrics::gauge!(names::CACHE_SIZE_BYTES).set(self.cache.current_size as f64);
         if let Some(limit) = self.cache.cache_size {
             metrics::gauge!(names::CACHE_SIZE_LIMIT_BYTES).set(limit as f64);
@@ -280,6 +291,7 @@ impl CacheWriter {
     }
 
     /// Utility function to get the size of the currently cached data
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn cache_size_load(&mut self) -> CacheResult<usize> {
         let size: i64 = self
             .db_cache
@@ -308,12 +320,11 @@ impl CacheWriter {
     }
 }
 
-const BATCH_SIZE_MAX: usize = 100;
-
-/// Main writer runtime - processes writer commands with LocalSet for spawned tasks.
+/// Main writer runtime - processes query and CDC commands with LocalSet for spawned tasks.
 pub fn writer_run(
     settings: &Settings,
-    mut writer_rx: UnboundedReceiver<WriterCommand>,
+    mut query_rx: UnboundedReceiver<QueryCommand>,
+    mut cdc_rx: UnboundedReceiver<CdcCommand>,
     state_view: Arc<RwLock<CacheStateView>>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
@@ -323,26 +334,40 @@ pub fn writer_run(
 
     debug!("writer loop");
     rt.block_on(async {
-        // Create writer channel for spawned tasks to send commands back
-        let (writer_tx, mut internal_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create internal channel for population workers to send query commands back
+        let (query_tx, mut internal_rx) = tokio::sync::mpsc::unbounded_channel();
 
         LocalSet::new()
             .run_until(async move {
                 // Create writer inside LocalSet so spawn_local works for population workers
-                let mut writer = CacheWriter::new(settings, state_view, writer_tx).await?;
+                let mut writer = CacheWriter::new(settings, state_view, query_tx).await?;
 
                 loop {
                     tokio::select! {
-                        // Handle commands from coordinator/CDC
-                        msg = writer_rx.recv() => {
+                        // Handle query commands from coordinator
+                        msg = query_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
-                                    if let Err(e) = writer.command_handle(cmd).await {
-                                        error!("writer command failed: {e}");
+                                    if let Err(e) = writer.query_command_handle(cmd).await {
+                                        error!("writer query command failed: {e}");
                                     }
                                 }
                                 None => {
-                                    debug!("writer channel closed, shutting down");
+                                    debug!("writer query channel closed, shutting down");
+                                    break;
+                                }
+                            }
+                        }
+                        // Handle CDC commands from coordinator
+                        msg = cdc_rx.recv() => {
+                            match msg {
+                                Some(cmd) => {
+                                    if let Err(e) = writer.cdc_command_handle(cmd).await {
+                                        error!("writer cdc command failed: {e}");
+                                    }
+                                }
+                                None => {
+                                    debug!("writer cdc channel closed, shutting down");
                                     break;
                                 }
                             }
@@ -351,7 +376,7 @@ pub fn writer_run(
                         msg = internal_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
-                                    if let Err(e) = writer.command_handle(cmd).await {
+                                    if let Err(e) = writer.query_command_handle(cmd).await {
                                         error!("writer internal command failed: {e}");
                                     }
                                 }
@@ -363,29 +388,12 @@ pub fn writer_run(
                         }
                     }
 
-                    for _ in 0..writer_rx.len().max(BATCH_SIZE_MAX) {
-                        if let Ok(cmd) = writer_rx.try_recv() {
-                            if let Err(e) = writer.command_handle(cmd).await {
-                                error!("writer command failed: {e}");
-                            }
-                        } else {
-                            break;
-                        }
-                        metrics::gauge!(names::CACHE_WRITER_QUEUE).set(writer_rx.len() as f64);
-                    }
-
-                    for _ in 0..internal_rx.len().max(BATCH_SIZE_MAX) {
-                        if let Ok(cmd) = internal_rx.try_recv() {
-                            if let Err(e) = writer.command_handle(cmd).await {
-                                error!("writer internal command failed: {e}");
-                            }
-                        } else {
-                            break;
-                        }
-                        metrics::gauge!(names::CACHE_WRITER_INTERNAL_QUEUE)
-                            .set(internal_rx.len() as f64);
-                    }
+                    metrics::gauge!(names::CACHE_WRITER_QUERY_QUEUE).set(query_rx.len() as f64);
+                    metrics::gauge!(names::CACHE_WRITER_CDC_QUEUE).set(cdc_rx.len() as f64);
+                    metrics::gauge!(names::CACHE_WRITER_INTERNAL_QUEUE)
+                        .set(internal_rx.len() as f64);
                 }
+
                 Ok(())
             })
             .await

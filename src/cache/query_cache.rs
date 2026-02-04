@@ -14,7 +14,7 @@ use crate::timing::QueryTiming;
 
 use super::{
     CacheError, CacheResult,
-    messages::{CacheReply, WriterCommand},
+    messages::{CacheReply, QueryCommand},
     query::CacheableQuery,
     types::{CacheStateView, CachedQueryState, CachedQueryView},
 };
@@ -57,7 +57,7 @@ pub struct WorkerRequest {
 /// Query cache coordinator - routes queries and delegates writes to the writer thread.
 #[derive(Debug, Clone)]
 pub struct QueryCache {
-    writer_tx: UnboundedSender<WriterCommand>,
+    query_tx: UnboundedSender<QueryCommand>,
     worker_tx: UnboundedSender<WorkerRequest>,
     state_view: Arc<RwLock<CacheStateView>>,
 }
@@ -65,12 +65,12 @@ pub struct QueryCache {
 impl QueryCache {
     pub async fn new(
         _settings: &Settings,
-        writer_tx: UnboundedSender<WriterCommand>,
+        query_tx: UnboundedSender<QueryCommand>,
         worker_tx: UnboundedSender<WorkerRequest>,
         state_view: Arc<RwLock<CacheStateView>>,
     ) -> CacheResult<Self> {
         Ok(Self {
-            writer_tx,
+            query_tx,
             worker_tx,
             state_view,
         })
@@ -81,6 +81,7 @@ impl QueryCache {
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> CacheResult<()> {
         // Generate fingerprint from AST
         let fingerprint = select_node_fingerprint(&msg.cacheable_query.node);
+        trace!("{fingerprint}");
 
         // Measure cache lookup latency
         let lookup_start = Instant::now();
@@ -122,15 +123,19 @@ impl QueryCache {
                 timing,
             };
             self.worker_tx.send(worker_request).map_err(|e| {
-                error!("worker send {e}");
+                error!("worker send {e} {fingerprint}");
                 CacheError::WorkerSend.into()
             })
         } else {
             // Cache miss or Loading - forward to origin
+            trace!("cache miss {fingerprint}");
+
             msg.reply_tx
                 .send(CacheReply::Forward(msg.data))
                 .await
                 .map_err(|_| CacheError::Reply)?;
+
+            trace!("cache_entry check {fingerprint}");
 
             // Register only if not already in cache (prevents duplicate registrations)
             if cache_entry.is_none() {
@@ -146,16 +151,21 @@ impl QueryCache {
                     );
                 }
 
-                self.writer_tx
-                    .send(WriterCommand::QueryRegister {
+                trace!("send to writer {fingerprint}");
+
+                self.query_tx
+                    .send(QueryCommand::Register {
                         fingerprint,
                         cacheable_query: msg.cacheable_query,
                         search_path: msg.search_path,
                         started_at: Instant::now(),
                     })
-                    .map_err(|_| CacheError::WorkerSend)?;
+                    .map_err(|_| {
+                        trace!("query registration error {fingerprint}");
+                        CacheError::WorkerSend
+                    })?;
 
-                trace!("query registration sent to writer");
+                trace!("sent to writer {fingerprint}");
             }
 
             Ok(())
