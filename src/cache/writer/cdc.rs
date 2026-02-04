@@ -597,10 +597,13 @@ impl CacheWriter {
 
     pub(super) fn cache_upsert_with_predicate_sql(
         &self,
-        resolved: &crate::query::resolved::ResolvedSelectNode,
+        resolved: &crate::query::resolved::ResolvedQueryExpr,
         table_metadata: &crate::catalog::TableMetadata,
         row_data: &[Option<String>],
     ) -> CacheResult<String> {
+        // Extract SELECT body - update queries are always SELECT queries
+        let resolved_select = resolved.as_select().ok_or(CacheError::InvalidQuery)?;
+
         let mut column_names = Vec::new();
         let mut values = Vec::new();
 
@@ -617,7 +620,7 @@ impl CacheWriter {
         }
 
         let value_select = crate::query::transform::resolved_select_node_table_replace_with_values(
-            resolved,
+            resolved_select,
             table_metadata,
             row_data,
         )

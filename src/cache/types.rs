@@ -6,9 +6,9 @@ use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 use crate::{
     catalog::TableMetadata,
     query::{
-        ast::{LimitClause, OrderByClause, SelectNode},
+        ast::QueryExpr,
         constraints::QueryConstraints,
-        resolved::ResolvedSelectNode,
+        resolved::ResolvedQueryExpr,
     },
     settings::Settings,
 };
@@ -27,10 +27,8 @@ pub struct CachedQuery {
     /// Generation number assigned when query was registered (monotonically increasing)
     pub generation: u64,
     pub relation_oids: Vec<u32>,
-    pub select_node: SelectNode,
-    pub order_by: Vec<OrderByClause>,
-    pub limit: Option<LimitClause>,
-    pub resolved: ResolvedSelectNode,
+    pub query: QueryExpr,
+    pub resolved: ResolvedQueryExpr,
     pub constraints: QueryConstraints,
     /// Estimated size of cached data in bytes (sum of raw value bytes)
     pub cached_bytes: usize,
@@ -69,7 +67,7 @@ pub struct UpdateQuery {
     /// Fingerprint of cached query that generated this update query
     pub fingerprint: u64,
     /// Resolved AST query
-    pub resolved: ResolvedSelectNode,
+    pub resolved: ResolvedQueryExpr,
     /// Complexity score (lower = simpler = more likely to match = try first)
     pub complexity: usize,
 }
@@ -147,5 +145,5 @@ pub struct CachedQueryView {
     /// Generation number (0 for Loading placeholder before writer assigns real value)
     pub generation: u64,
     /// Resolved query (None for Loading placeholder before writer resolves)
-    pub resolved: Option<ResolvedSelectNode>,
+    pub resolved: Option<ResolvedQueryExpr>,
 }

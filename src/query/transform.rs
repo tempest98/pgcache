@@ -752,10 +752,13 @@ fn resolved_column_expr_alias_update(
 /// Returns one update query per table in the join - all queries use the same
 /// full SELECT statement (preserving the join structure) since we need to check
 /// if a change to any table affects the cached result.
+///
+/// Returns `None` if the query body is not a SELECT (should not happen for
+/// valid `CacheableQuery` instances since construction validates this).
 pub fn query_table_update_queries(
     cacheable_query: &CacheableQuery,
-) -> Vec<(&TableNode, SelectNode)> {
-    let select_node = &cacheable_query.node;
+) -> Option<Vec<(&TableNode, QueryExpr)>> {
+    let select_node = cacheable_query.as_select()?;
     let tables = select_node.nodes::<TableNode>().collect::<Vec<_>>();
 
     let column = SelectColumn {
@@ -764,10 +767,20 @@ pub fn query_table_update_queries(
     };
     let select_list = SelectColumns::Columns(vec![column]);
 
-    tables
-        .into_iter()
-        .map(|table| (table, select_node_columns_replace(select_node, select_list.clone())))
-        .collect()
+    Some(
+        tables
+            .into_iter()
+            .map(|table| {
+                let replaced = select_node_columns_replace(select_node, select_list.clone());
+                let query_expr = QueryExpr {
+                    body: QueryBody::Select(replaced),
+                    order_by: vec![],
+                    limit: None,
+                };
+                (table, query_expr)
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -996,7 +1009,7 @@ mod tests {
     fn test_query_table_update_query_simple_select() {
         let original_query = "SELECT id, name, email FROM users WHERE id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query);
+        let result = query_table_update_queries(&cacheable_query).unwrap();
 
         assert_eq!(result.len(), 1);
 
@@ -1012,7 +1025,7 @@ mod tests {
                             JOIN location ON location.user_id = users.user_id \
                             WHERE users.user_id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query);
+        let result = query_table_update_queries(&cacheable_query).unwrap();
 
         assert_eq!(result.len(), 2);
 
@@ -1038,7 +1051,7 @@ mod tests {
                             JOIN orders ON orders.user_id = users.user_id \
                             WHERE users.user_id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query);
+        let result = query_table_update_queries(&cacheable_query).unwrap();
 
         assert_eq!(result.len(), 3, "Should have 3 update queries for 3 tables");
 
@@ -1063,7 +1076,7 @@ mod tests {
                             JOIN d ON c.id = d.id \
                             WHERE a.id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query);
+        let result = query_table_update_queries(&cacheable_query).unwrap();
 
         assert_eq!(result.len(), 4, "Should have 4 update queries for 4 tables");
 

@@ -7,8 +7,8 @@ use tracing::{error, instrument, trace};
 
 use crate::metrics::names;
 
-use crate::query::ast::select_node_fingerprint;
-use crate::query::resolved::ResolvedSelectNode;
+use crate::query::ast::query_expr_fingerprint;
+use crate::query::resolved::ResolvedQueryExpr;
 use crate::settings::Settings;
 use crate::timing::QueryTiming;
 
@@ -44,7 +44,7 @@ pub struct QueryRequest {
 pub struct WorkerRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
-    pub resolved: ResolvedSelectNode,
+    pub resolved: ResolvedQueryExpr,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
     pub result_formats: Vec<i16>,
@@ -80,7 +80,7 @@ impl QueryCache {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> CacheResult<()> {
         // Generate fingerprint from AST
-        let fingerprint = select_node_fingerprint(&msg.cacheable_query.node);
+        let fingerprint = query_expr_fingerprint(&msg.cacheable_query.query);
         trace!("{fingerprint}");
 
         // Measure cache lookup latency

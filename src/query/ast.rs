@@ -2386,6 +2386,14 @@ pub fn select_node_fingerprint(node: &SelectNode) -> u64 {
     hasher.finish()
 }
 
+/// Generate a fingerprint hash for a QueryExpr.
+/// This is used for cache key generation.
+pub fn query_expr_fingerprint(query: &QueryExpr) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    query.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing)]

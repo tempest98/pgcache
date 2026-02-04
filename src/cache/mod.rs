@@ -50,6 +50,8 @@ error_set! {
         InvalidUtf8,
         Parse(pg_query::Error),
         AstTransformError(AstTransformError),
+        /// Query structure is invalid (e.g., expected SELECT but got something else)
+        InvalidQuery,
         Other,
     }
 

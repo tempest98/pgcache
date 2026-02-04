@@ -201,8 +201,8 @@ impl ConnectionState {
                             }
                             Ok(Action::CacheCheck(ast)) => {
                                 // Create timing with fingerprint from the cacheable query
-                                use crate::query::ast::select_node_fingerprint;
-                                let fingerprint = select_node_fingerprint(&ast.node);
+                                use crate::query::ast::query_expr_fingerprint;
+                                let fingerprint = query_expr_fingerprint(&ast.query);
                                 let query_id = QueryId::new(fingerprint);
                                 let received_at = self.query_start.unwrap_or_else(Instant::now);
                                 let mut timing = QueryTiming::new(query_id, received_at);
@@ -472,11 +472,11 @@ impl ConnectionState {
         self.proxy_mode = match self.try_cache_execute(&msg) {
             Some(cache_msg) => {
                 // Create timing with fingerprint from the cacheable query
-                use crate::query::ast::select_node_fingerprint;
+                use crate::query::ast::query_expr_fingerprint;
                 let fingerprint = match &cache_msg {
                     CacheMessage::Query(_, ast)
                     | CacheMessage::QueryParameterized(_, ast, _, _) => {
-                        select_node_fingerprint(&ast.node)
+                        query_expr_fingerprint(&ast.query)
                     }
                 };
                 let query_id = QueryId::new(fingerprint);

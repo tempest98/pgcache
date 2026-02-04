@@ -7,7 +7,7 @@ use crate::metrics::names;
 use crate::query::ast::TableNode;
 use crate::query::constraints::analyze_query_constraints;
 use crate::query::transform::query_table_update_queries;
-use crate::{catalog::TableMetadata, query::resolved::select_node_resolve};
+use crate::{catalog::TableMetadata, query::resolved::query_expr_resolve};
 
 use super::super::{
     CacheError, CacheResult, ReportExt,
@@ -76,7 +76,7 @@ impl CacheWriter {
     ) -> CacheResult<()> {
         let mut relation_oids = Vec::new();
 
-        for table_node in cacheable_query.node.nodes::<TableNode>() {
+        for table_node in cacheable_query.query.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
             let schema = self
                 .table_schema_resolve(table_name, table_node.schema.as_deref(), search_path)
@@ -92,14 +92,20 @@ impl CacheWriter {
             }
         }
 
-        let resolved = select_node_resolve(&cacheable_query.node, &self.cache.tables, search_path)
+        let resolved = query_expr_resolve(&cacheable_query.query, &self.cache.tables, search_path)
             .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
-            .attach_loc("resolving select statement")?;
+            .attach_loc("resolving query expression")?;
 
-        // Analyze constraints from the resolved query
-        let query_constraints = analyze_query_constraints(&resolved);
+        // Analyze constraints from the resolved query (requires SELECT body)
+        let resolved_select = resolved
+            .as_select()
+            .ok_or(CacheError::InvalidQuery)?;
+        let query_constraints = analyze_query_constraints(resolved_select);
 
-        for (table_node, update_select) in query_table_update_queries(cacheable_query) {
+        let update_queries = query_table_update_queries(cacheable_query)
+            .ok_or(CacheError::InvalidQuery)?;
+
+        for (table_node, update_query_expr) in update_queries {
             let schema = self
                 .table_schema_resolve(
                     table_node.name.as_str(),
@@ -118,9 +124,9 @@ impl CacheWriter {
                 .relation_oid;
 
             let update_resolved =
-                select_node_resolve(&update_select, &self.cache.tables, search_path)
+                query_expr_resolve(&update_query_expr, &self.cache.tables, search_path)
                     .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
-                    .attach_loc("resolving update select statement")?;
+                    .attach_loc("resolving update query expression")?;
 
             let complexity = update_resolved.complexity();
             let update_query = UpdateQuery {
@@ -143,9 +149,7 @@ impl CacheWriter {
             fingerprint,
             generation,
             relation_oids: relation_oids.clone(),
-            select_node: cacheable_query.node.clone(),
-            order_by: cacheable_query.order_by.clone(),
-            limit: cacheable_query.limit.clone(),
+            query: cacheable_query.query.clone(),
             resolved: resolved.clone(),
             constraints: query_constraints,
             cached_bytes: 0,

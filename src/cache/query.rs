@@ -2,11 +2,11 @@ use crate::{
     cache::QueryParameters,
     query::{
         ast::{
-            BinaryOp, JoinNode, JoinType, LimitClause, MultiOp, OrderByClause, QueryBody,
-            QueryExpr, SelectNode, TableSource, UnaryOp, WhereExpr,
+            BinaryOp, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode, TableSource,
+            UnaryOp, WhereExpr,
         },
         evaluate::is_simple_comparison,
-        transform::{AstTransformResult, select_node_parameters_replace},
+        transform::{AstTransformResult, query_expr_parameters_replace},
     },
 };
 use error_set::error_set;
@@ -22,9 +22,7 @@ error_set! {
 
 #[derive(Debug, Clone)]
 pub struct CacheableQuery {
-    pub node: SelectNode,
-    pub order_by: Vec<OrderByClause>,
-    pub limit: Option<LimitClause>,
+    pub query: QueryExpr,
 }
 
 impl CacheableQuery {
@@ -37,11 +35,17 @@ impl CacheableQuery {
     /// # Errors
     /// Returns `AstTransformError` if parameter replacement fails (e.g., invalid index, invalid UTF-8)
     pub fn parameters_replace(&mut self, parameters: &QueryParameters) -> AstTransformResult<()> {
-        select_node_parameters_replace(&mut self.node, parameters)?;
-        // Note: order_by and limit are not processed here because:
-        // - Queries with LIMIT are not cacheable (checked in TryFrom)
-        // - ORDER BY expressions typically don't have parameter placeholders
+        self.query = query_expr_parameters_replace(&self.query, parameters)?;
         Ok(())
+    }
+
+    /// Get the SELECT body of this query.
+    ///
+    /// Returns `Some` if the query body is a SELECT statement, `None` otherwise.
+    /// Note: `CacheableQuery` construction validates that the body is SELECT,
+    /// so this should always return `Some` for valid instances.
+    pub fn as_select(&self) -> Option<&SelectNode> {
+        self.query.as_select()
     }
 }
 
@@ -68,9 +72,7 @@ impl TryFrom<&QueryExpr> for CacheableQuery {
             return Err(CacheabilityError::UnsupportedWhereClause);
         }
         Ok(CacheableQuery {
-            node: node.clone(),
-            order_by: query.order_by.clone(),
-            limit: query.limit.clone(),
+            query: query.clone(),
         })
     }
 }

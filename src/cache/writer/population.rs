@@ -26,12 +26,30 @@ pub async fn population_worker(
     debug!("population worker {id} started");
 
     while let Some(work) = rx.recv().await {
+        // Extract SELECT body from resolved query expression
+        // This should always succeed since CacheableQuery construction validates SELECT body
+        let Some(resolved_select) = work.resolved.as_select() else {
+            error!(
+                "population worker {id}: query {} has non-SELECT body",
+                work.fingerprint
+            );
+            if query_tx
+                .send(QueryCommand::Failed {
+                    fingerprint: work.fingerprint,
+                })
+                .is_err()
+            {
+                error!("population worker {id}: failed to send QueryFailed");
+            }
+            continue;
+        };
+
         let result = population_task(
             work.fingerprint,
             work.generation,
             &work.relation_oids,
             &work.table_metadata,
-            &work.resolved,
+            resolved_select,
             Rc::clone(&db_origin),
             &db_cache,
         )
