@@ -30,6 +30,9 @@ error_set! {
 
         #[display("Invalid table reference")]
         InvalidTableRef,
+
+        #[display("Correlated subquery not supported: references outer table '{table}'")]
+        CorrelatedSubqueryNotSupported { table: String },
     }
 }
 
@@ -279,6 +282,20 @@ impl ResolvedWhereExpr {
                 }
             }
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => {}
+        }
+    }
+
+    /// Check if this WHERE expression contains any subqueries.
+    pub fn has_subqueries(&self) -> bool {
+        match self {
+            ResolvedWhereExpr::Subquery { .. } => true,
+            ResolvedWhereExpr::Binary(binary) => {
+                binary.lexpr.has_subqueries() || binary.rexpr.has_subqueries()
+            }
+            ResolvedWhereExpr::Unary(unary) => unary.expr.has_subqueries(),
+            ResolvedWhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_subqueries()),
+            ResolvedWhereExpr::Function { args, .. } => args.iter().any(|a| a.has_subqueries()),
+            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => false,
         }
     }
 }
@@ -583,6 +600,27 @@ impl ResolvedColumnExpr {
             }
         }
     }
+
+    /// Check if this column expression contains any subqueries.
+    pub fn has_subqueries(&self) -> bool {
+        match self {
+            ResolvedColumnExpr::Subquery(_) => true,
+            ResolvedColumnExpr::Function { args, .. } => args.iter().any(|a| a.has_subqueries()),
+            ResolvedColumnExpr::Case(case) => {
+                case.arg.as_ref().is_some_and(|a| a.has_subqueries())
+                    || case.whens.iter().any(|w| {
+                        w.condition.has_subqueries() || w.result.has_subqueries()
+                    })
+                    || case.default.as_ref().is_some_and(|d| d.has_subqueries())
+            }
+            ResolvedColumnExpr::Arithmetic(arith) => {
+                arith.left.has_subqueries() || arith.right.has_subqueries()
+            }
+            ResolvedColumnExpr::Column(_)
+            | ResolvedColumnExpr::Identifier(_)
+            | ResolvedColumnExpr::Literal(_) => false,
+        }
+    }
 }
 
 impl ResolvedCaseExpr {
@@ -745,6 +783,14 @@ impl ResolvedSelectColumns {
         }
         // ResolvedSelectColumns::All only contains ResolvedColumnNode (no subqueries)
     }
+
+    /// Check if the SELECT list contains any subqueries.
+    pub fn has_subqueries(&self) -> bool {
+        match self {
+            ResolvedSelectColumns::None | ResolvedSelectColumns::All(_) => false,
+            ResolvedSelectColumns::Columns(cols) => cols.iter().any(|c| c.expr.has_subqueries()),
+        }
+    }
 }
 
 impl Deparse for ResolvedSelectColumns {
@@ -802,6 +848,22 @@ impl ResolvedTableSource {
                 if let Some(condition) = &join.condition {
                     condition.collect_subquery_branches(branches);
                 }
+            }
+        }
+    }
+
+    /// Check if this table source contains any subqueries.
+    pub fn has_subqueries(&self) -> bool {
+        match self {
+            ResolvedTableSource::Table(_) => false,
+            ResolvedTableSource::Subquery(_) => true,
+            ResolvedTableSource::Join(join) => {
+                join.left.has_subqueries()
+                    || join.right.has_subqueries()
+                    || join
+                        .condition
+                        .as_ref()
+                        .is_some_and(|c| c.has_subqueries())
             }
         }
     }
@@ -981,6 +1043,31 @@ impl ResolvedSelectNode {
             .map(|w| w.predicate_count())
             .unwrap_or(0);
         (join_count * 3) + predicate_count
+    }
+
+    /// Check if this SELECT contains any subqueries (in FROM, WHERE, HAVING, or SELECT list).
+    pub fn has_subqueries(&self) -> bool {
+        // Check FROM clause for subqueries
+        if self.from.iter().any(|source| source.has_subqueries()) {
+            return true;
+        }
+
+        // Check WHERE clause for subqueries
+        if self
+            .where_clause
+            .as_ref()
+            .is_some_and(|w| w.has_subqueries())
+        {
+            return true;
+        }
+
+        // Check HAVING clause for subqueries
+        if self.having.as_ref().is_some_and(|h| h.has_subqueries()) {
+            return true;
+        }
+
+        // Check SELECT list for subqueries
+        self.columns.has_subqueries()
     }
 }
 
@@ -1273,6 +1360,57 @@ impl<'a> ResolutionScope<'a> {
             })
             .copied()
     }
+
+    /// Find which outer-scope table contains a given column name, if any.
+    fn column_scope_find(&self, column: &str) -> Option<&'a TableMetadata> {
+        self.tables
+            .iter()
+            .find(|(meta, _)| meta.columns.get1(column).is_some())
+            .map(|(meta, _)| *meta)
+    }
+
+    /// Resolve an inner query with a fresh scope, detecting correlated references.
+    ///
+    /// Detects two forms of correlated subqueries:
+    /// - Qualified references: `outer_table.column` produces `TableNotFound` in the fresh
+    ///   scope, intercepted here when the table exists in the outer scope.
+    /// - Unqualified references: a bare `column` that doesn't exist in any inner-scope
+    ///   table produces `ColumnNotFound`, intercepted here when the column exists in an
+    ///   outer-scope table.
+    fn subquery_resolve(&self, query: &QueryExpr) -> ResolveResult<ResolvedQueryExpr> {
+        query_expr_resolve(query, self.catalog_tables, &self.search_path).map_err(|report| {
+            match report.current_context() {
+                ResolveError::TableNotFound { name }
+                    if self.table_scope_find(name).is_some() =>
+                {
+                    ResolveError::CorrelatedSubqueryNotSupported {
+                        table: name.clone(),
+                    }
+                    .into()
+                }
+                ResolveError::ColumnNotFound { table, column } => {
+                    // Unqualified column (table == "<unknown>") not found in the inner
+                    // scope — check if it exists in the outer scope, which would make
+                    // this a correlated reference.
+                    if table == "<unknown>"
+                        && let Some(outer_table) = self.column_scope_find(column)
+                    {
+                        return ResolveError::CorrelatedSubqueryNotSupported {
+                            table: outer_table.name.clone(),
+                        }
+                        .into();
+                    }
+                    report
+                }
+                ResolveError::TableNotFound { .. }
+                | ResolveError::AmbiguousColumn { .. }
+                | ResolveError::SchemaNotFound { .. }
+                | ResolveError::SubqueryAliasNotFound { .. }
+                | ResolveError::InvalidTableRef
+                | ResolveError::CorrelatedSubqueryNotSupported { .. } => report,
+            }
+        })
+    }
 }
 
 /// Find table metadata for a table reference.
@@ -1424,10 +1562,9 @@ fn where_expr_resolve(
                 .transpose()?
                 .map(Box::new);
 
-            // Resolve the inner query with its own fresh scope
-            // (non-correlated subquery - doesn't access outer scope tables)
-            let resolved_query =
-                query_expr_resolve(query, scope.catalog_tables, &scope.search_path)?;
+            // Resolve the inner query with a fresh scope (non-correlated)
+            // Detects correlated references and returns a clear error
+            let resolved_query = scope.subquery_resolve(query)?;
 
             Ok(ResolvedWhereExpr::Subquery {
                 query: Box::new(resolved_query),
@@ -1499,10 +1636,10 @@ fn table_source_resolve<'a>(
                 })
             })?;
 
-            // Resolve the inner query with its own fresh scope
+            // Resolve the inner query with a fresh scope (non-correlated)
             // LATERAL subqueries would need access to outer scope, but we don't support those yet
-            let resolved_query =
-                query_expr_resolve(&subquery.query, scope.catalog_tables, &scope.search_path)?;
+            // Detects correlated references and returns a clear error
+            let resolved_query = scope.subquery_resolve(&subquery.query)?;
 
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
@@ -1591,9 +1728,9 @@ fn column_expr_resolve(
             }))
         }
         ColumnExpr::Subquery(query) => {
-            // Resolve the inner query with its own fresh scope (scalar subquery)
-            let resolved_query =
-                query_expr_resolve(query, scope.catalog_tables, &scope.search_path)?;
+            // Resolve the inner query with a fresh scope (non-correlated scalar subquery)
+            // Detects correlated references and returns a clear error
+            let resolved_query = scope.subquery_resolve(query)?;
             Ok(ResolvedColumnExpr::Subquery(Box::new(resolved_query)))
         }
     }
@@ -1983,6 +2120,34 @@ mod tests {
             name: name.to_owned(),
             schema: "public".to_owned(),
             primary_key_columns: vec!["id".to_owned()],
+            columns,
+            indexes: Vec::new(),
+        }
+    }
+
+    /// Create test table metadata with custom column names (all text type, first is PK).
+    fn test_table_metadata_with_columns(
+        name: &str,
+        relation_oid: u32,
+        column_names: &[&str],
+    ) -> TableMetadata {
+        let mut columns = BiHashMap::new();
+        for (i, col_name) in column_names.iter().enumerate() {
+            columns.insert_overwrite(ColumnMetadata {
+                name: (*col_name).to_owned(),
+                position: (i + 1) as i16,
+                type_oid: 25,
+                data_type: Type::TEXT,
+                type_name: "text".to_owned(),
+                cache_type_name: "text".to_owned(),
+                is_primary_key: i == 0,
+            });
+        }
+        TableMetadata {
+            relation_oid,
+            name: name.to_owned(),
+            schema: "public".to_owned(),
+            primary_key_columns: vec![column_names[0].to_owned()],
             columns,
             indexes: Vec::new(),
         }
@@ -3307,5 +3472,294 @@ mod tests {
         let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
         assert!(table_names.contains(&"users"), "Should find outer table");
         assert!(table_names.contains(&"active_users"), "Should find inner table");
+    }
+
+    #[test]
+    fn test_subquery_nodes_traversal_derived_table() {
+        // Test that nodes() traverses into FROM subqueries
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let resolved = resolve_sql(
+            "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
+            &tables,
+        );
+
+        // Should find the table inside the derived table
+        let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
+        assert_eq!(table_nodes.len(), 1, "Should find table in FROM subquery");
+        assert_eq!(table_nodes[0].name, "users");
+    }
+
+    #[test]
+    fn test_subquery_nodes_traversal_scalar() {
+        // Test that nodes() traverses into scalar subqueries in SELECT list
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("orders", 1001));
+        tables.insert_overwrite(test_table_metadata("users", 1002));
+
+        let resolved = resolve_sql(
+            "SELECT id, (SELECT COUNT(*) FROM users) AS user_count FROM orders WHERE id = 1",
+            &tables,
+        );
+
+        // Should find both tables
+        let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
+        assert_eq!(table_nodes.len(), 2, "Should find tables in outer and scalar subquery");
+
+        let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"), "Should find outer table");
+        assert!(table_names.contains(&"users"), "Should find scalar subquery table");
+    }
+
+    #[test]
+    fn test_subquery_nodes_traversal_nested() {
+        // Test that nodes() traverses into nested subqueries
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("a", 1001));
+        tables.insert_overwrite(test_table_metadata("b", 1002));
+        tables.insert_overwrite(test_table_metadata("c", 1003));
+
+        let resolved = resolve_sql(
+            "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))",
+            &tables,
+        );
+
+        // Should find all three tables
+        let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
+        assert_eq!(table_nodes.len(), 3, "Should find all tables in nested subqueries");
+
+        let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"a"), "Should find outermost table");
+        assert!(table_names.contains(&"b"), "Should find middle table");
+        assert!(table_names.contains(&"c"), "Should find innermost table");
+    }
+
+    // ==========================================================================
+    // Correlated Subquery Detection Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_correlated_exists_subquery_detected() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("orders", 1001));
+        tables.insert_overwrite(test_table_metadata("items", 1002));
+
+        let node = parse_select_node(
+            "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.id = orders.id)",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            matches!(
+                result.as_ref().map_err(|e| e.current_context()),
+                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
+            ),
+            "Correlated EXISTS subquery should return CorrelatedSubqueryNotSupported, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_correlated_in_subquery_detected() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let node = parse_select_node(
+            "SELECT * FROM users WHERE id IN (SELECT id FROM orders WHERE orders.name = users.name)",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            matches!(
+                result.as_ref().map_err(|e| e.current_context()),
+                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
+            ),
+            "Correlated IN subquery should return CorrelatedSubqueryNotSupported, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_correlated_scalar_subquery_detected() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let node = parse_select_node(
+            "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.id = users.id) FROM users",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            matches!(
+                result.as_ref().map_err(|e| e.current_context()),
+                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
+            ),
+            "Correlated scalar subquery should return CorrelatedSubqueryNotSupported, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_correlated_subquery_with_alias_detected() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        // Using table alias - the alias 'u' should be detected in the outer scope
+        let node = parse_select_node(
+            "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE orders.id = u.id)",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            matches!(
+                result.as_ref().map_err(|e| e.current_context()),
+                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
+            ),
+            "Correlated subquery using alias should return CorrelatedSubqueryNotSupported, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_correlated_unqualified_column_in_where() {
+        // `email` only exists on `users`, not `orders` — bare `email` in the subquery
+        // is an implicit correlated reference
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "users",
+            1001,
+            &["id", "email"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "orders",
+            1002,
+            &["id", "user_id", "total"],
+        ));
+
+        let node = parse_select_node(
+            "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE email = 'test@example.com')",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            matches!(
+                result.as_ref().map_err(|e| e.current_context()),
+                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
+            ),
+            "Unqualified column from outer scope should be detected as correlated, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_correlated_unqualified_column_in_select_list() {
+        // `email` only exists on `users` — bare `email` in subquery SELECT list
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "users",
+            1001,
+            &["id", "email"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "orders",
+            1002,
+            &["id", "user_id"],
+        ));
+
+        let node = parse_select_node(
+            "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE user_id = id)",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        // `id` exists in both tables so it resolves to `orders.id` (inner scope) — non-correlated.
+        // This should succeed.
+        assert!(
+            result.is_ok(),
+            "Column present in both scopes should resolve to inner scope, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_correlated_unqualified_column_scalar_subquery() {
+        // `status` only exists on `users`, bare reference in scalar subquery
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "users",
+            1001,
+            &["id", "status"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "orders",
+            1002,
+            &["id", "amount"],
+        ));
+
+        let node = parse_select_node(
+            "SELECT id, (SELECT COUNT(*) FROM orders WHERE status = 'active') FROM users",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            matches!(
+                result.as_ref().map_err(|e| e.current_context()),
+                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
+            ),
+            "Unqualified column from outer scope in scalar subquery should be detected as correlated, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_unqualified_column_not_in_any_scope() {
+        // `nonexistent` doesn't exist in any table — should remain ColumnNotFound
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "users",
+            1001,
+            &["id", "name"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "orders",
+            1002,
+            &["id", "total"],
+        ));
+
+        let node = parse_select_node(
+            "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE nonexistent = 1)",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            matches!(
+                result.as_ref().map_err(|e| e.current_context()),
+                Err(ResolveError::ColumnNotFound { .. })
+            ),
+            "Column not in any scope should remain ColumnNotFound, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_non_correlated_subquery_succeeds() {
+        // Non-correlated subquery should still resolve fine
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+
+        let node = parse_select_node(
+            "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        assert!(
+            result.is_ok(),
+            "Non-correlated subquery should resolve successfully, got: {:?}",
+            result
+        );
     }
 }

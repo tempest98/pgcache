@@ -189,8 +189,17 @@ fn propagate_constraints(
     constraints
 }
 
-/// Analyze a resolved query to determine all constant constraints on columns
+/// Analyze a resolved query to determine all constant constraints on columns.
+///
+/// For queries containing subqueries, returns empty constraints (conservative approach).
+/// Subquery constraint analysis is complex and deferred for future refinement.
 pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstraints {
+    // For queries with subqueries, use conservative (empty) constraints
+    // This matches the pattern used for set operations
+    if resolved.has_subqueries() {
+        return QueryConstraints::default();
+    }
+
     // Step 1: Collect all equality information (constraints + equivalences)
     let (constraints, equivalences) = collect_query_equalities(resolved);
 
@@ -456,6 +465,64 @@ mod tests {
         assert_eq!(
             test_constraints[0],
             ("id".to_owned(), LiteralValue::Integer(1))
+        );
+    }
+
+    #[test]
+    fn test_subquery_returns_empty_constraints() {
+        // Subqueries should return conservative (empty) constraints
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+
+        let sql = "SELECT * FROM users WHERE id IN (SELECT id FROM active_users) AND id = 1";
+        let resolved = resolve_sql(sql, &tables);
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        // Should return empty constraints for query with subquery
+        assert!(
+            constraints.column_constraints.is_empty(),
+            "Subquery should return empty constraints"
+        );
+        assert!(constraints.equivalences.is_empty());
+        assert!(constraints.table_constraints.is_empty());
+    }
+
+    #[test]
+    fn test_derived_table_returns_empty_constraints() {
+        // FROM subqueries should also return empty constraints
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub";
+        let resolved = resolve_sql(sql, &tables);
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        // Should return empty constraints for query with derived table
+        assert!(
+            constraints.column_constraints.is_empty(),
+            "Derived table should return empty constraints"
+        );
+    }
+
+    #[test]
+    fn test_scalar_subquery_returns_empty_constraints() {
+        // Scalar subqueries in SELECT list should also return empty constraints
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let sql = "SELECT id, (SELECT COUNT(*) FROM orders) FROM users WHERE id = 1";
+        let resolved = resolve_sql(sql, &tables);
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        // Should return empty constraints for query with scalar subquery
+        assert!(
+            constraints.column_constraints.is_empty(),
+            "Scalar subquery should return empty constraints"
         );
     }
 }
