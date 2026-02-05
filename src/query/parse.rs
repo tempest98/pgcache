@@ -15,8 +15,8 @@ use pg_query::protobuf::{
 use pg_query::{NodeRef, ParseResult};
 
 use super::ast::{
-    BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, UnaryExpr, UnaryOp,
-    WhereExpr,
+    BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, SubLinkType, UnaryExpr,
+    UnaryOp, WhereExpr, select_stmt_to_query_expr,
 };
 
 error_set! {
@@ -38,7 +38,9 @@ error_set! {
         #[display("Missing expression")]
         MissingExpression,
         #[display("{error}")]
-        Other { error: String }
+        Other { error: String },
+        #[display("Subquery parse error: {error}")]
+        SubqueryError { error: String },
     }
 
     SqlError := {
@@ -141,10 +143,7 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
             let value = param_ref_extract(param_ref);
             Ok(WhereExpr::Value(value))
         }
-        Some(NodeEnum::SubLink(sub_link)) => {
-            let query = sublink_query_extract(sub_link);
-            Ok(WhereExpr::Subquery { query })
-        }
+        Some(NodeEnum::SubLink(sub_link)) => sublink_convert(sub_link),
         Some(NodeEnum::NullTest(null_test)) => null_test_convert(null_test),
         unsupported => {
             dbg!(unsupported);
@@ -153,13 +152,40 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
     }
 }
 
-/// Extract SQL string from a SubLink node for storage
-/// Note: We store a placeholder since subqueries are rejected for caching anyway.
-/// The important thing is that this parses successfully so has_sublink() can detect it.
-fn sublink_query_extract(sub_link: &SubLink) -> String {
-    // We can't easily deparse a single node, but we don't need to -
-    // the query string is just for debugging. Store a marker instead.
-    format!("<subquery at location {}>", sub_link.location)
+/// Convert pg_query SubLink to WhereExpr::Subquery with properly parsed inner query
+fn sublink_convert(sub_link: &SubLink) -> Result<WhereExpr, WhereParseError> {
+    // Parse the subquery SELECT statement
+    let query = match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
+        Some(NodeEnum::SelectStmt(select_stmt)) => select_stmt_to_query_expr(select_stmt)
+            .map_err(|e| WhereParseError::SubqueryError {
+                error: e.to_string(),
+            })?,
+        _ => {
+            return Err(WhereParseError::Other {
+                error: "SubLink missing or invalid subselect".to_owned(),
+            })
+        }
+    };
+
+    // Parse the test expression (left-hand side for IN/ANY/ALL)
+    let test_expr = sub_link
+        .testexpr
+        .as_ref()
+        .map(|e| node_convert_to_expr(e))
+        .transpose()?
+        .map(Box::new);
+
+    // Convert the SubLink type
+    let sublink_type =
+        SubLinkType::try_from(sub_link.sub_link_type()).map_err(|e| WhereParseError::SubqueryError {
+            error: e.to_string(),
+        })?;
+
+    Ok(WhereExpr::Subquery {
+        query: Box::new(query),
+        sublink_type,
+        test_expr,
+    })
 }
 
 /// Convert pg_query NullTest to WhereExpr (IS NULL / IS NOT NULL)

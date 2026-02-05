@@ -37,6 +37,8 @@ error_set! {
         #[display("Invalid table reference")]
         InvalidTableRef,
         UnsupportedJoinType,
+        #[display("Unsupported SubLink type: {sublink_type}")]
+        UnsupportedSubLinkType { sublink_type: String },
         WhereParseError(WhereParseError),
     }
 }
@@ -395,9 +397,12 @@ pub enum WhereExpr {
         args: Vec<WhereExpr>,
     },
 
-    // Subqueries (for future support)
+    // Subqueries in WHERE clauses (EXISTS, IN, ANY, ALL, scalar)
     Subquery {
-        query: String, // Placeholder for now
+        query: Box<QueryExpr>,
+        sublink_type: SubLinkType,
+        /// Left-hand expression for IN/ANY/ALL (e.g., `id` in `id IN (SELECT ...)`)
+        test_expr: Option<Box<WhereExpr>>,
     },
 }
 
@@ -426,9 +431,14 @@ impl WhereExpr {
             WhereExpr::Binary(binary) => Box::new(binary.lexpr.nodes().chain(binary.rexpr.nodes())),
             WhereExpr::Multi(multi) => Box::new(multi.exprs.iter().flat_map(|expr| expr.nodes())),
             WhereExpr::Function { args, .. } => Box::new(args.iter().flat_map(|expr| expr.nodes())),
-            WhereExpr::Value(_) | WhereExpr::Column(_) | WhereExpr::Subquery { .. } => {
-                Box::new(std::iter::empty())
+            WhereExpr::Subquery {
+                query, test_expr, ..
+            } => {
+                let query_nodes = query.nodes();
+                let test_nodes = test_expr.iter().flat_map(|e| e.nodes());
+                Box::new(query_nodes.chain(test_nodes))
             }
+            WhereExpr::Value(_) | WhereExpr::Column(_) => Box::new(std::iter::empty()),
         };
 
         current.chain(children)
@@ -450,14 +460,67 @@ impl WhereExpr {
 impl Deparse for WhereExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
-            WhereExpr::Value(literal) => literal.deparse(buf),
-            WhereExpr::Column(col) => col.deparse(buf),
-            WhereExpr::Unary(expr) => expr.deparse(buf),
-            WhereExpr::Binary(expr) => expr.deparse(buf),
-            WhereExpr::Multi(expr) => expr.deparse(buf),
+            WhereExpr::Value(literal) => {
+                literal.deparse(buf);
+            }
+            WhereExpr::Column(col) => {
+                col.deparse(buf);
+            }
+            WhereExpr::Unary(expr) => {
+                expr.deparse(buf);
+            }
+            WhereExpr::Binary(expr) => {
+                expr.deparse(buf);
+            }
+            WhereExpr::Multi(expr) => {
+                expr.deparse(buf);
+            }
             WhereExpr::Function { .. } => todo!(),
-            WhereExpr::Subquery { .. } => todo!(),
-        };
+            WhereExpr::Subquery {
+                query,
+                sublink_type,
+                test_expr,
+            } => {
+                match sublink_type {
+                    SubLinkType::Exists => {
+                        buf.push_str("EXISTS (");
+                        query.deparse(buf);
+                        buf.push(')');
+                    }
+                    SubLinkType::Any => {
+                        // IN is a special case of ANY
+                        if let Some(test) = test_expr {
+                            test.deparse(buf);
+                            buf.push_str(" IN (");
+                            query.deparse(buf);
+                            buf.push(')');
+                        } else {
+                            buf.push('(');
+                            query.deparse(buf);
+                            buf.push(')');
+                        }
+                    }
+                    SubLinkType::All => {
+                        if let Some(test) = test_expr {
+                            test.deparse(buf);
+                            buf.push_str(" <> ALL (");
+                            query.deparse(buf);
+                            buf.push(')');
+                        } else {
+                            buf.push_str("ALL (");
+                            query.deparse(buf);
+                            buf.push(')');
+                        }
+                    }
+                    SubLinkType::Expr => {
+                        // Scalar subquery - just parenthesized query
+                        buf.push('(');
+                        query.deparse(buf);
+                        buf.push(')');
+                    }
+                }
+            }
+        }
 
         buf
     }
@@ -1496,6 +1559,40 @@ impl TryFrom<pg_query::protobuf::JoinType> for JoinType {
     }
 }
 
+/// SubLink type for subqueries in WHERE clauses
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubLinkType {
+    /// EXISTS (SELECT ...)
+    Exists,
+    /// expr IN (SELECT ...) / expr op ANY (SELECT ...)
+    Any,
+    /// expr op ALL (SELECT ...)
+    All,
+    /// Scalar subquery returning single value
+    Expr,
+}
+
+impl TryFrom<pg_query::protobuf::SubLinkType> for SubLinkType {
+    type Error = AstError;
+
+    fn try_from(v: pg_query::protobuf::SubLinkType) -> Result<Self, Self::Error> {
+        use pg_query::protobuf::SubLinkType as PgSubLinkType;
+        match v {
+            PgSubLinkType::ExistsSublink => Ok(Self::Exists),
+            PgSubLinkType::AnySublink => Ok(Self::Any),
+            PgSubLinkType::AllSublink => Ok(Self::All),
+            PgSubLinkType::ExprSublink => Ok(Self::Expr),
+            PgSubLinkType::Undefined
+            | PgSubLinkType::RowcompareSublink
+            | PgSubLinkType::MultiexprSublink
+            | PgSubLinkType::ArraySublink
+            | PgSubLinkType::CteSublink => Err(AstError::UnsupportedSubLinkType {
+                sublink_type: format!("{:?}", v),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct OrderByClause {
     pub expr: ColumnExpr,
@@ -1579,7 +1676,7 @@ pub fn query_expr_convert(ast: &ParseResult) -> Result<QueryExpr, AstError> {
 }
 
 /// Convert a SelectStmt to a QueryExpr, handling set operations
-fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, AstError> {
+pub fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, AstError> {
     let set_op = SetOperation::try_from(select_stmt.op).unwrap_or(SetOperation::Undefined);
 
     // ORDER BY and LIMIT apply to the whole query expression
@@ -4801,5 +4898,123 @@ mod tests {
 
         let branches = query_expr.select_branches();
         assert_eq!(branches.len(), 3, "nested UNION should have three branches");
+    }
+
+    // ==========================================================================
+    // WHERE Subquery Parsing Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_where_subquery_in_parsed() {
+        // Test that IN subquery is properly parsed
+        let select = parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
+
+        let where_clause = select.where_clause.as_ref().expect("should have WHERE clause");
+
+        match where_clause {
+            WhereExpr::Subquery { query, sublink_type, test_expr } => {
+                assert_eq!(*sublink_type, SubLinkType::Any, "IN should parse as SubLinkType::Any");
+                assert!(test_expr.is_some(), "IN should have test expression (id)");
+
+                // Verify the inner query structure
+                match &query.body {
+                    QueryBody::Select(inner_select) => {
+                        let tables: Vec<&TableNode> = inner_select.nodes().collect();
+                        assert_eq!(tables.len(), 1);
+                        assert_eq!(tables[0].name, "active_users");
+                    }
+                    _ => panic!("Expected inner SELECT"),
+                }
+            }
+            _ => panic!("Expected WhereExpr::Subquery, got {:?}", where_clause),
+        }
+    }
+
+    #[test]
+    fn test_where_subquery_exists_parsed() {
+        // Test that EXISTS subquery is properly parsed
+        let select = parse_select("SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)");
+
+        let where_clause = select.where_clause.as_ref().expect("should have WHERE clause");
+
+        match where_clause {
+            WhereExpr::Subquery { sublink_type, test_expr, .. } => {
+                assert_eq!(*sublink_type, SubLinkType::Exists, "EXISTS should parse as SubLinkType::Exists");
+                assert!(test_expr.is_none(), "EXISTS should not have test expression");
+            }
+            _ => panic!("Expected WhereExpr::Subquery, got {:?}", where_clause),
+        }
+    }
+
+    #[test]
+    fn test_where_subquery_scalar_parsed() {
+        // Test that scalar subquery in WHERE is properly parsed
+        let select = parse_select("SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)");
+
+        let where_clause = select.where_clause.as_ref().expect("should have WHERE clause");
+
+        // The scalar subquery should be on the right side of the > comparison
+        match where_clause {
+            WhereExpr::Binary(binary) => {
+                match binary.rexpr.as_ref() {
+                    WhereExpr::Subquery { sublink_type, test_expr, .. } => {
+                        assert_eq!(*sublink_type, SubLinkType::Expr, "Scalar subquery should parse as SubLinkType::Expr");
+                        assert!(test_expr.is_none(), "Scalar subquery should not have test expression");
+                    }
+                    _ => panic!("Expected WhereExpr::Subquery on right side"),
+                }
+            }
+            _ => panic!("Expected WhereExpr::Binary, got {:?}", where_clause),
+        }
+    }
+
+    #[test]
+    fn test_where_subquery_not_in_parsed() {
+        // NOT IN should also parse as SubLinkType::Any with proper negation
+        let select = parse_select("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)");
+
+        // PostgreSQL parses NOT IN as a negated ANY sublink
+        // The structure may vary, but we should be able to find the subquery
+        assert!(
+            select.where_clause.is_some(),
+            "Should have WHERE clause"
+        );
+        assert!(select.has_sublink(), "Should detect sublink in NOT IN");
+    }
+
+    #[test]
+    fn test_where_subquery_has_sublink_traversal() {
+        // Verify nodes() traverses into subqueries to find TableNode
+        let select = parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
+
+        let tables: Vec<&TableNode> = select.nodes().collect();
+
+        // Should find both outer table (users) and inner table (active_users)
+        assert_eq!(tables.len(), 2, "Should find tables in both outer query and subquery");
+
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"), "Should find outer table");
+        assert!(table_names.contains(&"active_users"), "Should find subquery table");
+    }
+
+    #[test]
+    fn test_where_subquery_deparse_in() {
+        let select = parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
+        let mut buf = String::new();
+        select.deparse(&mut buf);
+
+        // The deparsed output should contain IN and the subquery
+        assert!(buf.contains("IN"), "Deparsed should contain IN: {}", buf);
+        assert!(buf.contains("active_users"), "Deparsed should contain subquery table: {}", buf);
+    }
+
+    #[test]
+    fn test_where_subquery_deparse_exists() {
+        let select = parse_select("SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items)");
+        let mut buf = String::new();
+        select.deparse(&mut buf);
+
+        assert!(buf.contains("EXISTS"), "Deparsed should contain EXISTS: {}", buf);
+        assert!(buf.contains("items"), "Deparsed should contain subquery table: {}", buf);
     }
 }

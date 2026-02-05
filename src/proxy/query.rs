@@ -77,6 +77,7 @@ pub(super) async fn handle_query(
                         AstError::UnsupportedSelectFeature { .. }
                         | AstError::UnsupportedFeature { .. }
                         | AstError::UnsupportedJoinType
+                        | AstError::UnsupportedSubLinkType { .. }
                         | AstError::WhereParseError(_) => ForwardReason::UncacheableSelect,
                         AstError::MultipleStatements
                         | AstError::MissingStatement
