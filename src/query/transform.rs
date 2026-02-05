@@ -658,8 +658,13 @@ fn resolved_where_column_alias_update(
                 resolved_where_column_alias_update(arg, schema, table, alias);
             }
         }
-        ResolvedWhereExpr::Subquery { query } => {
+        ResolvedWhereExpr::Subquery {
+            query, test_expr, ..
+        } => {
             resolved_query_expr_column_alias_update(query, schema, table, alias);
+            if let Some(test) = test_expr {
+                resolved_where_column_alias_update(test, schema, table, alias);
+            }
         }
         ResolvedWhereExpr::Value(_) => {}
     }
