@@ -78,6 +78,10 @@ pub mod names {
     pub const QUERY_STAGE_RESPONSE_WRITE_SECONDS: &str =
         "pgcache.query.stage.response_write_seconds";
     pub const QUERY_STAGE_TOTAL_SECONDS: &str = "pgcache.query.stage.total_seconds";
+
+    // Worker wait time histograms
+    pub const CACHE_WORKER_WAIT_SECONDS: &str = "pgcache.cache.worker_wait_seconds";
+    pub const CACHE_WORKER_CONN_WAIT_SECONDS: &str = "pgcache.cache.worker_conn_wait_seconds";
 }
 
 /// Install the Prometheus metrics recorder.

@@ -322,19 +322,9 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                             }
                         }
 
-                        // Drain all immediately available messages without parking
-                        while let Ok(msg) = cdc_rx.try_recv() {
-                            handle_cdc_message(&cdc_cmd_tx, msg);
-                        }
-                        while let Ok(proxy_msg) = cache_rx.try_recv() {
-                            let mut qcache = qcache.clone();
-                            spawn_local(async move {
-                                handle_proxy_message(&mut qcache, proxy_msg).await;
-                            });
-                        }
-
                         metrics::gauge!(names::CACHE_CDC_MESSAGE_QUEUE).set(cdc_rx.len() as f64);
-                        metrics::gauge!(names::CACHE_PROXY_MESSAGE_QUEUE).set(cache_rx.len() as f64);
+                        metrics::gauge!(names::CACHE_PROXY_MESSAGE_QUEUE)
+                            .set(cache_rx.len() as f64);
                     }
 
                     debug!("cache loop exiting");
@@ -364,18 +354,24 @@ fn worker_run(
         LocalSet::new()
             .run_until(async move {
                 loop {
-                    // Block for at least one request
+                    // Block for at least one request (track wait time)
+                    let wait_start = Instant::now();
                     let Some(msg) = worker_rx.recv().await else {
                         break;
                     };
+                    metrics::histogram!(names::CACHE_WORKER_WAIT_SECONDS)
+                        .record(wait_start.elapsed().as_secs_f64());
 
-                    // Wait for an available connection
+                    // Wait for an available connection (track wait time only when blocking)
                     let client = if let Ok(client) = conn_rx.try_recv() {
                         client
                     } else {
+                        let conn_wait_start = Instant::now();
                         let Some(client) = conn_rx.recv().await else {
                             return Err(CacheError::NoConnection.into());
                         };
+                        metrics::histogram!(names::CACHE_WORKER_CONN_WAIT_SECONDS)
+                            .record(conn_wait_start.elapsed().as_secs_f64());
                         client
                     };
 
@@ -384,23 +380,6 @@ fn worker_run(
                     spawn_local(async move {
                         handle_worker_request(client, return_tx, msg).await;
                     });
-
-                    // Drain immediately available msg
-                    while let Ok(msg) = worker_rx.try_recv() {
-                        let client = if let Ok(client) = conn_rx.try_recv() {
-                            client
-                        } else {
-                            let Some(client) = conn_rx.recv().await else {
-                                return Err(CacheError::NoConnection.into());
-                            };
-                            client
-                        };
-
-                        let return_tx = conn_tx.clone();
-                        spawn_local(async move {
-                            handle_worker_request(client, return_tx, msg).await;
-                        });
-                    }
 
                     metrics::gauge!(names::CACHE_WORKER_QUEUE).set(worker_rx.len() as f64);
                 }
