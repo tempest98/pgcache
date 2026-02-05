@@ -28,7 +28,7 @@ impl ColumnEquivalence {
 }
 
 /// Analysis results for a query showing all constant constraints
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryConstraints {
     /// All column constraints (from WHERE + propagated through JOINs)
     pub column_constraints: HashMap<ResolvedColumnNode, LiteralValue>,

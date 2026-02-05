@@ -6,8 +6,9 @@ use tracing::{debug, error, info, instrument, trace};
 use crate::metrics::names;
 use crate::query::ast::TableNode;
 use crate::query::constraints::analyze_query_constraints;
+use crate::query::resolved::{ResolvedTableNode, query_expr_resolve};
 use crate::query::transform::query_table_update_queries;
-use crate::{catalog::TableMetadata, query::resolved::query_expr_resolve};
+use crate::catalog::TableMetadata;
 
 use super::super::{
     CacheError, CacheResult, ReportExt,
@@ -96,16 +97,15 @@ impl CacheWriter {
             .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
             .attach_loc("resolving query expression")?;
 
-        // Analyze constraints from the resolved query (requires SELECT body)
-        let resolved_select = resolved
+        // Analyze constraints from the resolved query
+        // For simple SELECT queries, analyze WHERE clause constraints
+        // For set operations, use empty constraints (conservative: always check for invalidation)
+        let query_constraints = resolved
             .as_select()
-            .ok_or(CacheError::InvalidQuery)?;
-        let query_constraints = analyze_query_constraints(resolved_select);
+            .map(analyze_query_constraints)
+            .unwrap_or_default();
 
-        let update_queries = query_table_update_queries(cacheable_query)
-            .ok_or(CacheError::InvalidQuery)?;
-
-        for (table_node, update_query_expr) in update_queries {
+        for (table_node, update_query_expr) in query_table_update_queries(cacheable_query) {
             let schema = self
                 .table_schema_resolve(
                     table_node.name.as_str(),
@@ -159,8 +159,25 @@ impl CacheWriter {
         self.cache.cached_queries.insert_overwrite(cached_query);
         trace!("cached query loading");
 
+        // Extract SELECT branches for population
+        // Each branch is processed independently, which handles set operations correctly
+        let branches: Vec<_> = resolved
+            .select_branches()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // Collect all unique table OIDs across all branches for metadata lookup
+        let branch_relation_oids: Vec<u32> = branches
+            .iter()
+            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
+            .map(|tn| tn.relation_oid)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
         // Collect table metadata needed for population
-        let table_metadata: Vec<TableMetadata> = relation_oids
+        let table_metadata: Vec<TableMetadata> = branch_relation_oids
             .iter()
             .filter_map(|oid| self.cache.tables.get1(oid).cloned())
             .collect();
@@ -169,9 +186,8 @@ impl CacheWriter {
         let work = PopulationWork {
             fingerprint,
             generation,
-            relation_oids,
             table_metadata,
-            resolved,
+            branches,
         };
 
         self.populate_work_dispatch(work)?;

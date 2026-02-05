@@ -358,6 +358,8 @@ impl Deparse for ResolvedArithmeticExpr {
 pub enum ResolvedColumnExpr {
     /// Fully qualified column reference
     Column(ResolvedColumnNode),
+    /// Unqualified column name (used in set operation ORDER BY)
+    Identifier(String),
     /// Function call (including window functions)
     Function {
         name: String,
@@ -449,6 +451,7 @@ impl ResolvedColumnExpr {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let children: Box<dyn Iterator<Item = &'_ N>> = match self {
             ResolvedColumnExpr::Column(col) => Box::new(col.nodes()),
+            ResolvedColumnExpr::Identifier(_) => Box::new(std::iter::empty()),
             ResolvedColumnExpr::Literal(lit) => Box::new(lit.nodes()),
             ResolvedColumnExpr::Function {
                 args,
@@ -494,6 +497,7 @@ impl Deparse for ResolvedColumnExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
             ResolvedColumnExpr::Column(col) => col.deparse(buf),
+            ResolvedColumnExpr::Identifier(name) => name.deparse(buf),
             ResolvedColumnExpr::Literal(lit) => lit.deparse(buf),
             ResolvedColumnExpr::Function {
                 name,
@@ -1017,6 +1021,34 @@ impl ResolvedQueryExpr {
             }
         }
     }
+
+    /// Extract all SELECT branches from this query expression.
+    ///
+    /// For a simple SELECT query, returns a single-element vector.
+    /// For set operations (UNION/INTERSECT/EXCEPT), recursively extracts
+    /// all SELECT branches from both sides.
+    /// VALUES clauses are skipped (they don't reference tables).
+    pub fn select_branches(&self) -> Vec<&ResolvedSelectNode> {
+        let mut branches = Vec::new();
+        self.select_branches_collect(&mut branches);
+        branches
+    }
+
+    /// Helper to recursively collect SELECT branches.
+    fn select_branches_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+        match &self.body {
+            ResolvedQueryBody::Select(select) => {
+                branches.push(select);
+            }
+            ResolvedQueryBody::Values(_) => {
+                // VALUES clauses don't reference tables, skip
+            }
+            ResolvedQueryBody::SetOp(set_op) => {
+                set_op.left.select_branches_collect(branches);
+                set_op.right.select_branches_collect(branches);
+            }
+        }
+    }
 }
 
 impl Deparse for ResolvedQueryExpr {
@@ -1457,6 +1489,49 @@ fn order_by_resolve(
         .collect()
 }
 
+/// Convert ORDER BY clauses to use unqualified Identifier expressions.
+/// Used for set operations where ORDER BY references output columns by name.
+fn order_by_as_identifiers(
+    order_by: &[crate::query::ast::OrderByClause],
+) -> Vec<ResolvedOrderByClause> {
+    order_by
+        .iter()
+        .map(|clause| {
+            let expr = column_expr_to_identifier(&clause.expr);
+            ResolvedOrderByClause {
+                expr,
+                direction: clause.direction.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Convert a ColumnExpr to a ResolvedColumnExpr using unqualified Identifier for columns.
+/// Used for ORDER BY in set operations where columns reference output names, not table columns.
+fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
+    match expr {
+        ColumnExpr::Column(col) => ResolvedColumnExpr::Identifier(col.column.clone()),
+        ColumnExpr::Literal(lit) => ResolvedColumnExpr::Literal(lit.clone()),
+        ColumnExpr::Function(func) => ResolvedColumnExpr::Function {
+            name: func.name.clone(),
+            args: func.args.iter().map(column_expr_to_identifier).collect(),
+            agg_star: func.agg_star,
+            agg_distinct: func.agg_distinct,
+            agg_order: vec![], // ORDER BY within aggregate not needed for set operation ORDER BY
+            over: None,        // Window spec not needed for set operation ORDER BY
+        },
+        ColumnExpr::Case(_) | ColumnExpr::Subquery(_) => {
+            // CASE and subquery expressions in ORDER BY are uncommon; use null as fallback
+            ResolvedColumnExpr::Literal(LiteralValue::Null)
+        }
+        ColumnExpr::Arithmetic(arith) => ResolvedColumnExpr::Arithmetic(ResolvedArithmeticExpr {
+            left: Box::new(column_expr_to_identifier(&arith.left)),
+            op: arith.op,
+            right: Box::new(column_expr_to_identifier(&arith.right)),
+        }),
+    }
+}
+
 /// Resolve GROUP BY clauses
 fn group_by_resolve(
     group_by: &[ColumnNode],
@@ -1498,20 +1573,20 @@ pub fn query_expr_resolve(
 ) -> ResolveResult<ResolvedQueryExpr> {
     let body = query_body_resolve(&query.body, tables, search_path)?;
 
-    // ORDER BY resolution needs scope from the body
-    // For now, we create a fresh scope - this works for simple cases
-    // but set operations with ORDER BY referencing output columns need special handling
-    let order_by = if query.order_by.is_empty() {
-        vec![]
-    } else {
-        // Build scope from the body for ORDER BY resolution
-        let mut scope = ResolutionScope::new();
-        if let QueryBody::Select(select) = &query.body {
+    // ORDER BY resolution depends on query type:
+    // - Simple SELECT: resolve against table columns
+    // - Set operations/VALUES: use unqualified identifiers (output column names)
+    let order_by = match &query.body {
+        QueryBody::Select(select) => {
+            let mut scope = ResolutionScope::new();
             for table_source in &select.from {
                 let _ = table_source_resolve(table_source, tables, &mut scope, search_path);
             }
+            order_by_resolve(&query.order_by, &scope)?
         }
-        order_by_resolve(&query.order_by, &scope)?
+        QueryBody::SetOp(_) | QueryBody::Values(_) => {
+            order_by_as_identifiers(&query.order_by)
+        }
     };
 
     let limit = limit_resolve(query.limit.as_ref());
@@ -2711,5 +2786,157 @@ mod tests {
             "deparsed SQL should contain ORDER BY: {}",
             buf
         );
+    }
+
+    #[test]
+    fn test_select_branches_simple_select() {
+        let query_expr = ResolvedQueryExpr {
+            body: ResolvedQueryBody::Select(Box::new(ResolvedSelectNode::default())),
+            order_by: vec![],
+            limit: None,
+        };
+
+        let branches = query_expr.select_branches();
+        assert_eq!(branches.len(), 1, "simple SELECT should have one branch");
+    }
+
+    #[test]
+    fn test_select_branches_union() {
+        use crate::query::ast::SetOpType;
+
+        let left_select = ResolvedSelectNode {
+            from: vec![ResolvedTableSource::Table(ResolvedTableNode {
+                schema: "public".to_owned(),
+                name: "a".to_owned(),
+                alias: None,
+                relation_oid: 1001,
+            })],
+            ..Default::default()
+        };
+
+        let right_select = ResolvedSelectNode {
+            from: vec![ResolvedTableSource::Table(ResolvedTableNode {
+                schema: "public".to_owned(),
+                name: "b".to_owned(),
+                alias: None,
+                relation_oid: 1002,
+            })],
+            ..Default::default()
+        };
+
+        let set_op = ResolvedSetOpNode {
+            op: SetOpType::Union,
+            all: false,
+            left: Box::new(ResolvedQueryExpr {
+                body: ResolvedQueryBody::Select(Box::new(left_select)),
+                order_by: vec![],
+                limit: None,
+            }),
+            right: Box::new(ResolvedQueryExpr {
+                body: ResolvedQueryBody::Select(Box::new(right_select)),
+                order_by: vec![],
+                limit: None,
+            }),
+        };
+
+        let query_expr = ResolvedQueryExpr {
+            body: ResolvedQueryBody::SetOp(set_op),
+            order_by: vec![],
+            limit: None,
+        };
+
+        let branches = query_expr.select_branches();
+        assert_eq!(branches.len(), 2, "UNION should have two branches");
+
+        // Verify each branch has the correct table
+        assert_eq!(branches[0].from.len(), 1);
+        assert_eq!(branches[1].from.len(), 1);
+
+        if let ResolvedTableSource::Table(t) = &branches[0].from[0] {
+            assert_eq!(t.name, "a");
+        } else {
+            panic!("Expected table source");
+        }
+
+        if let ResolvedTableSource::Table(t) = &branches[1].from[0] {
+            assert_eq!(t.name, "b");
+        } else {
+            panic!("Expected table source");
+        }
+    }
+
+    #[test]
+    fn test_select_branches_nested_union() {
+        use crate::query::ast::SetOpType;
+
+        // Build: (SELECT FROM a UNION SELECT FROM b) UNION SELECT FROM c
+        let a_select = ResolvedSelectNode {
+            from: vec![ResolvedTableSource::Table(ResolvedTableNode {
+                schema: "public".to_owned(),
+                name: "a".to_owned(),
+                alias: None,
+                relation_oid: 1001,
+            })],
+            ..Default::default()
+        };
+
+        let b_select = ResolvedSelectNode {
+            from: vec![ResolvedTableSource::Table(ResolvedTableNode {
+                schema: "public".to_owned(),
+                name: "b".to_owned(),
+                alias: None,
+                relation_oid: 1002,
+            })],
+            ..Default::default()
+        };
+
+        let c_select = ResolvedSelectNode {
+            from: vec![ResolvedTableSource::Table(ResolvedTableNode {
+                schema: "public".to_owned(),
+                name: "c".to_owned(),
+                alias: None,
+                relation_oid: 1003,
+            })],
+            ..Default::default()
+        };
+
+        let inner_union = ResolvedSetOpNode {
+            op: SetOpType::Union,
+            all: false,
+            left: Box::new(ResolvedQueryExpr {
+                body: ResolvedQueryBody::Select(Box::new(a_select)),
+                order_by: vec![],
+                limit: None,
+            }),
+            right: Box::new(ResolvedQueryExpr {
+                body: ResolvedQueryBody::Select(Box::new(b_select)),
+                order_by: vec![],
+                limit: None,
+            }),
+        };
+
+        let outer_union = ResolvedSetOpNode {
+            op: SetOpType::Union,
+            all: false,
+            left: Box::new(ResolvedQueryExpr {
+                body: ResolvedQueryBody::SetOp(inner_union),
+                order_by: vec![],
+                limit: None,
+            }),
+            right: Box::new(ResolvedQueryExpr {
+                body: ResolvedQueryBody::Select(Box::new(c_select)),
+                order_by: vec![],
+                limit: None,
+            }),
+        };
+
+        let query_expr = ResolvedQueryExpr {
+            body: ResolvedQueryBody::SetOp(outer_union),
+            order_by: vec![],
+            limit: None,
+        };
+
+        let branches = query_expr.select_branches();
+        assert_eq!(branches.len(), 3, "nested UNION should have three branches");
     }
 }

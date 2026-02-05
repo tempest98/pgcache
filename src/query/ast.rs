@@ -798,6 +798,34 @@ impl QueryExpr {
             QueryBody::Values(_) | QueryBody::SetOp(_) => None,
         }
     }
+
+    /// Extract all SELECT branches from this query expression.
+    ///
+    /// For a simple SELECT query, returns a single-element vector.
+    /// For set operations (UNION/INTERSECT/EXCEPT), recursively extracts
+    /// all SELECT branches from both sides.
+    /// VALUES clauses are skipped (they don't reference tables).
+    pub fn select_branches(&self) -> Vec<&SelectNode> {
+        let mut branches = Vec::new();
+        self.select_branches_collect(&mut branches);
+        branches
+    }
+
+    /// Helper to recursively collect SELECT branches.
+    fn select_branches_collect<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
+        match &self.body {
+            QueryBody::Select(select) => {
+                branches.push(select);
+            }
+            QueryBody::Values(_) => {
+                // VALUES clauses don't reference tables, skip
+            }
+            QueryBody::SetOp(set_op) => {
+                set_op.left.select_branches_collect(branches);
+                set_op.right.select_branches_collect(branches);
+            }
+        }
+    }
 }
 
 impl Deparse for QueryExpr {
@@ -4727,5 +4755,51 @@ mod tests {
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
         assert_eq!(buf, "SELECT a FROM t ORDER BY a ASC LIMIT 10");
+    }
+
+    #[test]
+    fn test_select_branches_simple_select() {
+        let sql = "SELECT id FROM users WHERE id = 1";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        assert_eq!(branches.len(), 1, "simple SELECT should have one branch");
+    }
+
+    #[test]
+    fn test_select_branches_union() {
+        let sql = "SELECT id FROM users UNION SELECT id FROM admins";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        assert_eq!(branches.len(), 2, "UNION should have two branches");
+
+        // Verify each branch has a FROM clause with different tables
+        let tables: Vec<_> = branches
+            .iter()
+            .filter_map(|b| b.from.first())
+            .filter_map(|ts| {
+                if let TableSource::Table(t) = ts {
+                    Some(t.name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(tables.contains(&"users"));
+        assert!(tables.contains(&"admins"));
+    }
+
+    #[test]
+    fn test_select_branches_nested_union() {
+        let sql = "SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM c";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        assert_eq!(branches.len(), 3, "nested UNION should have three branches");
     }
 }

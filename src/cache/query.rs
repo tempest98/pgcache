@@ -2,8 +2,8 @@ use crate::{
     cache::QueryParameters,
     query::{
         ast::{
-            BinaryOp, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode, TableSource,
-            UnaryOp, WhereExpr,
+            BinaryOp, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode, SetOpNode,
+            TableSource, UnaryOp, WhereExpr,
         },
         evaluate::is_simple_comparison,
         transform::{AstTransformResult, query_expr_parameters_replace},
@@ -13,10 +13,11 @@ use error_set::error_set;
 
 error_set! {
     CacheabilityError := {
-        NotSelect,
+        UnsupportedQueryType,
         UnsupportedFrom,
         HasSublink,
         UnsupportedWhereClause,
+        HasLimit,
     }
 }
 
@@ -39,11 +40,10 @@ impl CacheableQuery {
         Ok(())
     }
 
-    /// Get the SELECT body of this query.
+    /// Get the SELECT body of this query, if it is a simple SELECT.
     ///
-    /// Returns `Some` if the query body is a SELECT statement, `None` otherwise.
-    /// Note: `CacheableQuery` construction validates that the body is SELECT,
-    /// so this should always return `Some` for valid instances.
+    /// Returns `Some` if the query body is a SELECT statement, `None` if it's
+    /// a set operation (UNION/INTERSECT/EXCEPT) or VALUES clause.
     pub fn as_select(&self) -> Option<&SelectNode> {
         self.query.as_select()
     }
@@ -53,28 +53,65 @@ impl TryFrom<&QueryExpr> for CacheableQuery {
     type Error = CacheabilityError;
 
     fn try_from(query: &QueryExpr) -> Result<Self, Self::Error> {
-        let QueryBody::Select(node) = &query.body else {
-            return Err(CacheabilityError::NotSelect);
-        };
-
-        // Check cacheability
-        if !is_supported_from(node) {
-            return Err(CacheabilityError::UnsupportedFrom);
-        }
-        if node.has_sublink() {
-            return Err(CacheabilityError::HasSublink);
-        }
-        // LIMIT makes queries non-cacheable
+        // LIMIT/OFFSET at top level makes queries non-cacheable
         if query.limit.is_some() {
-            return Err(CacheabilityError::UnsupportedWhereClause);
+            return Err(CacheabilityError::HasLimit);
         }
-        if !is_cacheable_where(node) {
-            return Err(CacheabilityError::UnsupportedWhereClause);
-        }
+
+        // Validate the query body (SELECT, VALUES, or SetOp)
+        is_cacheable_body(&query.body)?;
+
         Ok(CacheableQuery {
             query: query.clone(),
         })
     }
+}
+
+/// Check if a query body is cacheable.
+/// Recursively validates SELECT nodes and set operation branches.
+fn is_cacheable_body(body: &QueryBody) -> Result<(), CacheabilityError> {
+    match body {
+        QueryBody::Select(node) => is_cacheable_select(node),
+        QueryBody::Values(_) => {
+            // VALUES clauses are not cacheable as standalone queries
+            Err(CacheabilityError::UnsupportedQueryType)
+        }
+        QueryBody::SetOp(set_op) => is_cacheable_set_op(set_op),
+    }
+}
+
+/// Check if a SELECT node is cacheable.
+fn is_cacheable_select(node: &SelectNode) -> Result<(), CacheabilityError> {
+    if !is_supported_from(node) {
+        return Err(CacheabilityError::UnsupportedFrom);
+    }
+    if node.has_sublink() {
+        return Err(CacheabilityError::HasSublink);
+    }
+    if !is_cacheable_where(node) {
+        return Err(CacheabilityError::UnsupportedWhereClause);
+    }
+    Ok(())
+}
+
+/// Check if a set operation (UNION/INTERSECT/EXCEPT) is cacheable.
+/// Both branches must be cacheable.
+fn is_cacheable_set_op(set_op: &SetOpNode) -> Result<(), CacheabilityError> {
+    // Check for sublinks in the set operation
+    if set_op.has_sublink() {
+        return Err(CacheabilityError::HasSublink);
+    }
+
+    // LIMIT/OFFSET on branches makes them non-cacheable
+    if set_op.left.limit.is_some() || set_op.right.limit.is_some() {
+        return Err(CacheabilityError::HasLimit);
+    }
+
+    // Recursively validate both branches
+    is_cacheable_body(&set_op.left.body)?;
+    is_cacheable_body(&set_op.right.body)?;
+
+    Ok(())
 }
 
 fn is_supported_from(select: &SelectNode) -> bool {
@@ -290,7 +327,7 @@ mod tests {
         let sql = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
+            matches!(result, Err(CacheabilityError::HasLimit)),
             "LIMIT should not be cacheable yet"
         );
     }
@@ -300,7 +337,7 @@ mod tests {
         let sql = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
+            matches!(result, Err(CacheabilityError::HasLimit)),
             "OFFSET should not be cacheable yet"
         );
     }
@@ -310,7 +347,7 @@ mod tests {
         let sql = "SELECT status FROM orders WHERE tenant_id = 1 GROUP BY status LIMIT 5";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
+            matches!(result, Err(CacheabilityError::HasLimit)),
             "GROUP BY with LIMIT should not be cacheable"
         );
     }
@@ -365,5 +402,101 @@ mod tests {
         let sql = "SELECT COUNT(*), SUM(amount) FROM orders WHERE tenant_id = 1";
         let result = check_cacheable(sql);
         assert!(result.is_ok(), "Functions in SELECT should be cacheable");
+    }
+
+    // ==================== Set Operation Tests ====================
+
+    #[test]
+    fn test_union_cacheable() {
+        let sql = "SELECT id FROM a WHERE tenant_id = 1 UNION SELECT id FROM b WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "UNION should be cacheable");
+    }
+
+    #[test]
+    fn test_union_all_cacheable() {
+        let sql =
+            "SELECT id FROM a WHERE tenant_id = 1 UNION ALL SELECT id FROM b WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "UNION ALL should be cacheable");
+    }
+
+    #[test]
+    fn test_intersect_cacheable() {
+        let sql =
+            "SELECT id FROM a WHERE tenant_id = 1 INTERSECT SELECT id FROM b WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "INTERSECT should be cacheable");
+    }
+
+    #[test]
+    fn test_except_cacheable() {
+        let sql =
+            "SELECT id FROM a WHERE tenant_id = 1 EXCEPT SELECT id FROM b WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "EXCEPT should be cacheable");
+    }
+
+    #[test]
+    fn test_nested_union_cacheable() {
+        let sql = "SELECT id FROM a WHERE tenant_id = 1 \
+                   UNION SELECT id FROM b WHERE tenant_id = 1 \
+                   UNION SELECT id FROM c WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "Nested UNION should be cacheable");
+    }
+
+    #[test]
+    fn test_union_with_join_cacheable() {
+        let sql = "SELECT a.id FROM a JOIN b ON a.id = b.a_id WHERE a.tenant_id = 1 \
+                   UNION \
+                   SELECT c.id FROM c WHERE c.tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "UNION with JOIN should be cacheable");
+    }
+
+    #[test]
+    fn test_union_with_outer_limit_not_cacheable() {
+        let sql = "SELECT id FROM a WHERE tenant_id = 1 \
+                   UNION SELECT id FROM b WHERE tenant_id = 1 \
+                   LIMIT 10";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::HasLimit)),
+            "UNION with outer LIMIT should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_union_with_branch_limit_not_cacheable() {
+        let sql = "(SELECT id FROM a WHERE tenant_id = 1 LIMIT 5) \
+                   UNION SELECT id FROM b WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::HasLimit)),
+            "UNION with LIMIT in branch should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_union_with_subquery_not_cacheable() {
+        let sql = "SELECT id FROM a WHERE id IN (SELECT id FROM other) \
+                   UNION SELECT id FROM b WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::HasSublink)),
+            "UNION with subquery should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_union_with_left_join_not_cacheable() {
+        let sql = "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.tenant_id = 1 \
+                   UNION SELECT id FROM c WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            "UNION with LEFT JOIN should not be cacheable"
+        );
     }
 }

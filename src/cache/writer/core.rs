@@ -11,7 +11,7 @@ use tracing::{debug, error, trace};
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::pg;
-use crate::query::resolved::ResolvedQueryExpr;
+use crate::query::resolved::{ResolvedQueryExpr, ResolvedSelectNode};
 use crate::settings::Settings;
 
 use super::super::{
@@ -31,9 +31,11 @@ const CACHE_POOL_SIZE: usize = 4;
 pub struct PopulationWork {
     pub fingerprint: u64,
     pub generation: u64,
-    pub relation_oids: Vec<u32>,
     pub table_metadata: Vec<TableMetadata>,
-    pub resolved: ResolvedQueryExpr,
+    /// SELECT branches extracted from the query at registration time.
+    /// For simple SELECT queries, this contains one branch.
+    /// For set operations (UNION/INTERSECT/EXCEPT), contains all branches.
+    pub branches: Vec<ResolvedSelectNode>,
 }
 
 /// Cache writer that owns the Cache and serializes all mutations.

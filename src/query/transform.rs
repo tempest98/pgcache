@@ -744,22 +744,21 @@ fn resolved_column_expr_alias_update(
         ResolvedColumnExpr::Subquery(query) => {
             resolved_query_expr_column_alias_update(query, schema, table, alias);
         }
-        ResolvedColumnExpr::Literal(_) => {}
+        ResolvedColumnExpr::Identifier(_) | ResolvedColumnExpr::Literal(_) => {}
     }
 }
 
 /// Generate queries used to check if a DML statement applies to a given table.
-/// Returns one update query per table in the join - all queries use the same
-/// full SELECT statement (preserving the join structure) since we need to check
-/// if a change to any table affects the cached result.
+/// Returns one update query per (table, branch) pair.
 ///
-/// Returns `None` if the query body is not a SELECT (should not happen for
-/// valid `CacheableQuery` instances since construction validates this).
-pub fn query_table_update_queries(
-    cacheable_query: &CacheableQuery,
-) -> Option<Vec<(&TableNode, QueryExpr)>> {
-    let select_node = cacheable_query.as_select()?;
-    let tables = select_node.nodes::<TableNode>().collect::<Vec<_>>();
+/// For simple SELECT queries, each table gets one update query derived from that SELECT.
+/// For set operations (UNION/INTERSECT/EXCEPT), each table gets an update query derived
+/// from just the branch that contains it (not the full set operation).
+///
+/// This approach ensures that CDC handling only checks if a changed row matches the
+/// specific branch conditions, not the entire set operation structure.
+pub fn query_table_update_queries(cacheable_query: &CacheableQuery) -> Vec<(&TableNode, QueryExpr)> {
+    let mut result = Vec::new();
 
     let column = SelectColumn {
         expr: ColumnExpr::Literal(LiteralValue::Boolean(true)),
@@ -767,20 +766,22 @@ pub fn query_table_update_queries(
     };
     let select_list = SelectColumns::Columns(vec![column]);
 
-    Some(
-        tables
-            .into_iter()
-            .map(|table| {
-                let replaced = select_node_columns_replace(select_node, select_list.clone());
-                let query_expr = QueryExpr {
-                    body: QueryBody::Select(replaced),
-                    order_by: vec![],
-                    limit: None,
-                };
-                (table, query_expr)
-            })
-            .collect(),
-    )
+    // For each SELECT branch in the query
+    for branch in cacheable_query.query.select_branches() {
+        // For each table in this branch
+        for table in branch.nodes::<TableNode>() {
+            // Create update query from just this branch (not full query)
+            let update_select = select_node_columns_replace(branch, select_list.clone());
+            let update_query = QueryExpr {
+                body: QueryBody::Select(update_select),
+                order_by: vec![],
+                limit: None,
+            };
+            result.push((table, update_query));
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1009,7 +1010,7 @@ mod tests {
     fn test_query_table_update_query_simple_select() {
         let original_query = "SELECT id, name, email FROM users WHERE id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query).unwrap();
+        let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 1);
 
@@ -1025,7 +1026,7 @@ mod tests {
                             JOIN location ON location.user_id = users.user_id \
                             WHERE users.user_id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query).unwrap();
+        let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 2);
 
@@ -1051,7 +1052,7 @@ mod tests {
                             JOIN orders ON orders.user_id = users.user_id \
                             WHERE users.user_id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query).unwrap();
+        let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 3, "Should have 3 update queries for 3 tables");
 
@@ -1076,7 +1077,7 @@ mod tests {
                             JOIN d ON c.id = d.id \
                             WHERE a.id = 1";
         let cacheable_query = parse_cacheable(original_query);
-        let result = query_table_update_queries(&cacheable_query).unwrap();
+        let result = query_table_update_queries(&cacheable_query);
 
         assert_eq!(result.len(), 4, "Should have 4 update queries for 4 tables");
 
@@ -1086,6 +1087,94 @@ mod tests {
         assert!(table_names.contains(&"b"));
         assert!(table_names.contains(&"c"));
         assert!(table_names.contains(&"d"));
+    }
+
+    // ==================== Set Operation Update Query Tests ====================
+    //
+    // Update queries for set operations are now branch-specific:
+    // - Each table gets an update query derived from just its branch
+    // - No UNION structure is preserved in update queries
+    // - This enables CDC to check individual branch predicates
+
+    #[test]
+    fn test_query_table_update_query_union() {
+        let original_query = "SELECT id FROM users WHERE tenant_id = 1 \
+                              UNION SELECT id FROM admins WHERE tenant_id = 1";
+        let cacheable_query = parse_cacheable(original_query);
+        let result = query_table_update_queries(&cacheable_query);
+
+        assert_eq!(result.len(), 2, "Should have 2 update queries for 2 tables");
+
+        // Verify each table is associated with an update query
+        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"));
+        assert!(table_names.contains(&"admins"));
+
+        // Update queries should be branch-specific (no UNION)
+        for (table, query) in &result {
+            let mut sql = String::new();
+            query.deparse(&mut sql);
+            assert!(
+                !sql.contains("UNION"),
+                "Update query for {} should NOT contain UNION: {}",
+                table.name,
+                sql
+            );
+            assert!(
+                sql.contains("SELECT true"),
+                "Update query should have SELECT true: {}",
+                sql
+            );
+            assert!(
+                sql.contains(&table.name),
+                "Update query for {} should reference that table: {}",
+                table.name,
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_table_update_query_nested_union() {
+        let original_query = "SELECT id FROM a WHERE tenant_id = 1 \
+                              UNION SELECT id FROM b WHERE tenant_id = 1 \
+                              UNION SELECT id FROM c WHERE tenant_id = 1";
+        let cacheable_query = parse_cacheable(original_query);
+        let result = query_table_update_queries(&cacheable_query);
+
+        assert_eq!(result.len(), 3, "Should have 3 update queries for 3 tables");
+
+        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        assert!(table_names.contains(&"a"));
+        assert!(table_names.contains(&"b"));
+        assert!(table_names.contains(&"c"));
+
+        // Verify each update query is branch-specific (no UNION)
+        for (table, query) in &result {
+            let mut sql = String::new();
+            query.deparse(&mut sql);
+            assert!(
+                !sql.contains("UNION"),
+                "Update query for {} should NOT contain UNION: {}",
+                table.name,
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_table_update_query_union_with_join() {
+        let original_query = "SELECT a.id FROM a JOIN b ON a.id = b.a_id WHERE a.tenant_id = 1 \
+                              UNION SELECT id FROM c WHERE tenant_id = 1";
+        let cacheable_query = parse_cacheable(original_query);
+        let result = query_table_update_queries(&cacheable_query);
+
+        assert_eq!(result.len(), 3, "Should have 3 update queries (a, b, c)");
+
+        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        assert!(table_names.contains(&"a"));
+        assert!(table_names.contains(&"b"));
+        assert!(table_names.contains(&"c"));
     }
 
     // ==================== Text Format Parameter Tests ====================

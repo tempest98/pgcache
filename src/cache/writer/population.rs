@@ -26,30 +26,11 @@ pub async fn population_worker(
     debug!("population worker {id} started");
 
     while let Some(work) = rx.recv().await {
-        // Extract SELECT body from resolved query expression
-        // This should always succeed since CacheableQuery construction validates SELECT body
-        let Some(resolved_select) = work.resolved.as_select() else {
-            error!(
-                "population worker {id}: query {} has non-SELECT body",
-                work.fingerprint
-            );
-            if query_tx
-                .send(QueryCommand::Failed {
-                    fingerprint: work.fingerprint,
-                })
-                .is_err()
-            {
-                error!("population worker {id}: failed to send QueryFailed");
-            }
-            continue;
-        };
-
         let result = population_task(
             work.fingerprint,
             work.generation,
-            &work.relation_oids,
+            &work.branches,
             &work.table_metadata,
-            resolved_select,
             Rc::clone(&db_origin),
             &db_cache,
         )
@@ -89,13 +70,15 @@ pub async fn population_worker(
 
 /// Background task for populating cache with query results.
 /// Runs on a dedicated pool connection to avoid session variable conflicts.
-#[allow(clippy::too_many_arguments)]
+///
+/// For queries with multiple SELECT branches (set operations), each branch is
+/// processed independently. This correctly handles UNION/INTERSECT/EXCEPT where
+/// different branches may reference different tables with different columns.
 async fn population_task(
     fingerprint: u64,
     generation: u64,
-    relation_oids: &[u32],
+    branches: &[ResolvedSelectNode],
     table_metadata: &[TableMetadata],
-    resolved: &ResolvedSelectNode,
     db_origin: Rc<Client>,
     db_cache: &Client,
 ) -> CacheResult<usize> {
@@ -109,32 +92,37 @@ async fn population_task(
     let mut total_bytes: usize = 0;
     let task_start = Instant::now();
 
-    // Fetch and populate for each table
-    for &table_oid in relation_oids {
-        let table = table_metadata
-            .iter()
-            .find(|t| t.relation_oid == table_oid)
-            .ok_or(CacheError::UnknownTable {
-                oid: Some(table_oid),
-                name: None,
-            })?;
+    // Process each SELECT branch independently
+    // For simple SELECT queries, there's just one branch
+    // For set operations, each branch fetches its own tables
+    for branch in branches {
+        // Find all tables referenced by this branch
+        for table_node in branch.nodes::<ResolvedTableNode>() {
+            let table = table_metadata
+                .iter()
+                .find(|t| t.relation_oid == table_node.relation_oid)
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(table_node.relation_oid),
+                    name: Some(table_node.name.clone()),
+                })?;
 
-        // Fetch from origin
-        let fetch_start = Instant::now();
-        let rows = population_fetch(&db_origin, table_oid, table, resolved).await?;
-        let fetch_elapsed = fetch_start.elapsed();
+            // Fetch from origin using this branch
+            let fetch_start = Instant::now();
+            let rows = population_fetch(&db_origin, table, branch).await?;
+            let fetch_elapsed = fetch_start.elapsed();
 
-        // Populate cache
-        let insert_start = Instant::now();
-        let bytes = population_insert(db_cache, table, &rows).await?;
-        let insert_elapsed = insert_start.elapsed();
+            // Populate cache (UPSERT handles duplicates if same table in multiple branches)
+            let insert_start = Instant::now();
+            let bytes = population_insert(db_cache, table, &rows).await?;
+            let insert_elapsed = insert_start.elapsed();
 
-        total_bytes += bytes;
+            total_bytes += bytes;
 
-        trace!(
-            "population table {}.{} fetch={:?} insert={:?} bytes={bytes}",
-            table.schema, table.name, fetch_elapsed, insert_elapsed
-        );
+            trace!(
+                "population table {}.{} fetch={:?} insert={:?} bytes={bytes}",
+                table.schema, table.name, fetch_elapsed, insert_elapsed
+            );
+        }
     }
 
     let task_elapsed = task_start.elapsed();
@@ -152,16 +140,16 @@ async fn population_task(
     Ok(total_bytes)
 }
 
-/// Fetch data from origin database for a single table.
+/// Fetch data from origin database for a single table using a SELECT branch.
 async fn population_fetch(
     db_origin: &Client,
-    relation_oid: u32,
     table: &TableMetadata,
-    resolved: &ResolvedSelectNode,
+    branch: &ResolvedSelectNode,
 ) -> CacheResult<Vec<SimpleQueryMessage>> {
-    let maybe_alias = resolved
+    // Find the table's alias in this branch (if any)
+    let maybe_alias = branch
         .nodes::<ResolvedTableNode>()
-        .find(|tn| tn.relation_oid == relation_oid)
+        .find(|tn| tn.relation_oid == table.relation_oid)
         .and_then(|t| t.alias.as_deref());
 
     // Use table metadata to get column list
@@ -169,7 +157,7 @@ async fn population_fetch(
 
     // Build query with table columns
     use crate::query::transform::resolved_select_node_replace;
-    let new_ast = resolved_select_node_replace(resolved, select_columns);
+    let new_ast = resolved_select_node_replace(branch, select_columns);
     let mut buf = String::with_capacity(1024);
     new_ast.deparse(&mut buf);
 
