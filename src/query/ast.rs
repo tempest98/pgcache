@@ -455,6 +455,36 @@ impl WhereExpr {
             WhereExpr::Value(_) | WhereExpr::Column(_) => false,
         }
     }
+
+    /// Recursively collect SELECT branches from subqueries in this WHERE expression.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
+        match self {
+            WhereExpr::Binary(binary) => {
+                binary.lexpr.collect_subquery_branches(branches);
+                binary.rexpr.collect_subquery_branches(branches);
+            }
+            WhereExpr::Unary(unary) => {
+                unary.expr.collect_subquery_branches(branches);
+            }
+            WhereExpr::Multi(multi) => {
+                for expr in &multi.exprs {
+                    expr.collect_subquery_branches(branches);
+                }
+            }
+            WhereExpr::Function { args, .. } => {
+                for arg in args {
+                    arg.collect_subquery_branches(branches);
+                }
+            }
+            WhereExpr::Subquery { query, test_expr, .. } => {
+                query.select_branches_collect(branches);
+                if let Some(test) = test_expr {
+                    test.collect_subquery_branches(branches);
+                }
+            }
+            WhereExpr::Value(_) | WhereExpr::Column(_) => {}
+        }
+    }
 }
 
 impl Deparse for WhereExpr {
@@ -879,6 +909,20 @@ impl QueryExpr {
         match &self.body {
             QueryBody::Select(select) => {
                 branches.push(select);
+                // Descend into subqueries in FROM clause
+                for source in &select.from {
+                    source.collect_subquery_branches(branches);
+                }
+                // Descend into subqueries in WHERE clause
+                if let Some(where_clause) = &select.where_clause {
+                    where_clause.collect_subquery_branches(branches);
+                }
+                // Descend into subqueries in HAVING clause
+                if let Some(having) = &select.having {
+                    having.collect_subquery_branches(branches);
+                }
+                // Descend into subqueries in SELECT list
+                select.columns.collect_subquery_branches(branches);
             }
             QueryBody::Values(_) => {
                 // VALUES clauses don't reference tables, skip
@@ -938,6 +982,15 @@ impl SelectColumns {
         };
 
         Box::new(current.chain(children))
+    }
+
+    /// Recursively collect SELECT branches from subqueries in the SELECT list.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
+        if let SelectColumns::Columns(columns) = self {
+            for col in columns {
+                col.expr.collect_subquery_branches(branches);
+            }
+        }
     }
 }
 
@@ -1068,6 +1121,37 @@ impl ColumnExpr {
             ColumnExpr::Arithmetic(arith) => arith.has_sublink(),
             ColumnExpr::Subquery(_) => true,
             ColumnExpr::Column(_) | ColumnExpr::Literal(_) => false,
+        }
+    }
+
+    /// Recursively collect SELECT branches from subqueries in this column expression.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
+        match self {
+            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => {}
+            ColumnExpr::Function(func) => {
+                for arg in &func.args {
+                    arg.collect_subquery_branches(branches);
+                }
+            }
+            ColumnExpr::Case(case) => {
+                if let Some(arg) = &case.arg {
+                    arg.collect_subquery_branches(branches);
+                }
+                for when in &case.whens {
+                    when.condition.collect_subquery_branches(branches);
+                    when.result.collect_subquery_branches(branches);
+                }
+                if let Some(default) = &case.default {
+                    default.collect_subquery_branches(branches);
+                }
+            }
+            ColumnExpr::Arithmetic(arith) => {
+                arith.left.collect_subquery_branches(branches);
+                arith.right.collect_subquery_branches(branches);
+            }
+            ColumnExpr::Subquery(query) => {
+                query.select_branches_collect(branches);
+            }
         }
     }
 }
@@ -1332,6 +1416,23 @@ impl TableSource {
                 join.left.has_sublink()
                     || join.right.has_sublink()
                     || join.condition.as_ref().is_some_and(|c| c.has_sublink())
+            }
+        }
+    }
+
+    /// Recursively collect SELECT branches from subqueries in this table source.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
+        match self {
+            TableSource::Table(_) => {}
+            TableSource::Subquery(sub) => {
+                sub.query.select_branches_collect(branches);
+            }
+            TableSource::Join(join) => {
+                join.left.collect_subquery_branches(branches);
+                join.right.collect_subquery_branches(branches);
+                if let Some(condition) = &join.condition {
+                    condition.collect_subquery_branches(branches);
+                }
             }
         }
     }
@@ -4898,6 +4999,66 @@ mod tests {
 
         let branches = query_expr.select_branches();
         assert_eq!(branches.len(), 3, "nested UNION should have three branches");
+    }
+
+    #[test]
+    fn test_select_branches_from_subquery() {
+        // Derived table in FROM clause
+        let sql = "SELECT * FROM (SELECT id FROM users) sub";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        // Outer SELECT + inner SELECT in FROM subquery
+        assert_eq!(branches.len(), 2, "FROM subquery should add one branch");
+    }
+
+    #[test]
+    fn test_select_branches_where_subquery() {
+        // IN subquery in WHERE clause
+        let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM active)";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        // Outer SELECT + inner SELECT in WHERE subquery
+        assert_eq!(branches.len(), 2, "WHERE IN subquery should add one branch");
+    }
+
+    #[test]
+    fn test_select_branches_exists_subquery() {
+        // EXISTS subquery in WHERE clause
+        let sql = "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        // Outer SELECT + inner SELECT in EXISTS subquery
+        assert_eq!(branches.len(), 2, "WHERE EXISTS subquery should add one branch");
+    }
+
+    #[test]
+    fn test_select_branches_scalar_subquery() {
+        // Scalar subquery in SELECT list
+        let sql = "SELECT id, (SELECT name FROM users WHERE users.id = orders.user_id) FROM orders";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        // Outer SELECT + inner SELECT in SELECT list subquery
+        assert_eq!(branches.len(), 2, "SELECT list subquery should add one branch");
+    }
+
+    #[test]
+    fn test_select_branches_nested_subqueries() {
+        // Nested subqueries
+        let sql = "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT user_id FROM active)) sub";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let branches = query_expr.select_branches();
+        // Outer SELECT + FROM subquery + nested IN subquery
+        assert_eq!(branches.len(), 3, "nested subqueries should add all branches");
     }
 
     // ==========================================================================

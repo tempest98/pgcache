@@ -646,8 +646,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_non_cacheable_subquery() {
-        // SELECT with subquery - not currently cacheable
+    fn test_parse_cacheable_subquery() {
+        // SELECT with subquery - now cacheable (non-correlated subqueries are supported)
         let mut data = BytesMut::new();
         data.extend_from_slice(b"P");
         data.extend_from_slice(&[0, 0, 0, 80]); // length
@@ -661,8 +661,8 @@ mod tests {
         let result = parse_parse_message(&data).unwrap();
         assert_eq!(result.statement_name, "");
 
-        // Test that this SQL parses but is NOT cacheable (has subquery)
-        use crate::cache::query::{CacheabilityError, CacheableQuery};
+        // Test that this SQL parses and IS cacheable (non-correlated subquery)
+        use crate::cache::query::CacheableQuery;
         use crate::query::ast::{QueryBody, query_expr_convert};
 
         let ast = pg_query::parse(&result.sql).unwrap();
@@ -674,11 +674,11 @@ mod tests {
         };
         assert!(select.has_sublink(), "has_sublink() should detect subquery in WHERE");
 
-        // Verify cacheability check rejects it
+        // Verify cacheability check accepts it (non-correlated subqueries are now cacheable)
         let cacheable_result = CacheableQuery::try_from(&query);
         assert!(
-            matches!(cacheable_result, Err(CacheabilityError::HasSublink)),
-            "SELECT with subquery should not be cacheable"
+            cacheable_result.is_ok(),
+            "SELECT with non-correlated subquery should be cacheable"
         );
     }
 

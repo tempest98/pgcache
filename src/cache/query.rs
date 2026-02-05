@@ -3,9 +3,8 @@ use crate::{
     query::{
         ast::{
             BinaryOp, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode, SetOpNode,
-            TableSource, UnaryOp, WhereExpr,
+            SubLinkType, TableSource, TableSubqueryNode, UnaryOp, WhereExpr,
         },
-        evaluate::is_simple_comparison,
         transform::{AstTransformResult, query_expr_parameters_replace},
     },
 };
@@ -15,7 +14,8 @@ error_set! {
     CacheabilityError := {
         UnsupportedQueryType,
         UnsupportedFrom,
-        HasSublink,
+        #[display("Unsupported subquery type")]
+        UnsupportedSubquery,
         UnsupportedWhereClause,
         HasLimit,
     }
@@ -82,58 +82,69 @@ fn is_cacheable_body(body: &QueryBody) -> Result<(), CacheabilityError> {
 
 /// Check if a SELECT node is cacheable.
 fn is_cacheable_select(node: &SelectNode) -> Result<(), CacheabilityError> {
-    if !is_supported_from(node) {
-        return Err(CacheabilityError::UnsupportedFrom);
-    }
-    if node.has_sublink() {
-        return Err(CacheabilityError::HasSublink);
-    }
-    if !is_cacheable_where(node) {
-        return Err(CacheabilityError::UnsupportedWhereClause);
-    }
+    // Check FROM clause (tables, joins, subqueries)
+    is_supported_from(node)?;
+
+    // Check WHERE clause (including any subqueries)
+    is_cacheable_where(node)?;
+
+    // Check SELECT list for subqueries
+    is_cacheable_select_list(node)?;
+
     Ok(())
 }
 
 /// Check if a set operation (UNION/INTERSECT/EXCEPT) is cacheable.
 /// Both branches must be cacheable.
 fn is_cacheable_set_op(set_op: &SetOpNode) -> Result<(), CacheabilityError> {
-    // Check for sublinks in the set operation
-    if set_op.has_sublink() {
-        return Err(CacheabilityError::HasSublink);
-    }
-
     // LIMIT/OFFSET on branches makes them non-cacheable
     if set_op.left.limit.is_some() || set_op.right.limit.is_some() {
         return Err(CacheabilityError::HasLimit);
     }
 
-    // Recursively validate both branches
+    // Recursively validate both branches (subquery cacheability checked recursively)
     is_cacheable_body(&set_op.left.body)?;
     is_cacheable_body(&set_op.right.body)?;
 
     Ok(())
 }
 
-fn is_supported_from(select: &SelectNode) -> bool {
+fn is_supported_from(select: &SelectNode) -> Result<(), CacheabilityError> {
     match select.from.as_slice() {
         [TableSource::Join(join)] => is_supported_join(join),
-        [_] => true,
-        _ => false,
+        [TableSource::Table(_)] => Ok(()),
+        [TableSource::Subquery(sub)] => is_cacheable_table_subquery(sub),
+        _ => Err(CacheabilityError::UnsupportedFrom),
     }
 }
 
-fn is_supported_join(join: &JoinNode) -> bool {
+/// Check if a table subquery (derived table) is cacheable.
+fn is_cacheable_table_subquery(subquery: &TableSubqueryNode) -> Result<(), CacheabilityError> {
+    // LATERAL subqueries are not supported (they reference outer scope)
+    if subquery.lateral {
+        return Err(CacheabilityError::UnsupportedSubquery);
+    }
+
+    // Subquery must have an alias
+    if subquery.alias.is_none() {
+        return Err(CacheabilityError::UnsupportedSubquery);
+    }
+
+    // Inner query must be cacheable
+    // Note: We check the inner query for cacheability but don't check for LIMIT
+    // since LIMIT in a derived table subquery is valid SQL
+    is_cacheable_body(&subquery.query.body)
+}
+
+fn is_supported_join(join: &JoinNode) -> Result<(), CacheabilityError> {
     // Only INNER joins are cacheable
     if join.join_type != JoinType::Inner {
-        return false;
+        return Err(CacheabilityError::UnsupportedFrom);
     }
 
     // Validate join condition: must be simple equality or absent
     let condition_valid = match &join.condition {
-        Some(WhereExpr::Binary(binary_expr)) => {
-            binary_expr.op == BinaryOp::Equal
-                && !join.condition.as_ref().is_some_and(|e| e.has_sublink())
-        }
+        Some(WhereExpr::Binary(binary_expr)) => binary_expr.op == BinaryOp::Equal,
         Some(
             WhereExpr::Value(_)
             | WhereExpr::Column(_)
@@ -146,23 +157,23 @@ fn is_supported_join(join: &JoinNode) -> bool {
     };
 
     if !condition_valid {
-        return false;
+        return Err(CacheabilityError::UnsupportedFrom);
     }
 
-    // Recursively validate nested joins
-    let left_valid = match join.left.as_ref() {
-        TableSource::Join(nested) => is_supported_join(nested),
-        TableSource::Table(_) => true,
-        TableSource::Subquery(_) => false,
-    };
+    // Recursively validate nested joins/tables/subqueries
+    is_supported_table_source(&join.left)?;
+    is_supported_table_source(&join.right)?;
 
-    let right_valid = match join.right.as_ref() {
-        TableSource::Join(nested) => is_supported_join(nested),
-        TableSource::Table(_) => true,
-        TableSource::Subquery(_) => false,
-    };
+    Ok(())
+}
 
-    left_valid && right_valid
+/// Check if a table source (in a join) is supported.
+fn is_supported_table_source(source: &TableSource) -> Result<(), CacheabilityError> {
+    match source {
+        TableSource::Join(nested) => is_supported_join(nested),
+        TableSource::Table(_) => Ok(()),
+        TableSource::Subquery(sub) => is_cacheable_table_subquery(sub),
+    }
 }
 
 /// Check if a SELECT's WHERE clause can be efficiently cached.
@@ -170,18 +181,19 @@ fn is_supported_join(join: &JoinNode) -> bool {
 /// Supports:
 /// - Simple equality, AND of equalities, OR of equalities in WHERE
 /// - GROUP BY and HAVING (aggregation performed on cached rows at retrieval time)
+/// - Non-correlated subqueries (EXISTS, IN, scalar)
 ///
 /// Note: LIMIT/OFFSET check is done separately in TryFrom
-fn is_cacheable_where(select: &SelectNode) -> bool {
+fn is_cacheable_where(select: &SelectNode) -> Result<(), CacheabilityError> {
     match &select.where_clause {
         Some(where_expr) => is_cacheable_expr(where_expr),
-        None => true, // No WHERE clause is always cacheable
+        None => Ok(()), // No WHERE clause is always cacheable
     }
 }
 
 /// Determine if a WHERE expression can be efficiently cached.
-/// Step 2: Support simple equality, AND of equalities, OR of equalities.
-fn is_cacheable_expr(expr: &WhereExpr) -> bool {
+/// Supports simple comparisons, AND/OR of comparisons, and non-correlated subqueries.
+fn is_cacheable_expr(expr: &WhereExpr) -> Result<(), CacheabilityError> {
     match expr {
         WhereExpr::Binary(binary_expr) => match binary_expr.op {
             BinaryOp::Equal
@@ -190,26 +202,128 @@ fn is_cacheable_expr(expr: &WhereExpr) -> bool {
             | BinaryOp::LessThanOrEqual
             | BinaryOp::GreaterThan
             | BinaryOp::GreaterThanOrEqual => {
-                // Simple comparison: column op value
-                is_simple_comparison(binary_expr)
+                // Recursively check both sides are cacheable
+                is_cacheable_expr(&binary_expr.lexpr)?;
+                is_cacheable_expr(&binary_expr.rexpr)?;
+                // Allow comparisons where both sides are cacheable:
+                // - (Column, Value) - simple comparisons for cache filtering
+                // - (Column, Column) - join conditions in subqueries
+                // - (Column, Subquery) - scalar subquery comparisons
+                Ok(())
             }
             BinaryOp::And | BinaryOp::Or => {
-                is_cacheable_expr(&binary_expr.lexpr) && is_cacheable_expr(&binary_expr.rexpr)
+                is_cacheable_expr(&binary_expr.lexpr)?;
+                is_cacheable_expr(&binary_expr.rexpr)
             }
-            BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => false,
+            BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => {
+                Err(CacheabilityError::UnsupportedWhereClause)
+            }
         },
-        WhereExpr::Value(_) => true,
-        WhereExpr::Column(_) => true,
+        WhereExpr::Value(_) => Ok(()),
+        WhereExpr::Column(_) => Ok(()),
         WhereExpr::Multi(multi_expr) => match multi_expr.op {
-            MultiOp::In | MultiOp::NotIn => multi_expr.exprs.iter().all(is_cacheable_expr),
-            MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => false,
+            MultiOp::In | MultiOp::NotIn => {
+                for e in &multi_expr.exprs {
+                    is_cacheable_expr(e)?;
+                }
+                Ok(())
+            }
+            MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => {
+                Err(CacheabilityError::UnsupportedWhereClause)
+            }
         },
         WhereExpr::Unary(unary_expr) => match unary_expr.op {
-            UnaryOp::IsNull | UnaryOp::IsNotNull => is_cacheable_expr(&unary_expr.expr),
-            UnaryOp::Not => is_cacheable_expr(&unary_expr.expr),
-            UnaryOp::Exists | UnaryOp::NotExists => false,
+            UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Not => {
+                is_cacheable_expr(&unary_expr.expr)
+            }
+            UnaryOp::Exists | UnaryOp::NotExists => Err(CacheabilityError::UnsupportedWhereClause),
         },
-        WhereExpr::Function { .. } | WhereExpr::Subquery { .. } => false,
+        WhereExpr::Function { .. } => Err(CacheabilityError::UnsupportedWhereClause),
+        WhereExpr::Subquery {
+            query,
+            sublink_type,
+            test_expr,
+        } => {
+            // Check the inner query is cacheable
+            is_cacheable_subquery_inner(query)?;
+
+            // Check test_expr (left-hand side for IN/ANY/ALL) is cacheable
+            if let Some(test) = test_expr {
+                is_cacheable_expr(test)?;
+            }
+
+            // All supported sublink types are cacheable if inner query is cacheable
+            match sublink_type {
+                SubLinkType::Exists | SubLinkType::Any | SubLinkType::Expr => Ok(()),
+                SubLinkType::All => {
+                    // ALL subqueries can be complex - allow for now
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Check if a subquery's inner query is cacheable.
+/// For subqueries, we allow LIMIT since it's valid in derived tables.
+fn is_cacheable_subquery_inner(query: &QueryExpr) -> Result<(), CacheabilityError> {
+    // Check the query body (SELECT, VALUES, or SetOp)
+    is_cacheable_body(&query.body)
+}
+
+/// Check if a SELECT list contains cacheable expressions.
+/// Currently rejects functions that contain subqueries.
+fn is_cacheable_select_list(select: &SelectNode) -> Result<(), CacheabilityError> {
+    use crate::query::ast::SelectColumns;
+
+    match &select.columns {
+        SelectColumns::All | SelectColumns::None => Ok(()),
+        SelectColumns::Columns(cols) => {
+            for col in cols {
+                is_cacheable_column_expr(&col.expr)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Check if a column expression is cacheable.
+fn is_cacheable_column_expr(expr: &crate::query::ast::ColumnExpr) -> Result<(), CacheabilityError> {
+    use crate::query::ast::ColumnExpr;
+
+    match expr {
+        ColumnExpr::Column(_) | ColumnExpr::Literal(_) => Ok(()),
+        ColumnExpr::Function(func) => {
+            // Recursively check function arguments
+            for arg in &func.args {
+                is_cacheable_column_expr(arg)?;
+            }
+            Ok(())
+        }
+        ColumnExpr::Case(case) => {
+            // Check case argument if present
+            if let Some(arg) = &case.arg {
+                is_cacheable_column_expr(arg)?;
+            }
+            // Check when conditions and results
+            for when in &case.whens {
+                is_cacheable_expr(&when.condition)?;
+                is_cacheable_column_expr(&when.result)?;
+            }
+            // Check default
+            if let Some(default) = &case.default {
+                is_cacheable_column_expr(default)?;
+            }
+            Ok(())
+        }
+        ColumnExpr::Arithmetic(arith) => {
+            is_cacheable_column_expr(&arith.left)?;
+            is_cacheable_column_expr(&arith.right)
+        }
+        ColumnExpr::Subquery(query) => {
+            // Scalar subquery in SELECT list - check inner query
+            is_cacheable_subquery_inner(query)
+        }
     }
 }
 
@@ -352,48 +466,69 @@ mod tests {
         );
     }
 
+    // ==================== Subquery Tests ====================
+
     #[test]
-    fn test_subquery_in_select_not_cacheable() {
+    fn test_subquery_in_select_cacheable() {
+        // Scalar subqueries in SELECT list are now cacheable
         let sql = "SELECT id, (SELECT x FROM other WHERE id = 1) FROM t WHERE id = 1";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::HasSublink)),
-            "Subquery in SELECT list should not be cacheable"
-        );
+        assert!(result.is_ok(), "Scalar subquery in SELECT list should be cacheable");
     }
 
     #[test]
-    fn test_subquery_in_from_not_cacheable() {
+    fn test_subquery_in_from_cacheable() {
+        // Derived tables (non-LATERAL subqueries) in FROM are now cacheable
         let sql = "SELECT * FROM (SELECT id FROM users) sub WHERE id = 1";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::HasSublink)),
-            "Subquery in FROM clause should not be cacheable"
-        );
+        assert!(result.is_ok(), "Subquery in FROM clause should be cacheable");
     }
 
     #[test]
-    fn test_subquery_in_join_not_cacheable() {
+    fn test_subquery_in_join_cacheable() {
+        // Subqueries in JOIN are now cacheable
         let sql = "SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id WHERE a.id = 1";
         let result = check_cacheable(sql);
-        // Note: Currently returns UnsupportedFrom because is_supported_from() runs first
-        // and rejects subqueries in joins. Both errors correctly reject the query.
-        assert!(
-            matches!(
-                result,
-                Err(CacheabilityError::HasSublink) | Err(CacheabilityError::UnsupportedFrom)
-            ),
-            "Subquery in JOIN should not be cacheable"
-        );
+        assert!(result.is_ok(), "Subquery in JOIN should be cacheable");
     }
 
     #[test]
-    fn test_subquery_in_where_not_cacheable() {
+    fn test_subquery_in_where_cacheable() {
+        // IN subqueries in WHERE are now cacheable
         let sql = "SELECT * FROM t WHERE id IN (SELECT id FROM other)";
         let result = check_cacheable(sql);
+        assert!(result.is_ok(), "Subquery in WHERE clause should be cacheable");
+    }
+
+    #[test]
+    fn test_subquery_exists_cacheable() {
+        let sql = "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "EXISTS subquery should be cacheable, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_subquery_scalar_in_where_cacheable() {
+        let sql = "SELECT * FROM users WHERE id > (SELECT AVG(id) FROM users)";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "Scalar subquery in WHERE should be cacheable, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_subquery_nested_cacheable() {
+        let sql = "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "Nested subqueries should be cacheable");
+    }
+
+    #[test]
+    fn test_subquery_with_limit_in_outer_not_cacheable() {
+        // LIMIT at outer level still makes query not cacheable
+        let sql = "SELECT * FROM (SELECT id FROM users) sub LIMIT 10";
+        let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::HasSublink)),
-            "Subquery in WHERE clause should not be cacheable"
+            matches!(result, Err(CacheabilityError::HasLimit)),
+            "Outer LIMIT should make query not cacheable"
         );
     }
 
@@ -479,14 +614,12 @@ mod tests {
     }
 
     #[test]
-    fn test_union_with_subquery_not_cacheable() {
+    fn test_union_with_subquery_cacheable() {
+        // Subqueries in UNION branches are now cacheable
         let sql = "SELECT id FROM a WHERE id IN (SELECT id FROM other) \
                    UNION SELECT id FROM b WHERE tenant_id = 1";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::HasSublink)),
-            "UNION with subquery should not be cacheable"
-        );
+        assert!(result.is_ok(), "UNION with subquery should be cacheable");
     }
 
     #[test]

@@ -6,7 +6,6 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use pgcache_lib::query::ast::{
     QueryBody, SelectColumns, SelectNode, TableNode, query_expr_convert,
 };
-use pgcache_lib::query::parse::query_where_clause_parse;
 
 /// Helper to extract SelectNode from a SQL string
 fn parse_select_node(sql: &str) -> SelectNode {
@@ -64,17 +63,6 @@ fn ast_conversion_benchmarks(c: &mut Criterion) {
             BenchmarkId::new("query_expr_convert", name),
             &pg_ast,
             |b, ast| b.iter(|| black_box(query_expr_convert(black_box(ast)).unwrap())),
-        );
-    }
-
-    // Benchmark just the WHERE clause parsing (our existing approach)
-    for (name, sql) in &test_queries {
-        let pg_ast = pg_query::parse(sql).expect("SQL should parse");
-
-        group.bench_with_input(
-            BenchmarkId::new("where_clause_parse", name),
-            &pg_ast,
-            |b, ast| b.iter(|| black_box(query_where_clause_parse(black_box(ast)).unwrap())),
         );
     }
 

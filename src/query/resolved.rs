@@ -251,6 +251,36 @@ impl ResolvedWhereExpr {
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
         }
     }
+
+    /// Recursively collect SELECT branches from subqueries in this WHERE expression.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+        match self {
+            ResolvedWhereExpr::Binary(binary) => {
+                binary.lexpr.collect_subquery_branches(branches);
+                binary.rexpr.collect_subquery_branches(branches);
+            }
+            ResolvedWhereExpr::Unary(unary) => {
+                unary.expr.collect_subquery_branches(branches);
+            }
+            ResolvedWhereExpr::Multi(multi) => {
+                for expr in &multi.exprs {
+                    expr.collect_subquery_branches(branches);
+                }
+            }
+            ResolvedWhereExpr::Function { args, .. } => {
+                for arg in args {
+                    arg.collect_subquery_branches(branches);
+                }
+            }
+            ResolvedWhereExpr::Subquery { query, test_expr, .. } => {
+                query.select_branches_collect(branches);
+                if let Some(test) = test_expr {
+                    test.collect_subquery_branches(branches);
+                }
+            }
+            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => {}
+        }
+    }
 }
 
 impl Deparse for ResolvedWhereExpr {
@@ -520,6 +550,39 @@ impl ResolvedColumnExpr {
         };
         current.chain(children)
     }
+
+    /// Recursively collect SELECT branches from subqueries in this column expression.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+        match self {
+            ResolvedColumnExpr::Column(_)
+            | ResolvedColumnExpr::Identifier(_)
+            | ResolvedColumnExpr::Literal(_) => {}
+            ResolvedColumnExpr::Function { args, .. } => {
+                for arg in args {
+                    arg.collect_subquery_branches(branches);
+                }
+            }
+            ResolvedColumnExpr::Case(case) => {
+                if let Some(arg) = &case.arg {
+                    arg.collect_subquery_branches(branches);
+                }
+                for when in &case.whens {
+                    when.condition.collect_subquery_branches(branches);
+                    when.result.collect_subquery_branches(branches);
+                }
+                if let Some(default) = &case.default {
+                    default.collect_subquery_branches(branches);
+                }
+            }
+            ResolvedColumnExpr::Arithmetic(arith) => {
+                arith.left.collect_subquery_branches(branches);
+                arith.right.collect_subquery_branches(branches);
+            }
+            ResolvedColumnExpr::Subquery(query) => {
+                query.select_branches_collect(branches);
+            }
+        }
+    }
 }
 
 impl ResolvedCaseExpr {
@@ -672,6 +735,16 @@ impl ResolvedSelectColumns {
         };
         current.chain(children)
     }
+
+    /// Recursively collect SELECT branches from subqueries in the SELECT list.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+        if let ResolvedSelectColumns::Columns(columns) = self {
+            for col in columns {
+                col.expr.collect_subquery_branches(branches);
+            }
+        }
+        // ResolvedSelectColumns::All only contains ResolvedColumnNode (no subqueries)
+    }
 }
 
 impl Deparse for ResolvedSelectColumns {
@@ -714,6 +787,23 @@ impl ResolvedTableSource {
             ResolvedTableSource::Join(join) => Box::new(join.nodes()),
         };
         current.chain(children)
+    }
+
+    /// Recursively collect SELECT branches from subqueries in this table source.
+    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+        match self {
+            ResolvedTableSource::Table(_) => {}
+            ResolvedTableSource::Subquery(sub) => {
+                sub.query.select_branches_collect(branches);
+            }
+            ResolvedTableSource::Join(join) => {
+                join.left.collect_subquery_branches(branches);
+                join.right.collect_subquery_branches(branches);
+                if let Some(condition) = &join.condition {
+                    condition.collect_subquery_branches(branches);
+                }
+            }
+        }
     }
 }
 
@@ -1089,6 +1179,20 @@ impl ResolvedQueryExpr {
         match &self.body {
             ResolvedQueryBody::Select(select) => {
                 branches.push(select);
+                // Descend into subqueries in FROM clause
+                for source in &select.from {
+                    source.collect_subquery_branches(branches);
+                }
+                // Descend into subqueries in WHERE clause
+                if let Some(where_clause) = &select.where_clause {
+                    where_clause.collect_subquery_branches(branches);
+                }
+                // Descend into subqueries in HAVING clause
+                if let Some(having) = &select.having {
+                    having.collect_subquery_branches(branches);
+                }
+                // Descend into subqueries in SELECT list
+                select.columns.collect_subquery_branches(branches);
             }
             ResolvedQueryBody::Values(_) => {
                 // VALUES clauses don't reference tables, skip
