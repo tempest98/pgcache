@@ -972,6 +972,7 @@ async fn handle_connection(
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn connection_run(
+    worker_id: usize,
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
     cache_sender: CacheSender,
@@ -999,6 +1000,9 @@ pub fn connection_run(
         LocalSet::new()
             .run_until(async {
                 while let Some(socket) = rx.recv().await {
+                    metrics::gauge!(names::PROXY_WORKER_QUEUE, "worker" => worker_id.to_string())
+                        .set(rx.len() as f64);
+
                     let addrs = addrs.clone();
                     let server_name = server_name.clone();
                     let cache_sender = cache_sender.clone();

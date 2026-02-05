@@ -145,8 +145,14 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
     let (tx, rx) = unbounded_channel::<TcpStream>();
     let join = thread::Builder::new()
         .name(format!("cnxt {worker_id}"))
-        .spawn_scoped(scope, || {
-            connection_run(settings, rx, resources.cache_sender, resources.tls_acceptor)
+        .spawn_scoped(scope, move || {
+            connection_run(
+                worker_id,
+                settings,
+                rx,
+                resources.cache_sender,
+                resources.tls_acceptor,
+            )
         })
         .map_into_report::<ConnectionError>()?;
 

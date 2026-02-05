@@ -38,10 +38,15 @@ pub mod names {
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
 
-    // Writer queue depth gauges
+    // Queue depth gauges
     pub const CACHE_WRITER_QUERY_QUEUE: &str = "pgcache.cache.writer_query_queue";
     pub const CACHE_WRITER_CDC_QUEUE: &str = "pgcache.cache.writer_cdc_queue";
     pub const CACHE_WRITER_INTERNAL_QUEUE: &str = "pgcache.cache.writer_internal_queue";
+    pub const CACHE_WORKER_QUEUE: &str = "pgcache.cache.worker_queue";
+    pub const CACHE_CDC_MESSAGE_QUEUE: &str = "pgcache.cache.cdc_message_queue";
+    pub const CACHE_POPULATION_WORKER_QUEUE: &str = "pgcache.cache.population_worker_queue";
+    pub const CACHE_PROXY_MESSAGE_QUEUE: &str = "pgcache.cache.proxy_message_queue";
+    pub const PROXY_WORKER_QUEUE: &str = "pgcache.proxy.worker_queue";
     pub const CACHE_HANDLE_INSERTS: &str = "pgcache.cache.handle_inserts";
     pub const CACHE_HANDLE_UPDATES: &str = "pgcache.cache.handle_updates";
     pub const CACHE_HANDLE_DELETES: &str = "pgcache.cache.handle_deletes";

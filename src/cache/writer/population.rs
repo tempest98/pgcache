@@ -8,6 +8,7 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 use tracing::{debug, error, trace};
 
 use crate::catalog::TableMetadata;
+use crate::metrics::names;
 use crate::query::ast::Deparse;
 use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
 
@@ -26,6 +27,9 @@ pub async fn population_worker(
     debug!("population worker {id} started");
 
     while let Some(work) = rx.recv().await {
+        metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => id.to_string())
+            .set(rx.len() as f64);
+
         let result = population_task(
             work.fingerprint,
             work.generation,

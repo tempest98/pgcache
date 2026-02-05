@@ -22,6 +22,7 @@ use crate::{
         worker::handle_cached_query,
         writer::writer_run,
     },
+    metrics::names,
     settings::Settings,
 };
 
@@ -331,6 +332,9 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                                 handle_proxy_message(&mut qcache, proxy_msg).await;
                             });
                         }
+
+                        metrics::gauge!(names::CACHE_CDC_MESSAGE_QUEUE).set(cdc_rx.len() as f64);
+                        metrics::gauge!(names::CACHE_PROXY_MESSAGE_QUEUE).set(cache_rx.len() as f64);
                     }
 
                     debug!("cache loop exiting");
@@ -397,6 +401,8 @@ fn worker_run(
                             handle_worker_request(client, return_tx, msg).await;
                         });
                     }
+
+                    metrics::gauge!(names::CACHE_WORKER_QUEUE).set(worker_rx.len() as f64);
                 }
 
                 Ok(())
