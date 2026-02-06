@@ -100,8 +100,9 @@ async fn population_task(
     // For simple SELECT queries, there's just one branch
     // For set operations, each branch fetches its own tables
     for branch in branches {
-        // Find all tables referenced by this branch
-        for table_node in branch.nodes::<ResolvedTableNode>() {
+        // Find tables directly in this branch's FROM clause (not in subqueries).
+        // Subquery tables are handled as separate branches.
+        for table_node in branch.direct_table_nodes() {
             let table = table_metadata
                 .iter()
                 .find(|t| t.relation_oid == table_node.relation_oid)

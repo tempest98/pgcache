@@ -656,6 +656,16 @@ impl SelectNode {
             .chain(having_nodes)
     }
 
+    /// Return table nodes directly in this SELECT's FROM clause.
+    /// Traverses JOINs but does NOT descend into subqueries.
+    pub fn direct_table_nodes(&self) -> Vec<&TableNode> {
+        let mut tables = Vec::new();
+        for source in &self.from {
+            source.direct_table_nodes_collect(&mut tables);
+        }
+        tables
+    }
+
     /// Check if this SELECT references only a single table
     pub fn is_single_table(&self) -> bool {
         matches!(self.from.as_slice(), [TableSource::Table(_)])
@@ -1098,19 +1108,27 @@ pub enum ColumnExpr {
 
 impl ColumnExpr {
     pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        Box::new(
-            ((self as &dyn Any)
-                .downcast_ref::<N>()
-                .or_else(|| match self {
-                    ColumnExpr::Column(col) => (col as &dyn Any).downcast_ref::<N>(),
-                    ColumnExpr::Function(func) => (func as &dyn Any).downcast_ref::<N>(),
-                    ColumnExpr::Literal(lit) => (lit as &dyn Any).downcast_ref::<N>(),
-                    ColumnExpr::Case(case) => (case as &dyn Any).downcast_ref::<N>(),
-                    ColumnExpr::Arithmetic(arith) => (arith as &dyn Any).downcast_ref::<N>(),
-                    ColumnExpr::Subquery(select) => (select as &dyn Any).downcast_ref::<N>(),
-                }))
-            .into_iter(),
-        )
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            return Box::new(std::iter::once(r));
+        }
+        match self {
+            ColumnExpr::Column(col) => {
+                Box::new((col as &dyn Any).downcast_ref::<N>().into_iter())
+            }
+            ColumnExpr::Function(func) => {
+                Box::new((func as &dyn Any).downcast_ref::<N>().into_iter())
+            }
+            ColumnExpr::Literal(lit) => {
+                Box::new((lit as &dyn Any).downcast_ref::<N>().into_iter())
+            }
+            ColumnExpr::Case(case) => {
+                Box::new((case as &dyn Any).downcast_ref::<N>().into_iter())
+            }
+            ColumnExpr::Arithmetic(arith) => {
+                Box::new((arith as &dyn Any).downcast_ref::<N>().into_iter())
+            }
+            ColumnExpr::Subquery(query) => query.nodes(),
+        }
     }
 
     /// Check if this column expression contains sublinks/subqueries
@@ -1403,7 +1421,20 @@ impl TableSource {
         TableSourceNodeIter {
             source: Some(self),
             join_iter: None,
+            subquery_iter: None,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Collect direct table nodes, traversing JOINs but not subqueries.
+    fn direct_table_nodes_collect<'a>(&'a self, tables: &mut Vec<&'a TableNode>) {
+        match self {
+            TableSource::Table(table) => tables.push(table),
+            TableSource::Subquery(_) => {} // handled as separate branch
+            TableSource::Join(join) => {
+                join.left.direct_table_nodes_collect(tables);
+                join.right.direct_table_nodes_collect(tables);
+            }
         }
     }
 
@@ -1451,6 +1482,7 @@ impl Deparse for TableSource {
 struct TableSourceNodeIter<'a, N> {
     source: Option<&'a TableSource>,
     join_iter: Option<Box<JoinNodeIter<'a, N>>>,
+    subquery_iter: Option<Box<dyn Iterator<Item = &'a N> + 'a>>,
     _phantom: PhantomData<N>,
 }
 
@@ -1463,9 +1495,24 @@ impl<'a, N: Any> Iterator for TableSourceNodeIter<'a, N> {
                 self.source = None;
                 (table as &dyn Any).downcast_ref::<N>()
             }
-            Some(TableSource::Subquery(_)) => {
-                self.source = None;
-                None // TODO: implement subquery node iteration if needed
+            Some(TableSource::Subquery(sub)) => {
+                if let Some(iter) = &mut self.subquery_iter {
+                    if let Some(node) = iter.next() {
+                        return Some(node);
+                    } else {
+                        self.source = None;
+                        return None;
+                    }
+                }
+
+                let mut iter = sub.nodes();
+                if let Some(node) = iter.next() {
+                    self.subquery_iter = Some(iter);
+                    Some(node)
+                } else {
+                    self.source = None;
+                    None
+                }
             }
             Some(TableSource::Join(join)) => {
                 if let Some(iter) = &mut self.join_iter {
@@ -3676,11 +3723,33 @@ mod tests {
     fn test_table_subquery_node_nodes() {
         let ast = parse_query("SELECT * FROM (SELECT id FROM users) sub");
 
-        // Note: TableSource::Subquery iteration is not fully implemented yet
-        // So we can't extract nodes from within subqueries via TableSource
-        // This test verifies that TableSubqueryNode itself can be extracted
+        // TableSourceNodeIter traverses into subqueries
         let subqueries: Vec<&TableSubqueryNode> = ast.nodes().collect();
-        assert_eq!(subqueries.len(), 0); // Currently not traversed via TableSourceNodeIter
+        assert_eq!(subqueries.len(), 1);
+
+        // Inner table is also reachable
+        let tables: Vec<&TableNode> = ast.nodes().collect();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "users");
+    }
+
+    #[test]
+    fn test_column_expr_subquery_nodes() {
+        // Scalar subquery in SELECT list: ColumnExpr::Subquery should traverse into inner query
+        let ast = parse_query("SELECT id, (SELECT COUNT(*) FROM orders) FROM users");
+
+        // Should find both tables: users (FROM) and orders (inside scalar subquery)
+        let tables: Vec<&TableNode> = ast.nodes().collect();
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            table_names.contains(&"users"),
+            "should find outer table 'users'"
+        );
+        assert!(
+            table_names.contains(&"orders"),
+            "should find inner table 'orders' via ColumnExpr::Subquery traversal"
+        );
+        assert_eq!(tables.len(), 2);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::any::Any;
 use error_set::error_set;
 use iddqd::BiHashMap;
 use rootcause::Report;
+use tokio_postgres::types::Type;
 
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
@@ -275,7 +276,9 @@ impl ResolvedWhereExpr {
                     arg.collect_subquery_branches(branches);
                 }
             }
-            ResolvedWhereExpr::Subquery { query, test_expr, .. } => {
+            ResolvedWhereExpr::Subquery {
+                query, test_expr, ..
+            } => {
                 query.select_branches_collect(branches);
                 if let Some(test) = test_expr {
                     test.collect_subquery_branches(branches);
@@ -608,9 +611,10 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Function { args, .. } => args.iter().any(|a| a.has_subqueries()),
             ResolvedColumnExpr::Case(case) => {
                 case.arg.as_ref().is_some_and(|a| a.has_subqueries())
-                    || case.whens.iter().any(|w| {
-                        w.condition.has_subqueries() || w.result.has_subqueries()
-                    })
+                    || case
+                        .whens
+                        .iter()
+                        .any(|w| w.condition.has_subqueries() || w.result.has_subqueries())
                     || case.default.as_ref().is_some_and(|d| d.has_subqueries())
             }
             ResolvedColumnExpr::Arithmetic(arith) => {
@@ -835,6 +839,18 @@ impl ResolvedTableSource {
         current.chain(children)
     }
 
+    /// Collect direct table nodes from this source, traversing JOINs but not subqueries.
+    fn direct_table_nodes_collect<'a>(&'a self, tables: &mut Vec<&'a ResolvedTableNode>) {
+        match self {
+            ResolvedTableSource::Table(table) => tables.push(table),
+            ResolvedTableSource::Subquery(_) => {} // handled as separate branch
+            ResolvedTableSource::Join(join) => {
+                join.left.direct_table_nodes_collect(tables);
+                join.right.direct_table_nodes_collect(tables);
+            }
+        }
+    }
+
     /// Recursively collect SELECT branches from subqueries in this table source.
     fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
@@ -860,10 +876,7 @@ impl ResolvedTableSource {
             ResolvedTableSource::Join(join) => {
                 join.left.has_subqueries()
                     || join.right.has_subqueries()
-                    || join
-                        .condition
-                        .as_ref()
-                        .is_some_and(|c| c.has_subqueries())
+                    || join.condition.as_ref().is_some_and(|c| c.has_subqueries())
             }
         }
     }
@@ -1026,6 +1039,20 @@ impl ResolvedSelectNode {
             .chain(where_nodes)
             .chain(group_by_nodes)
             .chain(having_nodes)
+    }
+
+    /// Returns table nodes directly in the FROM clause, traversing JOINs but not
+    /// entering subqueries (FROM-clause derived tables or WHERE-clause subqueries).
+    ///
+    /// Use this instead of `nodes::<ResolvedTableNode>()` when you only want the
+    /// tables that this branch can directly SELECT from. Subquery tables are handled
+    /// as separate branches via `select_branches_collect`.
+    pub fn direct_table_nodes(&self) -> Vec<&ResolvedTableNode> {
+        let mut tables = Vec::new();
+        for source in &self.from {
+            source.direct_table_nodes_collect(&mut tables);
+        }
+        tables
     }
 
     /// Check if this SELECT references only a single table
@@ -1327,6 +1354,9 @@ impl Deparse for ResolvedQueryExpr {
 struct ResolutionScope<'a> {
     /// Tables available in this scope, indexed by alias (or table name if no alias)
     tables: Vec<(&'a TableMetadata, Option<&'a str>)>, // (metadata, alias)
+    /// Derived tables (FROM subqueries) with owned synthetic metadata.
+    /// These are virtual tables whose columns are determined by the subquery's output.
+    derived_tables: Vec<(TableMetadata, String)>, // (synthetic metadata, alias)
     /// Catalog of all known tables (for subquery resolution)
     catalog_tables: &'a BiHashMap<TableMetadata>,
     /// Search path for schema resolution
@@ -1337,6 +1367,7 @@ impl<'a> ResolutionScope<'a> {
     fn new(catalog_tables: &'a BiHashMap<TableMetadata>, search_path: &[&'a str]) -> Self {
         Self {
             tables: Vec::new(),
+            derived_tables: Vec::new(),
             catalog_tables,
             search_path: search_path.to_vec(),
         }
@@ -1347,26 +1378,89 @@ impl<'a> ResolutionScope<'a> {
         self.tables.push((metadata, alias));
     }
 
-    /// Find table metadata by name or alias
-    fn table_scope_find(&self, name: &str) -> Option<(&'a TableMetadata, Option<&'a str>)> {
-        self.tables
+    /// Find table metadata by name or alias.
+    /// Checks both catalog tables and derived tables (FROM subqueries).
+    fn table_scope_find(&self, name: &str) -> Option<(&TableMetadata, Option<&str>)> {
+        // Check catalog tables first
+        if let Some((meta, alias)) = self.tables.iter().find(|(meta, alias)| {
+            if let Some(alias_name) = alias {
+                *alias_name == name
+            } else {
+                meta.name == name
+            }
+        }) {
+            return Some((*meta, *alias));
+        }
+
+        // Check derived tables
+        self.derived_tables
             .iter()
-            .find(|(meta, alias)| {
-                if let Some(alias_name) = alias {
-                    *alias_name == name
-                } else {
-                    meta.name == name
-                }
-            })
-            .copied()
+            .find(|(_, alias)| alias == name)
+            .map(|(meta, alias)| (meta, Some(alias.as_str())))
     }
 
     /// Find which outer-scope table contains a given column name, if any.
-    fn column_scope_find(&self, column: &str) -> Option<&'a TableMetadata> {
-        self.tables
+    fn column_scope_find(&self, column: &str) -> Option<&TableMetadata> {
+        // Check catalog tables first
+        if let Some((meta, _)) = self
+            .tables
             .iter()
             .find(|(meta, _)| meta.columns.get1(column).is_some())
-            .map(|(meta, _)| *meta)
+        {
+            return Some(*meta);
+        }
+
+        // Check derived tables
+        self.derived_tables
+            .iter()
+            .find(|(meta, _)| meta.columns.get1(column).is_some())
+            .map(|(meta, _)| meta)
+    }
+
+    /// Add a derived table (FROM subquery) to the scope.
+    ///
+    /// Extracts output columns from the resolved inner query and creates synthetic
+    /// `TableMetadata` so the outer query can resolve column references against
+    /// the subquery alias.
+    fn derived_table_scope_add(&mut self, resolved_query: &ResolvedQueryExpr, alias: &str) {
+        let columns = derived_table_columns_extract(resolved_query);
+        let mut column_map = BiHashMap::new();
+        for col in columns {
+            column_map.insert_overwrite(col);
+        }
+
+        let synthetic_metadata = TableMetadata {
+            relation_oid: 0,
+            name: alias.to_owned(),
+            schema: String::new(),
+            primary_key_columns: Vec::new(),
+            columns: column_map,
+            indexes: Vec::new(),
+        };
+
+        self.derived_tables.push((synthetic_metadata, alias.to_owned()));
+    }
+
+    /// Find all tables in scope that contain a given column (for unqualified column resolution).
+    fn column_matches_find<'b>(
+        &'b self,
+        column: &str,
+    ) -> Vec<(&'b TableMetadata, Option<&'b str>, &'b ColumnMetadata)> {
+        let mut matches = Vec::new();
+
+        for (table_metadata, alias) in &self.tables {
+            if let Some(col_meta) = table_metadata.columns.get1(column) {
+                matches.push((*table_metadata, *alias, col_meta));
+            }
+        }
+
+        for (table_metadata, alias) in &self.derived_tables {
+            if let Some(col_meta) = table_metadata.columns.get1(column) {
+                matches.push((table_metadata, Some(alias.as_str()), col_meta));
+            }
+        }
+
+        matches
     }
 
     /// Resolve an inner query with a fresh scope, detecting correlated references.
@@ -1380,9 +1474,7 @@ impl<'a> ResolutionScope<'a> {
     fn subquery_resolve(&self, query: &QueryExpr) -> ResolveResult<ResolvedQueryExpr> {
         query_expr_resolve(query, self.catalog_tables, &self.search_path).map_err(|report| {
             match report.current_context() {
-                ResolveError::TableNotFound { name }
-                    if self.table_scope_find(name).is_some() =>
-                {
+                ResolveError::TableNotFound { name } if self.table_scope_find(name).is_some() => {
                     ResolveError::CorrelatedSubqueryNotSupported {
                         table: name.clone(),
                     }
@@ -1410,6 +1502,79 @@ impl<'a> ResolutionScope<'a> {
                 | ResolveError::CorrelatedSubqueryNotSupported { .. } => report,
             }
         })
+    }
+}
+
+/// Extract output column metadata from a resolved query for derived table scope.
+///
+/// Handles the three cases:
+/// - `SELECT *`: returns all columns from all tables in the inner query
+/// - `SELECT col1, col2`: returns column metadata for each, using aliases as names
+/// - `SELECT <none>`: returns empty (e.g., EXISTS subqueries)
+fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<ColumnMetadata> {
+    let select = match &resolved_query.body {
+        ResolvedQueryBody::Select(select) => select,
+        // For set operations and VALUES, we can't easily determine output columns
+        ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => return Vec::new(),
+    };
+
+    match &select.columns {
+        ResolvedSelectColumns::None => Vec::new(),
+        ResolvedSelectColumns::All(cols) => cols
+            .iter()
+            .map(|col| col.column_metadata.clone())
+            .collect(),
+        ResolvedSelectColumns::Columns(cols) => cols
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| {
+                // Determine the column name: alias if present, otherwise
+                // infer from the expression
+                let name = if let Some(alias) = &col.alias {
+                    alias.clone()
+                } else {
+                    match &col.expr {
+                        ResolvedColumnExpr::Column(c) => c.column.clone(),
+                        ResolvedColumnExpr::Identifier(ident) => ident.clone(),
+                        // Functions, literals, etc. — without an alias we
+                        // can't determine a stable column name
+                        ResolvedColumnExpr::Function { .. }
+                        | ResolvedColumnExpr::Literal(_)
+                        | ResolvedColumnExpr::Case(_)
+                        | ResolvedColumnExpr::Arithmetic(_)
+                        | ResolvedColumnExpr::Subquery(_) => return None,
+                    }
+                };
+
+                // Use column metadata from the source column if available,
+                // otherwise create a synthetic entry with TEXT type
+                let base_meta = match &col.expr {
+                    ResolvedColumnExpr::Column(c) => c.column_metadata.clone(),
+                    ResolvedColumnExpr::Identifier(_)
+                    | ResolvedColumnExpr::Function { .. }
+                    | ResolvedColumnExpr::Literal(_)
+                    | ResolvedColumnExpr::Case(_)
+                    | ResolvedColumnExpr::Arithmetic(_)
+                    | ResolvedColumnExpr::Subquery(_) => ColumnMetadata {
+                        name: name.clone(),
+                        position: (i + 1) as i16,
+                        type_oid: 25, // TEXT OID
+                        data_type: Type::TEXT,
+                        type_name: "text".to_owned(),
+                        cache_type_name: "text".to_owned(),
+                        is_primary_key: false,
+                    },
+                };
+
+                // Override name with alias if provided (the column metadata
+                // from the source has the original name)
+                Some(ColumnMetadata {
+                    name,
+                    position: (i + 1) as i16,
+                    ..base_meta
+                })
+            })
+            .collect(),
     }
 }
 
@@ -1474,13 +1639,8 @@ fn column_resolve<'a>(
         });
     }
 
-    // Unqualified column - search all tables in scope
-    let mut matches = Vec::new();
-    for (table_metadata, alias) in &scope.tables {
-        if let Some(column_metadata) = table_metadata.columns.get1(column_name.as_str()) {
-            matches.push((table_metadata, *alias, column_metadata));
-        }
-    }
+    // Unqualified column - search all tables in scope (including derived tables)
+    let matches = scope.column_matches_find(column_name.as_str());
 
     match matches.as_slice() {
         [] => Err(ResolveError::ColumnNotFound {
@@ -1640,6 +1800,9 @@ fn table_source_resolve<'a>(
             // LATERAL subqueries would need access to outer scope, but we don't support those yet
             // Detects correlated references and returns a clear error
             let resolved_query = scope.subquery_resolve(&subquery.query)?;
+
+            // Add derived table to outer scope so outer columns can reference it
+            scope.derived_table_scope_add(&resolved_query, &alias.name);
 
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
@@ -1918,9 +2081,7 @@ pub fn query_expr_resolve(
             }
             order_by_resolve(&query.order_by, &scope)?
         }
-        QueryBody::SetOp(_) | QueryBody::Values(_) => {
-            order_by_as_identifiers(&query.order_by)
-        }
+        QueryBody::SetOp(_) | QueryBody::Values(_) => order_by_as_identifiers(&query.order_by),
     };
 
     let limit = limit_resolve(query.limit.as_ref());
@@ -3153,7 +3314,7 @@ mod tests {
     #[test]
     fn test_select_branches_simple_select() {
         let query_expr = ResolvedQueryExpr {
-            body: ResolvedQueryBody::Select(Box::new(ResolvedSelectNode::default())),
+            body: ResolvedQueryBody::Select(Box::default()),
             order_by: vec![],
             limit: None,
         };
@@ -3319,7 +3480,10 @@ mod tests {
         );
 
         // Should have resolved WHERE clause with subquery
-        let where_clause = resolved.where_clause.as_ref().expect("should have WHERE clause");
+        let where_clause = resolved
+            .where_clause
+            .as_ref()
+            .expect("should have WHERE clause");
 
         match where_clause {
             ResolvedWhereExpr::Subquery {
@@ -3327,7 +3491,11 @@ mod tests {
                 test_expr,
                 query,
             } => {
-                assert_eq!(*sublink_type, SubLinkType::Any, "IN should resolve as SubLinkType::Any");
+                assert_eq!(
+                    *sublink_type,
+                    SubLinkType::Any,
+                    "IN should resolve as SubLinkType::Any"
+                );
                 assert!(test_expr.is_some(), "IN should have test expression");
 
                 // Verify inner query was resolved
@@ -3344,7 +3512,10 @@ mod tests {
                     _ => panic!("Expected SELECT body in subquery"),
                 }
             }
-            _ => panic!("Expected ResolvedWhereExpr::Subquery, got {:?}", where_clause),
+            _ => panic!(
+                "Expected ResolvedWhereExpr::Subquery, got {:?}",
+                where_clause
+            ),
         }
     }
 
@@ -3360,7 +3531,10 @@ mod tests {
             &tables,
         );
 
-        let where_clause = resolved.where_clause.as_ref().expect("should have WHERE clause");
+        let where_clause = resolved
+            .where_clause
+            .as_ref()
+            .expect("should have WHERE clause");
 
         match where_clause {
             ResolvedWhereExpr::Subquery {
@@ -3368,8 +3542,15 @@ mod tests {
                 test_expr,
                 ..
             } => {
-                assert_eq!(*sublink_type, SubLinkType::Exists, "EXISTS should resolve correctly");
-                assert!(test_expr.is_none(), "EXISTS should not have test expression");
+                assert_eq!(
+                    *sublink_type,
+                    SubLinkType::Exists,
+                    "EXISTS should resolve correctly"
+                );
+                assert!(
+                    test_expr.is_none(),
+                    "EXISTS should not have test expression"
+                );
             }
             _ => panic!("Expected ResolvedWhereExpr::Subquery"),
         }
@@ -3386,18 +3567,23 @@ mod tests {
             &tables,
         );
 
-        let where_clause = resolved.where_clause.as_ref().expect("should have WHERE clause");
+        let where_clause = resolved
+            .where_clause
+            .as_ref()
+            .expect("should have WHERE clause");
 
         // The scalar subquery should be on the right side of the > comparison
         match where_clause {
-            ResolvedWhereExpr::Binary(binary) => {
-                match binary.rexpr.as_ref() {
-                    ResolvedWhereExpr::Subquery { sublink_type, .. } => {
-                        assert_eq!(*sublink_type, SubLinkType::Expr, "Scalar subquery should be SubLinkType::Expr");
-                    }
-                    _ => panic!("Expected ResolvedWhereExpr::Subquery on right side"),
+            ResolvedWhereExpr::Binary(binary) => match binary.rexpr.as_ref() {
+                ResolvedWhereExpr::Subquery { sublink_type, .. } => {
+                    assert_eq!(
+                        *sublink_type,
+                        SubLinkType::Expr,
+                        "Scalar subquery should be SubLinkType::Expr"
+                    );
                 }
-            }
+                _ => panic!("Expected ResolvedWhereExpr::Subquery on right side"),
+            },
             _ => panic!("Expected ResolvedWhereExpr::Binary"),
         }
     }
@@ -3467,11 +3653,18 @@ mod tests {
 
         // Should find both outer table and inner table via nodes() traversal
         let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-        assert_eq!(table_nodes.len(), 2, "Should find tables in both outer and inner query");
+        assert_eq!(
+            table_nodes.len(),
+            2,
+            "Should find tables in both outer and inner query"
+        );
 
         let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
         assert!(table_names.contains(&"users"), "Should find outer table");
-        assert!(table_names.contains(&"active_users"), "Should find inner table");
+        assert!(
+            table_names.contains(&"active_users"),
+            "Should find inner table"
+        );
     }
 
     #[test]
@@ -3505,11 +3698,18 @@ mod tests {
 
         // Should find both tables
         let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-        assert_eq!(table_nodes.len(), 2, "Should find tables in outer and scalar subquery");
+        assert_eq!(
+            table_nodes.len(),
+            2,
+            "Should find tables in outer and scalar subquery"
+        );
 
         let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
         assert!(table_names.contains(&"orders"), "Should find outer table");
-        assert!(table_names.contains(&"users"), "Should find scalar subquery table");
+        assert!(
+            table_names.contains(&"users"),
+            "Should find scalar subquery table"
+        );
     }
 
     #[test]
@@ -3527,12 +3727,108 @@ mod tests {
 
         // Should find all three tables
         let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-        assert_eq!(table_nodes.len(), 3, "Should find all tables in nested subqueries");
+        assert_eq!(
+            table_nodes.len(),
+            3,
+            "Should find all tables in nested subqueries"
+        );
 
         let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
         assert!(table_names.contains(&"a"), "Should find outermost table");
         assert!(table_names.contains(&"b"), "Should find middle table");
         assert!(table_names.contains(&"c"), "Should find innermost table");
+    }
+
+    // ==========================================================================
+    // Direct Table Nodes Tests (population uses these, not nodes())
+    // ==========================================================================
+
+    #[test]
+    fn test_direct_table_nodes_excludes_where_subquery() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+
+        let resolved = resolve_sql(
+            "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
+            &tables,
+        );
+
+        // nodes() finds both tables (full traversal)
+        let all_tables: Vec<&ResolvedTableNode> = resolved.nodes().collect();
+        assert_eq!(all_tables.len(), 2);
+
+        // direct_table_nodes() only finds the FROM-clause table
+        let direct_tables = resolved.direct_table_nodes();
+        assert_eq!(direct_tables.len(), 1, "Should only find direct FROM table");
+        assert_eq!(direct_tables[0].name, "users");
+    }
+
+    #[test]
+    fn test_direct_table_nodes_with_join_and_subquery() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "items",
+            1001,
+            &["id", "name", "category_id"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "inventory",
+            1002,
+            &["id", "item_id", "quantity"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "categories",
+            1003,
+            &["id", "name", "active"],
+        ));
+
+        let resolved = resolve_sql(
+            "SELECT i.name FROM items i \
+             JOIN inventory inv ON i.id = inv.item_id \
+             WHERE i.category_id IN (SELECT c.id FROM categories c WHERE c.active = true) \
+             ORDER BY i.name",
+            &tables,
+        );
+
+        // nodes() finds all 3 tables
+        let all_tables: Vec<&ResolvedTableNode> = resolved.nodes().collect();
+        assert_eq!(all_tables.len(), 3);
+
+        // direct_table_nodes() only finds the 2 JOIN tables, not the WHERE subquery table
+        let direct_tables = resolved.direct_table_nodes();
+        assert_eq!(
+            direct_tables.len(),
+            2,
+            "Should find items and inventory but not categories"
+        );
+        let names: Vec<&str> = direct_tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"items"));
+        assert!(names.contains(&"inventory"));
+        assert!(!names.contains(&"categories"));
+    }
+
+    #[test]
+    fn test_direct_table_nodes_derived_table() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let resolved = resolve_sql(
+            "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
+            &tables,
+        );
+
+        // nodes() finds the table inside the derived table
+        let all_tables: Vec<&ResolvedTableNode> = resolved.nodes().collect();
+        assert_eq!(all_tables.len(), 1);
+
+        // direct_table_nodes() finds nothing — the derived table is a subquery, not a direct table
+        let direct_tables = resolved.direct_table_nodes();
+        assert_eq!(
+            direct_tables.len(),
+            0,
+            "Derived table should not appear in direct_table_nodes"
+        );
     }
 
     // ==========================================================================
@@ -3751,9 +4047,8 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("active_users", 1002));
 
-        let node = parse_select_node(
-            "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
-        );
+        let node =
+            parse_select_node("SELECT * FROM users WHERE id IN (SELECT id FROM active_users)");
         let result = select_node_resolve(&node, &tables, &["public"]);
 
         assert!(

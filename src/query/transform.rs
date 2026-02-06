@@ -773,8 +773,9 @@ pub fn query_table_update_queries(cacheable_query: &CacheableQuery) -> Vec<(&Tab
 
     // For each SELECT branch in the query
     for branch in cacheable_query.query.select_branches() {
-        // For each table in this branch
-        for table in branch.nodes::<TableNode>() {
+        // For each direct table in this branch (not inside subqueries).
+        // Tables inside subqueries are handled by their own inner branch.
+        for table in branch.direct_table_nodes() {
             // Create update query from just this branch (not full query)
             let update_select = select_node_columns_replace(branch, select_list.clone());
             let update_query = QueryExpr {
