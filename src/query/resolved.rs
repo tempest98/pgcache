@@ -1809,6 +1809,28 @@ fn table_source_resolve<'a>(
                 alias: alias.clone(),
             }))
         }
+        TableSource::CteRef(cte_ref) => {
+            let alias_name = cte_ref
+                .alias
+                .as_ref()
+                .map(|a| a.name.as_str())
+                .unwrap_or(&cte_ref.cte_name);
+
+            // Resolve CTE body with fresh scope (non-correlated)
+            let resolved_query = scope.subquery_resolve(&cte_ref.query)?;
+
+            let alias = TableAlias {
+                name: alias_name.to_owned(),
+                columns: cte_ref.column_aliases.clone(),
+            };
+
+            scope.derived_table_scope_add(&resolved_query, alias_name);
+
+            Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
+                query: Box::new(resolved_query),
+                alias,
+            }))
+        }
     }
 }
 

@@ -46,6 +46,12 @@ pub fn query_expr_parameters_replace(
 ) -> AstTransformResult<QueryExpr> {
     let mut new_query = query_expr.clone();
 
+    // Replace parameters in CTE definitions
+    for cte in &mut new_query.ctes {
+        let replaced = query_expr_parameters_replace(&cte.query, parameters)?;
+        cte.query = replaced;
+    }
+
     // Replace parameters in body
     query_body_parameters_replace(&mut new_query.body, parameters)?;
 
@@ -140,6 +146,10 @@ fn table_source_parameters_replace(
         TableSource::Subquery(subquery) => {
             // Replace parameters in subquery
             query_expr_parameters_replace_mut(&mut subquery.query, parameters)?;
+        }
+        TableSource::CteRef(cte_ref) => {
+            // Replace parameters in CTE reference body
+            query_expr_parameters_replace_mut(&mut cte_ref.query, parameters)?;
         }
         TableSource::Table(_) => {
             // No parameters in simple table references
@@ -783,6 +793,7 @@ pub fn query_table_update_queries(cacheable_query: &CacheableQuery) -> Vec<(&Tab
             // Create update query from just this branch (not full query)
             let update_select = select_node_columns_replace(branch, select_list.clone());
             let update_query = QueryExpr {
+                ctes: vec![],
                 body: QueryBody::Select(update_select),
                 order_by: vec![],
                 limit: None,
@@ -1669,6 +1680,68 @@ mod tests {
             result.from.len(),
             1,
             "resolved_select_node_replace should preserve FROM clause"
+        );
+    }
+
+    // ==================== CTE Parameter Replacement Tests ====================
+
+    #[test]
+    fn test_cte_parameter_replacement() {
+        let sql = "WITH active_users AS (SELECT id, name FROM users WHERE status = $1) \
+                   SELECT id FROM active_users WHERE name = $2";
+        let ast = pg_query::parse(sql).expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+
+        let params = typed_text_params(vec![
+            (Some(b"active"), PgType::TEXT),
+            (Some(b"alice"), PgType::TEXT),
+        ]);
+
+        let replaced = query_expr_parameters_replace(&query_expr, &params)
+            .expect("parameter replacement");
+
+        let mut buf = String::new();
+        replaced.deparse(&mut buf);
+
+        // Parameters should be replaced in both the CTE body and the main query
+        assert!(
+            buf.contains("status = 'active'"),
+            "CTE body should have $1 replaced: {buf}"
+        );
+        assert!(
+            buf.contains("name = 'alice'"),
+            "Main query should have $2 replaced: {buf}"
+        );
+        assert!(
+            !buf.contains("$1"),
+            "No unreplaced $1 should remain: {buf}"
+        );
+        assert!(
+            !buf.contains("$2"),
+            "No unreplaced $2 should remain: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_cte_update_queries() {
+        let sql = "WITH active_users AS (SELECT id, name FROM users WHERE status = 'active') \
+                   SELECT active_users.id, orders.total \
+                   FROM active_users \
+                   JOIN orders ON orders.user_id = active_users.id";
+        let cacheable = parse_cacheable(sql);
+        let result = query_table_update_queries(&cacheable);
+
+        // The CTE body contains "users" and the main query joins with "orders".
+        // select_branches traverses into CTE definitions, so we should get
+        // tables from both the CTE body branch and the main query branch.
+        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        assert!(
+            table_names.contains(&"users"),
+            "Should have update query for 'users' table from CTE body: {table_names:?}"
+        );
+        assert!(
+            table_names.contains(&"orders"),
+            "Should have update query for 'orders' table from main query: {table_names:?}"
         );
     }
 }

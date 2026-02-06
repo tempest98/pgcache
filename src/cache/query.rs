@@ -2,8 +2,8 @@ use crate::{
     cache::QueryParameters,
     query::{
         ast::{
-            BinaryOp, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode, SetOpNode,
-            SubLinkType, TableSource, TableSubqueryNode, UnaryOp, WhereExpr,
+            BinaryOp, CteRefNode, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode,
+            SetOpNode, SubLinkType, TableSource, TableSubqueryNode, UnaryOp, WhereExpr,
         },
         transform::{AstTransformResult, query_expr_parameters_replace},
     },
@@ -114,6 +114,7 @@ fn is_supported_from(select: &SelectNode) -> Result<(), CacheabilityError> {
         [TableSource::Join(join)] => is_supported_join(join),
         [TableSource::Table(_)] => Ok(()),
         [TableSource::Subquery(sub)] => is_cacheable_table_subquery(sub),
+        [TableSource::CteRef(cte_ref)] => is_cacheable_cte_ref(cte_ref),
         _ => Err(CacheabilityError::UnsupportedFrom),
     }
 }
@@ -173,7 +174,13 @@ fn is_supported_table_source(source: &TableSource) -> Result<(), CacheabilityErr
         TableSource::Join(nested) => is_supported_join(nested),
         TableSource::Table(_) => Ok(()),
         TableSource::Subquery(sub) => is_cacheable_table_subquery(sub),
+        TableSource::CteRef(cte_ref) => is_cacheable_cte_ref(cte_ref),
     }
+}
+
+/// Check if a CTE reference is cacheable.
+fn is_cacheable_cte_ref(cte_ref: &CteRefNode) -> Result<(), CacheabilityError> {
+    is_cacheable_body(&cte_ref.query.body)
 }
 
 /// Check if a SELECT's WHERE clause can be efficiently cached.
@@ -630,6 +637,35 @@ mod tests {
         assert!(
             matches!(result, Err(CacheabilityError::UnsupportedFrom)),
             "UNION with LEFT JOIN should not be cacheable"
+        );
+    }
+
+    // CTE cacheability tests
+
+    #[test]
+    fn test_cte_simple_cacheable() {
+        let sql = "WITH x AS (SELECT id FROM users WHERE id = 1) SELECT * FROM x";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "simple CTE should be cacheable: {result:?}");
+    }
+
+    #[test]
+    fn test_cte_with_join_cacheable() {
+        let sql = "WITH active AS (SELECT id, name FROM users WHERE active = true) \
+                    SELECT u.id, a.name FROM users u JOIN active a ON u.id = a.id WHERE u.id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "CTE in join should be cacheable: {result:?}");
+    }
+
+    #[test]
+    fn test_cte_multiple_cacheable() {
+        let sql = "WITH a AS (SELECT id FROM users WHERE id = 1), \
+                    b AS (SELECT id FROM products WHERE id = 2) \
+                    SELECT * FROM a JOIN b ON a.id = b.id";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "multiple CTEs should be cacheable: {result:?}"
         );
     }
 }

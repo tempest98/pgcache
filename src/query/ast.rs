@@ -8,8 +8,8 @@ use error_set::error_set;
 use ordered_float::NotNan;
 use pg_query::ParseResult;
 use pg_query::protobuf::{
-    AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, FuncCall, JoinExpr, MinMaxExpr,
-    MinMaxOp, RangeSubselect, SortByDir,
+    AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, CteMaterialize, FuncCall, JoinExpr,
+    MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir,
 };
 use pg_query::protobuf::{
     ColumnRef, Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum,
@@ -829,6 +829,7 @@ impl Deparse for QueryBody {
 /// ORDER BY and LIMIT apply to the entire query expression.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct QueryExpr {
+    pub ctes: Vec<CteDefinition>,
     pub body: QueryBody,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<LimitClause>,
@@ -837,6 +838,7 @@ pub struct QueryExpr {
 impl Default for QueryExpr {
     fn default() -> Self {
         Self {
+            ctes: Vec::new(),
             body: QueryBody::Values(ValuesClause::default()),
             order_by: Vec::new(),
             limit: None,
@@ -844,12 +846,33 @@ impl Default for QueryExpr {
     }
 }
 
+/// Materialization hint for a CTE definition.
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
+pub enum CteMaterialization {
+    /// No keyword — optimizer decides
+    Default,
+    /// AS MATERIALIZED — evaluate once, results reused
+    Materialized,
+    /// AS NOT MATERIALIZED — optimizer may inline
+    NotMaterialized,
+}
+
+/// A CTE definition from a WITH clause.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct CteDefinition {
+    pub name: String,
+    pub query: QueryExpr,
+    pub column_aliases: Vec<String>,
+    pub materialization: CteMaterialization,
+}
+
 impl QueryExpr {
     pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let cte_nodes = self.ctes.iter().flat_map(|c| c.query.nodes::<N>());
         let body_nodes = self.body.nodes();
         let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
-        Box::new(current.chain(body_nodes).chain(order_by_nodes))
+        Box::new(current.chain(cte_nodes).chain(body_nodes).chain(order_by_nodes))
     }
 
     /// Check if query only references a single table
@@ -883,7 +906,9 @@ impl QueryExpr {
 
     /// Check if this query contains sublinks/subqueries
     pub fn has_sublink(&self) -> bool {
-        self.body.has_sublink() || self.order_by.iter().any(|o| o.expr.has_sublink())
+        !self.ctes.is_empty()
+            || self.body.has_sublink()
+            || self.order_by.iter().any(|o| o.expr.has_sublink())
     }
 
     /// Get the SELECT body if this is a simple SELECT query
@@ -916,6 +941,11 @@ impl QueryExpr {
 
     /// Helper to recursively collect SELECT branches.
     fn select_branches_collect<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
+        // Collect from CTE definitions
+        for cte in &self.ctes {
+            cte.query.select_branches_collect(branches);
+        }
+
         match &self.body {
             QueryBody::Select(select) => {
                 branches.push(select);
@@ -947,6 +977,36 @@ impl QueryExpr {
 
 impl Deparse for QueryExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        if !self.ctes.is_empty() {
+            buf.push_str("WITH ");
+            for (i, cte) in self.ctes.iter().enumerate() {
+                if i > 0 {
+                    buf.push_str(", ");
+                }
+                cte.name.deparse(buf);
+                if !cte.column_aliases.is_empty() {
+                    buf.push('(');
+                    for (j, col) in cte.column_aliases.iter().enumerate() {
+                        if j > 0 {
+                            buf.push_str(", ");
+                        }
+                        col.deparse(buf);
+                    }
+                    buf.push(')');
+                }
+                buf.push_str(" AS ");
+                match cte.materialization {
+                    CteMaterialization::Default => {}
+                    CteMaterialization::Materialized => buf.push_str("MATERIALIZED "),
+                    CteMaterialization::NotMaterialized => buf.push_str("NOT MATERIALIZED "),
+                }
+                buf.push('(');
+                cte.query.deparse(buf);
+                buf.push(')');
+            }
+            buf.push(' ');
+        }
+
         self.body.deparse(buf);
 
         if !self.order_by.is_empty() {
@@ -1414,6 +1474,21 @@ pub enum TableSource {
     Table(TableNode),
     Subquery(TableSubqueryNode),
     Join(JoinNode),
+    CteRef(CteRefNode),
+}
+
+/// A reference to a CTE in a FROM clause or subquery position.
+///
+/// Contains a clone of the CTE's query body so that traversal methods
+/// (nodes, select_branches, etc.) are self-contained without needing
+/// external context.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct CteRefNode {
+    pub cte_name: String,
+    pub query: Box<QueryExpr>,
+    pub column_aliases: Vec<String>,
+    pub materialization: CteMaterialization,
+    pub alias: Option<TableAlias>,
 }
 
 impl TableSource {
@@ -1426,11 +1501,11 @@ impl TableSource {
         }
     }
 
-    /// Collect direct table nodes, traversing JOINs but not subqueries.
+    /// Collect direct table nodes, traversing JOINs but not subqueries/CTEs.
     fn direct_table_nodes_collect<'a>(&'a self, tables: &mut Vec<&'a TableNode>) {
         match self {
             TableSource::Table(table) => tables.push(table),
-            TableSource::Subquery(_) => {} // handled as separate branch
+            TableSource::Subquery(_) | TableSource::CteRef(_) => {} // handled as separate branch
             TableSource::Join(join) => {
                 join.left.direct_table_nodes_collect(tables);
                 join.right.direct_table_nodes_collect(tables);
@@ -1441,7 +1516,7 @@ impl TableSource {
     /// Check if this table source contains sublinks/subqueries
     pub fn has_sublink(&self) -> bool {
         match self {
-            TableSource::Subquery(_) => true,
+            TableSource::Subquery(_) | TableSource::CteRef(_) => true,
             TableSource::Table(_) => false,
             TableSource::Join(join) => {
                 join.left.has_sublink()
@@ -1457,6 +1532,9 @@ impl TableSource {
             TableSource::Table(_) => {}
             TableSource::Subquery(sub) => {
                 sub.query.select_branches_collect(branches);
+            }
+            TableSource::CteRef(cte_ref) => {
+                cte_ref.query.select_branches_collect(branches);
             }
             TableSource::Join(join) => {
                 join.left.collect_subquery_branches(branches);
@@ -1475,6 +1553,7 @@ impl Deparse for TableSource {
             TableSource::Table(table) => table.deparse(buf),
             TableSource::Subquery(subquery) => subquery.deparse(buf),
             TableSource::Join(join) => join.deparse(buf),
+            TableSource::CteRef(cte_ref) => cte_ref.deparse(buf),
         }
     }
 }
@@ -1546,6 +1625,25 @@ impl<'a, N: Any> Iterator for TableSourceNodeIter<'a, N> {
                     None
                 }
             }
+            Some(TableSource::CteRef(cte_ref)) => {
+                if let Some(iter) = &mut self.subquery_iter {
+                    if let Some(node) = iter.next() {
+                        return Some(node);
+                    } else {
+                        self.source = None;
+                        return None;
+                    }
+                }
+
+                let mut iter = cte_ref.nodes();
+                if let Some(node) = iter.next() {
+                    self.subquery_iter = Some(iter);
+                    Some(node)
+                } else {
+                    self.source = None;
+                    None
+                }
+            }
             None => None,
         }
     }
@@ -1608,6 +1706,28 @@ impl Deparse for TableSubqueryNode {
         buf.push('(');
         self.query.deparse(buf);
         buf.push(')');
+
+        if let Some(alias) = &self.alias {
+            buf.push(' ');
+            alias.deparse(buf);
+        }
+
+        buf
+    }
+}
+
+impl CteRefNode {
+    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let children = self.query.nodes();
+        Box::new(current.chain(children))
+    }
+}
+
+impl Deparse for CteRefNode {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push(' ');
+        self.cte_name.deparse(buf);
 
         if let Some(alias) = &self.alias {
             buf.push(' ');
@@ -1823,8 +1943,121 @@ pub fn query_expr_convert(ast: &ParseResult) -> Result<QueryExpr, AstError> {
     }
 }
 
-/// Convert a SelectStmt to a QueryExpr, handling set operations
+/// Context for CTE-aware parsing. Tracks CTE definitions from an outer
+/// WITH clause so that table references in the body can be recognized as
+/// CTE references instead of catalog tables.
+struct ParseContext {
+    ctes: Vec<CteDefinition>,
+}
+
+impl ParseContext {
+    fn empty() -> Self {
+        Self { ctes: Vec::new() }
+    }
+
+    fn cte_find(&self, name: &str) -> Option<&CteDefinition> {
+        self.ctes.iter().find(|c| c.name == name)
+    }
+}
+
+/// Extract CTE definitions from a WITH clause protobuf.
+fn with_clause_extract(
+    with_clause: &pg_query::protobuf::WithClause,
+) -> Result<Vec<CteDefinition>, AstError> {
+    if with_clause.recursive {
+        return Err(AstError::UnsupportedFeature {
+            feature: "WITH RECURSIVE".to_owned(),
+        });
+    }
+
+    let mut ctes = Vec::new();
+
+    for cte_node in &with_clause.ctes {
+        let Some(NodeEnum::CommonTableExpr(cte)) = &cte_node.node else {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("WITH clause entry: {cte_node:?}"),
+            });
+        };
+
+        if cte.cterecursive {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("recursive CTE: {}", cte.ctename),
+            });
+        }
+
+        let materialization = match CteMaterialize::try_from(cte.ctematerialized) {
+            Ok(CteMaterialize::Always) => CteMaterialization::Materialized,
+            Ok(CteMaterialize::Never) => CteMaterialization::NotMaterialized,
+            _ => CteMaterialization::Default,
+        };
+
+        let column_aliases = cte
+            .aliascolnames
+            .iter()
+            .filter_map(|n| {
+                if let Some(NodeEnum::String(s)) = &n.node {
+                    Some(s.sval.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Parse inner query with context of previously parsed CTEs
+        // (supports CTE-referencing-CTE)
+        let inner_select = cte
+            .ctequery
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| AstError::UnsupportedFeature {
+                feature: format!("CTE missing query: {}", cte.ctename),
+            })?;
+
+        let NodeEnum::SelectStmt(inner_stmt) = inner_select else {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("CTE query is not SELECT: {}", cte.ctename),
+            });
+        };
+
+        let ctx = ParseContext {
+            ctes: ctes.clone(),
+        };
+        let query = select_stmt_to_query_expr_with_ctx(inner_stmt, &ctx)?;
+
+        ctes.push(CteDefinition {
+            name: cte.ctename.clone(),
+            query,
+            column_aliases,
+            materialization,
+        });
+    }
+
+    Ok(ctes)
+}
+
+/// Convert a SelectStmt to a QueryExpr, handling set operations.
+/// Public entry point — creates an empty ParseContext.
 pub fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, AstError> {
+    let ctx = ParseContext::empty();
+    select_stmt_to_query_expr_with_ctx(select_stmt, &ctx)
+}
+
+/// Convert a SelectStmt to a QueryExpr with CTE context.
+fn select_stmt_to_query_expr_with_ctx(
+    select_stmt: &SelectStmt,
+    outer_ctx: &ParseContext,
+) -> Result<QueryExpr, AstError> {
+    // Parse WITH clause if present, merging with any outer CTE context
+    let ctes = if let Some(with_clause) = &select_stmt.with_clause {
+        with_clause_extract(with_clause)?
+    } else {
+        Vec::new()
+    };
+
+    // Build context: outer CTEs + this level's CTEs
+    let mut all_ctes = outer_ctx.ctes.clone();
+    all_ctes.extend(ctes.clone());
+    let ctx = ParseContext { ctes: all_ctes };
     let set_op = SetOperation::try_from(select_stmt.op).unwrap_or(SetOperation::Undefined);
 
     // ORDER BY and LIMIT apply to the whole query expression
@@ -1841,7 +2074,7 @@ pub fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, 
                 let rows = value_list_convert(&select_stmt.values_lists)?;
                 QueryBody::Values(ValuesClause { rows })
             } else {
-                let select_node = select_stmt_to_select_node(select_stmt)?;
+                let select_node = select_stmt_to_select_node(select_stmt, &ctx)?;
                 QueryBody::Select(select_node)
             }
         }
@@ -1860,9 +2093,9 @@ pub fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, 
                     feature: "SET operation without right argument".to_owned(),
                 })?;
 
-            // Recursively convert left and right
-            let left = select_stmt_to_query_expr(larg)?;
-            let right = select_stmt_to_query_expr(rarg)?;
+            // Recursively convert left and right with CTE context
+            let left = select_stmt_to_query_expr_with_ctx(larg, &ctx)?;
+            let right = select_stmt_to_query_expr_with_ctx(rarg, &ctx)?;
 
             let op_type = match set_op {
                 SetOperation::SetopUnion => SetOpType::Union,
@@ -1882,6 +2115,7 @@ pub fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, 
     };
 
     Ok(QueryExpr {
+        ctes,
         body,
         order_by,
         limit,
@@ -1889,9 +2123,12 @@ pub fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, 
 }
 
 /// Convert a SelectStmt to a SelectNode (without ORDER BY/LIMIT)
-fn select_stmt_to_select_node(select_stmt: &SelectStmt) -> Result<SelectNode, AstError> {
+fn select_stmt_to_select_node(
+    select_stmt: &SelectStmt,
+    ctx: &ParseContext,
+) -> Result<SelectNode, AstError> {
     let columns = select_columns_convert(&select_stmt.target_list)?;
-    let from = from_clause_convert(&select_stmt.from_clause)?;
+    let from = from_clause_convert(&select_stmt.from_clause, ctx)?;
     let where_clause = select_stmt_parse_where(select_stmt)?;
     let group_by = group_by_clause_convert(&select_stmt.group_clause)?;
     let having = having_clause_convert(select_stmt.having_clause.as_deref())?;
@@ -2063,21 +2300,24 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
     }
 }
 
-fn from_clause_convert(from_clause: &[Node]) -> Result<Vec<TableSource>, AstError> {
+fn from_clause_convert(
+    from_clause: &[Node],
+    ctx: &ParseContext,
+) -> Result<Vec<TableSource>, AstError> {
     let mut tables = Vec::new();
 
     for from_node in from_clause {
         match &from_node.node {
             Some(NodeEnum::RangeVar(range_var)) => {
-                let table_node = table_node_convert(range_var)?;
+                let table_node = table_node_convert(range_var, ctx)?;
                 tables.push(table_node);
             }
             Some(NodeEnum::RangeSubselect(range_subselect)) => {
-                let table_subquery_node = table_subquery_node_convert(range_subselect)?;
+                let table_subquery_node = table_subquery_node_convert(range_subselect, ctx)?;
                 tables.push(table_subquery_node);
             }
             Some(NodeEnum::JoinExpr(join_expr)) => {
-                let join_node = join_expr_convert(join_expr)?;
+                let join_node = join_expr_convert(join_expr, ctx)?;
                 tables.push(join_node);
             }
             _ => {
@@ -2091,15 +2331,15 @@ fn from_clause_convert(from_clause: &[Node]) -> Result<Vec<TableSource>, AstErro
     Ok(tables)
 }
 
-fn join_arg_convert(node: &Node, side: &str) -> Result<TableSource, AstError> {
+fn join_arg_convert(node: &Node, side: &str, ctx: &ParseContext) -> Result<TableSource, AstError> {
     match &node.node {
-        Some(NodeEnum::RangeVar(range_var)) => table_node_convert(range_var),
+        Some(NodeEnum::RangeVar(range_var)) => table_node_convert(range_var, ctx),
         Some(NodeEnum::RangeSubselect(range_subselect)) => {
-            table_subquery_node_convert(range_subselect)
+            table_subquery_node_convert(range_subselect, ctx)
         }
         Some(NodeEnum::JoinExpr(nested_join)) => {
             // Recursively handle nested joins
-            join_expr_convert(nested_join)
+            join_expr_convert(nested_join, ctx)
         }
         _ => Err(AstError::UnsupportedSelectFeature {
             feature: format!("join {side} argument: {node:?}"),
@@ -2107,10 +2347,10 @@ fn join_arg_convert(node: &Node, side: &str) -> Result<TableSource, AstError> {
     }
 }
 
-fn join_expr_convert(join_expr: &JoinExpr) -> Result<TableSource, AstError> {
+fn join_expr_convert(join_expr: &JoinExpr, ctx: &ParseContext) -> Result<TableSource, AstError> {
     // Convert left argument - can be a table, subquery, or another join
     let left_table = if let Some(larg_node) = &join_expr.larg {
-        join_arg_convert(larg_node, "left")?
+        join_arg_convert(larg_node, "left", ctx)?
     } else {
         return Err(AstError::UnsupportedSelectFeature {
             feature: "join missing left argument".to_owned(),
@@ -2119,7 +2359,7 @@ fn join_expr_convert(join_expr: &JoinExpr) -> Result<TableSource, AstError> {
 
     // Convert right argument - can be a table, subquery, or another join
     let right_table = if let Some(rarg_node) = &join_expr.rarg {
-        join_arg_convert(rarg_node, "right")?
+        join_arg_convert(rarg_node, "right", ctx)?
     } else {
         return Err(AstError::UnsupportedSelectFeature {
             feature: "join missing right argument".to_owned(),
@@ -2140,7 +2380,7 @@ fn join_expr_convert(join_expr: &JoinExpr) -> Result<TableSource, AstError> {
     }))
 }
 
-fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
+fn table_node_convert(range_var: &RangeVar, ctx: &ParseContext) -> Result<TableSource, AstError> {
     let schema = if range_var.schemaname.is_empty() {
         None
     } else {
@@ -2164,6 +2404,19 @@ fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
             .collect::<Vec<_>>(),
     });
 
+    // Check if this is a CTE reference (unqualified name matching a CTE)
+    if schema.is_none()
+        && let Some(cte_def) = ctx.cte_find(&name)
+    {
+        return Ok(TableSource::CteRef(CteRefNode {
+            cte_name: name,
+            query: Box::new(cte_def.query.clone()),
+            column_aliases: cte_def.column_aliases.clone(),
+            materialization: cte_def.materialization,
+            alias,
+        }));
+    }
+
     Ok(TableSource::Table(TableNode {
         schema,
         name,
@@ -2171,7 +2424,10 @@ fn table_node_convert(range_var: &RangeVar) -> Result<TableSource, AstError> {
     }))
 }
 
-fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<TableSource, AstError> {
+fn table_subquery_node_convert(
+    range_subselect: &RangeSubselect,
+    ctx: &ParseContext,
+) -> Result<TableSource, AstError> {
     let Some(NodeEnum::SelectStmt(select_stmt)) = range_subselect
         .subquery
         .as_ref()
@@ -2182,7 +2438,7 @@ fn table_subquery_node_convert(range_subselect: &RangeSubselect) -> Result<Table
         });
     };
 
-    let query = select_stmt_to_query_expr(select_stmt)?;
+    let query = select_stmt_to_query_expr_with_ctx(select_stmt, ctx)?;
 
     let alias = range_subselect.alias.as_ref().map(|alias_node| TableAlias {
         name: alias_node.aliasname.clone(),
@@ -5246,5 +5502,357 @@ mod tests {
 
         assert!(buf.contains("EXISTS"), "Deparsed should contain EXISTS: {}", buf);
         assert!(buf.contains("items"), "Deparsed should contain subquery table: {}", buf);
+    }
+
+    // ====================================================================
+    // CTE tests
+    // ====================================================================
+
+    #[test]
+    fn test_cte_simple_parsed() {
+        let query = parse_query("WITH x AS (SELECT id FROM users) SELECT * FROM x");
+
+        // QueryExpr should have one CTE definition
+        assert_eq!(query.ctes.len(), 1);
+        assert_eq!(query.ctes[0].name, "x");
+        assert_eq!(query.ctes[0].materialization, CteMaterialization::Default);
+
+        // Body should reference CTE via CteRef, not Table
+        let select = query.as_select().unwrap();
+        assert_eq!(select.from.len(), 1);
+        match &select.from[0] {
+            TableSource::CteRef(cte_ref) => {
+                assert_eq!(cte_ref.cte_name, "x");
+                assert!(cte_ref.alias.is_none());
+                // Inner query should reference "users"
+                let inner_tables: Vec<_> = cte_ref
+                    .query
+                    .nodes::<TableNode>()
+                    .map(|t| t.name.as_str())
+                    .collect();
+                assert_eq!(inner_tables, vec!["users"]);
+            }
+            other => panic!("expected CteRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_deparse() {
+        let query = parse_query("WITH x AS (SELECT id FROM users) SELECT * FROM x");
+        let mut buf = String::new();
+        query.deparse(&mut buf);
+
+        assert!(buf.contains("WITH"), "should contain WITH: {buf}");
+        assert!(buf.contains("x AS"), "should contain CTE name: {buf}");
+        // The FROM clause should reference x by name, not inline the body
+        // The output should have the CTE body once (in WITH) and the name once (in FROM)
+        let x_count = buf.matches(" x").count();
+        assert!(
+            x_count >= 2,
+            "should reference x at least twice (definition + FROM): {buf}"
+        );
+    }
+
+    #[test]
+    fn test_cte_column_aliases() {
+        let query =
+            parse_query("WITH x(a, b) AS (SELECT id, name FROM users) SELECT * FROM x");
+
+        assert_eq!(query.ctes[0].column_aliases, vec!["a", "b"]);
+
+        // CteRefNode should also have column aliases
+        let select = query.as_select().unwrap();
+        match &select.from[0] {
+            TableSource::CteRef(cte_ref) => {
+                assert_eq!(cte_ref.column_aliases, vec!["a", "b"]);
+            }
+            other => panic!("expected CteRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_reference_alias() {
+        let query =
+            parse_query("WITH x AS (SELECT id FROM users) SELECT * FROM x AS y");
+
+        let select = query.as_select().unwrap();
+        match &select.from[0] {
+            TableSource::CteRef(cte_ref) => {
+                assert_eq!(cte_ref.cte_name, "x");
+                assert_eq!(cte_ref.alias.as_ref().unwrap().name, "y");
+            }
+            other => panic!("expected CteRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_with_join() {
+        let query = parse_query(
+            "WITH active AS (SELECT id, name FROM users WHERE active = true) \
+             SELECT u.id, a.name FROM users u JOIN active a ON u.id = a.id",
+        );
+
+        assert_eq!(query.ctes.len(), 1);
+        let select = query.as_select().unwrap();
+        assert_eq!(select.from.len(), 1);
+
+        // Should be a Join with Table on left and CteRef on right
+        match &select.from[0] {
+            TableSource::Join(join) => {
+                assert!(matches!(*join.left, TableSource::Table(_)));
+                assert!(matches!(*join.right, TableSource::CteRef(_)));
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_referencing_cte() {
+        let query = parse_query(
+            "WITH a AS (SELECT id FROM users), \
+             b AS (SELECT * FROM a) \
+             SELECT * FROM b",
+        );
+
+        assert_eq!(query.ctes.len(), 2);
+        assert_eq!(query.ctes[0].name, "a");
+        assert_eq!(query.ctes[1].name, "b");
+
+        // CTE b's body should contain a CteRef to a
+        let b_select = query.ctes[1].query.as_select().unwrap();
+        match &b_select.from[0] {
+            TableSource::CteRef(cte_ref) => {
+                assert_eq!(cte_ref.cte_name, "a");
+            }
+            other => panic!("expected CteRef in b's body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_multiple_references() {
+        let query = parse_query(
+            "WITH x AS (SELECT id FROM users) \
+             SELECT * FROM x a JOIN x b ON a.id = b.id",
+        );
+
+        assert_eq!(query.ctes.len(), 1);
+        let select = query.as_select().unwrap();
+
+        // Should be a Join with two CteRef nodes
+        match &select.from[0] {
+            TableSource::Join(join) => {
+                assert!(matches!(*join.left, TableSource::CteRef(_)));
+                assert!(matches!(*join.right, TableSource::CteRef(_)));
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_in_union() {
+        let query = parse_query(
+            "WITH x AS (SELECT id FROM users) \
+             SELECT * FROM x UNION ALL SELECT * FROM x",
+        );
+
+        assert_eq!(query.ctes.len(), 1);
+
+        match &query.body {
+            QueryBody::SetOp(set_op) => {
+                // Both sides should have CteRef
+                let left_select = set_op.left.as_select().unwrap();
+                assert!(matches!(&left_select.from[0], TableSource::CteRef(_)));
+
+                let right_select = set_op.right.as_select().unwrap();
+                assert!(matches!(&right_select.from[0], TableSource::CteRef(_)));
+            }
+            _ => panic!("expected SetOp"),
+        }
+    }
+
+    #[test]
+    fn test_cte_unreferenced() {
+        let query = parse_query(
+            "WITH x AS (SELECT 1) SELECT * FROM users",
+        );
+
+        // CTE definition should still be stored
+        assert_eq!(query.ctes.len(), 1);
+        assert_eq!(query.ctes[0].name, "x");
+
+        // Body should reference users as a Table, not CteRef
+        let select = query.as_select().unwrap();
+        match &select.from[0] {
+            TableSource::Table(table) => {
+                assert_eq!(table.name, "users");
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_schema_qualified_not_replaced() {
+        let query = parse_query(
+            "WITH users AS (SELECT 1 AS id) SELECT * FROM public.users",
+        );
+
+        assert_eq!(query.ctes.len(), 1);
+
+        // public.users should remain as Table (schema-qualified)
+        let select = query.as_select().unwrap();
+        match &select.from[0] {
+            TableSource::Table(table) => {
+                assert_eq!(table.schema.as_deref(), Some("public"));
+                assert_eq!(table.name, "users");
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_recursive_rejected() {
+        let result = pg_query::parse(
+            "WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT 1) SELECT * FROM x",
+        );
+        if let Ok(ast) = result {
+            let result = query_expr_convert(&ast);
+            assert!(result.is_err(), "recursive CTE should be rejected");
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string().contains("RECURSIVE"),
+                "error should mention RECURSIVE: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cte_materialized() {
+        let query = parse_query(
+            "WITH x AS MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
+        );
+
+        assert_eq!(query.ctes[0].materialization, CteMaterialization::Materialized);
+
+        let select = query.as_select().unwrap();
+        match &select.from[0] {
+            TableSource::CteRef(cte_ref) => {
+                assert_eq!(cte_ref.materialization, CteMaterialization::Materialized);
+            }
+            other => panic!("expected CteRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cte_not_materialized() {
+        let query = parse_query(
+            "WITH x AS NOT MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
+        );
+
+        assert_eq!(
+            query.ctes[0].materialization,
+            CteMaterialization::NotMaterialized
+        );
+    }
+
+    #[test]
+    fn test_cte_select_branches() {
+        let query = parse_query(
+            "WITH x AS (SELECT id FROM users WHERE active = true) SELECT * FROM x",
+        );
+
+        let branches = query.select_branches();
+        // Should have branches from: the CTE body (users) + the outer query (CteRef body)
+        // CTE definition branch + CteRef body branch + outer SELECT
+        // Actually: select_branches_collect collects from ctes first (CTE definition's body),
+        // then from body (outer SELECT including CteRef which recursively collects from CteRef's body)
+        // CTE def body has users → 1 branch
+        // Outer SELECT → 1 branch, which then recurses into CteRef → 1 more branch
+        assert!(
+            branches.len() >= 2,
+            "should have at least 2 select branches (CTE + outer): got {}",
+            branches.len()
+        );
+
+        // All branches combined should reference "users"
+        let table_names: Vec<_> = branches
+            .iter()
+            .flat_map(|b| b.direct_table_nodes())
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(
+            table_names.contains(&"users"),
+            "branches should reference users: {table_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_cte_nodes_traversal() {
+        let query = parse_query(
+            "WITH x AS (SELECT id FROM users) SELECT * FROM x",
+        );
+
+        let table_names: Vec<_> = query
+            .nodes::<TableNode>()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(
+            table_names.contains(&"users"),
+            "nodes traversal should find users: {table_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_cte_deparse_materialized() {
+        let query = parse_query(
+            "WITH x AS MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
+        );
+        let mut buf = String::new();
+        query.deparse(&mut buf);
+
+        assert!(
+            buf.contains("MATERIALIZED"),
+            "deparse should contain MATERIALIZED: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_cte_deparse_not_materialized() {
+        let query = parse_query(
+            "WITH x AS NOT MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
+        );
+        let mut buf = String::new();
+        query.deparse(&mut buf);
+
+        assert!(
+            buf.contains("NOT MATERIALIZED"),
+            "deparse should contain NOT MATERIALIZED: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_cte_multiple_definitions() {
+        let query = parse_query(
+            "WITH a AS (SELECT id FROM users), \
+             b AS (SELECT id FROM products) \
+             SELECT * FROM a JOIN b ON a.id = b.id",
+        );
+
+        assert_eq!(query.ctes.len(), 2);
+        assert_eq!(query.ctes[0].name, "a");
+        assert_eq!(query.ctes[1].name, "b");
+
+        let select = query.as_select().unwrap();
+        match &select.from[0] {
+            TableSource::Join(join) => {
+                match (&*join.left, &*join.right) {
+                    (TableSource::CteRef(left), TableSource::CteRef(right)) => {
+                        assert_eq!(left.cte_name, "a");
+                        assert_eq!(right.cte_name, "b");
+                    }
+                    other => panic!("expected two CteRefs, got {other:?}"),
+                }
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
     }
 }
