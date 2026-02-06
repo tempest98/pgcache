@@ -192,9 +192,13 @@ fn where_expr_parameters_replace(
                 where_expr_parameters_replace(arg, parameters)?;
             }
         }
-        WhereExpr::Subquery { .. } => {
-            // Subqueries would need their own parameter replacement
-            // but we don't currently support subqueries with parameters
+        WhereExpr::Subquery {
+            query, test_expr, ..
+        } => {
+            query_expr_parameters_replace_mut(query, parameters)?;
+            if let Some(test) = test_expr {
+                where_expr_parameters_replace(test, parameters)?;
+            }
         }
     }
     Ok(())
@@ -1455,6 +1459,102 @@ mod tests {
 
         assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
     }
+
+    // ==================== WHERE Subquery Parameter Tests ====================
+
+    #[test]
+    fn test_parameters_replace_in_subquery() {
+        let mut node =
+            parse_select_node("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > $1)");
+
+        let params = typed_text_params(vec![(Some(b"100"), PgType::INT4)]);
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        node.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 100)"
+        );
+    }
+
+    #[test]
+    fn test_parameters_replace_exists_subquery() {
+        let mut node = parse_select_node(
+            "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > $1)",
+        );
+
+        let params = typed_text_params(vec![(Some(b"50"), PgType::INT4)]);
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        node.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > 50)"
+        );
+    }
+
+    #[test]
+    fn test_parameters_replace_subquery_with_outer_param() {
+        let mut node = parse_select_node(
+            "SELECT id FROM users WHERE status = $1 AND id IN (SELECT user_id FROM orders WHERE total > $2)",
+        );
+
+        let params = typed_text_params(vec![
+            (Some(b"active"), PgType::TEXT),
+            (Some(b"200"), PgType::INT4),
+        ]);
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        node.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT id FROM users WHERE status = 'active' AND id IN (SELECT user_id FROM orders WHERE total > 200)"
+        );
+    }
+
+    #[test]
+    fn test_parameters_replace_nested_subquery() {
+        let mut node = parse_select_node(
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > $1))",
+        );
+
+        let params = typed_text_params(vec![(Some(b"99"), PgType::INT4)]);
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        node.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > 99))"
+        );
+    }
+
+    #[test]
+    fn test_parameters_replace_scalar_subquery_in_where() {
+        let mut node = parse_select_node(
+            "SELECT id FROM users WHERE age > (SELECT avg(age) FROM users WHERE status = $1)",
+        );
+
+        let params = typed_text_params(vec![(Some(b"active"), PgType::TEXT)]);
+        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
+
+        let mut buf = String::new();
+        node.deparse(&mut buf);
+
+        assert_eq!(
+            buf,
+            "SELECT id FROM users WHERE age > (SELECT AVG(age) FROM users WHERE status = 'active')"
+        );
+    }
+
+    // ==================== Resolved Node Tests ====================
 
     #[test]
     fn test_resolved_select_node_replace_strips_group_by() {
