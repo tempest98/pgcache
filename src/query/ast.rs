@@ -202,9 +202,6 @@ pub enum UnaryOp {
     IsNull,
     #[strum(to_string = "IS NOT NULL")]
     IsNotNull,
-    Exists,
-    #[strum(to_string = "NOT EXISTS")]
-    NotExists,
 }
 
 impl Deparse for UnaryOp {
@@ -294,8 +291,8 @@ impl Deparse for UnaryExpr {
                 buf.push(' ');
                 self.op.deparse(buf);
             }
-            UnaryOp::Not | UnaryOp::Exists | UnaryOp::NotExists => {
-                // Prefix operators: NOT expr
+            UnaryOp::Not => {
+                // Prefix operator: NOT expr
                 self.op.deparse(buf);
                 buf.push(' ');
                 self.expr.deparse(buf);
@@ -446,72 +443,43 @@ impl WhereExpr {
     }
 
     /// Check if this WHERE expression contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
+    pub fn has_subqueries(&self) -> bool {
         match self {
-            WhereExpr::Binary(binary) => binary.lexpr.has_sublink() || binary.rexpr.has_sublink(),
-            WhereExpr::Unary(unary) => unary.expr.has_sublink(),
-            WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_sublink()),
-            WhereExpr::Function { args, .. } => args.iter().any(|e| e.has_sublink()),
+            WhereExpr::Binary(binary) => binary.lexpr.has_subqueries() || binary.rexpr.has_subqueries(),
+            WhereExpr::Unary(unary) => unary.expr.has_subqueries(),
+            WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_subqueries()),
+            WhereExpr::Function { args, .. } => args.iter().any(|e| e.has_subqueries()),
             WhereExpr::Subquery { .. } => true,
             WhereExpr::Value(_) | WhereExpr::Column(_) => false,
         }
     }
 
     /// Recursively collect SELECT branches from subqueries in this WHERE expression.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
-        match self {
-            WhereExpr::Binary(binary) => {
-                binary.lexpr.collect_subquery_branches(branches);
-                binary.rexpr.collect_subquery_branches(branches);
-            }
-            WhereExpr::Unary(unary) => {
-                unary.expr.collect_subquery_branches(branches);
-            }
-            WhereExpr::Multi(multi) => {
-                for expr in &multi.exprs {
-                    expr.collect_subquery_branches(branches);
-                }
-            }
-            WhereExpr::Function { args, .. } => {
-                for arg in args {
-                    arg.collect_subquery_branches(branches);
-                }
-            }
-            WhereExpr::Subquery { query, test_expr, .. } => {
-                query.select_branches_collect(branches);
-                if let Some(test) = test_expr {
-                    test.collect_subquery_branches(branches);
-                }
-            }
-            WhereExpr::Value(_) | WhereExpr::Column(_) => {}
-        }
-    }
-
     /// Recursively collect subquery branches with source tracking.
     /// `negated` tracks NOT-wrapping to flip Inclusion↔Exclusion for
     /// EXISTS/ANY subqueries. ALL is already Exclusion (NOT IN).
-    fn subquery_branches_with_source_collect<'a>(
+    fn subquery_nodes_collect<'a>(
         &'a self,
         branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
         negated: bool,
     ) {
         match self {
             WhereExpr::Binary(binary) => {
-                binary.lexpr.subquery_branches_with_source_collect(branches, negated);
-                binary.rexpr.subquery_branches_with_source_collect(branches, negated);
+                binary.lexpr.subquery_nodes_collect(branches, negated);
+                binary.rexpr.subquery_nodes_collect(branches, negated);
             }
             WhereExpr::Unary(unary) => {
                 let child_negated = if unary.op == UnaryOp::Not { !negated } else { negated };
-                unary.expr.subquery_branches_with_source_collect(branches, child_negated);
+                unary.expr.subquery_nodes_collect(branches, child_negated);
             }
             WhereExpr::Multi(multi) => {
                 for expr in &multi.exprs {
-                    expr.subquery_branches_with_source_collect(branches, negated);
+                    expr.subquery_nodes_collect(branches, negated);
                 }
             }
             WhereExpr::Function { args, .. } => {
                 for arg in args {
-                    arg.subquery_branches_with_source_collect(branches, negated);
+                    arg.subquery_nodes_collect(branches, negated);
                 }
             }
             WhereExpr::Subquery { query, sublink_type, test_expr } => {
@@ -525,9 +493,9 @@ impl WhereExpr {
                     }
                 };
                 let source = UpdateQuerySource::Subquery(kind);
-                query.branches_with_source_collect(branches, source, negated);
+                query.select_nodes_collect(branches, source, negated);
                 if let Some(test) = test_expr {
-                    test.subquery_branches_with_source_collect(branches, negated);
+                    test.subquery_nodes_collect(branches, negated);
                 }
             }
             WhereExpr::Value(_) | WhereExpr::Column(_) => {}
@@ -650,7 +618,7 @@ impl ValuesClause {
             .flat_map(|row| row.iter().flat_map(|v| v.nodes()))
     }
 
-    pub fn has_sublink(&self) -> bool {
+    pub fn has_subqueries(&self) -> bool {
         false // VALUES clauses contain only literals
     }
 }
@@ -730,29 +698,29 @@ impl SelectNode {
     }
 
     /// Check if this SELECT contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
+    pub fn has_subqueries(&self) -> bool {
         // Check columns for subqueries
         if let SelectColumns::Columns(columns) = &self.columns
-            && columns.iter().any(|col| col.expr.has_sublink())
+            && columns.iter().any(|col| col.expr.has_subqueries())
         {
             return true;
         }
 
         // Check FROM clause for subqueries
-        if self.from.iter().any(TableSource::has_sublink) {
+        if self.from.iter().any(TableSource::has_subqueries) {
             return true;
         }
 
         // Check WHERE clause for subqueries
         if let Some(where_clause) = &self.where_clause
-            && where_clause.has_sublink()
+            && where_clause.has_subqueries()
         {
             return true;
         }
 
         // Check HAVING clause for subqueries
         if let Some(having) = &self.having
-            && having.has_sublink()
+            && having.has_subqueries()
         {
             return true;
         }
@@ -820,8 +788,8 @@ impl SetOpNode {
         Box::new(current.chain(left_nodes).chain(right_nodes))
     }
 
-    pub fn has_sublink(&self) -> bool {
-        self.left.has_sublink() || self.right.has_sublink()
+    pub fn has_subqueries(&self) -> bool {
+        self.left.has_subqueries() || self.right.has_subqueries()
     }
 }
 
@@ -858,11 +826,11 @@ impl QueryBody {
         Box::new(current.chain(children))
     }
 
-    pub fn has_sublink(&self) -> bool {
+    pub fn has_subqueries(&self) -> bool {
         match self {
-            QueryBody::Select(select) => select.has_sublink(),
-            QueryBody::Values(values) => values.has_sublink(),
-            QueryBody::SetOp(set_op) => set_op.has_sublink(),
+            QueryBody::Select(select) => select.has_subqueries(),
+            QueryBody::Values(values) => values.has_subqueries(),
+            QueryBody::SetOp(set_op) => set_op.has_subqueries(),
         }
     }
 }
@@ -954,32 +922,16 @@ impl QueryExpr {
         }
     }
 
-    /// Check if this is a SELECT * query (only for SELECT bodies)
-    pub fn is_select_star(&self) -> bool {
-        match &self.body {
-            QueryBody::Select(select) => matches!(select.columns, SelectColumns::All),
-            QueryBody::Values(_) | QueryBody::SetOp(_) => false,
-        }
-    }
-
-    /// Check if this query contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
+    /// Check if this query contains subqueries
+    pub fn has_subqueries(&self) -> bool {
         !self.ctes.is_empty()
-            || self.body.has_sublink()
-            || self.order_by.iter().any(|o| o.expr.has_sublink())
+            || self.body.has_subqueries()
+            || self.order_by.iter().any(|o| o.expr.has_subqueries())
     }
 
     /// Get the SELECT body if this is a simple SELECT query
     pub fn as_select(&self) -> Option<&SelectNode> {
         match &self.body {
-            QueryBody::Select(select) => Some(select),
-            QueryBody::Values(_) | QueryBody::SetOp(_) => None,
-        }
-    }
-
-    /// Get the SELECT body mutably if this is a simple SELECT query
-    pub fn as_select_mut(&mut self) -> Option<&mut SelectNode> {
-        match &mut self.body {
             QueryBody::Select(select) => Some(select),
             QueryBody::Values(_) | QueryBody::SetOp(_) => None,
         }
@@ -991,63 +943,30 @@ impl QueryExpr {
     /// For set operations (UNION/INTERSECT/EXCEPT), recursively extracts
     /// all SELECT branches from both sides.
     /// VALUES clauses are skipped (they don't reference tables).
-    pub fn select_branches(&self) -> Vec<&SelectNode> {
-        let mut branches = Vec::new();
-        self.select_branches_collect(&mut branches);
-        branches
-    }
-
-    /// Helper to recursively collect SELECT branches.
-    fn select_branches_collect<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
-        // Collect from CTE definitions
-        for cte in &self.ctes {
-            cte.query.select_branches_collect(branches);
-        }
-
-        match &self.body {
-            QueryBody::Select(select) => {
-                branches.push(select);
-                // Descend into subqueries in FROM clause
-                for source in &select.from {
-                    source.collect_subquery_branches(branches);
-                }
-                // Descend into subqueries in WHERE clause
-                if let Some(where_clause) = &select.where_clause {
-                    where_clause.collect_subquery_branches(branches);
-                }
-                // Descend into subqueries in HAVING clause
-                if let Some(having) = &select.having {
-                    having.collect_subquery_branches(branches);
-                }
-                // Descend into subqueries in SELECT list
-                select.columns.collect_subquery_branches(branches);
-            }
-            QueryBody::Values(_) => {
-                // VALUES clauses don't reference tables, skip
-            }
-            QueryBody::SetOp(set_op) => {
-                set_op.left.select_branches_collect(branches);
-                set_op.right.select_branches_collect(branches);
-            }
-        }
+    /// CTE definitions are collected via CteRef references, not eagerly.
+    pub fn select_nodes(&self) -> Vec<&SelectNode> {
+        self.select_nodes_with_source()
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect()
     }
 
     /// Extract all SELECT branches with their source context (Direct vs Subquery).
     ///
-    /// Unlike `select_branches()`, this tracks whether each branch came from
-    /// the top-level body (Direct) or from a subquery context (Subquery with kind).
-    /// CTE definitions are not collected directly — their branches are collected
-    /// when referenced via CteRef, inheriting the reference site's source context.
-    pub fn select_branches_with_source(&self) -> Vec<(&SelectNode, UpdateQuerySource)> {
+    /// Tracks whether each branch came from the top-level body (Direct) or
+    /// from a subquery context (Subquery with kind). CTE definitions are not
+    /// collected directly — their branches are collected when referenced via
+    /// CteRef, inheriting the reference site's source context.
+    pub fn select_nodes_with_source(&self) -> Vec<(&SelectNode, UpdateQuerySource)> {
         let mut branches = Vec::new();
-        self.branches_with_source_collect(&mut branches, UpdateQuerySource::Direct, false);
+        self.select_nodes_collect(&mut branches, UpdateQuerySource::Direct, false);
         branches
     }
 
     /// Collects branches with source tracking.
     /// `outer_source` is the source assigned to this query's body branches.
     /// `negated` tracks NOT-wrapping to flip Inclusion↔Exclusion.
-    fn branches_with_source_collect<'a>(
+    fn select_nodes_collect<'a>(
         &'a self,
         branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
         outer_source: UpdateQuerySource,
@@ -1057,19 +976,19 @@ impl QueryExpr {
             QueryBody::Select(select) => {
                 branches.push((select, outer_source));
                 for source in &select.from {
-                    source.subquery_branches_with_source_collect(branches, negated);
+                    source.subquery_nodes_collect(branches, negated);
                 }
                 if let Some(where_clause) = &select.where_clause {
-                    where_clause.subquery_branches_with_source_collect(branches, negated);
+                    where_clause.subquery_nodes_collect(branches, negated);
                 }
                 if let Some(having) = &select.having {
-                    having.subquery_branches_with_source_collect(branches, negated);
+                    having.subquery_nodes_collect(branches, negated);
                 }
-                select.columns.subquery_branches_with_source_collect(branches);
+                select.columns.subquery_nodes_collect(branches);
             }
             QueryBody::SetOp(set_op) => {
-                set_op.left.branches_with_source_collect(branches, outer_source, negated);
-                set_op.right.branches_with_source_collect(branches, outer_source, negated);
+                set_op.left.select_nodes_collect(branches, outer_source, negated);
+                set_op.right.select_nodes_collect(branches, outer_source, negated);
             }
             QueryBody::Values(_) => {}
         }
@@ -1155,24 +1074,15 @@ impl SelectColumns {
         Box::new(current.chain(children))
     }
 
-    /// Recursively collect SELECT branches from subqueries in the SELECT list.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
-        if let SelectColumns::Columns(columns) = self {
-            for col in columns {
-                col.expr.collect_subquery_branches(branches);
-            }
-        }
-    }
-
     /// Collect subquery branches from SELECT list with source tracking.
     /// All subqueries in a SELECT list are Scalar (must return single value).
-    fn subquery_branches_with_source_collect<'a>(
+    fn subquery_nodes_collect<'a>(
         &'a self,
         branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
     ) {
         if let SelectColumns::Columns(columns) = self {
             for col in columns {
-                col.expr.subquery_branches_with_source_collect(branches);
+                col.expr.subquery_nodes_collect(branches);
             }
         }
     }
@@ -1252,8 +1162,8 @@ impl ArithmeticExpr {
         current.chain(left_children).chain(right_children)
     }
 
-    pub fn has_sublink(&self) -> bool {
-        self.left.has_sublink() || self.right.has_sublink()
+    pub fn has_subqueries(&self) -> bool {
+        self.left.has_subqueries() || self.right.has_subqueries()
     }
 }
 
@@ -1306,50 +1216,19 @@ impl ColumnExpr {
     }
 
     /// Check if this column expression contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
+    pub fn has_subqueries(&self) -> bool {
         match self {
-            ColumnExpr::Function(func) => func.has_sublink(),
-            ColumnExpr::Case(case) => case.has_sublink(),
-            ColumnExpr::Arithmetic(arith) => arith.has_sublink(),
+            ColumnExpr::Function(func) => func.has_subqueries(),
+            ColumnExpr::Case(case) => case.has_subqueries(),
+            ColumnExpr::Arithmetic(arith) => arith.has_subqueries(),
             ColumnExpr::Subquery(_) => true,
             ColumnExpr::Column(_) | ColumnExpr::Literal(_) => false,
         }
     }
 
-    /// Recursively collect SELECT branches from subqueries in this column expression.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
-        match self {
-            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => {}
-            ColumnExpr::Function(func) => {
-                for arg in &func.args {
-                    arg.collect_subquery_branches(branches);
-                }
-            }
-            ColumnExpr::Case(case) => {
-                if let Some(arg) = &case.arg {
-                    arg.collect_subquery_branches(branches);
-                }
-                for when in &case.whens {
-                    when.condition.collect_subquery_branches(branches);
-                    when.result.collect_subquery_branches(branches);
-                }
-                if let Some(default) = &case.default {
-                    default.collect_subquery_branches(branches);
-                }
-            }
-            ColumnExpr::Arithmetic(arith) => {
-                arith.left.collect_subquery_branches(branches);
-                arith.right.collect_subquery_branches(branches);
-            }
-            ColumnExpr::Subquery(query) => {
-                query.select_branches_collect(branches);
-            }
-        }
-    }
-
     /// Collect subquery branches from column expressions with source tracking.
     /// All subqueries within column expressions are Scalar.
-    fn subquery_branches_with_source_collect<'a>(
+    fn subquery_nodes_collect<'a>(
         &'a self,
         branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
     ) {
@@ -1357,29 +1236,29 @@ impl ColumnExpr {
             ColumnExpr::Column(_) | ColumnExpr::Literal(_) => {}
             ColumnExpr::Function(func) => {
                 for arg in &func.args {
-                    arg.subquery_branches_with_source_collect(branches);
+                    arg.subquery_nodes_collect(branches);
                 }
             }
             ColumnExpr::Case(case) => {
                 if let Some(arg) = &case.arg {
-                    arg.subquery_branches_with_source_collect(branches);
+                    arg.subquery_nodes_collect(branches);
                 }
                 for when in &case.whens {
                     // condition is WhereExpr — use negated=false (Scalar context)
-                    when.condition.subquery_branches_with_source_collect(branches, false);
-                    when.result.subquery_branches_with_source_collect(branches);
+                    when.condition.subquery_nodes_collect(branches, false);
+                    when.result.subquery_nodes_collect(branches);
                 }
                 if let Some(default) = &case.default {
-                    default.subquery_branches_with_source_collect(branches);
+                    default.subquery_nodes_collect(branches);
                 }
             }
             ColumnExpr::Arithmetic(arith) => {
-                arith.left.subquery_branches_with_source_collect(branches);
-                arith.right.subquery_branches_with_source_collect(branches);
+                arith.left.subquery_nodes_collect(branches);
+                arith.right.subquery_nodes_collect(branches);
             }
             ColumnExpr::Subquery(query) => {
                 let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);
-                query.branches_with_source_collect(branches, source, false);
+                query.select_nodes_collect(branches, source, false);
             }
         }
     }
@@ -1426,10 +1305,10 @@ impl FunctionCall {
     }
 
     /// Check if this function call contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
-        self.args.iter().any(|arg| arg.has_sublink())
-            || self.agg_order.iter().any(|o| o.expr.has_sublink())
-            || self.over.as_ref().is_some_and(|w| w.has_sublink())
+    pub fn has_subqueries(&self) -> bool {
+        self.args.iter().any(|arg| arg.has_subqueries())
+            || self.agg_order.iter().any(|o| o.expr.has_subqueries())
+            || self.over.as_ref().is_some_and(|w| w.has_subqueries())
     }
 }
 
@@ -1486,9 +1365,9 @@ impl WindowSpec {
     }
 
     /// Check if this window spec contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
-        self.partition_by.iter().any(|p| p.has_sublink())
-            || self.order_by.iter().any(|o| o.expr.has_sublink())
+    pub fn has_subqueries(&self) -> bool {
+        self.partition_by.iter().any(|p| p.has_subqueries())
+            || self.order_by.iter().any(|o| o.expr.has_subqueries())
     }
 }
 
@@ -1546,10 +1425,10 @@ impl CaseExpr {
     }
 
     /// Check if this CASE expression contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
-        self.arg.as_ref().is_some_and(|a| a.has_sublink())
-            || self.whens.iter().any(|w| w.has_sublink())
-            || self.default.as_ref().is_some_and(|d| d.has_sublink())
+    pub fn has_subqueries(&self) -> bool {
+        self.arg.as_ref().is_some_and(|a| a.has_subqueries())
+            || self.whens.iter().any(|w| w.has_subqueries())
+            || self.default.as_ref().is_some_and(|d| d.has_subqueries())
     }
 }
 
@@ -1591,8 +1470,8 @@ impl CaseWhen {
         condition_nodes.chain(result_nodes)
     }
 
-    pub fn has_sublink(&self) -> bool {
-        self.condition.has_sublink() || self.result.has_sublink()
+    pub fn has_subqueries(&self) -> bool {
+        self.condition.has_subqueries() || self.result.has_subqueries()
     }
 }
 
@@ -1631,7 +1510,7 @@ pub enum TableSource {
 /// A reference to a CTE in a FROM clause or subquery position.
 ///
 /// Contains a clone of the CTE's query body so that traversal methods
-/// (nodes, select_branches, etc.) are self-contained without needing
+/// (nodes, select_nodes, etc.) are self-contained without needing
 /// external context.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CteRefNode {
@@ -1665,41 +1544,21 @@ impl TableSource {
     }
 
     /// Check if this table source contains sublinks/subqueries
-    pub fn has_sublink(&self) -> bool {
+    pub fn has_subqueries(&self) -> bool {
         match self {
             TableSource::Subquery(_) | TableSource::CteRef(_) => true,
             TableSource::Table(_) => false,
             TableSource::Join(join) => {
-                join.left.has_sublink()
-                    || join.right.has_sublink()
-                    || join.condition.as_ref().is_some_and(|c| c.has_sublink())
-            }
-        }
-    }
-
-    /// Recursively collect SELECT branches from subqueries in this table source.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a SelectNode>) {
-        match self {
-            TableSource::Table(_) => {}
-            TableSource::Subquery(sub) => {
-                sub.query.select_branches_collect(branches);
-            }
-            TableSource::CteRef(cte_ref) => {
-                cte_ref.query.select_branches_collect(branches);
-            }
-            TableSource::Join(join) => {
-                join.left.collect_subquery_branches(branches);
-                join.right.collect_subquery_branches(branches);
-                if let Some(condition) = &join.condition {
-                    condition.collect_subquery_branches(branches);
-                }
+                join.left.has_subqueries()
+                    || join.right.has_subqueries()
+                    || join.condition.as_ref().is_some_and(|c| c.has_subqueries())
             }
         }
     }
 
     /// Collect subquery branches from table sources with source tracking.
     /// FROM subqueries and CteRef inherit the negation context as Inclusion/Exclusion.
-    fn subquery_branches_with_source_collect<'a>(
+    fn subquery_nodes_collect<'a>(
         &'a self,
         branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
         negated: bool,
@@ -1708,21 +1567,21 @@ impl TableSource {
             TableSource::Table(_) => {}
             TableSource::Subquery(sub) => {
                 let kind = if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion };
-                sub.query.branches_with_source_collect(
+                sub.query.select_nodes_collect(
                     branches, UpdateQuerySource::Subquery(kind), negated,
                 );
             }
             TableSource::CteRef(cte_ref) => {
                 let kind = if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion };
-                cte_ref.query.branches_with_source_collect(
+                cte_ref.query.select_nodes_collect(
                     branches, UpdateQuerySource::Subquery(kind), negated,
                 );
             }
             TableSource::Join(join) => {
-                join.left.subquery_branches_with_source_collect(branches, negated);
-                join.right.subquery_branches_with_source_collect(branches, negated);
+                join.left.subquery_nodes_collect(branches, negated);
+                join.right.subquery_nodes_collect(branches, negated);
                 if let Some(condition) = &join.condition {
-                    condition.subquery_branches_with_source_collect(branches, negated);
+                    condition.subquery_nodes_collect(branches, negated);
                 }
             }
         }
@@ -3136,7 +2995,6 @@ mod tests {
 
         assert!(ast.is_single_table());
         assert!(ast.has_where_clause());
-        assert!(!ast.is_select_star());
         assert_eq!(
             ast.nodes::<TableNode>()
                 .map(|t| (t.schema.as_deref(), t.name.as_str()))
@@ -3151,7 +3009,6 @@ mod tests {
 
         assert!(ast.is_single_table());
         assert!(!ast.has_where_clause());
-        assert!(ast.is_select_star());
         assert_eq!(
             ast.nodes::<TableNode>()
                 .map(|t| (t.schema.as_deref(), t.name.as_str()))
@@ -4563,52 +4420,52 @@ mod tests {
     }
 
     #[test]
-    fn test_has_sublink_in_select_list() {
+    fn test_has_subqueries_in_select_list() {
         let select = parse_select("SELECT id, (SELECT x FROM other WHERE id = 1) as val FROM t");
 
         assert!(
-            select.has_sublink(),
-            "has_sublink() should detect subquery in SELECT list"
+            select.has_subqueries(),
+            "has_subqueries() should detect subquery in SELECT list"
         );
     }
 
     #[test]
-    fn test_has_sublink_in_from_clause() {
+    fn test_has_subqueries_in_from_clause() {
         let select = parse_select("SELECT * FROM (SELECT id FROM users) sub");
 
         assert!(
-            select.has_sublink(),
-            "has_sublink() should detect subquery in FROM clause"
+            select.has_subqueries(),
+            "has_subqueries() should detect subquery in FROM clause"
         );
     }
 
     #[test]
-    fn test_has_sublink_in_join() {
+    fn test_has_subqueries_in_join() {
         let select = parse_select("SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id");
 
         assert!(
-            select.has_sublink(),
-            "has_sublink() should detect subquery in JOIN"
+            select.has_subqueries(),
+            "has_subqueries() should detect subquery in JOIN"
         );
     }
 
     #[test]
-    fn test_has_sublink_in_where_clause() {
+    fn test_has_subqueries_in_where_clause() {
         let select = parse_select("SELECT * FROM t WHERE id IN (SELECT id FROM other)");
 
         assert!(
-            select.has_sublink(),
-            "has_sublink() should detect subquery in WHERE clause"
+            select.has_subqueries(),
+            "has_subqueries() should detect subquery in WHERE clause"
         );
     }
 
     #[test]
-    fn test_has_sublink_no_subquery() {
+    fn test_has_subqueries_no_subquery() {
         let select = parse_select("SELECT id, name FROM users WHERE active = true");
 
         assert!(
-            !select.has_sublink(),
-            "has_sublink() should return false when no subquery exists"
+            !select.has_subqueries(),
+            "has_subqueries() should return false when no subquery exists"
         );
     }
 
@@ -4919,14 +4776,14 @@ mod tests {
     }
 
     #[test]
-    fn test_case_has_sublink() {
+    fn test_case_has_subqueries() {
         // CASE with subquery in WHEN condition
         let select = parse_select(
             "SELECT CASE WHEN id IN (SELECT id FROM other) THEN 1 ELSE 0 END FROM items",
         );
 
         assert!(
-            select.has_sublink(),
+            select.has_subqueries(),
             "CASE with subquery should have sublink"
         );
     }
@@ -5268,7 +5125,6 @@ mod tests {
 
         assert!(query_expr.is_single_table());
         assert!(query_expr.has_where_clause());
-        assert!(!query_expr.is_select_star());
 
         let select = query_expr.as_select().unwrap();
         assert_eq!(select.from.len(), 1);
@@ -5283,7 +5139,7 @@ mod tests {
 
         assert!(query_expr.is_single_table());
         assert!(!query_expr.has_where_clause());
-        assert!(query_expr.is_select_star());
+        assert!(matches!(query_expr.as_select().unwrap().columns, SelectColumns::All));
     }
 
     #[test]
@@ -5463,22 +5319,22 @@ mod tests {
     }
 
     #[test]
-    fn test_select_branches_simple_select() {
+    fn test_select_nodes_simple_select() {
         let sql = "SELECT id FROM users WHERE id = 1";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 1, "simple SELECT should have one branch");
     }
 
     #[test]
-    fn test_select_branches_union() {
+    fn test_select_nodes_union() {
         let sql = "SELECT id FROM users UNION SELECT id FROM admins";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 2, "UNION should have two branches");
 
         // Verify each branch has a FROM clause with different tables
@@ -5499,71 +5355,71 @@ mod tests {
     }
 
     #[test]
-    fn test_select_branches_nested_union() {
+    fn test_select_nodes_nested_union() {
         let sql = "SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM c";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 3, "nested UNION should have three branches");
     }
 
     #[test]
-    fn test_select_branches_from_subquery() {
+    fn test_select_nodes_from_subquery() {
         // Derived table in FROM clause
         let sql = "SELECT * FROM (SELECT id FROM users) sub";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in FROM subquery
         assert_eq!(branches.len(), 2, "FROM subquery should add one branch");
     }
 
     #[test]
-    fn test_select_branches_where_subquery() {
+    fn test_select_nodes_where_subquery() {
         // IN subquery in WHERE clause
         let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM active)";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in WHERE subquery
         assert_eq!(branches.len(), 2, "WHERE IN subquery should add one branch");
     }
 
     #[test]
-    fn test_select_branches_exists_subquery() {
+    fn test_select_nodes_exists_subquery() {
         // EXISTS subquery in WHERE clause
         let sql = "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in EXISTS subquery
         assert_eq!(branches.len(), 2, "WHERE EXISTS subquery should add one branch");
     }
 
     #[test]
-    fn test_select_branches_scalar_subquery() {
+    fn test_select_nodes_scalar_subquery() {
         // Scalar subquery in SELECT list
         let sql = "SELECT id, (SELECT name FROM users WHERE users.id = orders.user_id) FROM orders";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in SELECT list subquery
         assert_eq!(branches.len(), 2, "SELECT list subquery should add one branch");
     }
 
     #[test]
-    fn test_select_branches_nested_subqueries() {
+    fn test_select_nodes_nested_subqueries() {
         // Nested subqueries
         let sql = "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT user_id FROM active)) sub";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         // Outer SELECT + FROM subquery + nested IN subquery
         assert_eq!(branches.len(), 3, "nested subqueries should add all branches");
     }
@@ -5647,11 +5503,11 @@ mod tests {
             select.where_clause.is_some(),
             "Should have WHERE clause"
         );
-        assert!(select.has_sublink(), "Should detect sublink in NOT IN");
+        assert!(select.has_subqueries(), "Should detect sublink in NOT IN");
     }
 
     #[test]
-    fn test_where_subquery_has_sublink_traversal() {
+    fn test_where_subquery_has_subqueries_traversal() {
         // Verify nodes() traverses into subqueries to find TableNode
         let select = parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
 
@@ -5937,23 +5793,14 @@ mod tests {
     }
 
     #[test]
-    fn test_cte_select_branches() {
+    fn test_cte_select_nodes() {
         let query = parse_query(
             "WITH x AS (SELECT id FROM users WHERE active = true) SELECT * FROM x",
         );
 
-        let branches = query.select_branches();
-        // Should have branches from: the CTE body (users) + the outer query (CteRef body)
-        // CTE definition branch + CteRef body branch + outer SELECT
-        // Actually: select_branches_collect collects from ctes first (CTE definition's body),
-        // then from body (outer SELECT including CteRef which recursively collects from CteRef's body)
-        // CTE def body has users → 1 branch
-        // Outer SELECT → 1 branch, which then recurses into CteRef → 1 more branch
-        assert!(
-            branches.len() >= 2,
-            "should have at least 2 select branches (CTE + outer): got {}",
-            branches.len()
-        );
+        let branches = query.select_nodes();
+        // Outer SELECT + CteRef body (CTE collected via reference, not eagerly from definition)
+        assert_eq!(branches.len(), 2);
 
         // All branches combined should reference "users"
         let table_names: Vec<_> = branches
@@ -6039,22 +5886,22 @@ mod tests {
     }
 
     // ==========================================================================
-    // select_branches_with_source tests
+    // select_nodes_with_source tests
     // ==========================================================================
 
     #[test]
-    fn test_branches_with_source_simple() {
+    fn test_select_nodes_with_source_simple() {
         let query = parse_query("SELECT id FROM users WHERE id = 1");
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].1, UpdateQuerySource::Direct);
     }
 
     #[test]
-    fn test_branches_with_source_union() {
+    fn test_select_nodes_with_source_union() {
         let query = parse_query("SELECT id FROM users UNION SELECT id FROM admins");
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
         // Both branches of a UNION are Direct
@@ -6062,11 +5909,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_where_in() {
+    fn test_select_nodes_with_source_where_in() {
         let query = parse_query(
             "SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)",
         );
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         // Outer SELECT (Direct) + IN subquery (Inclusion)
         assert_eq!(branches.len(), 2);
@@ -6078,11 +5925,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_not_in() {
+    fn test_select_nodes_with_source_not_in() {
         let query = parse_query(
             "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)",
         );
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].1, UpdateQuerySource::Direct);
@@ -6096,11 +5943,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_exists() {
+    fn test_select_nodes_with_source_exists() {
         let query = parse_query(
             "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)",
         );
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].1, UpdateQuerySource::Direct);
@@ -6111,11 +5958,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_not_exists() {
+    fn test_select_nodes_with_source_not_exists() {
         let query = parse_query(
             "SELECT * FROM orders WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)",
         );
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].1, UpdateQuerySource::Direct);
@@ -6127,11 +5974,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_scalar_in_where() {
+    fn test_select_nodes_with_source_scalar_in_where() {
         let query = parse_query(
             "SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)",
         );
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].1, UpdateQuerySource::Direct);
@@ -6143,11 +5990,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_scalar_in_select() {
+    fn test_select_nodes_with_source_scalar_in_select() {
         let query = parse_query(
             "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) FROM users",
         );
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].1, UpdateQuerySource::Direct);
@@ -6159,9 +6006,9 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_from_subquery() {
+    fn test_select_nodes_with_source_from_subquery() {
         let query = parse_query("SELECT * FROM (SELECT id FROM users) sub");
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].1, UpdateQuerySource::Direct);
@@ -6173,11 +6020,11 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_cte() {
+    fn test_select_nodes_with_source_cte() {
         let query = parse_query(
             "WITH active AS (SELECT id FROM users WHERE active = true) SELECT * FROM active",
         );
-        let branches = query.select_branches_with_source();
+        let branches = query.select_nodes_with_source();
 
         // Outer SELECT (Direct) + CteRef body (Subquery(Inclusion))
         // CTE definitions are NOT collected — only CteRef references are
@@ -6196,28 +6043,18 @@ mod tests {
     }
 
     #[test]
-    fn test_branches_with_source_cte_no_duplication() {
-        // Verify CTE body is collected only via CteRef, not from definition
+    fn test_select_nodes_cte_no_duplication() {
+        // Both select_nodes() and select_nodes_with_source() collect CTE bodies
+        // via CteRef references only, avoiding duplication from CTE definitions
         let query = parse_query(
             "WITH x AS (SELECT id FROM users) SELECT * FROM x",
         );
 
-        let branches = query.select_branches_with_source();
-        let with_source = query.select_branches_with_source();
-        let without_source = query.select_branches();
+        let with_source = query.select_nodes_with_source();
+        let without_source = query.select_nodes();
 
-        // With source should have 2 (outer + CteRef body)
+        // Both should have 2 (outer + CteRef body)
         assert_eq!(with_source.len(), 2);
-
-        // Without source has 3 (CTE def body + outer + CteRef body) due to legacy collection
-        // The new method avoids the duplication
-        assert!(
-            with_source.len() <= without_source.len(),
-            "with_source ({}) should not exceed without_source ({})",
-            with_source.len(),
-            without_source.len()
-        );
-        // Just verify the branch count is exactly 2 (no CTE def duplication)
-        assert_eq!(branches.len(), 2);
+        assert_eq!(without_source.len(), 2);
     }
 }

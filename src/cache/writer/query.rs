@@ -163,7 +163,7 @@ impl CacheWriter {
         // Extract SELECT branches for population
         // Each branch is processed independently, which handles set operations correctly
         let branches: Vec<_> = resolved
-            .select_branches()
+            .select_nodes()
             .into_iter()
             .cloned()
             .collect();

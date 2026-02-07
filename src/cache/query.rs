@@ -3,7 +3,7 @@ use crate::{
     query::{
         ast::{
             BinaryOp, CteRefNode, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode,
-            SetOpNode, SubLinkType, TableSource, TableSubqueryNode, UnaryOp, WhereExpr,
+            SetOpNode, SubLinkType, TableSource, TableSubqueryNode, WhereExpr,
         },
         transform::{AstTransformResult, query_expr_parameters_replace},
     },
@@ -257,12 +257,7 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
                 Err(CacheabilityError::UnsupportedWhereClause)
             }
         },
-        WhereExpr::Unary(unary_expr) => match unary_expr.op {
-            UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Not => {
-                is_cacheable_expr(&unary_expr.expr, ctx)
-            }
-            UnaryOp::Exists | UnaryOp::NotExists => Err(CacheabilityError::UnsupportedWhereClause),
-        },
+        WhereExpr::Unary(unary_expr) => is_cacheable_expr(&unary_expr.expr, ctx),
         WhereExpr::Function { args, .. } => match ctx {
             ExprContext::FromClause | ExprContext::WhereClause => {
                 Err(CacheabilityError::UnsupportedWhereClause)

@@ -668,11 +668,11 @@ mod tests {
         let ast = pg_query::parse(&result.sql).unwrap();
         let query = query_expr_convert(&ast).expect("subquery should parse to AST");
 
-        // Verify has_sublink() detects the subquery
+        // Verify has_subqueries() detects the subquery
         let QueryBody::Select(select) = &query.body else {
             panic!("expected SELECT");
         };
-        assert!(select.has_sublink(), "has_sublink() should detect subquery in WHERE");
+        assert!(select.has_subqueries(), "has_subqueries() should detect subquery in WHERE");
 
         // Verify cacheability check accepts it (non-correlated subqueries are now cacheable)
         let cacheable_result = CacheableQuery::try_from(&query);

@@ -1,18 +1,12 @@
-use std::collections::HashSet;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use error_set::error_set;
 use ordered_float::NotNan;
 
-use pg_query::protobuf::SelectStmt;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{
     AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, FuncCall, NullTest, NullTestType,
-    ParamRef, SubLink,
+    ParamRef, SelectStmt, SubLink,
 };
-use pg_query::{NodeRef, ParseResult};
 
 use super::ast::{
     BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, SubLinkType, UnaryExpr,
@@ -20,8 +14,6 @@ use super::ast::{
 };
 
 error_set! {
-    ParseError := WhereParseError || SqlError
-
     WhereParseError := {
         #[display("Unsupported WHERE clause pattern")]
         UnsupportedPattern,
@@ -41,74 +33,6 @@ error_set! {
         Other { error: String },
         #[display("Subquery parse error: {error}")]
         SubqueryError { error: String },
-    }
-
-    SqlError := {
-        DeparseError(pg_query::Error)
-    }
-}
-
-pub fn query_fingerprint(ast: &ParseResult) -> Result<u64, SqlError> {
-    let query_sql = ast.deparse()?;
-    let mut hasher = DefaultHasher::new();
-    query_sql.hash(&mut hasher);
-    Ok(hasher.finish())
-}
-
-pub fn query_select_has_sublink(ast: &ParseResult) -> bool {
-    let select_stmt = query_select_statement(ast);
-
-    select_stmt.target_list.iter().any(|target| {
-        if let Some(node) = &target.node {
-            node.nodes()
-                .iter()
-                .any(|(node_ref, _, _, _)| matches!(node_ref, NodeRef::SubLink(_)))
-        } else {
-            false
-        }
-    })
-}
-
-//todo, figure out how to handle subqueries
-pub fn _query_select_columns(ast: &ParseResult) -> HashSet<String> {
-    let select_stmt = query_select_statement(ast);
-
-    let mut columns = HashSet::new();
-    for target in &select_stmt.target_list {
-        if let Some(node) = &target.node {
-            node.nodes().iter().for_each(|&(node_ref, _, _, _)| {
-                if let NodeRef::ColumnRef(column_ref) = node_ref
-                    && let Some(field) = column_ref.fields.first()
-                    && let Some(NodeEnum::String(column)) = &field.node
-                {
-                    columns.insert(column.sval.clone());
-                }
-            });
-        }
-    }
-
-    columns
-}
-
-pub fn query_where_clause_parse(ast: &ParseResult) -> Result<Option<WhereExpr>, WhereParseError> {
-    let select_stmt = query_select_statement(ast);
-    select_stmt_parse_where(select_stmt)
-}
-
-fn query_select_statement(ast: &ParseResult) -> &SelectStmt {
-    if ast.protobuf.stmts.len() > 1 {
-        todo!("support multiple statements in query");
-    }
-
-    let raw_stmt = ast.protobuf.stmts.first().expect("statement in query");
-
-    if let Some(NodeEnum::SelectStmt(select_stmt)) =
-        raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref())
-    {
-        select_stmt
-    } else {
-        dbg!(ast);
-        todo!();
     }
 }
 
@@ -505,44 +429,61 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::query::ast::{
+        AstError, ColumnExpr, SelectColumns, query_expr_convert, query_expr_fingerprint,
+    };
+
+    /// Parse SQL and extract the WHERE clause via the AST layer.
+    fn where_clause_parse(sql: &str) -> Result<Option<WhereExpr>, AstError> {
+        let ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&ast)?;
+        Ok(query_expr.where_clause().cloned())
+    }
 
     #[test]
     fn fingerprint_literals_differ() {
-        let f1 = query_fingerprint(
+        let q1 = query_expr_convert(
             &pg_query::parse("select id, str from test where str = 'hello'").unwrap(),
         )
         .unwrap();
-        let f2 = query_fingerprint(
+        let q2 = query_expr_convert(
             &pg_query::parse("select id, str from test where str = 'bye'").unwrap(),
         )
         .unwrap();
 
-        assert_ne!(f1, f2);
+        assert_ne!(query_expr_fingerprint(&q1), query_expr_fingerprint(&q2));
     }
 
     #[test]
     fn select_columns() {
-        let cols = _query_select_columns(
+        let q = query_expr_convert(
             &pg_query::parse("select id, str from test where str = 'hello'").unwrap(),
-        );
-        assert_eq!(cols, HashSet::from(["id".to_owned(), "str".to_owned()]));
+        )
+        .unwrap();
+        let select = q.as_select().unwrap();
+        let SelectColumns::Columns(cols) = &select.columns else {
+            panic!("expected explicit columns");
+        };
+        assert_eq!(cols.len(), 2);
+        assert!(matches!(&cols[0].expr, ColumnExpr::Column(c) if c.column == "id"));
+        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "str"));
 
-        let cols = _query_select_columns(
+        let q = query_expr_convert(
             &pg_query::parse("select count(id), str from test where str = 'hihi'").unwrap(),
-        );
-        assert_eq!(cols, HashSet::from(["id".to_owned(), "str".to_owned()]));
-
-        // let cols = _query_select_columns(
-        //     &pg_query::parse("select *, count(*) from test where str = 'hihi'").unwrap(),
-        // );
-        // assert_eq!(cols, HashSet::from(["id".to_owned(), "str".to_owned()]));
+        )
+        .unwrap();
+        let select = q.as_select().unwrap();
+        let SelectColumns::Columns(cols) = &select.columns else {
+            panic!("expected explicit columns");
+        };
+        assert_eq!(cols.len(), 2);
+        assert!(matches!(&cols[0].expr, ColumnExpr::Function(f) if f.name == "count"));
+        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "str"));
     }
 
     #[test]
     fn where_clause_simple_equality() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id, str FROM test WHERE str = 'hello'").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id, str FROM test WHERE str = 'hello'");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -561,9 +502,7 @@ mod tests {
 
     #[test]
     fn where_clause_integer_equality() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id = 123").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id = 123");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -581,9 +520,7 @@ mod tests {
 
     #[test]
     fn where_clause_boolean_equality() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE active = true").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE active = true");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -601,9 +538,7 @@ mod tests {
 
     #[test]
     fn where_clause_greater_than() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE cnt > 0").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE cnt > 0");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -621,9 +556,7 @@ mod tests {
 
     #[test]
     fn where_clause_and_operation() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE str = 'hello' AND id = 123").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE str = 'hello' AND id = 123");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -652,9 +585,7 @@ mod tests {
 
     #[test]
     fn where_clause_or_operation() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE str = 'hello' OR str = 'world'").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE str = 'hello' OR str = 'world'");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -683,9 +614,7 @@ mod tests {
 
     #[test]
     fn where_clause_not_operation() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE NOT str = 'hello'").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE NOT str = 'hello'");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -706,9 +635,7 @@ mod tests {
 
     #[test]
     fn where_clause_qualified_column() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE test.str = 'hello'").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE test.str = 'hello'");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -726,9 +653,7 @@ mod tests {
 
     #[test]
     fn where_clause_null_value() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE data = NULL").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE data = NULL");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -747,7 +672,7 @@ mod tests {
 
     #[test]
     fn where_clause_no_where() {
-        let result = query_where_clause_parse(&pg_query::parse("SELECT id FROM test").unwrap());
+        let result = where_clause_parse("SELECT id FROM test");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -757,9 +682,7 @@ mod tests {
 
     #[test]
     fn where_clause_not_equal_with_exclamation() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id != 123").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id != 123");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -777,9 +700,7 @@ mod tests {
 
     #[test]
     fn where_clause_not_equal_with_angle_brackets() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id <> 123").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id <> 123");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -797,9 +718,7 @@ mod tests {
 
     #[test]
     fn where_clause_less_than() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id < 123").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id < 123");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -817,9 +736,7 @@ mod tests {
 
     #[test]
     fn where_clause_less_than_or_equal() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id <= 123").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id <= 123");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -837,9 +754,7 @@ mod tests {
 
     #[test]
     fn where_clause_greater_than_or_equal() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id >= 123").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id >= 123");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -857,27 +772,23 @@ mod tests {
 
     #[test]
     fn where_clause_unsupported_operator() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id LIKE 'test%'").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id LIKE 'test%'");
 
         assert!(result.is_err());
         // LIKE uses AexprLike, not AexprOp, so it fails with UnsupportedAExpr
-        match result.unwrap_err() {
-            WhereParseError::UnsupportedAExpr { .. } => {
-                // This is expected for LIKE operations
-            }
-            other => panic!("Expected UnsupportedAExpr error, got: {other:?}"),
-        }
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                AstError::WhereParseError(WhereParseError::UnsupportedAExpr { .. })
+            ),
+            "Expected UnsupportedAExpr error for LIKE"
+        );
     }
 
     #[test]
     fn where_clause_chained_and_operation() {
-        let result = query_where_clause_parse(
-            &pg_query::parse(
-                "SELECT id FROM test WHERE name = 'john' AND age > 25 AND active = true",
-            )
-            .unwrap(),
+        let result = where_clause_parse(
+            "SELECT id FROM test WHERE name = 'john' AND age > 25 AND active = true",
         );
 
         assert!(result.is_ok());
@@ -920,11 +831,8 @@ mod tests {
 
     #[test]
     fn where_clause_chained_or_operation() {
-        let result = query_where_clause_parse(
-            &pg_query::parse(
-                "SELECT id FROM test WHERE name = 'john' OR name = 'jane' OR name = 'bob'",
-            )
-            .unwrap(),
+        let result = where_clause_parse(
+            "SELECT id FROM test WHERE name = 'john' OR name = 'jane' OR name = 'bob'",
         );
 
         assert!(result.is_ok());
@@ -967,9 +875,7 @@ mod tests {
 
     #[test]
     fn where_clause_parameterized_query_single() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE id = $1").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE id = $1");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -987,9 +893,7 @@ mod tests {
 
     #[test]
     fn where_clause_parameterized_query_multiple() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE name = $1 AND age > $2").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE name = $1 AND age > $2");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -1018,9 +922,7 @@ mod tests {
 
     #[test]
     fn where_clause_parameterized_query_mixed_with_literals() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE name = $1 AND active = true").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE name = $1 AND active = true");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap();
@@ -1049,9 +951,8 @@ mod tests {
 
     #[test]
     fn where_clause_in_with_strings() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')")
-                .unwrap(),
+        let result = where_clause_parse(
+            "SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')",
         );
 
         assert!(result.is_ok());
@@ -1079,9 +980,7 @@ mod tests {
 
     #[test]
     fn where_clause_not_in() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT * FROM t WHERE id NOT IN (1, 2, 3)").unwrap(),
-        );
+        let result = where_clause_parse("SELECT * FROM t WHERE id NOT IN (1, 2, 3)");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1096,9 +995,7 @@ mod tests {
 
     #[test]
     fn where_clause_in_with_integers() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT * FROM t WHERE id IN (1, 2, 3)").unwrap(),
-        );
+        let result = where_clause_parse("SELECT * FROM t WHERE id IN (1, 2, 3)");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1118,11 +1015,8 @@ mod tests {
 
     #[test]
     fn where_clause_in_combined_with_and() {
-        let result = query_where_clause_parse(
-            &pg_query::parse(
-                "SELECT * FROM t WHERE tenant_id = 1 AND status IN ('active', 'pending')",
-            )
-            .unwrap(),
+        let result = where_clause_parse(
+            "SELECT * FROM t WHERE tenant_id = 1 AND status IN ('active', 'pending')",
         );
 
         assert!(result.is_ok());
@@ -1144,9 +1038,7 @@ mod tests {
 
     #[test]
     fn where_clause_is_null() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE deleted_at IS NULL").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE deleted_at IS NULL");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1165,9 +1057,7 @@ mod tests {
 
     #[test]
     fn where_clause_is_not_null() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT id FROM test WHERE name IS NOT NULL").unwrap(),
-        );
+        let result = where_clause_parse("SELECT id FROM test WHERE name IS NOT NULL");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1186,9 +1076,7 @@ mod tests {
 
     #[test]
     fn where_clause_is_null_combined_with_and() {
-        let result = query_where_clause_parse(
-            &pg_query::parse("SELECT * FROM t WHERE id = 1 AND deleted_at IS NULL").unwrap(),
-        );
+        let result = where_clause_parse("SELECT * FROM t WHERE id = 1 AND deleted_at IS NULL");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();

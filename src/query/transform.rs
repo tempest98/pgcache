@@ -788,7 +788,7 @@ pub fn query_table_update_queries(
     let select_list = SelectColumns::Columns(vec![column]);
 
     // For each SELECT branch in the query, with its source context
-    for (branch, source) in cacheable_query.query.select_branches_with_source() {
+    for (branch, source) in cacheable_query.query.select_nodes_with_source() {
         // For each direct table in this branch (not inside subqueries).
         // Tables inside subqueries are handled by their own inner branch.
         for table in branch.direct_table_nodes() {
@@ -1735,8 +1735,8 @@ mod tests {
         let result = query_table_update_queries(&cacheable);
 
         // The CTE body contains "users" and the main query joins with "orders".
-        // select_branches traverses into CTE definitions, so we should get
-        // tables from both the CTE body branch and the main query branch.
+        // select_nodes_with_source traverses into CTE bodies via CteRef,
+        // so we should get tables from both the CTE body and the main query.
         let table_names: Vec<_> = result.iter().map(|(t, _, _)| t.name.as_str()).collect();
         assert!(
             table_names.contains(&"users"),

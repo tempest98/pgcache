@@ -257,50 +257,37 @@ impl ResolvedWhereExpr {
     }
 
     /// Recursively collect SELECT branches from subqueries in this WHERE expression.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
             ResolvedWhereExpr::Binary(binary) => {
-                binary.lexpr.collect_subquery_branches(branches);
-                binary.rexpr.collect_subquery_branches(branches);
+                binary.lexpr.subquery_nodes_collect(branches);
+                binary.rexpr.subquery_nodes_collect(branches);
             }
             ResolvedWhereExpr::Unary(unary) => {
-                unary.expr.collect_subquery_branches(branches);
+                unary.expr.subquery_nodes_collect(branches);
             }
             ResolvedWhereExpr::Multi(multi) => {
                 for expr in &multi.exprs {
-                    expr.collect_subquery_branches(branches);
+                    expr.subquery_nodes_collect(branches);
                 }
             }
             ResolvedWhereExpr::Function { args, .. } => {
                 for arg in args {
-                    arg.collect_subquery_branches(branches);
+                    arg.subquery_nodes_collect(branches);
                 }
             }
             ResolvedWhereExpr::Subquery {
                 query, test_expr, ..
             } => {
-                query.select_branches_collect(branches);
+                query.select_nodes_collect(branches);
                 if let Some(test) = test_expr {
-                    test.collect_subquery_branches(branches);
+                    test.subquery_nodes_collect(branches);
                 }
             }
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => {}
         }
     }
 
-    /// Check if this WHERE expression contains any subqueries.
-    pub fn has_subqueries(&self) -> bool {
-        match self {
-            ResolvedWhereExpr::Subquery { .. } => true,
-            ResolvedWhereExpr::Binary(binary) => {
-                binary.lexpr.has_subqueries() || binary.rexpr.has_subqueries()
-            }
-            ResolvedWhereExpr::Unary(unary) => unary.expr.has_subqueries(),
-            ResolvedWhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_subqueries()),
-            ResolvedWhereExpr::Function { args, .. } => args.iter().any(|a| a.has_subqueries()),
-            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => false,
-        }
-    }
 }
 
 impl Deparse for ResolvedWhereExpr {
@@ -316,8 +303,8 @@ impl Deparse for ResolvedWhereExpr {
                         buf.push(' ');
                         unary.op.deparse(buf);
                     }
-                    UnaryOp::Not | UnaryOp::Exists | UnaryOp::NotExists => {
-                        // Prefix operators: NOT expr
+                    UnaryOp::Not => {
+                        // Prefix operator: NOT expr
                         unary.op.deparse(buf);
                         buf.push(' ');
                         unary.expr.deparse(buf);
@@ -572,59 +559,38 @@ impl ResolvedColumnExpr {
     }
 
     /// Recursively collect SELECT branches from subqueries in this column expression.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
             ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
             | ResolvedColumnExpr::Literal(_) => {}
             ResolvedColumnExpr::Function { args, .. } => {
                 for arg in args {
-                    arg.collect_subquery_branches(branches);
+                    arg.subquery_nodes_collect(branches);
                 }
             }
             ResolvedColumnExpr::Case(case) => {
                 if let Some(arg) = &case.arg {
-                    arg.collect_subquery_branches(branches);
+                    arg.subquery_nodes_collect(branches);
                 }
                 for when in &case.whens {
-                    when.condition.collect_subquery_branches(branches);
-                    when.result.collect_subquery_branches(branches);
+                    when.condition.subquery_nodes_collect(branches);
+                    when.result.subquery_nodes_collect(branches);
                 }
                 if let Some(default) = &case.default {
-                    default.collect_subquery_branches(branches);
+                    default.subquery_nodes_collect(branches);
                 }
             }
             ResolvedColumnExpr::Arithmetic(arith) => {
-                arith.left.collect_subquery_branches(branches);
-                arith.right.collect_subquery_branches(branches);
+                arith.left.subquery_nodes_collect(branches);
+                arith.right.subquery_nodes_collect(branches);
             }
             ResolvedColumnExpr::Subquery(query) => {
-                query.select_branches_collect(branches);
+                query.select_nodes_collect(branches);
             }
         }
     }
 
-    /// Check if this column expression contains any subqueries.
-    pub fn has_subqueries(&self) -> bool {
-        match self {
-            ResolvedColumnExpr::Subquery(_) => true,
-            ResolvedColumnExpr::Function { args, .. } => args.iter().any(|a| a.has_subqueries()),
-            ResolvedColumnExpr::Case(case) => {
-                case.arg.as_ref().is_some_and(|a| a.has_subqueries())
-                    || case
-                        .whens
-                        .iter()
-                        .any(|w| w.condition.has_subqueries() || w.result.has_subqueries())
-                    || case.default.as_ref().is_some_and(|d| d.has_subqueries())
-            }
-            ResolvedColumnExpr::Arithmetic(arith) => {
-                arith.left.has_subqueries() || arith.right.has_subqueries()
-            }
-            ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Literal(_) => false,
-        }
-    }
 }
 
 impl ResolvedCaseExpr {
@@ -779,22 +745,15 @@ impl ResolvedSelectColumns {
     }
 
     /// Recursively collect SELECT branches from subqueries in the SELECT list.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         if let ResolvedSelectColumns::Columns(columns) = self {
             for col in columns {
-                col.expr.collect_subquery_branches(branches);
+                col.expr.subquery_nodes_collect(branches);
             }
         }
         // ResolvedSelectColumns::All only contains ResolvedColumnNode (no subqueries)
     }
 
-    /// Check if the SELECT list contains any subqueries.
-    pub fn has_subqueries(&self) -> bool {
-        match self {
-            ResolvedSelectColumns::None | ResolvedSelectColumns::All(_) => false,
-            ResolvedSelectColumns::Columns(cols) => cols.iter().any(|c| c.expr.has_subqueries()),
-        }
-    }
 }
 
 impl Deparse for ResolvedSelectColumns {
@@ -852,34 +811,22 @@ impl ResolvedTableSource {
     }
 
     /// Recursively collect SELECT branches from subqueries in this table source.
-    fn collect_subquery_branches<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
             ResolvedTableSource::Table(_) => {}
             ResolvedTableSource::Subquery(sub) => {
-                sub.query.select_branches_collect(branches);
+                sub.query.select_nodes_collect(branches);
             }
             ResolvedTableSource::Join(join) => {
-                join.left.collect_subquery_branches(branches);
-                join.right.collect_subquery_branches(branches);
+                join.left.subquery_nodes_collect(branches);
+                join.right.subquery_nodes_collect(branches);
                 if let Some(condition) = &join.condition {
-                    condition.collect_subquery_branches(branches);
+                    condition.subquery_nodes_collect(branches);
                 }
             }
         }
     }
 
-    /// Check if this table source contains any subqueries.
-    pub fn has_subqueries(&self) -> bool {
-        match self {
-            ResolvedTableSource::Table(_) => false,
-            ResolvedTableSource::Subquery(_) => true,
-            ResolvedTableSource::Join(join) => {
-                join.left.has_subqueries()
-                    || join.right.has_subqueries()
-                    || join.condition.as_ref().is_some_and(|c| c.has_subqueries())
-            }
-        }
-    }
 }
 
 impl Deparse for ResolvedTableSource {
@@ -1046,7 +993,7 @@ impl ResolvedSelectNode {
     ///
     /// Use this instead of `nodes::<ResolvedTableNode>()` when you only want the
     /// tables that this branch can directly SELECT from. Subquery tables are handled
-    /// as separate branches via `select_branches_collect`.
+    /// as separate branches via `select_nodes_collect`.
     pub fn direct_table_nodes(&self) -> Vec<&ResolvedTableNode> {
         let mut tables = Vec::new();
         for source in &self.from {
@@ -1072,30 +1019,6 @@ impl ResolvedSelectNode {
         (join_count * 3) + predicate_count
     }
 
-    /// Check if this SELECT contains any subqueries (in FROM, WHERE, HAVING, or SELECT list).
-    pub fn has_subqueries(&self) -> bool {
-        // Check FROM clause for subqueries
-        if self.from.iter().any(|source| source.has_subqueries()) {
-            return true;
-        }
-
-        // Check WHERE clause for subqueries
-        if self
-            .where_clause
-            .as_ref()
-            .is_some_and(|w| w.has_subqueries())
-        {
-            return true;
-        }
-
-        // Check HAVING clause for subqueries
-        if self.having.as_ref().is_some_and(|h| h.has_subqueries()) {
-            return true;
-        }
-
-        // Check SELECT list for subqueries
-        self.columns.has_subqueries()
-    }
 }
 
 impl Deparse for ResolvedSelectNode {
@@ -1257,14 +1180,6 @@ impl ResolvedQueryExpr {
         }
     }
 
-    /// Get the SELECT body mutably if this is a simple SELECT query
-    pub fn as_select_mut(&mut self) -> Option<&mut ResolvedSelectNode> {
-        match &mut self.body {
-            ResolvedQueryBody::Select(select) => Some(select),
-            ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => None,
-        }
-    }
-
     /// Compute a complexity score for this query.
     pub fn complexity(&self) -> usize {
         match &self.body {
@@ -1282,38 +1197,38 @@ impl ResolvedQueryExpr {
     /// For set operations (UNION/INTERSECT/EXCEPT), recursively extracts
     /// all SELECT branches from both sides.
     /// VALUES clauses are skipped (they don't reference tables).
-    pub fn select_branches(&self) -> Vec<&ResolvedSelectNode> {
+    pub fn select_nodes(&self) -> Vec<&ResolvedSelectNode> {
         let mut branches = Vec::new();
-        self.select_branches_collect(&mut branches);
+        self.select_nodes_collect(&mut branches);
         branches
     }
 
     /// Helper to recursively collect SELECT branches.
-    fn select_branches_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
+    fn select_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match &self.body {
             ResolvedQueryBody::Select(select) => {
                 branches.push(select);
                 // Descend into subqueries in FROM clause
                 for source in &select.from {
-                    source.collect_subquery_branches(branches);
+                    source.subquery_nodes_collect(branches);
                 }
                 // Descend into subqueries in WHERE clause
                 if let Some(where_clause) = &select.where_clause {
-                    where_clause.collect_subquery_branches(branches);
+                    where_clause.subquery_nodes_collect(branches);
                 }
                 // Descend into subqueries in HAVING clause
                 if let Some(having) = &select.having {
-                    having.collect_subquery_branches(branches);
+                    having.subquery_nodes_collect(branches);
                 }
                 // Descend into subqueries in SELECT list
-                select.columns.collect_subquery_branches(branches);
+                select.columns.subquery_nodes_collect(branches);
             }
             ResolvedQueryBody::Values(_) => {
                 // VALUES clauses don't reference tables, skip
             }
             ResolvedQueryBody::SetOp(set_op) => {
-                set_op.left.select_branches_collect(branches);
-                set_op.right.select_branches_collect(branches);
+                set_op.left.select_nodes_collect(branches);
+                set_op.right.select_nodes_collect(branches);
             }
         }
     }
@@ -3334,19 +3249,19 @@ mod tests {
     }
 
     #[test]
-    fn test_select_branches_simple_select() {
+    fn test_select_nodes_simple_select() {
         let query_expr = ResolvedQueryExpr {
             body: ResolvedQueryBody::Select(Box::default()),
             order_by: vec![],
             limit: None,
         };
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 1, "simple SELECT should have one branch");
     }
 
     #[test]
-    fn test_select_branches_union() {
+    fn test_select_nodes_union() {
         use crate::query::ast::SetOpType;
 
         let left_select = ResolvedSelectNode {
@@ -3390,7 +3305,7 @@ mod tests {
             limit: None,
         };
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 2, "UNION should have two branches");
 
         // Verify each branch has the correct table
@@ -3411,7 +3326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_branches_nested_union() {
+    fn test_select_nodes_nested_union() {
         use crate::query::ast::SetOpType;
 
         // Build: (SELECT FROM a UNION SELECT FROM b) UNION SELECT FROM c
@@ -3481,7 +3396,7 @@ mod tests {
             limit: None,
         };
 
-        let branches = query_expr.select_branches();
+        let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 3, "nested UNION should have three branches");
     }
 
