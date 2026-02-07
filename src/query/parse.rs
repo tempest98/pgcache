@@ -9,8 +9,8 @@ use pg_query::protobuf::SelectStmt;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{
-    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, NullTest, NullTestType, ParamRef,
-    SubLink,
+    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, FuncCall, NullTest, NullTestType,
+    ParamRef, SubLink,
 };
 use pg_query::{NodeRef, ParseResult};
 
@@ -145,6 +145,7 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
         }
         Some(NodeEnum::SubLink(sub_link)) => sublink_convert(sub_link),
         Some(NodeEnum::NullTest(null_test)) => null_test_convert(null_test),
+        Some(NodeEnum::FuncCall(func_call)) => func_call_to_where_expr(func_call),
         unsupported => {
             dbg!(unsupported);
             Err(WhereParseError::UnsupportedPattern)
@@ -209,6 +210,33 @@ fn null_test_convert(null_test: &NullTest) -> Result<WhereExpr, WhereParseError>
         op,
         expr: Box::new(node_convert_to_expr(arg)?),
     }))
+}
+
+/// Convert pg_query FuncCall to WhereExpr::Function
+fn func_call_to_where_expr(func_call: &FuncCall) -> Result<WhereExpr, WhereParseError> {
+    // Extract function name — last component of qualified name (e.g., "pg_catalog.now" -> "now")
+    let name = func_call
+        .funcname
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
+        .ok_or(WhereParseError::UnsupportedPattern)?;
+
+    // Handle COUNT(*) — agg_star means no explicit args
+    let args = if func_call.agg_star {
+        vec![]
+    } else {
+        func_call
+            .args
+            .iter()
+            .map(node_convert_to_expr)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(WhereExpr::Function { name, args })
 }
 
 /// Extract column reference from pg_query ColumnRef

@@ -553,7 +553,17 @@ impl Deparse for WhereExpr {
             WhereExpr::Multi(expr) => {
                 expr.deparse(buf);
             }
-            WhereExpr::Function { .. } => todo!(),
+            WhereExpr::Function { name, args } => {
+                buf.push_str(name);
+                buf.push('(');
+                let mut sep = "";
+                for arg in args {
+                    buf.push_str(sep);
+                    arg.deparse(buf);
+                    sep = ", ";
+                }
+                buf.push(')');
+            }
             WhereExpr::Subquery {
                 query,
                 sublink_type,

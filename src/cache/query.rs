@@ -83,13 +83,13 @@ fn is_cacheable_body(body: &QueryBody) -> Result<(), CacheabilityError> {
 /// Check if a SELECT node is cacheable.
 fn is_cacheable_select(node: &SelectNode) -> Result<(), CacheabilityError> {
     // Check FROM clause (tables, joins, subqueries)
-    is_supported_from(node)?;
+    is_supported_from(node, ExprContext::FromClause)?;
 
     // Check WHERE clause (including any subqueries)
-    is_cacheable_where(node)?;
+    is_cacheable_where(node, ExprContext::WhereClause)?;
 
     // Check SELECT list for subqueries
-    is_cacheable_select_list(node)?;
+    is_cacheable_select_list(node, ExprContext::SelectList)?;
 
     Ok(())
 }
@@ -109,18 +109,21 @@ fn is_cacheable_set_op(set_op: &SetOpNode) -> Result<(), CacheabilityError> {
     Ok(())
 }
 
-fn is_supported_from(select: &SelectNode) -> Result<(), CacheabilityError> {
+fn is_supported_from(select: &SelectNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
     match select.from.as_slice() {
-        [TableSource::Join(join)] => is_supported_join(join),
+        [TableSource::Join(join)] => is_supported_join(join, ctx),
         [TableSource::Table(_)] => Ok(()),
-        [TableSource::Subquery(sub)] => is_cacheable_table_subquery(sub),
-        [TableSource::CteRef(cte_ref)] => is_cacheable_cte_ref(cte_ref),
+        [TableSource::Subquery(sub)] => is_cacheable_table_subquery(sub, ctx),
+        [TableSource::CteRef(cte_ref)] => is_cacheable_cte_ref(cte_ref, ctx),
         _ => Err(CacheabilityError::UnsupportedFrom),
     }
 }
 
 /// Check if a table subquery (derived table) is cacheable.
-fn is_cacheable_table_subquery(subquery: &TableSubqueryNode) -> Result<(), CacheabilityError> {
+fn is_cacheable_table_subquery(
+    subquery: &TableSubqueryNode,
+    _ctx: ExprContext,
+) -> Result<(), CacheabilityError> {
     // LATERAL subqueries are not supported (they reference outer scope)
     if subquery.lateral {
         return Err(CacheabilityError::UnsupportedSubquery);
@@ -137,7 +140,7 @@ fn is_cacheable_table_subquery(subquery: &TableSubqueryNode) -> Result<(), Cache
     is_cacheable_body(&subquery.query.body)
 }
 
-fn is_supported_join(join: &JoinNode) -> Result<(), CacheabilityError> {
+fn is_supported_join(join: &JoinNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
     // Only INNER joins are cacheable
     if join.join_type != JoinType::Inner {
         return Err(CacheabilityError::UnsupportedFrom);
@@ -162,24 +165,24 @@ fn is_supported_join(join: &JoinNode) -> Result<(), CacheabilityError> {
     }
 
     // Recursively validate nested joins/tables/subqueries
-    is_supported_table_source(&join.left)?;
-    is_supported_table_source(&join.right)?;
+    is_supported_table_source(&join.left, ctx)?;
+    is_supported_table_source(&join.right, ctx)?;
 
     Ok(())
 }
 
 /// Check if a table source (in a join) is supported.
-fn is_supported_table_source(source: &TableSource) -> Result<(), CacheabilityError> {
+fn is_supported_table_source(source: &TableSource, ctx: ExprContext) -> Result<(), CacheabilityError> {
     match source {
-        TableSource::Join(nested) => is_supported_join(nested),
+        TableSource::Join(nested) => is_supported_join(nested, ctx),
         TableSource::Table(_) => Ok(()),
-        TableSource::Subquery(sub) => is_cacheable_table_subquery(sub),
-        TableSource::CteRef(cte_ref) => is_cacheable_cte_ref(cte_ref),
+        TableSource::Subquery(sub) => is_cacheable_table_subquery(sub, ctx),
+        TableSource::CteRef(cte_ref) => is_cacheable_cte_ref(cte_ref, ctx),
     }
 }
 
 /// Check if a CTE reference is cacheable.
-fn is_cacheable_cte_ref(cte_ref: &CteRefNode) -> Result<(), CacheabilityError> {
+fn is_cacheable_cte_ref(cte_ref: &CteRefNode, _ctx: ExprContext) -> Result<(), CacheabilityError> {
     is_cacheable_body(&cte_ref.query.body)
 }
 
@@ -191,16 +194,31 @@ fn is_cacheable_cte_ref(cte_ref: &CteRefNode) -> Result<(), CacheabilityError> {
 /// - Non-correlated subqueries (EXISTS, IN, scalar)
 ///
 /// Note: LIMIT/OFFSET check is done separately in TryFrom
-fn is_cacheable_where(select: &SelectNode) -> Result<(), CacheabilityError> {
+fn is_cacheable_where(select: &SelectNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
     match &select.where_clause {
-        Some(where_expr) => is_cacheable_expr(where_expr),
+        Some(where_expr) => is_cacheable_expr(where_expr, ctx),
         None => Ok(()), // No WHERE clause is always cacheable
     }
 }
 
+/// Where in the query tree a cacheability check is being evaluated.
+///
+/// Functions in the SELECT list (e.g. CASE WHEN conditions) are safe — they're
+/// re-evaluated against cached rows. Functions in the WHERE clause affect row-set
+/// membership and need separate design work, so they're rejected there.
+#[derive(Clone, Copy)]
+enum ExprContext {
+    /// Expression in the FROM clause — functions not yet supported
+    FromClause,
+    /// Expression in the WHERE clause — functions not yet supported
+    WhereClause,
+    /// Expression in the SELECT list — functions allowed
+    SelectList,
+}
+
 /// Determine if a WHERE expression can be efficiently cached.
 /// Supports simple comparisons, AND/OR of comparisons, and non-correlated subqueries.
-fn is_cacheable_expr(expr: &WhereExpr) -> Result<(), CacheabilityError> {
+fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), CacheabilityError> {
     match expr {
         WhereExpr::Binary(binary_expr) => match binary_expr.op {
             BinaryOp::Equal
@@ -210,8 +228,8 @@ fn is_cacheable_expr(expr: &WhereExpr) -> Result<(), CacheabilityError> {
             | BinaryOp::GreaterThan
             | BinaryOp::GreaterThanOrEqual => {
                 // Recursively check both sides are cacheable
-                is_cacheable_expr(&binary_expr.lexpr)?;
-                is_cacheable_expr(&binary_expr.rexpr)?;
+                is_cacheable_expr(&binary_expr.lexpr, ctx)?;
+                is_cacheable_expr(&binary_expr.rexpr, ctx)?;
                 // Allow comparisons where both sides are cacheable:
                 // - (Column, Value) - simple comparisons for cache filtering
                 // - (Column, Column) - join conditions in subqueries
@@ -219,8 +237,8 @@ fn is_cacheable_expr(expr: &WhereExpr) -> Result<(), CacheabilityError> {
                 Ok(())
             }
             BinaryOp::And | BinaryOp::Or => {
-                is_cacheable_expr(&binary_expr.lexpr)?;
-                is_cacheable_expr(&binary_expr.rexpr)
+                is_cacheable_expr(&binary_expr.lexpr, ctx)?;
+                is_cacheable_expr(&binary_expr.rexpr, ctx)
             }
             BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => {
                 Err(CacheabilityError::UnsupportedWhereClause)
@@ -231,7 +249,7 @@ fn is_cacheable_expr(expr: &WhereExpr) -> Result<(), CacheabilityError> {
         WhereExpr::Multi(multi_expr) => match multi_expr.op {
             MultiOp::In | MultiOp::NotIn => {
                 for e in &multi_expr.exprs {
-                    is_cacheable_expr(e)?;
+                    is_cacheable_expr(e, ctx)?;
                 }
                 Ok(())
             }
@@ -241,11 +259,18 @@ fn is_cacheable_expr(expr: &WhereExpr) -> Result<(), CacheabilityError> {
         },
         WhereExpr::Unary(unary_expr) => match unary_expr.op {
             UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::Not => {
-                is_cacheable_expr(&unary_expr.expr)
+                is_cacheable_expr(&unary_expr.expr, ctx)
             }
             UnaryOp::Exists | UnaryOp::NotExists => Err(CacheabilityError::UnsupportedWhereClause),
         },
-        WhereExpr::Function { .. } => Err(CacheabilityError::UnsupportedWhereClause),
+        WhereExpr::Function { args, .. } => match ctx {
+            ExprContext::FromClause | ExprContext::WhereClause => {
+                Err(CacheabilityError::UnsupportedWhereClause)
+            }
+            ExprContext::SelectList => args
+                .iter()
+                .try_for_each(|arg| is_cacheable_expr(arg, ctx)),
+        },
         WhereExpr::Subquery {
             query,
             sublink_type,
@@ -256,7 +281,7 @@ fn is_cacheable_expr(expr: &WhereExpr) -> Result<(), CacheabilityError> {
 
             // Check test_expr (left-hand side for IN/ANY/ALL) is cacheable
             if let Some(test) = test_expr {
-                is_cacheable_expr(test)?;
+                is_cacheable_expr(test, ctx)?;
             }
 
             // All supported sublink types are cacheable if inner query is cacheable
@@ -280,14 +305,17 @@ fn is_cacheable_subquery_inner(query: &QueryExpr) -> Result<(), CacheabilityErro
 
 /// Check if a SELECT list contains cacheable expressions.
 /// Currently rejects functions that contain subqueries.
-fn is_cacheable_select_list(select: &SelectNode) -> Result<(), CacheabilityError> {
+fn is_cacheable_select_list(
+    select: &SelectNode,
+    ctx: ExprContext,
+) -> Result<(), CacheabilityError> {
     use crate::query::ast::SelectColumns;
 
     match &select.columns {
         SelectColumns::All | SelectColumns::None => Ok(()),
         SelectColumns::Columns(cols) => {
             for col in cols {
-                is_cacheable_column_expr(&col.expr)?;
+                is_cacheable_column_expr(&col.expr, ctx)?;
             }
             Ok(())
         }
@@ -295,7 +323,10 @@ fn is_cacheable_select_list(select: &SelectNode) -> Result<(), CacheabilityError
 }
 
 /// Check if a column expression is cacheable.
-fn is_cacheable_column_expr(expr: &crate::query::ast::ColumnExpr) -> Result<(), CacheabilityError> {
+fn is_cacheable_column_expr(
+    expr: &crate::query::ast::ColumnExpr,
+    ctx: ExprContext,
+) -> Result<(), CacheabilityError> {
     use crate::query::ast::ColumnExpr;
 
     match expr {
@@ -303,29 +334,29 @@ fn is_cacheable_column_expr(expr: &crate::query::ast::ColumnExpr) -> Result<(), 
         ColumnExpr::Function(func) => {
             // Recursively check function arguments
             for arg in &func.args {
-                is_cacheable_column_expr(arg)?;
+                is_cacheable_column_expr(arg, ctx)?;
             }
             Ok(())
         }
         ColumnExpr::Case(case) => {
             // Check case argument if present
             if let Some(arg) = &case.arg {
-                is_cacheable_column_expr(arg)?;
+                is_cacheable_column_expr(arg, ctx)?;
             }
             // Check when conditions and results
             for when in &case.whens {
-                is_cacheable_expr(&when.condition)?;
-                is_cacheable_column_expr(&when.result)?;
+                is_cacheable_expr(&when.condition, ctx)?;
+                is_cacheable_column_expr(&when.result, ctx)?;
             }
             // Check default
             if let Some(default) = &case.default {
-                is_cacheable_column_expr(default)?;
+                is_cacheable_column_expr(default, ctx)?;
             }
             Ok(())
         }
         ColumnExpr::Arithmetic(arith) => {
-            is_cacheable_column_expr(&arith.left)?;
-            is_cacheable_column_expr(&arith.right)
+            is_cacheable_column_expr(&arith.left, ctx)?;
+            is_cacheable_column_expr(&arith.right, ctx)
         }
         ColumnExpr::Subquery(query) => {
             // Scalar subquery in SELECT list - check inner query
@@ -666,6 +697,38 @@ mod tests {
         assert!(
             result.is_ok(),
             "multiple CTEs should be cacheable: {result:?}"
+        );
+    }
+
+    // ==================== Function in CASE WHEN Tests ====================
+
+    #[test]
+    fn test_case_with_function_in_condition_cacheable() {
+        let sql = "SELECT CASE WHEN date_trunc('day', created_at) = '2024-01-01' THEN 'yes' ELSE 'no' END FROM orders WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "CASE with function in condition should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_case_with_nested_function_cacheable() {
+        let sql = "SELECT CASE WHEN date_trunc('day', now()) = '2024-01-01' THEN 'yes' ELSE 'no' END FROM orders WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "CASE with nested function calls should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_function_in_where_clause_not_cacheable() {
+        let sql = "SELECT * FROM orders WHERE date_trunc('day', created_at) = '2024-01-01'";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
+            "Function in WHERE clause should not be cacheable: {result:?}"
         );
     }
 }
