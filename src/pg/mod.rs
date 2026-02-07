@@ -1,3 +1,4 @@
+pub(crate) mod cache_connection;
 pub(crate) mod cdc;
 pub(crate) mod connect;
 pub(crate) mod protocol;

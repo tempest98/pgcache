@@ -20,7 +20,7 @@ use super::{
 };
 use crate::proxy::ClientSocket;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryType {
     Simple,
     Extended,

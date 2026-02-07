@@ -9,7 +9,7 @@ use tokio::{
     },
     task::{LocalSet, spawn_local},
 };
-use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres::{Config, NoTls};
 use tracing::{debug, error, instrument};
 
 use crate::{
@@ -23,6 +23,7 @@ use crate::{
         writer::writer_run,
     },
     metrics::names,
+    pg::cache_connection::CacheConnection,
     settings::Settings,
 };
 
@@ -80,13 +81,17 @@ fn handle_cdc_message(cdc_cmd_tx: &UnboundedSender<CdcCommand>, msg: CdcMessage)
 }
 
 /// Handles a worker request by executing the query and sending the reply
-async fn handle_worker_request(client: Client, return_tx: Sender<Client>, mut msg: WorkerRequest) {
+async fn handle_worker_request(
+    conn: CacheConnection,
+    return_tx: Sender<CacheConnection>,
+    mut msg: WorkerRequest,
+) {
     debug!("cache worker task spawn");
 
     // Record worker start time
     msg.timing.worker_start_at = Some(Instant::now());
 
-    let reply = match handle_cached_query(client, return_tx, &mut msg).await {
+    let reply = match handle_cached_query(conn, return_tx, &mut msg).await {
         Ok(_) => CacheReply::Complete(msg.data, Some(msg.timing)),
         Err(e) => {
             error!("handle_cached_query failed: {e}");
@@ -101,12 +106,12 @@ async fn handle_worker_request(client: Client, return_tx: Sender<Client>, mut ms
     debug!("cache worker task done");
 }
 
-/// Creates database connections and returns them as a channel pair.
+/// Creates cache database connections and returns them as a channel pair.
 /// Connections are immediately available in the receiver.
 async fn connection_pool_create(
     settings: &Settings,
     size: usize,
-) -> CacheResult<(Sender<Client>, Receiver<Client>)> {
+) -> CacheResult<(Sender<CacheConnection>, Receiver<CacheConnection>)> {
     let (tx, rx) = channel(size);
 
     for i in 0..size {
@@ -118,24 +123,11 @@ async fn connection_pool_create(
             settings.cache.port
         );
 
-        let (client, connection) = Config::new()
-            .host(&settings.cache.host)
-            .port(settings.cache.port)
-            .user(&settings.cache.user)
-            .dbname(&settings.cache.database)
-            .connect(NoTls)
+        let conn = CacheConnection::connect(&settings.cache)
             .await
-            .map_into_report::<CacheError>()
-            .attach_loc("creating connection")?;
+            .attach_loc("creating cache connection")?;
 
-        // Spawn task to drive the connection
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("Connection {} error: {e}", i);
-            }
-        });
-
-        tx.send(client)
+        tx.send(conn)
             .await
             .map_err(|_| CacheError::NoConnection)?;
     }
@@ -373,22 +365,22 @@ fn worker_run(
                         .record(wait_start.elapsed().as_secs_f64());
 
                     // Wait for an available connection (track wait time only when blocking)
-                    let client = if let Ok(client) = conn_rx.try_recv() {
-                        client
+                    let conn = if let Ok(conn) = conn_rx.try_recv() {
+                        conn
                     } else {
                         let conn_wait_start = Instant::now();
-                        let Some(client) = conn_rx.recv().await else {
+                        let Some(conn) = conn_rx.recv().await else {
                             return Err(CacheError::NoConnection.into());
                         };
                         metrics::histogram!(names::CACHE_WORKER_CONN_WAIT_SECONDS)
                             .record(conn_wait_start.elapsed().as_secs_f64());
-                        client
+                        conn
                     };
 
                     // Spawn task with both the request and connection
                     let return_tx = conn_tx.clone();
                     spawn_local(async move {
-                        handle_worker_request(client, return_tx, msg).await;
+                        handle_worker_request(conn, return_tx, msg).await;
                     });
 
                     metrics::gauge!(names::CACHE_WORKER_QUEUE).set(worker_rx.len() as f64);

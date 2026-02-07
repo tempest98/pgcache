@@ -1,17 +1,19 @@
-use std::ops::Deref;
 use std::time::Instant;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
-use tokio_postgres::{Client, SimpleQueryMessage};
-use tokio_util::bytes::{BufMut, BytesMut};
+use tokio_stream::StreamExt;
+use tokio_util::bytes::BytesMut;
+use tokio_util::codec::FramedRead;
 use tracing::{debug, error, instrument};
 
-use crate::pg::protocol::encode::*;
+use crate::pg::cache_connection::CacheConnection;
+use crate::pg::protocol::backend::PgBackendMessageType;
+use crate::pg::protocol::encode::ready_for_query_encode;
 use crate::query::ast::Deparse;
 
 use super::{
-    CacheError, CacheResult, MapIntoReport,
+    CacheError, CacheResult,
     query_cache::{QueryType, WorkerRequest},
 };
 
@@ -19,26 +21,29 @@ const BUFFER_SIZE_THRESHOLD: usize = 64 * 1024;
 
 /// Guard that ensures a connection is returned to the pool.
 ///
-/// Returns the connection via async `release()` when done, or via
-/// sync `try_send()` on drop if the function exits early due to an error.
+/// Returns the connection via async `release()` on success.
+/// On error (drop without release), the connection is discarded if poisoned
+/// to avoid returning a connection with stale response data in its buffer.
 struct ConnectionGuard {
-    client: Option<Client>,
-    return_tx: Sender<Client>,
+    conn: Option<CacheConnection>,
+    return_tx: Sender<CacheConnection>,
+    poisoned: bool,
 }
 
 impl ConnectionGuard {
-    fn new(client: Client, return_tx: Sender<Client>) -> Self {
+    fn new(conn: CacheConnection, return_tx: Sender<CacheConnection>) -> Self {
         Self {
-            client: Some(client),
+            conn: Some(conn),
             return_tx,
+            poisoned: false,
         }
     }
 
     /// Return the connection to the pool.
     async fn release(mut self) -> CacheResult<()> {
-        if let Some(client) = self.client.take() {
+        if let Some(conn) = self.conn.take() {
             self.return_tx
-                .send(client)
+                .send(conn)
                 .await
                 .map_err(|_| CacheError::NoConnection)?;
         }
@@ -46,20 +51,17 @@ impl ConnectionGuard {
     }
 }
 
-impl Deref for ConnectionGuard {
-    type Target = Client;
-
-    fn deref(&self) -> &Self::Target {
-        self.client.as_ref().expect("connection available")
-    }
-}
-
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
+        if self.poisoned {
+            // Discard connection — may have unread response data
+            self.conn.take();
+            return;
+        }
+        if let Some(conn) = self.conn.take() {
             // try_send won't block; channel always has capacity since
             // pool size equals channel size
-            let _ = self.return_tx.try_send(client);
+            let _ = self.return_tx.try_send(conn);
         }
     }
 }
@@ -67,184 +69,301 @@ impl Drop for ConnectionGuard {
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn handle_cached_query(
-    client: Client,
-    return_tx: Sender<Client>,
+    conn: CacheConnection,
+    return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
 ) -> CacheResult<()> {
     debug!("message query generation {}", msg.generation);
 
     let rv = if msg.result_formats.first().is_none_or(|&f| f == 0) {
-        handle_cached_query_text(client, return_tx, msg).await
+        handle_cached_query_text(conn, return_tx, msg).await
     } else {
-        handle_cached_query_binary(client, return_tx, msg).await
+        handle_cached_query_binary(conn, return_tx, msg).await
     };
 
     debug!("cache hit");
     rv
 }
 
+/// Response state machine for the text (simple query) path.
+///
+/// A combined `SET gen; SELECT ...` produces:
+/// CommandComplete (SET) → RowDescription → DataRow* → CommandComplete (SELECT) → ReadyForQuery
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextResponseState {
+    /// Waiting for SET CommandComplete
+    SetComplete,
+    /// Waiting for RowDescription (or DataRows if no rows)
+    RowDescription,
+    /// Streaming DataRow messages
+    DataRows,
+    /// Done — ReadyForQuery received
+    Done,
+}
+
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_cached_query_text(
-    client: Client,
-    return_tx: Sender<Client>,
+    conn: CacheConnection,
+    return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
 ) -> CacheResult<()> {
-    let conn = ConnectionGuard::new(client, return_tx);
+    let mut guard = ConnectionGuard::new(conn, return_tx);
+    let mut conn = guard.conn.take().expect("connection available");
 
     // Generate SQL query from resolved AST (with schema-qualified table names)
+    #[cfg(feature = "hotpath")]
+    let _m = hotpath::functions::MeasurementGuard::new("hcqt:deparse", false, false);
+
     let mut sql = String::new();
     msg.resolved.deparse(&mut sql);
-
     let combined_sql = format!("SET mem.query_generation = {}; {};", msg.generation, &sql);
 
-    // Execute query against cache database
-    let res = conn
-        .simple_query(&combined_sql)
+    #[cfg(feature = "hotpath")]
+    drop(_m);
+
+    // Send query to cache database
+    #[cfg(feature = "hotpath")]
+    let _m = hotpath::functions::MeasurementGuard::new("hcqt:send_query", false, false);
+
+    conn.simple_query_send(&combined_sql)
         .await
-        .map_into_report::<CacheError>()?;
+        .inspect_err(|_| {
+            guard.poisoned = true;
+        })?;
 
-    // Return connection early - query is done, only writing to client remains
-    conn.release().await?;
+    #[cfg(feature = "hotpath")]
+    drop(_m);
 
-    // Record query completion time
-    msg.timing.query_done_at = Some(Instant::now());
+    // Stream results to client
+    #[cfg(feature = "hotpath")]
+    let _m = hotpath::functions::MeasurementGuard::new("hcqt:stream", false, false);
 
-    let [
-        SimpleQueryMessage::CommandComplete(_),
-        SimpleQueryMessage::RowDescription(desc),
-        data_rows @ ..,
-        SimpleQueryMessage::CommandComplete(cnt),
-    ] = res.as_slice()
-    else {
-        return Err(CacheError::InvalidMessage.into());
-    };
+    let CacheConnection {
+        stream,
+        read_buf,
+        codec,
+    } = conn;
+    let mut framed = FramedRead::new(stream, codec);
+    *framed.read_buffer_mut() = read_buf;
 
-    let mut buf = BytesMut::new();
+    let query_type = msg.query_type;
+    let client_socket = &mut msg.client_socket;
 
-    if msg.query_type == QueryType::Simple {
-        row_description_encode(desc, &mut buf);
-        // trace!("(w) client write {:?}", buf);
-        if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
-            error!("no client");
-            return Err(CacheError::Write.into());
+    let mut write_buf = BytesMut::with_capacity(BUFFER_SIZE_THRESHOLD);
+    let mut state = TextResponseState::SetComplete;
+
+    loop {
+        tokio::select! {
+            frame = framed.next() => {
+                let frame = match frame {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(_)) | None => {
+                        guard.poisoned = true;
+                        return Err(CacheError::InvalidMessage.into());
+                    }
+                };
+
+                #[cfg(feature = "hotpath")]
+                let _match = hotpath::functions::MeasurementGuard::new("hcqt:match", false, false);
+
+                match (state, frame.message_type) {
+                    (TextResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {
+                        // SET response — skip, advance state
+                        state = TextResponseState::RowDescription;
+                    }
+                    (TextResponseState::RowDescription, PgBackendMessageType::RowDescription) => {
+                        if query_type == QueryType::Simple {
+                            write_buf.extend_from_slice(&frame.data);
+                        }
+                        state = TextResponseState::DataRows;
+                    }
+                    (TextResponseState::DataRows, PgBackendMessageType::DataRows) => {
+                        write_buf.extend_from_slice(&frame.data);
+                    }
+                    (TextResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
+                        write_buf.extend_from_slice(&frame.data);
+                        msg.timing.query_done_at = Some(Instant::now());
+                    }
+                    (_, PgBackendMessageType::ReadyForQuery) => {
+                        state = TextResponseState::Done;
+                    }
+                    _ => {}
+                }
+
+                #[cfg(feature = "hotpath")]
+                drop(_match);
+
+            }
+            result = client_socket.write_buf(&mut write_buf), if !write_buf.is_empty() =>
+            {
+                if result.is_err() {
+                    guard.poisoned = true;
+                    error!("no client");
+                    return Err(CacheError::Write.into());
+                }
+            }
         }
-        // Buffer is guaranteed to be clear if there was no error
+
+        if state == TextResponseState::Done {
+            break;
+        }
     }
 
-    for query_msg in data_rows {
-        let SimpleQueryMessage::Row(row) = query_msg else {
-            return Err(CacheError::InvalidMessage.into());
-        };
-        // Use raw buffer directly to avoid decode/encode overhead
-        // The raw buffer contains field data but not the field count
-        let raw_data = row.raw_buffer_bytes();
-        let field_count = row.len() as u16;
+    // Reconstruct connection for pool return
+    let parts = framed.into_parts();
+    guard.conn = Some(CacheConnection {
+        stream: parts.io,
+        read_buf: parts.read_buf,
+        codec: parts.codec,
+    });
 
-        buf.put_u8(b'D'); // DATA_ROW_TAG
-        buf.put_i32(4 + 2 + raw_data.len() as i32); // 4 (length field) + 2 (field count) + data
-        buf.put_u16(field_count);
-        buf.put_slice(raw_data);
-
-        // Send data if more than 64kB have been accumulated
-        if buf.len() > BUFFER_SIZE_THRESHOLD
-            && msg.client_socket.write_all_buf(&mut buf).await.is_err()
-        {
-            error!("no client");
-            return Err(CacheError::Write.into());
-        }
+    // Append ReadyForQuery for simple query protocol
+    if query_type == QueryType::Simple {
+        ready_for_query_encode(&mut write_buf);
     }
-    // trace!("(w) client write data");
-    if !buf.is_empty() && msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+
+    // Final flush
+    if !write_buf.is_empty() && client_socket.write_all_buf(&mut write_buf).await.is_err() {
+        guard.poisoned = true;
         error!("no client");
         return Err(CacheError::Write.into());
     }
 
-    let mut buf = BytesMut::new();
-    command_complete_encode(*cnt, &mut buf);
-
-    if msg.query_type == QueryType::Simple {
-        ready_for_query_encode(&mut buf);
-    }
-
-    // trace!("(w) client write {:?}", buf);
-    if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
-        error!("no client");
-        return Err(CacheError::Write.into());
-    }
-
-    // Record response written time
     msg.timing.response_written_at = Some(Instant::now());
 
-    Ok(())
+    #[cfg(feature = "hotpath")]
+    drop(_m);
+
+    guard.release().await
+}
+
+/// Response state machine for the binary (pipelined extended query) path.
+///
+/// Pipelined: SET (simple query) + Parse/Bind/Execute/Sync produces:
+/// CommandComplete (SET) → ReadyForQuery → ParseComplete → BindComplete →
+/// DataRow* → CommandComplete (SELECT) → ReadyForQuery
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryResponseState {
+    /// Waiting for SET CommandComplete
+    SetComplete,
+    /// Waiting for ReadyForQuery after SET
+    SetReady,
+    /// Waiting for ParseComplete
+    ParseComplete,
+    /// Waiting for BindComplete
+    BindComplete,
+    /// Streaming DataRow messages
+    DataRows,
+    /// Done — final ReadyForQuery received
+    Done,
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_cached_query_binary(
-    client: Client,
-    return_tx: Sender<Client>,
+    conn: CacheConnection,
+    return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
 ) -> CacheResult<()> {
-    let conn = ConnectionGuard::new(client, return_tx);
+    let mut guard = ConnectionGuard::new(conn, return_tx);
+    let mut conn = guard.conn.take().expect("connection available");
 
-    // Generate SQL query from resolved AST (with schema-qualified table names)
+    // Generate SQL query from resolved AST
     let mut sql = String::new();
     msg.resolved.deparse(&mut sql);
+    let set_sql = format!("SET mem.query_generation = {}", msg.generation);
 
-    let set_gen = format!("SET mem.query_generation = {}", msg.generation);
-    conn.simple_query(&set_gen)
+    // Send pipelined: SET (simple query) + Parse/Bind/Execute/Sync (extended query)
+    conn.pipelined_binary_query_send(&set_sql, &sql)
         .await
-        .map_into_report::<CacheError>()?;
+        .inspect_err(|_| {
+            guard.poisoned = true;
+        })?;
 
-    // Execute query against cache database
-    let res = conn
-        .query(&sql, &[])
-        .await
-        .map_into_report::<CacheError>()?;
+    // Stream results to client
+    let CacheConnection {
+        stream,
+        read_buf,
+        codec,
+    } = conn;
+    let mut framed = FramedRead::new(stream, codec);
+    *framed.read_buffer_mut() = read_buf;
 
-    // Return connection early - query is done, only writing to client remains
-    conn.release().await?;
+    let client_socket = &mut msg.client_socket;
 
-    // Record query completion time
-    msg.timing.query_done_at = Some(Instant::now());
+    let mut write_buf = BytesMut::with_capacity(BUFFER_SIZE_THRESHOLD);
+    let mut state = BinaryResponseState::SetComplete;
 
-    let mut buf = BytesMut::new();
-    for row in &res {
-        // Use raw buffer directly to avoid decode/encode overhead
-        // The raw buffer contains field data but not the field count
-        let raw_data = row.raw_buffer_bytes();
-        let field_count = row.len() as u16;
+    loop {
+        tokio::select! {
+            frame = framed.next() => {
+                let frame = match frame {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(_)) | None => {
+                        guard.poisoned = true;
+                        return Err(CacheError::InvalidMessage.into());
+                    }
+                };
 
-        buf.put_u8(b'D'); // DATA_ROW_TAG
-        buf.put_i32(4 + 2 + raw_data.len() as i32); // 4 (length field) + 2 (field count) + data
-        buf.put_u16(field_count);
-        buf.put_slice(raw_data);
-
-        //send data if more than 64kB have been accumulated
-        if buf.len() > BUFFER_SIZE_THRESHOLD {
-            if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
-                error!("no client");
-                return Err(CacheError::Write.into());
+                match (state, frame.message_type) {
+                    (BinaryResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {
+                        state = BinaryResponseState::SetReady;
+                    }
+                    (BinaryResponseState::SetReady, PgBackendMessageType::ReadyForQuery) => {
+                        state = BinaryResponseState::ParseComplete;
+                    }
+                    (BinaryResponseState::ParseComplete, PgBackendMessageType::ParseComplete) => {
+                        state = BinaryResponseState::BindComplete;
+                    }
+                    (BinaryResponseState::BindComplete, PgBackendMessageType::BindComplete) => {
+                        state = BinaryResponseState::DataRows;
+                    }
+                    (BinaryResponseState::DataRows, PgBackendMessageType::DataRows) => {
+                        write_buf.extend_from_slice(&frame.data);
+                    }
+                    (BinaryResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
+                        write_buf.extend_from_slice(&frame.data);
+                        msg.timing.query_done_at = Some(Instant::now());
+                    }
+                    (_, PgBackendMessageType::ReadyForQuery)
+                        if state != BinaryResponseState::SetComplete
+                            && state != BinaryResponseState::SetReady =>
+                    {
+                        state = BinaryResponseState::Done;
+                    }
+                    _ => {}
+                }
             }
-            buf.clear();
+            result = client_socket.write_buf(&mut write_buf), if !write_buf.is_empty() =>
+            {
+                if result.is_err() {
+                    guard.poisoned = true;
+                    error!("no client");
+                    return Err(CacheError::Write.into());
+                }
+            }
+        }
+
+        if state == BinaryResponseState::Done {
+            break;
         }
     }
-    // trace!("(w) client write data [{:?}]", buf);
-    if !buf.is_empty() && msg.client_socket.write_all_buf(&mut buf).await.is_err() {
+
+    // Reconstruct connection for pool return
+    let parts = framed.into_parts();
+    guard.conn = Some(CacheConnection {
+        stream: parts.io,
+        read_buf: parts.read_buf,
+        codec: parts.codec,
+    });
+
+    // Final flush
+    if !write_buf.is_empty() && client_socket.write_all_buf(&mut write_buf).await.is_err() {
+        guard.poisoned = true;
         error!("no client");
         return Err(CacheError::Write.into());
     }
 
-    let mut buf = BytesMut::new();
-    command_complete_encode(res.len() as u64, &mut buf);
-
-    // trace!("(w) client write {:?}", buf);
-    if msg.client_socket.write_all_buf(&mut buf).await.is_err() {
-        error!("no client");
-        return Err(CacheError::Write.into());
-    }
-
-    // Record response written time
     msg.timing.response_written_at = Some(Instant::now());
 
-    Ok(())
+    guard.release().await
 }
