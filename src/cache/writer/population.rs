@@ -5,15 +5,20 @@ use postgres_protocol::escape;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::{Client, SimpleQueryMessage};
+use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
 
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::query::ast::Deparse;
 use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
+use crate::query::transform::resolved_select_node_replace;
 
 use super::super::{CacheError, CacheResult, MapIntoReport, messages::QueryCommand};
 use super::PopulationWork;
+
+/// Number of rows to batch per INSERT statement sent to the cache database.
+const POPULATION_INSERT_BATCH_SIZE: usize = 200;
 
 /// Persistent population worker that processes work items from a channel.
 /// Each worker owns its own cache database connection.
@@ -112,21 +117,15 @@ async fn population_task(
                     name: Some(table_node.name.clone()),
                 })?;
 
-            // Fetch from origin using this branch
-            let fetch_start = Instant::now();
-            let rows = population_fetch(&db_origin, table, branch).await?;
-            let fetch_elapsed = fetch_start.elapsed();
-
-            // Populate cache (UPSERT handles duplicates if same table in multiple branches)
-            let insert_start = Instant::now();
-            let bytes = population_insert(db_cache, table, &rows).await?;
-            let insert_elapsed = insert_start.elapsed();
+            let stream_start = Instant::now();
+            let bytes = population_stream(&db_origin, db_cache, table, branch).await?;
+            let stream_elapsed = stream_start.elapsed();
 
             total_bytes += bytes;
 
             trace!(
-                "population table {}.{} fetch={:?} insert={:?} bytes={bytes}",
-                table.schema, table.name, fetch_elapsed, insert_elapsed
+                "population table {}.{} elapsed={:?} bytes={bytes}",
+                table.schema, table.name, stream_elapsed
             );
         }
     }
@@ -146,109 +145,124 @@ async fn population_task(
     Ok(total_bytes)
 }
 
-/// Fetch data from origin database for a single table using a SELECT branch.
-async fn population_fetch(
+/// Fetch data from origin and stream it into the cache database in batches.
+///
+/// Streams rows from origin via SimpleQueryStream, batching INSERT...ON CONFLICT
+/// statements in groups of POPULATION_INSERT_BATCH_SIZE rows. This avoids materializing
+/// the entire result set in memory.
+async fn population_stream(
     db_origin: &Client,
+    db_cache: &Client,
     table: &TableMetadata,
     branch: &ResolvedSelectNode,
-) -> CacheResult<Vec<SimpleQueryMessage>> {
-    // Find the table's alias in this branch (if any)
+) -> CacheResult<usize> {
+    // Build the SELECT query
     let maybe_alias = branch
         .nodes::<ResolvedTableNode>()
         .find(|tn| tn.relation_oid == table.relation_oid)
         .and_then(|t| t.alias.as_deref());
 
-    // Use table metadata to get column list
     let select_columns = table.resolved_select_columns(maybe_alias);
-
-    // Build query with table columns
-    use crate::query::transform::resolved_select_node_replace;
     let new_ast = resolved_select_node_replace(branch, select_columns);
     let mut buf = String::with_capacity(1024);
     new_ast.deparse(&mut buf);
 
-    db_origin
-        .simple_query(&buf)
+    // Start streaming from origin
+    let stream = db_origin
+        .simple_query_raw(&buf)
         .await
-        .map_into_report::<CacheError>()
-}
+        .map_into_report::<CacheError>()?;
+    tokio::pin!(stream);
 
-/// Insert fetched rows into cache table.
-async fn population_insert(
-    db_cache: &Client,
-    table: &TableMetadata,
-    response: &[SimpleQueryMessage],
-) -> CacheResult<usize> {
-    let [
-        SimpleQueryMessage::RowDescription(row_description),
-        data_rows @ ..,
-        _command_complete,
-    ] = response
-    else {
-        return Ok(0);
+    // Extract RowDescription (first item from stream)
+    let row_description = match stream.next().await {
+        Some(Ok(SimpleQueryMessage::RowDescription(cols))) => cols,
+        Some(Ok(_)) => return Err(CacheError::InvalidMessage.into()),
+        Some(Err(e)) => return Err(CacheError::from(e).into()),
+        None => return Ok(0),
     };
 
-    let mut cached_bytes: usize = 0;
-
-    let pkey_columns = table
-        .primary_key_columns
-        .iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>();
-    let schema = &table.schema;
-    let table_name = &table.name;
-
-    let rows: Vec<_> = data_rows
-        .iter()
-        .filter_map(|msg| {
-            if let SimpleQueryMessage::Row(row) = msg {
-                Some(row)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut sql_list = Vec::new();
+    // Pre-compute column and conflict clause strings
     let columns: Vec<String> = row_description
         .iter()
         .map(|c| format!("\"{}\"", c.name()))
         .collect();
 
-    for row in &rows {
-        let mut values: Vec<String> = Vec::new();
-        for idx in 0..row.columns().len() {
-            let value = row.get(idx);
-            cached_bytes += value.map_or(0, |v| v.len());
-            values.push(
-                value
-                    .map(escape::escape_literal)
-                    .unwrap_or("NULL".to_owned()),
-            );
+    let pkey_columns: Vec<String> = table
+        .primary_key_columns
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect();
+
+    let update_columns: Vec<String> = columns
+        .iter()
+        .filter(|c| !pkey_columns.contains(c))
+        .map(|c| format!("{c} = EXCLUDED.{c}"))
+        .collect();
+
+    let columns_joined = columns.join(",");
+    let pkey_joined = pkey_columns.join(",");
+    let update_joined = update_columns.join(", ");
+
+    let schema = &table.schema;
+    let table_name = &table.name;
+
+    let mut cached_bytes: usize = 0;
+    let mut batch: Vec<String> = Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
+
+    // Pre-compute the fixed prefix and suffix for INSERT statements
+    let insert_prefix = format!(
+        "INSERT INTO \"{schema}\".\"{table_name}\"({columns_joined}) VALUES ("
+    );
+    let insert_suffix = format!(
+        ") ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}"
+    );
+
+    let num_columns = row_description.len();
+    let mut values: Vec<String> = Vec::with_capacity(num_columns);
+    let mut insert_sql = String::new();
+
+    // Consume stream, batching rows into INSERT statements
+    loop {
+        match stream.next().await {
+            Some(Ok(SimpleQueryMessage::Row(row))) => {
+                values.clear();
+                for idx in 0..num_columns {
+                    let value = row.get(idx);
+                    cached_bytes += value.map_or(0, |v| v.len());
+                    values.push(
+                        value
+                            .map(escape::escape_literal)
+                            .unwrap_or_else(|| "NULL".to_owned()),
+                    );
+                }
+
+                insert_sql.clear();
+                insert_sql.push_str(&insert_prefix);
+                insert_sql.push_str(&values.join(","));
+                insert_sql.push_str(&insert_suffix);
+
+                batch.push(insert_sql.clone());
+
+                if batch.len() >= POPULATION_INSERT_BATCH_SIZE {
+                    db_cache
+                        .batch_execute(&batch.join(";"))
+                        .await
+                        .map_into_report::<CacheError>()?;
+                    batch.clear();
+                }
+            }
+            Some(Ok(SimpleQueryMessage::CommandComplete(_))) => break,
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(CacheError::from(e).into()),
+            None => break,
         }
-
-        let update_columns: Vec<_> = columns
-            .iter()
-            .filter(|&c| !pkey_columns.contains(&c.to_owned()))
-            .map(|c| format!("{c} = EXCLUDED.{c}"))
-            .collect();
-
-        let mut insert_table = format!(
-            "insert into \"{schema}\".\"{table_name}\"({}) values (",
-            columns.join(",")
-        );
-        insert_table.push_str(&values.join(","));
-        insert_table.push_str(") on conflict (");
-        insert_table.push_str(&pkey_columns.join(","));
-        insert_table.push_str(") do update set ");
-        insert_table.push_str(&update_columns.join(", "));
-
-        sql_list.push(insert_table);
     }
 
-    if !sql_list.is_empty() {
+    // Flush remaining rows
+    if !batch.is_empty() {
         db_cache
-            .simple_query(sql_list.join(";").as_str())
+            .batch_execute(&batch.join(";"))
             .await
             .map_into_report::<CacheError>()?;
     }
