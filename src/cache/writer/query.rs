@@ -105,7 +105,7 @@ impl CacheWriter {
             .map(analyze_query_constraints)
             .unwrap_or_default();
 
-        for (table_node, update_query_expr) in query_table_update_queries(cacheable_query) {
+        for (table_node, update_query_expr, source) in query_table_update_queries(cacheable_query) {
             let schema = self
                 .table_schema_resolve(
                     table_node.name.as_str(),
@@ -133,6 +133,7 @@ impl CacheWriter {
                 fingerprint,
                 resolved: update_resolved,
                 complexity,
+                source,
             };
 
             self.update_query_register(relation_oid, update_query);

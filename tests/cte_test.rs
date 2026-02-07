@@ -59,6 +59,10 @@ async fn cte_simple(ctx: &mut TestContext) -> Result<(), Error> {
     )
     .await?;
 
+    // Wait for setup CDC events to be processed before caching —
+    // INSERT events on subquery/CTE tables would trigger invalidation
+    wait_for_cdc().await;
+
     let query = "WITH active_emp AS (SELECT id, name, department FROM employees WHERE active = true) \
                  SELECT name, department FROM active_emp ORDER BY name";
 
@@ -101,6 +105,10 @@ async fn cte_simple_cdc(ctx: &mut TestContext) -> Result<(), Error> {
     let query = "WITH active_emp AS (SELECT id, name, department FROM employees WHERE active = true) \
                  SELECT name, department FROM active_emp ORDER BY name";
 
+    // Verify query is cached from prior test
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // 3 rows: Alice, Charlie, Diana
+
     // Activate Bob via origin (CDC)
     ctx.origin_query(
         "UPDATE employees SET active = true WHERE id = 2",
@@ -110,12 +118,14 @@ async fn cte_simple_cdc(ctx: &mut TestContext) -> Result<(), Error> {
 
     wait_for_cdc().await;
 
+    // CDC UPDATE on CTE table invalidates → cache miss
     // Query should now include Bob
     let res = ctx.simple_query(query).await?;
-
     assert_eq!(res.len(), 6); // 4 rows now
     assert_row_at(&res, 1, &[("name", "Alice"), ("department", "eng")])?;
     assert_row_at(&res, 2, &[("name", "Bob"), ("department", "eng")])?;
+
+    wait_cache_load().await;
 
     // Delete an employee via CDC
     ctx.origin_query("DELETE FROM employees WHERE id = 4", &[])
@@ -123,14 +133,18 @@ async fn cte_simple_cdc(ctx: &mut TestContext) -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    // Diana should be gone
+    // CDC DELETE on CTE table (Inclusion) does NOT invalidate → cache hit
+    // Row removed from cache table, query re-evaluates correctly
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // back to 3 rows
 
     let after = ctx.metrics().await?;
     let delta = metrics_delta(&before, &after);
 
-    assert_eq!(delta.queries_cacheable, 2, "cacheable CTE queries");
+    assert_eq!(delta.queries_cacheable, 3, "cacheable CTE queries");
+    // First: hit (cached), second: miss (CDC UPDATE invalidated),
+    // third: hit (CDC DELETE doesn't invalidate)
+    assert_eq!(delta.queries_cache_miss, 1, "cache miss after CDC update");
     assert_eq!(delta.queries_cache_hit, 2, "cache hits after CDC");
 
     Ok(())
@@ -159,6 +173,9 @@ async fn cte_with_join(ctx: &mut TestContext) -> Result<(), Error> {
         &[],
     )
     .await?;
+
+    // Wait for setup CDC events to be processed before caching
+    wait_for_cdc().await;
 
     // CTE selects active employees, then join with projects
     let query = "WITH active_emp AS (SELECT id, name FROM employees WHERE active = true) \

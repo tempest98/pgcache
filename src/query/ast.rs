@@ -17,6 +17,7 @@ use pg_query::protobuf::{
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
+use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::pg::identifier_needs_quotes;
 use crate::query::parse::{const_value_extract, node_convert_to_expr, select_stmt_parse_where};
 
@@ -480,6 +481,53 @@ impl WhereExpr {
                 query.select_branches_collect(branches);
                 if let Some(test) = test_expr {
                     test.collect_subquery_branches(branches);
+                }
+            }
+            WhereExpr::Value(_) | WhereExpr::Column(_) => {}
+        }
+    }
+
+    /// Recursively collect subquery branches with source tracking.
+    /// `negated` tracks NOT-wrapping to flip Inclusion↔Exclusion for
+    /// EXISTS/ANY subqueries. ALL is already Exclusion (NOT IN).
+    fn subquery_branches_with_source_collect<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
+        negated: bool,
+    ) {
+        match self {
+            WhereExpr::Binary(binary) => {
+                binary.lexpr.subquery_branches_with_source_collect(branches, negated);
+                binary.rexpr.subquery_branches_with_source_collect(branches, negated);
+            }
+            WhereExpr::Unary(unary) => {
+                let child_negated = if unary.op == UnaryOp::Not { !negated } else { negated };
+                unary.expr.subquery_branches_with_source_collect(branches, child_negated);
+            }
+            WhereExpr::Multi(multi) => {
+                for expr in &multi.exprs {
+                    expr.subquery_branches_with_source_collect(branches, negated);
+                }
+            }
+            WhereExpr::Function { args, .. } => {
+                for arg in args {
+                    arg.subquery_branches_with_source_collect(branches, negated);
+                }
+            }
+            WhereExpr::Subquery { query, sublink_type, test_expr } => {
+                let kind = match sublink_type {
+                    SubLinkType::Expr => SubqueryKind::Scalar,
+                    SubLinkType::Any | SubLinkType::Exists => {
+                        if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion }
+                    }
+                    SubLinkType::All => {
+                        if negated { SubqueryKind::Inclusion } else { SubqueryKind::Exclusion }
+                    }
+                };
+                let source = UpdateQuerySource::Subquery(kind);
+                query.branches_with_source_collect(branches, source, negated);
+                if let Some(test) = test_expr {
+                    test.subquery_branches_with_source_collect(branches, negated);
                 }
             }
             WhereExpr::Value(_) | WhereExpr::Column(_) => {}
@@ -973,6 +1021,49 @@ impl QueryExpr {
             }
         }
     }
+
+    /// Extract all SELECT branches with their source context (Direct vs Subquery).
+    ///
+    /// Unlike `select_branches()`, this tracks whether each branch came from
+    /// the top-level body (Direct) or from a subquery context (Subquery with kind).
+    /// CTE definitions are not collected directly — their branches are collected
+    /// when referenced via CteRef, inheriting the reference site's source context.
+    pub fn select_branches_with_source(&self) -> Vec<(&SelectNode, UpdateQuerySource)> {
+        let mut branches = Vec::new();
+        self.branches_with_source_collect(&mut branches, UpdateQuerySource::Direct, false);
+        branches
+    }
+
+    /// Collects branches with source tracking.
+    /// `outer_source` is the source assigned to this query's body branches.
+    /// `negated` tracks NOT-wrapping to flip Inclusion↔Exclusion.
+    fn branches_with_source_collect<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
+        outer_source: UpdateQuerySource,
+        negated: bool,
+    ) {
+        match &self.body {
+            QueryBody::Select(select) => {
+                branches.push((select, outer_source));
+                for source in &select.from {
+                    source.subquery_branches_with_source_collect(branches, negated);
+                }
+                if let Some(where_clause) = &select.where_clause {
+                    where_clause.subquery_branches_with_source_collect(branches, negated);
+                }
+                if let Some(having) = &select.having {
+                    having.subquery_branches_with_source_collect(branches, negated);
+                }
+                select.columns.subquery_branches_with_source_collect(branches);
+            }
+            QueryBody::SetOp(set_op) => {
+                set_op.left.branches_with_source_collect(branches, outer_source, negated);
+                set_op.right.branches_with_source_collect(branches, outer_source, negated);
+            }
+            QueryBody::Values(_) => {}
+        }
+    }
 }
 
 impl Deparse for QueryExpr {
@@ -1059,6 +1150,19 @@ impl SelectColumns {
         if let SelectColumns::Columns(columns) = self {
             for col in columns {
                 col.expr.collect_subquery_branches(branches);
+            }
+        }
+    }
+
+    /// Collect subquery branches from SELECT list with source tracking.
+    /// All subqueries in a SELECT list are Scalar (must return single value).
+    fn subquery_branches_with_source_collect<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
+    ) {
+        if let SelectColumns::Columns(columns) = self {
+            for col in columns {
+                col.expr.subquery_branches_with_source_collect(branches);
             }
         }
     }
@@ -1229,6 +1333,43 @@ impl ColumnExpr {
             }
             ColumnExpr::Subquery(query) => {
                 query.select_branches_collect(branches);
+            }
+        }
+    }
+
+    /// Collect subquery branches from column expressions with source tracking.
+    /// All subqueries within column expressions are Scalar.
+    fn subquery_branches_with_source_collect<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
+    ) {
+        match self {
+            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => {}
+            ColumnExpr::Function(func) => {
+                for arg in &func.args {
+                    arg.subquery_branches_with_source_collect(branches);
+                }
+            }
+            ColumnExpr::Case(case) => {
+                if let Some(arg) = &case.arg {
+                    arg.subquery_branches_with_source_collect(branches);
+                }
+                for when in &case.whens {
+                    // condition is WhereExpr — use negated=false (Scalar context)
+                    when.condition.subquery_branches_with_source_collect(branches, false);
+                    when.result.subquery_branches_with_source_collect(branches);
+                }
+                if let Some(default) = &case.default {
+                    default.subquery_branches_with_source_collect(branches);
+                }
+            }
+            ColumnExpr::Arithmetic(arith) => {
+                arith.left.subquery_branches_with_source_collect(branches);
+                arith.right.subquery_branches_with_source_collect(branches);
+            }
+            ColumnExpr::Subquery(query) => {
+                let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);
+                query.branches_with_source_collect(branches, source, false);
             }
         }
     }
@@ -1541,6 +1682,37 @@ impl TableSource {
                 join.right.collect_subquery_branches(branches);
                 if let Some(condition) = &join.condition {
                     condition.collect_subquery_branches(branches);
+                }
+            }
+        }
+    }
+
+    /// Collect subquery branches from table sources with source tracking.
+    /// FROM subqueries and CteRef inherit the negation context as Inclusion/Exclusion.
+    fn subquery_branches_with_source_collect<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
+        negated: bool,
+    ) {
+        match self {
+            TableSource::Table(_) => {}
+            TableSource::Subquery(sub) => {
+                let kind = if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion };
+                sub.query.branches_with_source_collect(
+                    branches, UpdateQuerySource::Subquery(kind), negated,
+                );
+            }
+            TableSource::CteRef(cte_ref) => {
+                let kind = if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion };
+                cte_ref.query.branches_with_source_collect(
+                    branches, UpdateQuerySource::Subquery(kind), negated,
+                );
+            }
+            TableSource::Join(join) => {
+                join.left.subquery_branches_with_source_collect(branches, negated);
+                join.right.subquery_branches_with_source_collect(branches, negated);
+                if let Some(condition) = &join.condition {
+                    condition.subquery_branches_with_source_collect(branches, negated);
                 }
             }
         }
@@ -5854,5 +6026,188 @@ mod tests {
             }
             other => panic!("expected Join, got {other:?}"),
         }
+    }
+
+    // ==========================================================================
+    // select_branches_with_source tests
+    // ==========================================================================
+
+    #[test]
+    fn test_branches_with_source_simple() {
+        let query = parse_query("SELECT id FROM users WHERE id = 1");
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+    }
+
+    #[test]
+    fn test_branches_with_source_union() {
+        let query = parse_query("SELECT id FROM users UNION SELECT id FROM admins");
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 2);
+        // Both branches of a UNION are Direct
+        assert!(branches.iter().all(|(_, src)| *src == UpdateQuerySource::Direct));
+    }
+
+    #[test]
+    fn test_branches_with_source_where_in() {
+        let query = parse_query(
+            "SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)",
+        );
+        let branches = query.select_branches_with_source();
+
+        // Outer SELECT (Direct) + IN subquery (Inclusion)
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
+        );
+    }
+
+    #[test]
+    fn test_branches_with_source_not_in() {
+        let query = parse_query(
+            "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)",
+        );
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        // NOT IN is parsed as SubLinkType::All (already Exclusion)
+        // or as NOT wrapping Any (negated → Exclusion)
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+            "NOT IN subquery should be Exclusion"
+        );
+    }
+
+    #[test]
+    fn test_branches_with_source_exists() {
+        let query = parse_query(
+            "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)",
+        );
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
+        );
+    }
+
+    #[test]
+    fn test_branches_with_source_not_exists() {
+        let query = parse_query(
+            "SELECT * FROM orders WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)",
+        );
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+            "NOT EXISTS subquery should be Exclusion"
+        );
+    }
+
+    #[test]
+    fn test_branches_with_source_scalar_in_where() {
+        let query = parse_query(
+            "SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)",
+        );
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Scalar),
+            "Scalar subquery in WHERE should be Scalar"
+        );
+    }
+
+    #[test]
+    fn test_branches_with_source_scalar_in_select() {
+        let query = parse_query(
+            "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) FROM users",
+        );
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Scalar),
+            "Scalar subquery in SELECT list should be Scalar"
+        );
+    }
+
+    #[test]
+    fn test_branches_with_source_from_subquery() {
+        let query = parse_query("SELECT * FROM (SELECT id FROM users) sub");
+        let branches = query.select_branches_with_source();
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "FROM subquery should be Inclusion"
+        );
+    }
+
+    #[test]
+    fn test_branches_with_source_cte() {
+        let query = parse_query(
+            "WITH active AS (SELECT id FROM users WHERE active = true) SELECT * FROM active",
+        );
+        let branches = query.select_branches_with_source();
+
+        // Outer SELECT (Direct) + CteRef body (Subquery(Inclusion))
+        // CTE definitions are NOT collected — only CteRef references are
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(
+            branches[1].1,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "CTE body via CteRef should be Inclusion"
+        );
+
+        // The inner branch should reference "users" table
+        let inner_tables = branches[1].0.direct_table_nodes();
+        assert_eq!(inner_tables.len(), 1);
+        assert_eq!(inner_tables[0].name, "users");
+    }
+
+    #[test]
+    fn test_branches_with_source_cte_no_duplication() {
+        // Verify CTE body is collected only via CteRef, not from definition
+        let query = parse_query(
+            "WITH x AS (SELECT id FROM users) SELECT * FROM x",
+        );
+
+        let branches = query.select_branches_with_source();
+        let with_source = query.select_branches_with_source();
+        let without_source = query.select_branches();
+
+        // With source should have 2 (outer + CteRef body)
+        assert_eq!(with_source.len(), 2);
+
+        // Without source has 3 (CTE def body + outer + CteRef body) due to legacy collection
+        // The new method avoids the duplication
+        assert!(
+            with_source.len() <= without_source.len(),
+            "with_source ({}) should not exceed without_source ({})",
+            with_source.len(),
+            without_source.len()
+        );
+        // Just verify the branch count is exactly 2 (no CTE def duplication)
+        assert_eq!(branches.len(), 2);
     }
 }

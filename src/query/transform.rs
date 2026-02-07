@@ -5,7 +5,7 @@ use postgres_types::Type as PgType;
 use rootcause::Report;
 
 use crate::{
-    cache::{QueryParameter, QueryParameters, query::CacheableQuery},
+    cache::{QueryParameter, QueryParameters, UpdateQuerySource, query::CacheableQuery},
     catalog::TableMetadata,
     query::ast::{
         ColumnExpr, LiteralValue, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode,
@@ -776,7 +776,9 @@ fn resolved_column_expr_alias_update(
 ///
 /// This approach ensures that CDC handling only checks if a changed row matches the
 /// specific branch conditions, not the entire set operation structure.
-pub fn query_table_update_queries(cacheable_query: &CacheableQuery) -> Vec<(&TableNode, QueryExpr)> {
+pub fn query_table_update_queries(
+    cacheable_query: &CacheableQuery,
+) -> Vec<(&TableNode, QueryExpr, UpdateQuerySource)> {
     let mut result = Vec::new();
 
     let column = SelectColumn {
@@ -785,8 +787,8 @@ pub fn query_table_update_queries(cacheable_query: &CacheableQuery) -> Vec<(&Tab
     };
     let select_list = SelectColumns::Columns(vec![column]);
 
-    // For each SELECT branch in the query
-    for branch in cacheable_query.query.select_branches() {
+    // For each SELECT branch in the query, with its source context
+    for (branch, source) in cacheable_query.query.select_branches_with_source() {
         // For each direct table in this branch (not inside subqueries).
         // Tables inside subqueries are handled by their own inner branch.
         for table in branch.direct_table_nodes() {
@@ -798,7 +800,7 @@ pub fn query_table_update_queries(cacheable_query: &CacheableQuery) -> Vec<(&Tab
                 order_by: vec![],
                 limit: None,
             };
-            result.push((table, update_query));
+            result.push((table, update_query, source));
         }
     }
 
@@ -810,6 +812,7 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::wildcard_enum_match_arm)]
 
+    use crate::cache::SubqueryKind;
     use crate::query::ast::{Deparse, query_expr_convert};
 
     use super::*;
@@ -1084,7 +1087,7 @@ mod tests {
         assert!(update1.contains("JOIN"));
 
         // Verify each table is associated with an update query
-        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        let table_names: Vec<_> = result.iter().map(|(t, _, _)| t.name.as_str()).collect();
         assert!(table_names.contains(&"users"));
         assert!(table_names.contains(&"location"));
         assert!(table_names.contains(&"orders"));
@@ -1103,7 +1106,7 @@ mod tests {
         assert_eq!(result.len(), 4, "Should have 4 update queries for 4 tables");
 
         // Verify each table is associated with an update query
-        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        let table_names: Vec<_> = result.iter().map(|(t, _, _)| t.name.as_str()).collect();
         assert!(table_names.contains(&"a"));
         assert!(table_names.contains(&"b"));
         assert!(table_names.contains(&"c"));
@@ -1127,12 +1130,12 @@ mod tests {
         assert_eq!(result.len(), 2, "Should have 2 update queries for 2 tables");
 
         // Verify each table is associated with an update query
-        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        let table_names: Vec<_> = result.iter().map(|(t, _, _)| t.name.as_str()).collect();
         assert!(table_names.contains(&"users"));
         assert!(table_names.contains(&"admins"));
 
         // Update queries should be branch-specific (no UNION)
-        for (table, query) in &result {
+        for (table, query, _) in &result {
             let mut sql = String::new();
             query.deparse(&mut sql);
             assert!(
@@ -1165,13 +1168,13 @@ mod tests {
 
         assert_eq!(result.len(), 3, "Should have 3 update queries for 3 tables");
 
-        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        let table_names: Vec<_> = result.iter().map(|(t, _, _)| t.name.as_str()).collect();
         assert!(table_names.contains(&"a"));
         assert!(table_names.contains(&"b"));
         assert!(table_names.contains(&"c"));
 
         // Verify each update query is branch-specific (no UNION)
-        for (table, query) in &result {
+        for (table, query, _) in &result {
             let mut sql = String::new();
             query.deparse(&mut sql);
             assert!(
@@ -1192,7 +1195,7 @@ mod tests {
 
         assert_eq!(result.len(), 3, "Should have 3 update queries (a, b, c)");
 
-        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        let table_names: Vec<_> = result.iter().map(|(t, _, _)| t.name.as_str()).collect();
         assert!(table_names.contains(&"a"));
         assert!(table_names.contains(&"b"));
         assert!(table_names.contains(&"c"));
@@ -1734,7 +1737,7 @@ mod tests {
         // The CTE body contains "users" and the main query joins with "orders".
         // select_branches traverses into CTE definitions, so we should get
         // tables from both the CTE body branch and the main query branch.
-        let table_names: Vec<_> = result.iter().map(|(t, _)| t.name.as_str()).collect();
+        let table_names: Vec<_> = result.iter().map(|(t, _, _)| t.name.as_str()).collect();
         assert!(
             table_names.contains(&"users"),
             "Should have update query for 'users' table from CTE body: {table_names:?}"
@@ -1742,6 +1745,105 @@ mod tests {
         assert!(
             table_names.contains(&"orders"),
             "Should have update query for 'orders' table from main query: {table_names:?}"
+        );
+    }
+
+    // ==================== UpdateQuerySource Tests ====================
+
+    #[test]
+    fn test_update_query_source_simple() {
+        let cacheable = parse_cacheable("SELECT id FROM users WHERE id = 1");
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].2, UpdateQuerySource::Direct);
+    }
+
+    #[test]
+    fn test_update_query_source_join() {
+        let cacheable = parse_cacheable(
+            "SELECT a.id FROM users a JOIN orders b ON a.id = b.user_id WHERE a.id = 1",
+        );
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 2);
+        // Both tables in a JOIN are Direct
+        assert!(
+            result.iter().all(|(_, _, src)| *src == UpdateQuerySource::Direct),
+            "All JOIN tables should be Direct"
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_where_in() {
+        let cacheable = parse_cacheable(
+            "SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)",
+        );
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 2);
+
+        let users = result.iter().find(|(t, _, _)| t.name == "users").unwrap();
+        assert_eq!(users.2, UpdateQuerySource::Direct);
+
+        let active = result
+            .iter()
+            .find(|(t, _, _)| t.name == "active_users")
+            .unwrap();
+        assert_eq!(
+            active.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_not_in() {
+        let cacheable = parse_cacheable(
+            "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)",
+        );
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 2);
+
+        let banned = result
+            .iter()
+            .find(|(t, _, _)| t.name == "banned_users")
+            .unwrap();
+        assert_eq!(
+            banned.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+            "NOT IN subquery table should be Exclusion"
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_cte() {
+        let sql = "WITH active AS (SELECT id FROM users WHERE active = true) \
+                   SELECT * FROM active";
+        let cacheable = parse_cacheable(sql);
+        let result = query_table_update_queries(&cacheable);
+
+        // CTE body "users" should be Subquery(Inclusion)
+        let users = result.iter().find(|(t, _, _)| t.name == "users").unwrap();
+        assert_eq!(
+            users.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "CTE body table should be Subquery(Inclusion)"
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_from_subquery() {
+        let cacheable = parse_cacheable(
+            "SELECT * FROM (SELECT id FROM users WHERE id = 1) sub",
+        );
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].2,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "FROM subquery table should be Subquery(Inclusion)"
         );
     }
 }

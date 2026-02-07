@@ -61,6 +61,41 @@ impl BiHashItem for CachedQuery {
 //     id_upcast!();
 // }
 
+/// The kind of subquery context a table was found in.
+/// Determines invalidation behavior based on whether the subquery's
+/// result set growing or shrinking affects the outer query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SubqueryKind {
+    /// IN, EXISTS, FROM subquery, CTE.
+    /// Set growth → outer result grows → invalidate.
+    /// Set shrink → outer result shrinks → skip.
+    Inclusion,
+    /// NOT IN (<> ALL), NOT EXISTS.
+    /// Set growth → outer result shrinks → skip.
+    /// Set shrink → outer result grows → invalidate.
+    Exclusion,
+    /// Scalar subquery returning a single value.
+    /// Any change → invalidate.
+    Scalar,
+}
+
+/// Whether an update query was derived from a direct table or a subquery table
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UpdateQuerySource {
+    /// Table appears directly in FROM clause (including JOINs)
+    Direct,
+    /// Table appears inside a subquery, CTE, or derived table
+    Subquery(SubqueryKind),
+}
+
+/// CDC event type, used to determine invalidation direction for subquery tables
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CdcEventKind {
+    Insert,
+    Update,
+    Delete,
+}
+
 /// Query used to update cached results when data changes
 #[derive(Debug, Clone)]
 pub struct UpdateQuery {
@@ -70,6 +105,8 @@ pub struct UpdateQuery {
     pub resolved: ResolvedQueryExpr,
     /// Complexity score (lower = simpler = more likely to match = try first)
     pub complexity: usize,
+    /// Whether this table was found directly in FROM or inside a subquery
+    pub source: UpdateQuerySource,
 }
 
 /// Collection of update queries for a specific relation

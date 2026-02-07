@@ -1,6 +1,6 @@
-# Complex Query Support Plan
+# Complex Query Support
 
-This document tracks the work needed to support complex queries with features like UNION, aggregate functions, window functions, and CASE expressions.
+This document tracks query feature support in pgcache — what's implemented, what's cacheable, and what remains.
 
 ## Target Query
 
@@ -358,414 +358,99 @@ limit
   100 offset 0;
 ```
 
-## Simplified Test Query
+### Target Query Cacheability
 
-Use this query for incremental development and testing. It contains all the key features in a more manageable form:
+This query **cannot be cached** due to several design-level blockers:
 
-```sql
-SELECT
-  t.id,
-  t.name,
-  t.amount,
-  null as nullable_col,
-  false as bool_col,
-  123 as int_col,
-  'literal' as str_col,
-  count(distinct t.category_id) as category_count,
-  string_agg(distinct t.tag, ', ' order by t.tag) as tags,
-  sum(
-    case
-      when t.status in ('ACTIVE', 'PENDING') and t.type = 'CREDIT'
-        then t.amount
-      when t.status in ('ACTIVE', 'PENDING') and t.type = 'DEBIT'
-        then t.amount * -1
-      else 0
-    end
-  ) over (order by t.date_col asc, t.id asc) as running_balance
-from
-  (
-    select
-      a.id,
-      a.name,
-      a.amount,
-      a.status,
-      a.type,
-      a.date_col,
-      c.id as category_id,
-      tg.name as tag
-    from table_a a
-    join table_b b on b.id = a.b_id and b.tenant_id = 1
-    join table_c c on c.id = b.c_id
-    left join table_tags tg on tg.a_id = a.id
-    where a.tenant_id = 1
-      and a.deleted_at is null
-      and b.active = true
+- **LEFT JOIN** — `left join tb_accounts`, `left join tb_entities` — not cacheable (NULL semantics)
+- **LIMIT/OFFSET** — `limit 100 offset 0` — not cacheable at top level
+- **Non-deterministic functions** — `date_trunc('day', now())` — result changes over time
 
-    union
+The target query is useful as a parsing benchmark (can we parse all features?) but will need structural changes to become cacheable. A cacheable version would need to replace LEFT JOINs with INNER JOINs, remove LIMIT, and eliminate non-deterministic functions.
 
-    select
-      x.id,
-      x.name,
-      x.amount,
-      x.status,
-      x.type,
-      x.date_col,
-      c.id as category_id,
-      tg.name as tag
-    from table_x x
-    join table_c c on c.id = x.c_id
-    left join table_tags tg on tg.x_id = x.id
-    where x.tenant_id = 1
-      and x.deleted_at is null
-  ) t
-where t.date_col >= '2026-01-01'
-  and t.date_col <= '2026-12-31'
-group by t.id, t.name, t.amount, t.status, t.type, t.date_col
-order by t.date_col asc, t.id asc
-limit 100 offset 0;
-```
+## Feature Status
 
-## Feature Analysis
+### Fully Implemented and Cacheable
 
-### Currently Supported
+| Feature | Parsing | Resolution | Cacheability | Integration Tests |
+|---------|---------|------------|--------------|-------------------|
+| INNER JOINs (equality conditions) | `ast.rs` | `resolved.rs` | `query.rs` | multiple |
+| Basic WHERE (`=`, `>=`, `<=`, `AND`, `OR`, `NOT`) | `parse.rs` | `resolved.rs` | `query.rs` | multiple |
+| IS NULL / IS NOT NULL in WHERE | `parse.rs` `null_test_convert` | `resolved.rs` | `query.rs` | multiple |
+| IN clause (value list) | `parse.rs` `a_expr_convert` | `resolved.rs` | `query.rs` | multiple |
+| Column aliases | `ast.rs` | `resolved.rs` | `query.rs` | multiple |
+| ORDER BY | `ast.rs` | `resolved.rs` | `query.rs` | multiple |
+| Literal values in SELECT (NULL, bool, int, string) | `ast.rs` `select_columns_convert` | `resolved.rs` | `query.rs` | unit |
+| Aggregate functions (`COUNT(*)`, `SUM`, `string_agg`) | `ast.rs` `func_call_convert` | `resolved.rs` | `query.rs` | unit |
+| COUNT(DISTINCT col) | `ast.rs` via `agg_distinct` | `resolved.rs` | `query.rs` | unit |
+| ORDER BY in aggregates | `ast.rs` via `agg_order` | `resolved.rs` | `query.rs` | unit |
+| Window functions (`OVER (PARTITION BY ... ORDER BY ...)`) | `ast.rs` `WindowSpec` | `resolved.rs` `ResolvedWindowSpec` | `query.rs` | unit |
+| CASE expressions (searched and simple) | `ast.rs` `CaseExpr` | `resolved.rs` `ResolvedCaseExpr` | `query.rs` | unit |
+| Arithmetic expressions (`+`, `-`, `*`, `/`) | `ast.rs` `ArithmeticExpr` | `resolved.rs` `ResolvedArithmeticExpr` | `query.rs` | unit |
+| Function calls in SELECT | `ast.rs` `FunctionCall` | `resolved.rs` | `query.rs` | unit |
+| GROUP BY | `ast.rs` | `resolved.rs` | `query.rs` — cacheable, aggregation at retrieval | unit |
+| Subqueries in FROM (derived tables) | `ast.rs` `TableSubqueryNode` | `resolved.rs` `ResolvedTableSubqueryNode` | `query.rs` `is_cacheable_table_subquery` | `subquery_test.rs` |
+| UNION / UNION ALL / INTERSECT / EXCEPT | `ast.rs` `SetOpNode` | `resolved.rs` `ResolvedSetOpNode` | `query.rs` `is_cacheable_set_op` | `set_operations_test.rs` |
+| CTEs (WITH ... AS) | `ast.rs` `CteDefinition`, `CteRefNode` | `resolved.rs` via `ResolvedTableSubqueryNode` | `query.rs` `is_cacheable_cte_ref` | `cte_test.rs` |
+| MATERIALIZED / NOT MATERIALIZED CTEs | `ast.rs` `CteMaterialize` | `resolved.rs` | `query.rs` | `cte_test.rs` |
+| Subqueries in WHERE (IN, NOT IN, scalar) | `parse.rs` `sublink_convert` | `resolved.rs` | `query.rs` `is_cacheable_expr` | `subquery_test.rs` |
+| Nested subqueries (multi-level) | `parse.rs` | `resolved.rs` | `query.rs` | `subquery_test.rs` |
 
-| Feature | Status | Notes |
+### Parsed but Not Cacheable (by design)
+
+| Feature | Reason | Notes |
 |---------|--------|-------|
-| Subqueries in FROM | **Partial** | Parsed via `table_subquery_node_convert`, but **resolution not implemented** |
-| INNER JOINs | Yes | Multiple joins with equality conditions |
-| LEFT JOINs | Yes | Parsed but marked non-cacheable |
-| Basic WHERE (=, >=, <=, AND) | Yes | Simple comparisons work |
-| Column aliases | Yes | `col as alias` |
-| GROUP BY columns | Yes | Recently added, marks query non-cacheable |
-| LIMIT/OFFSET | Yes | Recently added, marks query non-cacheable |
-| ORDER BY | Yes | `OrderByClause` exists |
-| CASE expressions | Yes | Both searched (`CASE WHEN...`) and simple (`CASE expr WHEN...`) forms |
-| Aggregate functions | Yes | `FunctionCall` with `agg_star`, `agg_distinct`, and `agg_order` |
-| COUNT(*) | Yes | Properly parsed and deparsed via `agg_star` field |
-| COUNT(DISTINCT col) | Yes | Properly parsed and deparsed via `agg_distinct` field |
-| Literal values in SELECT | Yes | NULL, booleans, integers, strings supported |
-| Function calls in SELECT | Yes | `FunctionCall` struct handles named functions |
-| Window functions | Yes | `sum(...) OVER (PARTITION BY ... ORDER BY ...)` |
-
-### Not Supported (Blocking)
-
-| Priority | Feature | Example | Impact |
-|----------|---------|---------|--------|
-| **P0** | **Subquery resolution** | `SELECT * FROM (SELECT ...) sub` | Resolution fails with `InvalidTableRef` |
-| P0 | UNION | `select ... union select ...` | Query won't parse |
-| P0 | LIMIT/OFFSET cacheability | `LIMIT 100 OFFSET 0` | Currently marks query non-cacheable |
-| ~~P1~~ | ~~Aggregate functions~~ | ~~`count(...)`, `sum(...)`, `string_agg(...)`~~ | ✅ Implemented |
-| ~~P1~~ | ~~Window functions~~ | ~~`sum(...) over (order by ...)`~~ | ✅ Implemented |
-| ~~P1~~ | ~~CASE expressions~~ | ~~`case when ... then ... else ... end`~~ | ✅ Implemented |
-| ~~P1~~ | ~~Function calls in SELECT~~ | ~~`date_trunc('day', now())`~~ | ✅ Implemented |
-| ~~P2~~ | ~~Boolean literals in SELECT~~ | ~~`false as bool_col`~~ | ✅ Implemented |
-| ~~P2~~ | ~~NULL literals in SELECT~~ | ~~`null as nullable_col`~~ | ✅ Implemented |
-| ~~P2~~ | ~~Integer literals in SELECT~~ | ~~`123 as int_col`~~ | ✅ Implemented |
-| ~~P2~~ | ~~String literals in SELECT~~ | ~~`'literal' as str_col`~~ | ✅ Implemented |
-| ~~P2~~ | ~~Arithmetic expressions~~ | ~~`amount * -1`~~ | ✅ Implemented via `ArithmeticExpr` |
-| ~~P2~~ | ~~IS NULL in WHERE~~ | ~~`deleted_at is null`~~ | ✅ Implemented via `UnaryOp::IsNull/IsNotNull` |
-| ~~P2~~ | ~~IN clause~~ | ~~`status in ('A', 'B')`~~ | ✅ Implemented via `MultiOp::In` |
-| ~~P3~~ | ~~DISTINCT in aggregates~~ | ~~`count(distinct ...)`~~ | ✅ Implemented via `agg_distinct` |
-| ~~P2~~ | ~~Arithmetic expressions~~ | ~~`amount * -1`~~ | ✅ Implemented via `ArithmeticExpr` |
-| ~~P3~~ | ~~ORDER BY in aggregates~~ | ~~`string_agg(... order by ...)`~~ | ✅ Implemented via `agg_order` field |
-
-## Implementation Plan
-
-### Phase 1: Parse the Query
-
-#### Step 1.1: Add literal support to SELECT columns ✅ DONE
-
-**File:** `src/query/ast.rs`
-
-Literals (NULL, booleans, integers, strings) are now handled via `NodeEnum::AConst` in `select_columns_convert`.
-
-**Test query:**
-```sql
-SELECT null as a, false as b, 123 as c, 'text' as d FROM t
-```
-
-#### Step 1.2: Add UNION support
-
-**File:** `src/query/ast.rs`
-
-1. Add new types:
-```rust
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub enum SetOperation {
-    Union,
-    UnionAll,
-    Intersect,
-    IntersectAll,
-    Except,
-    ExceptAll,
-}
-
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub struct SetOperationStatement {
-    pub op: SetOperation,
-    pub left: Box<SelectStatement>,
-    pub right: Box<SelectStatement>,
-}
-```
-
-2. Update `SelectStatement` or create wrapper enum:
-```rust
-pub enum SelectBody {
-    Simple(SelectStatement),
-    SetOp(SetOperationStatement),
-}
-```
-
-3. In `select_statement_convert`, check `select_stmt.op` field
-
-**Test query:**
-```sql
-SELECT id, name FROM table_a UNION SELECT id, name FROM table_b
-```
-
-#### Step 1.3: Add IS NULL support in WHERE ✅ DONE
-
-**File:** `src/query/parse.rs`
-
-Implemented via `null_test_convert()` function that handles `NodeEnum::NullTest`. Creates `UnaryExpr` with `UnaryOp::IsNull` or `UnaryOp::IsNotNull`.
-
-Note: IS NULL uses postfix syntax (`expr IS NULL`), so `UnaryExpr::deparse` was updated to handle both prefix operators (NOT, EXISTS) and postfix operators (IS NULL, IS NOT NULL).
-
-**Test queries:**
-```sql
-SELECT * FROM t WHERE deleted_at IS NULL
-SELECT * FROM t WHERE name IS NOT NULL
-SELECT * FROM t WHERE id = 1 AND deleted_at IS NULL
-```
-
-#### Step 1.4: Add IN clause support ✅ DONE
-
-**File:** `src/query/parse.rs`
-
-Implemented via `AExprKind::AexprIn` handling in `a_expr_convert()`. Uses `MultiExpr` with `MultiOp::In` or `MultiOp::NotIn`.
-
-**Test query:**
-```sql
-SELECT * FROM t WHERE status IN ('A', 'B', 'C')
-SELECT * FROM t WHERE id NOT IN (1, 2, 3)
-```
-
-#### Step 1.5: Add function calls to SELECT columns ✅ DONE
-
-**File:** `src/query/ast.rs`
-
-`FunctionCall` struct is implemented with:
-```rust
-pub struct FunctionCall {
-    pub name: String,
-    pub args: Vec<ColumnExpr>,
-    pub agg_star: bool,     // For COUNT(*)
-    pub agg_distinct: bool, // For COUNT(DISTINCT ...)
-    pub agg_order: Vec<OrderByClause>, // For string_agg(... ORDER BY ...)
-    pub over: Option<WindowSpec>, // For window functions
-}
-```
-
-Still TODO for future enhancement:
-- `filter: Option<WhereExpr>` - For aggregate FILTER clause
-
-**Test query:**
-```sql
-SELECT count(*), sum(amount), count(distinct category) FROM t
-```
-
-#### Step 1.6: Add window function support ✅ DONE
-
-**File:** `src/query/ast.rs`, `src/query/resolved.rs`
-
-Implemented structures:
-
-```rust
-// In ast.rs
-pub struct WindowSpec {
-    pub partition_by: Vec<ColumnExpr>,
-    pub order_by: Vec<OrderByClause>,
-}
-
-pub struct FunctionCall {
-    pub name: String,
-    pub args: Vec<ColumnExpr>,
-    pub agg_star: bool,
-    pub agg_distinct: bool,
-    pub over: Option<WindowSpec>,  // Window function OVER clause
-}
-
-// In resolved.rs
-pub struct ResolvedWindowSpec {
-    pub partition_by: Vec<ResolvedColumnExpr>,
-    pub order_by: Vec<ResolvedOrderByClause>,
-}
-```
-
-Supports PARTITION BY and ORDER BY clauses. Frame specification (`ROWS BETWEEN...`) not yet implemented.
-
-**Test query:**
-```sql
-SELECT id, sum(amount) OVER (ORDER BY date ASC) as running_total FROM t
-SELECT sum(amount) OVER (PARTITION BY category ORDER BY date) FROM orders
-```
-
-#### Step 1.7: Add CASE expression support ✅ DONE
-
-**File:** `src/query/ast.rs`, `src/query/resolved.rs`
-
-Implemented structures:
-
-```rust
-// In ast.rs
-pub struct CaseExpr {
-    pub arg: Option<Box<ColumnExpr>>,  // For simple CASE (CASE expr WHEN val...)
-    pub whens: Vec<CaseWhen>,
-    pub default: Option<Box<ColumnExpr>>,  // ELSE clause
-}
-
-pub struct CaseWhen {
-    pub condition: WhereExpr,  // Uses WhereExpr for full boolean expression support
-    pub result: ColumnExpr,
-}
-
-// In resolved.rs - corresponding resolved types
-pub struct ResolvedCaseExpr { ... }
-pub struct ResolvedCaseWhen { ... }
-```
-
-Both searched CASE (`CASE WHEN condition...`) and simple CASE (`CASE expr WHEN value...`) are supported.
-The implementation uses `WhereExpr` for conditions, enabling complex boolean expressions.
-Includes `has_sublink()` detection for cacheability analysis.
-
-**Test queries:**
-```sql
-SELECT CASE WHEN status = 'A' THEN 1 WHEN status = 'B' THEN 2 ELSE 0 END FROM t
-SELECT CASE status WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 0 END FROM t
-```
-
-#### Step 1.8: Add arithmetic expressions ✅ DONE
-
-**Files:** `src/query/ast.rs`, `src/query/resolved.rs`, `src/query/transform.rs`
-
-Implemented structures:
-
-```rust
-// In ast.rs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
-pub enum ArithmeticOp {
-    Add,      // +
-    Subtract, // -
-    Multiply, // *
-    Divide,   // /
-}
-
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub struct ArithmeticExpr {
-    pub left: Box<ColumnExpr>,
-    pub op: ArithmeticOp,
-    pub right: Box<ColumnExpr>,
-}
-
-pub enum ColumnExpr {
-    // ... existing variants
-    Arithmetic(ArithmeticExpr),
-}
-
-// In resolved.rs - corresponding resolved types
-pub struct ResolvedArithmeticExpr { ... }
-pub enum ResolvedColumnExpr {
-    // ... existing variants
-    Arithmetic(ResolvedArithmeticExpr),
-}
-```
-
-Parsing handled in `select_columns_convert` and `node_convert_to_column_expr` via `AExprKind::AexprOp`.
-
-**Test queries:**
-```sql
-SELECT amount * -1 FROM t
-SELECT price + tax FROM t
-SELECT total / count FROM t
-SELECT (a + b) * c FROM t  -- nested expressions
-```
-
-#### Step 1.9: Add subquery resolution (P0 - BLOCKING)
-
-**File:** `src/query/resolved.rs`
-
-Currently, subqueries are parsed but resolution fails with `InvalidTableRef`. Need to implement:
-
-1. **Subquery in FROM clause** - `table_source_resolve` for `TableSource::Subquery`:
-   - Recursively resolve the inner SELECT statement
-   - Build a virtual schema from the subquery's SELECT columns
-   - Register the subquery alias in the resolution scope
-   - Allow outer query to reference `alias.column`
-
-2. **Schema inference from subquery**:
-   - Each SELECT column in the subquery defines a "virtual column"
-   - Column names come from aliases or derived from expressions
-   - These become available to the outer query via the subquery alias
-
-3. **Subquery in SELECT/WHERE** - Lower priority, already detected via `has_sublink()`
-
-```rust
-TableSource::Subquery(subquery) => {
-    // 1. Resolve the inner select statement
-    let resolved_select = select_statement_resolve(&subquery.select, tables, search_path)?;
-
-    // 2. Build virtual schema from SELECT columns
-    let virtual_columns = resolved_select.columns.iter().map(|col| {
-        // Extract column name from alias or expression
-    }).collect();
-
-    // 3. Register alias in scope for outer query resolution
-    scope.register_subquery_alias(&subquery.alias, virtual_columns);
-
-    Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-        select: Box::new(resolved_select),
-        alias: subquery.alias.clone(),
-    }))
-}
-```
-
-**Test query:**
-```sql
-SELECT sub.id, sub.name FROM (SELECT id, name FROM users WHERE active = true) sub WHERE sub.id > 10
-```
-
-### Phase 2: Resolution Support
-
-**File:** `src/query/resolved.rs`
-
-Add resolution functions for all new AST types:
-- `set_operation_resolve` - TODO
-- `case_expr_resolve` - ✅ DONE (integrated into `column_expr_resolve`)
-- `window_spec_resolve` - ✅ DONE
-- `subquery_table_source_resolve` - TODO (P0)
-- Enhanced `function_call_resolve` - ✅ DONE (handles `agg_star`, `agg_distinct`, `over`)
-
-### Phase 3: Cacheability
-
-**File:** `src/cache/query.rs`
-
-Add checks to mark queries as non-cacheable:
-- UNION/INTERSECT/EXCEPT
-- Window functions
-- Aggregate functions (already non-cacheable via GROUP BY)
-- Non-deterministic functions (now(), random(), etc.)
-
-## Progress Tracking
-
-- [x] Step 1.1: Literal support in SELECT
-- [ ] Step 1.2: UNION support
-- [x] Step 1.3: IS NULL in WHERE (via `UnaryOp::IsNull/IsNotNull`)
-- [x] Step 1.4: IN clause (via `MultiOp::In`, `MultiOp::NotIn`)
-- [x] Step 1.5: Function calls in SELECT (including COUNT(*), COUNT(DISTINCT))
-- [x] Step 1.6: Window functions (PARTITION BY, ORDER BY)
-- [x] Step 1.7: CASE expressions (searched and simple forms)
-- [x] Step 1.8: Arithmetic expressions (`+`, `-`, `*`, `/`)
-- [ ] **Step 1.9: Subquery resolution** (P0 - blocks target query)
-- [x] Phase 2: Resolution support (for implemented features)
-- [ ] Phase 3: Cacheability checks
-- [ ] Full test query parses successfully
+| LIMIT / OFFSET (top level) | Cache keys would vary per limit value | Allowed inside derived tables |
+| LEFT JOIN | NULL semantics on right side make cache invalidation unreliable | Parsed and resolved, rejected at cacheability |
+| GROUP BY + LIMIT | Combined constraint | GROUP BY alone is cacheable |
+
+### Not Supported
+
+| Feature | Parse | Resolve | Notes |
+|---------|-------|---------|-------|
+| FuncCall in WHERE/HAVING | No | No | `node_convert_to_expr` doesn't handle `NodeEnum::FuncCall`. `WhereExpr::Function` variant exists but is never produced. Needed for `HAVING SUM(x) > ...` |
+| Correlated subqueries | Yes | No — rejected with `CorrelatedSubqueryNotSupported` | Subqueries that reference outer table columns (e.g., `WHERE t2.id = t1.id`). Includes correlated EXISTS, NOT EXISTS, and scalar-in-SELECT |
+| RECURSIVE CTEs | No — rejected at parse time | No | `WITH RECURSIVE` explicitly rejected |
+| LATERAL subqueries | Yes | No | Rejected at cacheability (`is_cacheable_table_subquery` checks for lateral) |
+| Window frame specification | No | No | `ROWS BETWEEN ...` not parsed. `PARTITION BY` and `ORDER BY` are supported |
+| Aggregate FILTER clause | No | No | `FILTER (WHERE ...)` on aggregates not parsed |
+| Non-deterministic functions | Parsed as regular functions | Resolved | Not detected — `now()`, `random()` etc. are cached as if deterministic |
+
+## CDC Invalidation for Subqueries
+
+Subqueries and CTEs track `SubqueryKind` for directional CDC invalidation:
+
+| SubqueryKind | CDC INSERT | CDC DELETE | CDC UPDATE |
+|--------------|-----------|-----------|-----------|
+| **Inclusion** (IN, derived tables, CTEs) | Invalidates | Skips | Invalidates |
+| **Exclusion** (NOT IN) | Skips | Invalidates | Invalidates |
+| **Scalar** | Invalidates | Invalidates | Invalidates |
+
+Tables are tracked as either `Direct` (FROM clause) or `Subquery` (within a subquery/CTE) via `UpdateQuerySource`.
+
+## Integration Test Coverage
+
+| Test File | Tests | Features Covered |
+|-----------|-------|-----------------|
+| `tests/subquery_test.rs` | `test_subquery_from_derived_table` | Derived table cache + CDC INSERT/DELETE |
+| | `test_subquery_where_in` | IN subquery cache + CDC INSERT |
+| | `test_subquery_where_not_in` | NOT IN (exclusion) cache |
+| | `test_subquery_scalar_in_where` | Scalar subquery in WHERE |
+| | `test_subquery_nested` | 3-level nested IN subqueries |
+| | `test_subquery_multi_table_dependency` | Multi-table CDC dependency tracking |
+| `tests/cte_test.rs` | `cte_simple` | Basic CTE cache miss/hit |
+| | `cte_simple_cdc` | CTE CDC UPDATE invalidation + DELETE skip |
+| | `cte_with_join` | CTE joined with regular table |
+| | `cte_multiple_tables` | Multiple CTE definitions |
+| | `cte_materialized` | MATERIALIZED hint |
+| `tests/set_operations_test.rs` | `set_op_union` | UNION cache miss/hit |
+| | `set_op_union_cdc` | UNION with CDC updates |
+| | `set_op_union_all` | UNION ALL vs UNION deduplication |
+
+### Not Tested (correlated subqueries — not supported)
+
+These patterns fail resolution with `CorrelatedSubqueryNotSupported` and cannot be cached:
+
+- `WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.ref = t1.ref)`
+- `WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.ref = t1.ref)`
+- `SELECT col, (SELECT COUNT(*) FROM t2 WHERE t2.ref = t1.ref) FROM t1`

@@ -28,7 +28,10 @@ pub use messages::{
     CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
 };
 pub use runtime::cache_run;
-pub use types::{Cache, CachedQuery, CachedQueryState, UpdateQueries, UpdateQuery};
+pub use types::{
+    Cache, CachedQuery, CachedQueryState, CdcEventKind, SubqueryKind, UpdateQueries, UpdateQuery,
+    UpdateQuerySource,
+};
 
 error_set! {
     CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError

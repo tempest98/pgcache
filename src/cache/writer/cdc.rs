@@ -10,7 +10,7 @@ use tracing::{debug, error, instrument, trace};
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
 
-use super::super::types::{CachedQuery, UpdateQuery};
+use super::super::types::{CachedQuery, CdcEventKind, SubqueryKind, UpdateQuery, UpdateQuerySource};
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::CacheWriter;
 
@@ -27,7 +27,7 @@ impl CacheWriter {
         metrics::counter!(names::CACHE_HANDLE_INSERTS).increment(1);
 
         let fp_list = self
-            .update_queries_check_invalidate(relation_oid, &None, &row_data, None)
+            .update_queries_check_invalidate(relation_oid, &None, &row_data, None, CdcEventKind::Insert)
             .attach_loc("checking for query invalidations")?;
 
         let invalidation_count = fp_list.len() as u64;
@@ -69,6 +69,7 @@ impl CacheWriter {
             &row_changes.first(),
             &new_row_data,
             Some(&key_data),
+            CdcEventKind::Update,
         )?;
         let invalidation_count = fp_list.len() as u64;
         trace!("invalidation_count {}", invalidation_count);
@@ -125,9 +126,13 @@ impl CacheWriter {
     }
 
     /// Handle DELETE operation.
+    ///
+    /// Deletes the row from cache tables and checks for subquery invalidations.
+    /// For Exclusion subquery tables (NOT IN, NOT EXISTS), a DELETE shrinks the
+    /// exclusion set, which grows the outer result set — requiring invalidation.
     #[instrument(skip_all)]
     pub async fn handle_delete(
-        &self,
+        &mut self,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
@@ -149,6 +154,27 @@ impl CacheWriter {
             .execute(delete_sql.as_str(), &[])
             .await
             .map_into_report::<CacheError>()?;
+
+        // Check for subquery invalidations — Exclusion/Scalar subquery tables
+        // need invalidation on DELETE because the outer result set may grow
+        if self.cache.update_queries.contains_key(&relation_oid) {
+            let fp_list = self
+                .update_queries_check_invalidate(
+                    relation_oid, &None, &row_data, None, CdcEventKind::Delete,
+                )
+                .attach_loc("checking delete invalidations")?;
+
+            let invalidation_count = fp_list.len() as u64;
+            for fp in fp_list {
+                self.cache_query_invalidate(fp)
+                    .await
+                    .attach_loc("invalidating query on delete")?;
+            }
+            if invalidation_count > 0 {
+                metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
+                self.state_gauges_update();
+            }
+        }
 
         metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS)
             .record(start.elapsed().as_secs_f64());
@@ -333,61 +359,96 @@ impl CacheWriter {
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
         key_data: Option<&[Option<String>]>,
+        event_kind: CdcEventKind,
     ) -> bool {
-        // Single-table queries don't need invalidation for uncached rows
-        if update_query.resolved.is_single_table() {
-            return false;
-        }
-
-        let has_table_constraints = cached_query
-            .constraints
-            .table_constraints
-            .contains_key(&table_metadata.name);
-
-        // If key_data is empty, PK didn't change. If all join columns are PK columns
-        // and there are no WHERE constraints for this table, the row's membership
-        // in the result set is unchanged - skip invalidation.
-        if !has_table_constraints {
-            if let Some(key) = key_data
-                && key.is_empty()
-            {
-                let join_columns: Vec<&str> = cached_query
-                    .constraints
-                    .table_join_columns(&table_metadata.name)
-                    .collect();
-
-                let all_join_cols_are_pk = !join_columns.is_empty()
-                    && join_columns.iter().all(|col| {
-                        table_metadata
-                            .primary_key_columns
-                            .iter()
-                            .any(|pk| pk == col)
-                    });
-
-                if all_join_cols_are_pk {
-                    // PK didn't change, all join columns are PK, no WHERE constraints
-                    // Row membership is stable - skip invalidation
+        match update_query.source {
+            UpdateQuerySource::Direct => {
+                // Single-table queries don't need invalidation for uncached rows
+                if update_query.resolved.is_single_table() {
                     return false;
                 }
+
+                let has_table_constraints = cached_query
+                    .constraints
+                    .table_constraints
+                    .contains_key(&table_metadata.name);
+
+                // If key_data is empty, PK didn't change. If all join columns are PK columns
+                // and there are no WHERE constraints for this table, the row's membership
+                // in the result set is unchanged - skip invalidation.
+                if !has_table_constraints {
+                    if let Some(key) = key_data
+                        && key.is_empty()
+                    {
+                        let join_columns: Vec<&str> = cached_query
+                            .constraints
+                            .table_join_columns(&table_metadata.name)
+                            .collect();
+
+                        let all_join_cols_are_pk = !join_columns.is_empty()
+                            && join_columns.iter().all(|col| {
+                                table_metadata
+                                    .primary_key_columns
+                                    .iter()
+                                    .any(|pk| pk == col)
+                            });
+
+                        if all_join_cols_are_pk {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                }
+
+                // Check if row matches table constraints - invalidate only if it matches
+                self.row_constraints_match(cached_query, table_metadata, row_data)
             }
+            UpdateQuerySource::Subquery(kind) => {
+                // Check constraints — if row doesn't match constraints for this
+                // table, it's not relevant to the cached query
+                if !self.row_constraints_match(cached_query, table_metadata, row_data) {
+                    return false;
+                }
 
-            // No constraints and couldn't prove stability - must invalidate
-            return true;
+                // Directional invalidation based on kind + event type.
+                // Inclusion: set growth (INSERT) → outer grows → invalidate;
+                //            set shrink (DELETE) → outer shrinks → skip.
+                // Exclusion: inverse of Inclusion.
+                // Scalar: always invalidate.
+                match kind {
+                    SubqueryKind::Scalar => true,
+                    SubqueryKind::Inclusion => match event_kind {
+                        CdcEventKind::Insert => true,
+                        CdcEventKind::Delete => false,
+                        CdcEventKind::Update => true,
+                    },
+                    SubqueryKind::Exclusion => match event_kind {
+                        CdcEventKind::Insert => false,
+                        CdcEventKind::Delete => true,
+                        CdcEventKind::Update => true,
+                    },
+                }
+            }
         }
-
-        // Check if row matches table constraints - invalidate only if it matches
-        self.row_constraints_match(cached_query, table_metadata, row_data)
     }
 
     /// Determine if a query should be invalidated when the row exists in cache.
     /// Returns true if the query should be invalidated.
     fn row_cached_invalidation_check(
         &self,
+        update_query: &UpdateQuery,
         cached_query: &CachedQuery,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
         row_changes: &Row,
     ) -> bool {
+        // Subquery tables: always invalidate on UPDATE — column changes
+        // could shift set membership in either direction
+        if matches!(update_query.source, UpdateQuerySource::Subquery(_)) {
+            return true;
+        }
+
         for column in cached_query
             .constraints
             .table_join_columns(&table_metadata.name)
@@ -416,6 +477,7 @@ impl CacheWriter {
         row_changes: &Option<&Row>,
         row_data: &[Option<String>],
         key_data: Option<&[Option<String>]>,
+        event_kind: CdcEventKind,
     ) -> CacheResult<Vec<u64>> {
         let update_queries =
             self.cache
@@ -457,6 +519,7 @@ impl CacheWriter {
                     table_metadata,
                     row_data,
                     key_data,
+                    event_kind,
                 ) {
                     fp_list.push(update_query.fingerprint);
                 }
@@ -467,6 +530,7 @@ impl CacheWriter {
             // row_changes is guaranteed to be Some here due to the guard clause above
             if let Some(row_changes) = row_changes
                 && self.row_cached_invalidation_check(
+                    update_query,
                     cached_query,
                     table_metadata,
                     row_data,
