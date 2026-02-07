@@ -148,7 +148,13 @@ fn where_value_compare_string(
             }
         }
         LiteralValue::Boolean(filter_bool) => {
-            if let Ok(row_bool) = row_value_str.parse::<bool>() {
+            // PostgreSQL sends booleans as "t"/"f" in text protocol
+            let row_bool = match row_value_str {
+                "t" | "true" => Some(true),
+                "f" | "false" => Some(false),
+                _ => None,
+            };
+            if let Some(row_bool) = row_bool {
                 match op {
                     BinaryOp::Equal => row_bool == *filter_bool,
                     BinaryOp::NotEqual => row_bool != *filter_bool,
@@ -269,6 +275,7 @@ mod tests {
         let filter_value_true = LiteralValue::Boolean(true);
         let filter_value_false = LiteralValue::Boolean(false);
 
+        // Standard boolean strings
         assert!(where_value_compare_string(
             &filter_value_true,
             "true",
@@ -279,9 +286,16 @@ mod tests {
             "false",
             BinaryOp::Equal
         ));
+
+        // PostgreSQL text protocol format
+        assert!(where_value_compare_string(
+            &filter_value_true,
+            "t",
+            BinaryOp::Equal
+        ));
         assert!(!where_value_compare_string(
             &filter_value_true,
-            "1",
+            "f",
             BinaryOp::Equal
         ));
 
@@ -293,6 +307,25 @@ mod tests {
         assert!(!where_value_compare_string(
             &filter_value_false,
             "true",
+            BinaryOp::Equal
+        ));
+
+        // PostgreSQL text protocol format
+        assert!(where_value_compare_string(
+            &filter_value_false,
+            "f",
+            BinaryOp::Equal
+        ));
+        assert!(!where_value_compare_string(
+            &filter_value_false,
+            "t",
+            BinaryOp::Equal
+        ));
+
+        // Unrecognized strings don't match
+        assert!(!where_value_compare_string(
+            &filter_value_true,
+            "1",
             BinaryOp::Equal
         ));
         assert!(!where_value_compare_string(

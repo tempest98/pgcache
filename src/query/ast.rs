@@ -116,7 +116,12 @@ impl LiteralValue {
                     == Some(*constraint_float)
             }
             (Some(row_str), LiteralValue::Boolean(constraint_bool)) => {
-                row_str.parse::<bool>().ok() == Some(*constraint_bool)
+                // PostgreSQL sends booleans as "t"/"f" in text protocol (used by CDC)
+                match row_str.as_str() {
+                    "t" | "true" => *constraint_bool,
+                    "f" | "false" => !*constraint_bool,
+                    _ => false,
+                }
             }
             (Some(_), LiteralValue::Null) => false,
             (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints

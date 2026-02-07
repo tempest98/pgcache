@@ -10,7 +10,9 @@ use tracing::{debug, error, instrument, trace};
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
 
-use super::super::types::{CachedQuery, CdcEventKind, SubqueryKind, UpdateQuery, UpdateQuerySource};
+use crate::query::constraints::QueryConstraints;
+
+use super::super::types::{CdcEventKind, SubqueryKind, UpdateQuery, UpdateQuerySource};
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::CacheWriter;
 
@@ -325,12 +327,11 @@ impl CacheWriter {
     /// Returns true if all constraints match (or no constraints exist for this table).
     fn row_constraints_match(
         &self,
-        cached_query: &CachedQuery,
+        constraints: &QueryConstraints,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> bool {
-        let Some(constraints) = cached_query
-            .constraints
+        let Some(constraints) = constraints
             .table_constraints
             .get(&table_metadata.name)
         else {
@@ -356,7 +357,6 @@ impl CacheWriter {
     fn row_uncached_invalidation_check(
         &self,
         update_query: &UpdateQuery,
-        cached_query: &CachedQuery,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
         key_data: Option<&[Option<String>]>,
@@ -369,7 +369,7 @@ impl CacheWriter {
                     return false;
                 }
 
-                let has_table_constraints = cached_query
+                let has_table_constraints = update_query
                     .constraints
                     .table_constraints
                     .contains_key(&table_metadata.name);
@@ -381,7 +381,7 @@ impl CacheWriter {
                     if let Some(key) = key_data
                         && key.is_empty()
                     {
-                        let join_columns: Vec<&str> = cached_query
+                        let join_columns: Vec<&str> = update_query
                             .constraints
                             .table_join_columns(&table_metadata.name)
                             .collect();
@@ -403,12 +403,12 @@ impl CacheWriter {
                 }
 
                 // Check if row matches table constraints - invalidate only if it matches
-                self.row_constraints_match(cached_query, table_metadata, row_data)
+                self.row_constraints_match(&update_query.constraints, table_metadata, row_data)
             }
             UpdateQuerySource::Subquery(kind) => {
                 // Check constraints — if row doesn't match constraints for this
                 // table, it's not relevant to the cached query
-                if !self.row_constraints_match(cached_query, table_metadata, row_data) {
+                if !self.row_constraints_match(&update_query.constraints, table_metadata, row_data) {
                     return false;
                 }
 
@@ -439,7 +439,6 @@ impl CacheWriter {
     fn row_cached_invalidation_check(
         &self,
         update_query: &UpdateQuery,
-        cached_query: &CachedQuery,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
         row_changes: &Row,
@@ -450,7 +449,7 @@ impl CacheWriter {
             return true;
         }
 
-        for column in cached_query
+        for column in update_query
             .constraints
             .table_join_columns(&table_metadata.name)
         {
@@ -461,7 +460,7 @@ impl CacheWriter {
             }
 
             // Check constraints - skip if row doesn't match
-            if !self.row_constraints_match(cached_query, table_metadata, row_data) {
+            if !self.row_constraints_match(&update_query.constraints, table_metadata, row_data) {
                 continue;
             }
 
@@ -500,23 +499,10 @@ impl CacheWriter {
 
         let mut fp_list = Vec::new();
         for update_query in &update_queries.queries {
-            let cached_query = self
-                .cache
-                .cached_queries
-                .get1(&update_query.fingerprint)
-                .ok_or_else(|| {
-                    error!(
-                        "Cached query not found for fingerprint: {}",
-                        update_query.fingerprint
-                    );
-                    CacheError::Other
-                })?;
-
             // Guard clause: handle uncached rows (INSERT or UPDATE where row not in cache)
             if row_changes.is_none() {
                 if self.row_uncached_invalidation_check(
                     update_query,
-                    cached_query,
                     table_metadata,
                     row_data,
                     key_data,
@@ -532,7 +518,6 @@ impl CacheWriter {
             if let Some(row_changes) = row_changes
                 && self.row_cached_invalidation_check(
                     update_query,
-                    cached_query,
                     table_metadata,
                     row_data,
                     row_changes,

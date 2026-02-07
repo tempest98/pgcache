@@ -97,14 +97,6 @@ impl CacheWriter {
             .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
             .attach_loc("resolving query expression")?;
 
-        // Analyze constraints from the resolved query
-        // For simple SELECT queries, analyze WHERE clause constraints
-        // For set operations, use empty constraints (conservative: always check for invalidation)
-        let query_constraints = resolved
-            .as_select()
-            .map(analyze_query_constraints)
-            .unwrap_or_default();
-
         for (table_node, update_query_expr, source) in query_table_update_queries(cacheable_query) {
             let schema = self
                 .table_schema_resolve(
@@ -128,12 +120,18 @@ impl CacheWriter {
                     .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
                     .attach_loc("resolving update query expression")?;
 
+            let constraints = update_resolved
+                .as_select()
+                .map(analyze_query_constraints)
+                .unwrap_or_default();
+
             let complexity = update_resolved.complexity();
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
                 complexity,
                 source,
+                constraints,
             };
 
             self.update_query_register(relation_oid, update_query);
@@ -152,7 +150,6 @@ impl CacheWriter {
             relation_oids: relation_oids.clone(),
             query: cacheable_query.query.clone(),
             resolved: resolved.clone(),
-            constraints: query_constraints,
             cached_bytes: 0,
             registration_started_at: Some(started_at),
         };

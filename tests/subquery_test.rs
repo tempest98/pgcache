@@ -542,6 +542,222 @@ async fn test_subquery_multi_table_dependency() -> Result<(), Error> {
 }
 
 // =============================================================================
+// Constraint Filtering Tests
+// =============================================================================
+
+/// Test that derived table (FROM subquery) constraint filtering skips
+/// invalidation for CDC events that don't match the inner WHERE clause.
+///
+/// With per-UpdateQuery constraints, the inner SELECT's WHERE clause
+/// produces constraints on the inner table's UpdateQuery. For derived
+/// tables (Subquery/Inclusion source), `row_constraints_match` checks
+/// these constraints before proceeding to directional invalidation logic.
+///
+/// Before per-UpdateQuery constraints: inner tables had no constraints,
+/// so every INSERT triggered directional invalidation.
+/// After: non-matching rows are filtered by the inner WHERE constraint.
+#[tokio::test]
+async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE appliances (id INTEGER PRIMARY KEY, name TEXT, price INTEGER, dept TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO appliances (id, name, price, dept) VALUES \
+         (1, 'Blender', 80, 'kitchen'), \
+         (2, 'Toaster', 40, 'kitchen'), \
+         (3, 'Drill', 120, 'workshop'), \
+         (4, 'Mixer', 60, 'kitchen')",
+        &[],
+    )
+    .await?;
+
+    // Wait for setup CDC events to settle before caching
+    wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
+
+    // Derived table with inner predicate: dept = 'kitchen'
+    // The inner SELECT produces constraint {appliances.dept = 'kitchen'} on
+    // the UpdateQuery for the appliances table (source = Subquery(Inclusion)).
+    let query = "SELECT name, price \
+                 FROM (SELECT * FROM appliances WHERE dept = 'kitchen') AS kitchen_items \
+                 ORDER BY price";
+
+    // First query — cache miss, populates cache
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // 3 rows + RowDescription + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Toaster"), ("price", "40")])?;
+    assert_row_at(&res, 2, &[("name", "Mixer"), ("price", "60")])?;
+    assert_row_at(&res, 3, &[("name", "Blender"), ("price", "80")])?;
+
+    wait_cache_load().await;
+
+    // Second query — cache hit
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5);
+
+    // --- Non-matching INSERT: dept = 'workshop' does NOT match constraint ---
+    // row_constraints_match returns false → row_uncached_invalidation_check returns false
+    // → no invalidation → cache hit
+    ctx.origin_query(
+        "INSERT INTO appliances (id, name, price, dept) VALUES (5, 'Wrench', 30, 'workshop')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache hit — non-matching INSERT was filtered by constraint
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // still 3 kitchen rows
+
+    // --- Matching INSERT: dept = 'kitchen' DOES match constraint ---
+    // row_constraints_match returns true → Subquery(Inclusion) + Insert → invalidate
+    ctx.origin_query(
+        "INSERT INTO appliances (id, name, price, dept) VALUES (6, 'Kettle', 50, 'kitchen')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache miss — matching INSERT triggered invalidation
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 6); // 4 kitchen rows now
+    assert_row_at(&res, 1, &[("name", "Toaster"), ("price", "40")])?;
+    assert_row_at(&res, 2, &[("name", "Kettle"), ("price", "50")])?;
+    assert_row_at(&res, 3, &[("name", "Mixer"), ("price", "60")])?;
+    assert_row_at(&res, 4, &[("name", "Blender"), ("price", "80")])?;
+
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
+    // miss, hit, hit (non-matching filtered), miss (matching invalidated)
+    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
+    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+
+    Ok(())
+}
+
+/// Test that IN subquery constraint filtering skips invalidation for
+/// CDC events on the inner table that don't match the inner WHERE clause.
+///
+/// With per-UpdateQuery constraints, the inner SELECT's WHERE clause
+/// produces constraints on the inner table's UpdateQuery. For IN
+/// subqueries (Subquery/Inclusion source), `row_constraints_match`
+/// checks these constraints before directional invalidation logic.
+///
+/// Before per-UpdateQuery constraints: inner tables had empty constraints,
+/// so all CDC events passed through to directional logic.
+/// After: inner tables have their own WHERE constraints, filtering
+/// irrelevant CDC events.
+#[tokio::test]
+async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO departments (id, name, active) VALUES \
+         (1, 'Engineering', true), (2, 'Marketing', true), (3, 'Sales', false)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, dept_id) VALUES \
+         (10, 'Alice', 1), (11, 'Bob', 2), (12, 'Charlie', 3)",
+        &[],
+    )
+    .await?;
+
+    // Wait for setup CDC events to settle
+    wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
+
+    // IN subquery with inner predicate: active = true
+    // The inner SELECT produces constraint {departments.active = true} on
+    // the departments UpdateQuery (source = Subquery(Inclusion)).
+    let query = "SELECT e.name FROM employees e \
+                 WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.active = true) \
+                 ORDER BY e.name";
+
+    // First query — cache miss
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // Alice, Bob + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Bob")])?;
+
+    wait_cache_load().await;
+
+    // Second query — cache hit
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+
+    // --- Non-matching INSERT on inner table: active = false ---
+    // row_constraints_match returns false → no invalidation
+    ctx.origin_query(
+        "INSERT INTO departments (id, name, active) VALUES (4, 'Finance', false)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache hit — non-matching INSERT on inner table was filtered
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // still Alice, Bob
+
+    // --- Matching UPDATE on inner table: active changes to true ---
+    // New data has active = true which matches constraint.
+    // Row was NOT in cache (was false) → uncached path → constraint matches →
+    // Subquery(Inclusion) + Update → invalidate.
+    // Charlie's department (Sales, id=3) becomes active.
+    ctx.origin_query(
+        "UPDATE departments SET active = true WHERE id = 3",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache miss — matching UPDATE triggered invalidation
+    // Charlie now appears (Sales dept is active)
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // Alice, Bob, Charlie
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Bob")])?;
+    assert_row_at(&res, 3, &[("name", "Charlie")])?;
+
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
+    // miss, hit, hit (non-matching filtered), miss (matching invalidated)
+    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
+    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+
+    Ok(())
+}
+
+// =============================================================================
 // Correlated Subquery Tests (not yet supported for caching)
 // =============================================================================
 

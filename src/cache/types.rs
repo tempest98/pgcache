@@ -30,7 +30,6 @@ pub struct CachedQuery {
     pub relation_oids: Vec<u32>,
     pub query: QueryExpr,
     pub resolved: ResolvedQueryExpr,
-    pub constraints: QueryConstraints,
     /// Estimated size of cached data in bytes (sum of raw value bytes)
     pub cached_bytes: usize,
     /// Timestamp when registration started (for latency metrics)
@@ -108,6 +107,8 @@ pub struct UpdateQuery {
     pub complexity: usize,
     /// Whether this table was found directly in FROM or inside a subquery
     pub source: UpdateQuerySource,
+    /// WHERE clause constraints for CDC invalidation filtering
+    pub constraints: QueryConstraints,
 }
 
 /// Collection of update queries for a specific relation

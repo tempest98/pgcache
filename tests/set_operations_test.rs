@@ -17,6 +17,7 @@ async fn test_set_operations() -> Result<(), Error> {
     set_op_intersect(&mut ctx).await?;
     set_op_except(&mut ctx).await?;
     set_op_union_all(&mut ctx).await?;
+    set_op_union_join_constraint_filter(&mut ctx).await?;
 
     Ok(())
 }
@@ -396,6 +397,149 @@ async fn set_op_union_all(ctx: &mut TestContext) -> Result<(), Error> {
     assert_eq!(delta.queries_uncacheable, 4, "uncacheable queries");
     assert_eq!(delta.queries_unsupported, 4, "unsupported queries");
     // First UNION: miss, UNION ALL: miss, second UNION: hit, second UNION ALL: hit
+    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
+    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+
+    Ok(())
+}
+
+/// Test per-branch constraint filtering for UNION with JOINed branches.
+///
+/// Single-table UNION branches skip constraint checks via is_single_table(),
+/// so JOINs are needed to create multi-table branches that exercise the
+/// constraint checking code path.
+///
+/// With per-UpdateQuery constraints, each UNION branch's WHERE clause is
+/// analyzed independently. For Direct source multi-table branches,
+/// row_uncached_invalidation_check checks has_table_constraints and calls
+/// row_constraints_match before deciding on invalidation.
+///
+/// Before per-UpdateQuery constraints: UNION queries had empty constraints
+/// (as_select() returned None). Multi-table branches with
+/// has_table_constraints = false always invalidated.
+/// After: each branch gets its own constraints, and non-matching CDC events
+/// on constrained tables are filtered.
+async fn set_op_union_join_constraint_filter(ctx: &mut TestContext) -> Result<(), Error> {
+    // Branch 1 tables: orders joined with customers, filtered by region
+    ctx.query(
+        "CREATE TABLE union_customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE union_orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)",
+        &[],
+    )
+    .await?;
+
+    // Branch 2 tables: refunds joined with suppliers, filtered by region
+    ctx.query(
+        "CREATE TABLE union_suppliers (id INTEGER PRIMARY KEY, name TEXT, region TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE union_refunds (id INTEGER PRIMARY KEY, supplier_id INTEGER, amount INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO union_customers (id, name, region) VALUES \
+         (1, 'Acme', 'east'), (2, 'Globex', 'west')",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO union_orders (id, customer_id, amount) VALUES \
+         (10, 1, 500), (11, 2, 300)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO union_suppliers (id, name, region) VALUES \
+         (1, 'SupplyA', 'east'), (2, 'SupplyB', 'west')",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO union_refunds (id, supplier_id, amount) VALUES \
+         (20, 1, 100), (21, 2, 200)",
+        &[],
+    )
+    .await?;
+
+    // Wait for setup CDC events to settle
+    wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
+
+    // UNION with JOINs in each branch, both filtered by region = 'east'
+    //
+    // Branch 1 constraints: {union_customers.region = 'east'}
+    // Branch 2 constraints: {union_suppliers.region = 'east'}
+    let query = "SELECT o.amount FROM union_orders o \
+                 JOIN union_customers c ON o.customer_id = c.id \
+                 WHERE c.region = 'east' \
+                 UNION \
+                 SELECT r.amount FROM union_refunds r \
+                 JOIN union_suppliers s ON r.supplier_id = s.id \
+                 WHERE s.region = 'east' \
+                 ORDER BY amount";
+
+    // First query — cache miss
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // 2 rows (100, 500) + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("amount", "100")])?;
+    assert_row_at(&res, 2, &[("amount", "500")])?;
+
+    wait_cache_load().await;
+
+    // Second query — cache hit
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+
+    // --- Non-matching INSERT on constrained table: region = 'west' ---
+    // union_customers.region = 'west' does NOT match constraint 'east'
+    // row_constraints_match returns false → no invalidation
+    ctx.origin_query(
+        "INSERT INTO union_customers (id, name, region) VALUES (3, 'Wayne', 'west')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache hit — non-matching INSERT on constrained table was filtered
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // still 100, 500
+
+    // --- Matching INSERT on constrained table: region = 'east' ---
+    // union_customers.region = 'east' DOES match constraint
+    // has_table_constraints = true → row_constraints_match → true → invalidate
+    ctx.origin_query(
+        "INSERT INTO union_customers (id, name, region) VALUES (4, 'Stark', 'east')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache miss — matching INSERT triggered invalidation
+    // Result unchanged (Stark has no orders) but invalidation occurred
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // still 100, 500 (Stark has no orders)
+
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
+    // miss, hit, hit (non-matching filtered), miss (matching invalidated)
     assert_eq!(delta.queries_cache_miss, 2, "cache misses");
     assert_eq!(delta.queries_cache_hit, 2, "cache hits");
 
