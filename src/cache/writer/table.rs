@@ -296,8 +296,9 @@ impl CacheWriter {
         let schema = &table_metadata.schema;
         let table = &table_metadata.name;
 
-        let column_defs: Vec<String> = table_metadata
-            .columns
+        let mut columns: Vec<&ColumnMetadata> = table_metadata.columns.iter().collect();
+        columns.sort_by_key(|c| c.position);
+        let column_defs: Vec<String> = columns
             .iter()
             .map(|c| format!("    \"{}\" {}", c.name, c.cache_type_name))
             .collect();
