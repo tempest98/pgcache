@@ -864,7 +864,7 @@ mod tests {
 
     /// Parse SQL and return a SelectNode (for tests using new types)
     fn parse_select_node(sql: &str) -> SelectNode {
-        use crate::query::ast::{query_expr_convert, QueryBody};
+        use crate::query::ast::{QueryBody, query_expr_convert};
         let ast = pg_query::parse(sql).expect("parse SQL");
         let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
         match query_expr.body {
@@ -1478,8 +1478,9 @@ mod tests {
 
     #[test]
     fn test_parameters_replace_in_subquery() {
-        let mut node =
-            parse_select_node("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > $1)");
+        let mut node = parse_select_node(
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > $1)",
+        );
 
         let params = typed_text_params(vec![(Some(b"100"), PgType::INT4)]);
         select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
@@ -1573,10 +1574,10 @@ mod tests {
     #[test]
     fn test_resolved_select_node_replace_strips_group_by() {
         use crate::catalog::ColumnMetadata;
-        use postgres_types::Type;
         use crate::query::resolved::{
             ResolvedColumnNode, ResolvedSelectColumns, ResolvedSelectNode,
         };
+        use postgres_types::Type;
 
         let col_meta = ColumnMetadata {
             name: "status".to_owned(),
@@ -1700,8 +1701,8 @@ mod tests {
             (Some(b"alice"), PgType::TEXT),
         ]);
 
-        let replaced = query_expr_parameters_replace(&query_expr, &params)
-            .expect("parameter replacement");
+        let replaced =
+            query_expr_parameters_replace(&query_expr, &params).expect("parameter replacement");
 
         let mut buf = String::new();
         replaced.deparse(&mut buf);
@@ -1715,14 +1716,8 @@ mod tests {
             buf.contains("name = 'alice'"),
             "Main query should have $2 replaced: {buf}"
         );
-        assert!(
-            !buf.contains("$1"),
-            "No unreplaced $1 should remain: {buf}"
-        );
-        assert!(
-            !buf.contains("$2"),
-            "No unreplaced $2 should remain: {buf}"
-        );
+        assert!(!buf.contains("$1"), "No unreplaced $1 should remain: {buf}");
+        assert!(!buf.contains("$2"), "No unreplaced $2 should remain: {buf}");
     }
 
     #[test]
@@ -1769,16 +1764,17 @@ mod tests {
         assert_eq!(result.len(), 2);
         // Both tables in a JOIN are Direct
         assert!(
-            result.iter().all(|(_, _, src)| *src == UpdateQuerySource::Direct),
+            result
+                .iter()
+                .all(|(_, _, src)| *src == UpdateQuerySource::Direct),
             "All JOIN tables should be Direct"
         );
     }
 
     #[test]
     fn test_update_query_source_where_in() {
-        let cacheable = parse_cacheable(
-            "SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)",
-        );
+        let cacheable =
+            parse_cacheable("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
         let result = query_table_update_queries(&cacheable);
 
         assert_eq!(result.len(), 2);
@@ -1834,9 +1830,7 @@ mod tests {
 
     #[test]
     fn test_update_query_source_from_subquery() {
-        let cacheable = parse_cacheable(
-            "SELECT * FROM (SELECT id FROM users WHERE id = 1) sub",
-        );
+        let cacheable = parse_cacheable("SELECT * FROM (SELECT id FROM users WHERE id = 1) sub");
         let result = query_table_update_queries(&cacheable);
 
         assert_eq!(result.len(), 1);

@@ -110,11 +110,8 @@ async fn cte_simple_cdc(ctx: &mut TestContext) -> Result<(), Error> {
     assert_eq!(res.len(), 5); // 3 rows: Alice, Charlie, Diana
 
     // Activate Bob via origin (CDC)
-    ctx.origin_query(
-        "UPDATE employees SET active = true WHERE id = 2",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("UPDATE employees SET active = true WHERE id = 2", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -298,7 +295,10 @@ async fn cte_materialized(ctx: &mut TestContext) -> Result<(), Error> {
     let after = ctx.metrics().await?;
     let delta = metrics_delta(&before, &after);
 
-    assert_eq!(delta.queries_cacheable, 2, "cacheable MATERIALIZED CTE queries");
+    assert_eq!(
+        delta.queries_cacheable, 2,
+        "cacheable MATERIALIZED CTE queries"
+    );
     assert_eq!(delta.queries_cache_miss, 1, "cache misses");
     assert_eq!(delta.queries_cache_hit, 1, "cache hits");
 

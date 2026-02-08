@@ -450,7 +450,9 @@ impl WhereExpr {
     /// Check if this WHERE expression contains sublinks/subqueries
     pub fn has_subqueries(&self) -> bool {
         match self {
-            WhereExpr::Binary(binary) => binary.lexpr.has_subqueries() || binary.rexpr.has_subqueries(),
+            WhereExpr::Binary(binary) => {
+                binary.lexpr.has_subqueries() || binary.rexpr.has_subqueries()
+            }
             WhereExpr::Unary(unary) => unary.expr.has_subqueries(),
             WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_subqueries()),
             WhereExpr::Function { args, .. } => args.iter().any(|e| e.has_subqueries()),
@@ -474,7 +476,11 @@ impl WhereExpr {
                 binary.rexpr.subquery_nodes_collect(branches, negated);
             }
             WhereExpr::Unary(unary) => {
-                let child_negated = if unary.op == UnaryOp::Not { !negated } else { negated };
+                let child_negated = if unary.op == UnaryOp::Not {
+                    !negated
+                } else {
+                    negated
+                };
                 unary.expr.subquery_nodes_collect(branches, child_negated);
             }
             WhereExpr::Multi(multi) => {
@@ -487,14 +493,26 @@ impl WhereExpr {
                     arg.subquery_nodes_collect(branches, negated);
                 }
             }
-            WhereExpr::Subquery { query, sublink_type, test_expr } => {
+            WhereExpr::Subquery {
+                query,
+                sublink_type,
+                test_expr,
+            } => {
                 let kind = match sublink_type {
                     SubLinkType::Expr => SubqueryKind::Scalar,
                     SubLinkType::Any | SubLinkType::Exists => {
-                        if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion }
+                        if negated {
+                            SubqueryKind::Exclusion
+                        } else {
+                            SubqueryKind::Inclusion
+                        }
                     }
                     SubLinkType::All => {
-                        if negated { SubqueryKind::Inclusion } else { SubqueryKind::Exclusion }
+                        if negated {
+                            SubqueryKind::Inclusion
+                        } else {
+                            SubqueryKind::Exclusion
+                        }
                     }
                 };
                 let source = UpdateQuerySource::Subquery(kind);
@@ -903,7 +921,12 @@ impl QueryExpr {
         let cte_nodes = self.ctes.iter().flat_map(|c| c.query.nodes::<N>());
         let body_nodes = self.body.nodes();
         let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
-        Box::new(current.chain(cte_nodes).chain(body_nodes).chain(order_by_nodes))
+        Box::new(
+            current
+                .chain(cte_nodes)
+                .chain(body_nodes)
+                .chain(order_by_nodes),
+        )
     }
 
     /// Check if query only references a single table
@@ -992,8 +1015,12 @@ impl QueryExpr {
                 select.columns.subquery_nodes_collect(branches);
             }
             QueryBody::SetOp(set_op) => {
-                set_op.left.select_nodes_collect(branches, outer_source, negated);
-                set_op.right.select_nodes_collect(branches, outer_source, negated);
+                set_op
+                    .left
+                    .select_nodes_collect(branches, outer_source, negated);
+                set_op
+                    .right
+                    .select_nodes_collect(branches, outer_source, negated);
             }
             QueryBody::Values(_) => {}
         }
@@ -1201,18 +1228,12 @@ impl ColumnExpr {
             return Box::new(std::iter::once(r));
         }
         match self {
-            ColumnExpr::Column(col) => {
-                Box::new((col as &dyn Any).downcast_ref::<N>().into_iter())
-            }
+            ColumnExpr::Column(col) => Box::new((col as &dyn Any).downcast_ref::<N>().into_iter()),
             ColumnExpr::Function(func) => {
                 Box::new((func as &dyn Any).downcast_ref::<N>().into_iter())
             }
-            ColumnExpr::Literal(lit) => {
-                Box::new((lit as &dyn Any).downcast_ref::<N>().into_iter())
-            }
-            ColumnExpr::Case(case) => {
-                Box::new((case as &dyn Any).downcast_ref::<N>().into_iter())
-            }
+            ColumnExpr::Literal(lit) => Box::new((lit as &dyn Any).downcast_ref::<N>().into_iter()),
+            ColumnExpr::Case(case) => Box::new((case as &dyn Any).downcast_ref::<N>().into_iter()),
             ColumnExpr::Arithmetic(arith) => {
                 Box::new((arith as &dyn Any).downcast_ref::<N>().into_iter())
             }
@@ -1571,15 +1592,27 @@ impl TableSource {
         match self {
             TableSource::Table(_) => {}
             TableSource::Subquery(sub) => {
-                let kind = if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion };
+                let kind = if negated {
+                    SubqueryKind::Exclusion
+                } else {
+                    SubqueryKind::Inclusion
+                };
                 sub.query.select_nodes_collect(
-                    branches, UpdateQuerySource::Subquery(kind), negated,
+                    branches,
+                    UpdateQuerySource::Subquery(kind),
+                    negated,
                 );
             }
             TableSource::CteRef(cte_ref) => {
-                let kind = if negated { SubqueryKind::Exclusion } else { SubqueryKind::Inclusion };
+                let kind = if negated {
+                    SubqueryKind::Exclusion
+                } else {
+                    SubqueryKind::Inclusion
+                };
                 cte_ref.query.select_nodes_collect(
-                    branches, UpdateQuerySource::Subquery(kind), negated,
+                    branches,
+                    UpdateQuerySource::Subquery(kind),
+                    negated,
                 );
             }
             TableSource::Join(join) => {
@@ -2065,9 +2098,7 @@ fn with_clause_extract(
             });
         };
 
-        let ctx = ParseContext {
-            ctes: ctes.clone(),
-        };
+        let ctx = ParseContext { ctes: ctes.clone() };
         let query = select_stmt_to_query_expr_with_ctx(inner_stmt, &ctx)?;
 
         ctes.push(CteDefinition {
@@ -5144,7 +5175,10 @@ mod tests {
 
         assert!(query_expr.is_single_table());
         assert!(!query_expr.has_where_clause());
-        assert!(matches!(query_expr.as_select().unwrap().columns, SelectColumns::All));
+        assert!(matches!(
+            query_expr.as_select().unwrap().columns,
+            SelectColumns::All
+        ));
     }
 
     #[test]
@@ -5402,7 +5436,11 @@ mod tests {
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in EXISTS subquery
-        assert_eq!(branches.len(), 2, "WHERE EXISTS subquery should add one branch");
+        assert_eq!(
+            branches.len(),
+            2,
+            "WHERE EXISTS subquery should add one branch"
+        );
     }
 
     #[test]
@@ -5414,19 +5452,28 @@ mod tests {
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in SELECT list subquery
-        assert_eq!(branches.len(), 2, "SELECT list subquery should add one branch");
+        assert_eq!(
+            branches.len(),
+            2,
+            "SELECT list subquery should add one branch"
+        );
     }
 
     #[test]
     fn test_select_nodes_nested_subqueries() {
         // Nested subqueries
-        let sql = "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT user_id FROM active)) sub";
+        let sql =
+            "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT user_id FROM active)) sub";
         let pg_ast = pg_query::parse(sql).unwrap();
         let query_expr = query_expr_convert(&pg_ast).unwrap();
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + FROM subquery + nested IN subquery
-        assert_eq!(branches.len(), 3, "nested subqueries should add all branches");
+        assert_eq!(
+            branches.len(),
+            3,
+            "nested subqueries should add all branches"
+        );
     }
 
     // ==========================================================================
@@ -5436,13 +5483,25 @@ mod tests {
     #[test]
     fn test_where_subquery_in_parsed() {
         // Test that IN subquery is properly parsed
-        let select = parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
+        let select =
+            parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
 
-        let where_clause = select.where_clause.as_ref().expect("should have WHERE clause");
+        let where_clause = select
+            .where_clause
+            .as_ref()
+            .expect("should have WHERE clause");
 
         match where_clause {
-            WhereExpr::Subquery { query, sublink_type, test_expr } => {
-                assert_eq!(*sublink_type, SubLinkType::Any, "IN should parse as SubLinkType::Any");
+            WhereExpr::Subquery {
+                query,
+                sublink_type,
+                test_expr,
+            } => {
+                assert_eq!(
+                    *sublink_type,
+                    SubLinkType::Any,
+                    "IN should parse as SubLinkType::Any"
+                );
                 assert!(test_expr.is_some(), "IN should have test expression (id)");
 
                 // Verify the inner query structure
@@ -5462,14 +5521,30 @@ mod tests {
     #[test]
     fn test_where_subquery_exists_parsed() {
         // Test that EXISTS subquery is properly parsed
-        let select = parse_select("SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)");
+        let select = parse_select(
+            "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)",
+        );
 
-        let where_clause = select.where_clause.as_ref().expect("should have WHERE clause");
+        let where_clause = select
+            .where_clause
+            .as_ref()
+            .expect("should have WHERE clause");
 
         match where_clause {
-            WhereExpr::Subquery { sublink_type, test_expr, .. } => {
-                assert_eq!(*sublink_type, SubLinkType::Exists, "EXISTS should parse as SubLinkType::Exists");
-                assert!(test_expr.is_none(), "EXISTS should not have test expression");
+            WhereExpr::Subquery {
+                sublink_type,
+                test_expr,
+                ..
+            } => {
+                assert_eq!(
+                    *sublink_type,
+                    SubLinkType::Exists,
+                    "EXISTS should parse as SubLinkType::Exists"
+                );
+                assert!(
+                    test_expr.is_none(),
+                    "EXISTS should not have test expression"
+                );
             }
             _ => panic!("Expected WhereExpr::Subquery, got {:?}", where_clause),
         }
@@ -5480,19 +5555,31 @@ mod tests {
         // Test that scalar subquery in WHERE is properly parsed
         let select = parse_select("SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)");
 
-        let where_clause = select.where_clause.as_ref().expect("should have WHERE clause");
+        let where_clause = select
+            .where_clause
+            .as_ref()
+            .expect("should have WHERE clause");
 
         // The scalar subquery should be on the right side of the > comparison
         match where_clause {
-            WhereExpr::Binary(binary) => {
-                match binary.rexpr.as_ref() {
-                    WhereExpr::Subquery { sublink_type, test_expr, .. } => {
-                        assert_eq!(*sublink_type, SubLinkType::Expr, "Scalar subquery should parse as SubLinkType::Expr");
-                        assert!(test_expr.is_none(), "Scalar subquery should not have test expression");
-                    }
-                    _ => panic!("Expected WhereExpr::Subquery on right side"),
+            WhereExpr::Binary(binary) => match binary.rexpr.as_ref() {
+                WhereExpr::Subquery {
+                    sublink_type,
+                    test_expr,
+                    ..
+                } => {
+                    assert_eq!(
+                        *sublink_type,
+                        SubLinkType::Expr,
+                        "Scalar subquery should parse as SubLinkType::Expr"
+                    );
+                    assert!(
+                        test_expr.is_none(),
+                        "Scalar subquery should not have test expression"
+                    );
                 }
-            }
+                _ => panic!("Expected WhereExpr::Subquery on right side"),
+            },
             _ => panic!("Expected WhereExpr::Binary, got {:?}", where_clause),
         }
     }
@@ -5500,41 +5587,52 @@ mod tests {
     #[test]
     fn test_where_subquery_not_in_parsed() {
         // NOT IN should also parse as SubLinkType::Any with proper negation
-        let select = parse_select("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)");
+        let select =
+            parse_select("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)");
 
         // PostgreSQL parses NOT IN as a negated ANY sublink
         // The structure may vary, but we should be able to find the subquery
-        assert!(
-            select.where_clause.is_some(),
-            "Should have WHERE clause"
-        );
+        assert!(select.where_clause.is_some(), "Should have WHERE clause");
         assert!(select.has_subqueries(), "Should detect sublink in NOT IN");
     }
 
     #[test]
     fn test_where_subquery_has_subqueries_traversal() {
         // Verify nodes() traverses into subqueries to find TableNode
-        let select = parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
+        let select =
+            parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
 
         let tables: Vec<&TableNode> = select.nodes().collect();
 
         // Should find both outer table (users) and inner table (active_users)
-        assert_eq!(tables.len(), 2, "Should find tables in both outer query and subquery");
+        assert_eq!(
+            tables.len(),
+            2,
+            "Should find tables in both outer query and subquery"
+        );
 
         let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         assert!(table_names.contains(&"users"), "Should find outer table");
-        assert!(table_names.contains(&"active_users"), "Should find subquery table");
+        assert!(
+            table_names.contains(&"active_users"),
+            "Should find subquery table"
+        );
     }
 
     #[test]
     fn test_where_subquery_deparse_in() {
-        let select = parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
+        let select =
+            parse_select("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
         let mut buf = String::new();
         select.deparse(&mut buf);
 
         // The deparsed output should contain IN and the subquery
         assert!(buf.contains("IN"), "Deparsed should contain IN: {}", buf);
-        assert!(buf.contains("active_users"), "Deparsed should contain subquery table: {}", buf);
+        assert!(
+            buf.contains("active_users"),
+            "Deparsed should contain subquery table: {}",
+            buf
+        );
     }
 
     #[test]
@@ -5543,8 +5641,16 @@ mod tests {
         let mut buf = String::new();
         select.deparse(&mut buf);
 
-        assert!(buf.contains("EXISTS"), "Deparsed should contain EXISTS: {}", buf);
-        assert!(buf.contains("items"), "Deparsed should contain subquery table: {}", buf);
+        assert!(
+            buf.contains("EXISTS"),
+            "Deparsed should contain EXISTS: {}",
+            buf
+        );
+        assert!(
+            buf.contains("items"),
+            "Deparsed should contain subquery table: {}",
+            buf
+        );
     }
 
     // ====================================================================
@@ -5598,8 +5704,7 @@ mod tests {
 
     #[test]
     fn test_cte_column_aliases() {
-        let query =
-            parse_query("WITH x(a, b) AS (SELECT id, name FROM users) SELECT * FROM x");
+        let query = parse_query("WITH x(a, b) AS (SELECT id, name FROM users) SELECT * FROM x");
 
         assert_eq!(query.ctes[0].column_aliases, vec!["a", "b"]);
 
@@ -5615,8 +5720,7 @@ mod tests {
 
     #[test]
     fn test_cte_reference_alias() {
-        let query =
-            parse_query("WITH x AS (SELECT id FROM users) SELECT * FROM x AS y");
+        let query = parse_query("WITH x AS (SELECT id FROM users) SELECT * FROM x AS y");
 
         let select = query.as_select().unwrap();
         match &select.from[0] {
@@ -5715,9 +5819,7 @@ mod tests {
 
     #[test]
     fn test_cte_unreferenced() {
-        let query = parse_query(
-            "WITH x AS (SELECT 1) SELECT * FROM users",
-        );
+        let query = parse_query("WITH x AS (SELECT 1) SELECT * FROM users");
 
         // CTE definition should still be stored
         assert_eq!(query.ctes.len(), 1);
@@ -5735,9 +5837,7 @@ mod tests {
 
     #[test]
     fn test_cte_schema_qualified_not_replaced() {
-        let query = parse_query(
-            "WITH users AS (SELECT 1 AS id) SELECT * FROM public.users",
-        );
+        let query = parse_query("WITH users AS (SELECT 1 AS id) SELECT * FROM public.users");
 
         assert_eq!(query.ctes.len(), 1);
 
@@ -5754,9 +5854,8 @@ mod tests {
 
     #[test]
     fn test_cte_recursive_rejected() {
-        let result = pg_query::parse(
-            "WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT 1) SELECT * FROM x",
-        );
+        let result =
+            pg_query::parse("WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT 1) SELECT * FROM x");
         if let Ok(ast) = result {
             let result = query_expr_convert(&ast);
             assert!(result.is_err(), "recursive CTE should be rejected");
@@ -5770,11 +5869,12 @@ mod tests {
 
     #[test]
     fn test_cte_materialized() {
-        let query = parse_query(
-            "WITH x AS MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
-        );
+        let query = parse_query("WITH x AS MATERIALIZED (SELECT id FROM users) SELECT * FROM x");
 
-        assert_eq!(query.ctes[0].materialization, CteMaterialization::Materialized);
+        assert_eq!(
+            query.ctes[0].materialization,
+            CteMaterialization::Materialized
+        );
 
         let select = query.as_select().unwrap();
         match &select.from[0] {
@@ -5787,9 +5887,8 @@ mod tests {
 
     #[test]
     fn test_cte_not_materialized() {
-        let query = parse_query(
-            "WITH x AS NOT MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
-        );
+        let query =
+            parse_query("WITH x AS NOT MATERIALIZED (SELECT id FROM users) SELECT * FROM x");
 
         assert_eq!(
             query.ctes[0].materialization,
@@ -5799,9 +5898,8 @@ mod tests {
 
     #[test]
     fn test_cte_select_nodes() {
-        let query = parse_query(
-            "WITH x AS (SELECT id FROM users WHERE active = true) SELECT * FROM x",
-        );
+        let query =
+            parse_query("WITH x AS (SELECT id FROM users WHERE active = true) SELECT * FROM x");
 
         let branches = query.select_nodes();
         // Outer SELECT + CteRef body (CTE collected via reference, not eagerly from definition)
@@ -5821,9 +5919,7 @@ mod tests {
 
     #[test]
     fn test_cte_nodes_traversal() {
-        let query = parse_query(
-            "WITH x AS (SELECT id FROM users) SELECT * FROM x",
-        );
+        let query = parse_query("WITH x AS (SELECT id FROM users) SELECT * FROM x");
 
         let table_names: Vec<_> = query
             .nodes::<TableNode>()
@@ -5837,9 +5933,7 @@ mod tests {
 
     #[test]
     fn test_cte_deparse_materialized() {
-        let query = parse_query(
-            "WITH x AS MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
-        );
+        let query = parse_query("WITH x AS MATERIALIZED (SELECT id FROM users) SELECT * FROM x");
         let mut buf = String::new();
         query.deparse(&mut buf);
 
@@ -5851,9 +5945,8 @@ mod tests {
 
     #[test]
     fn test_cte_deparse_not_materialized() {
-        let query = parse_query(
-            "WITH x AS NOT MATERIALIZED (SELECT id FROM users) SELECT * FROM x",
-        );
+        let query =
+            parse_query("WITH x AS NOT MATERIALIZED (SELECT id FROM users) SELECT * FROM x");
         let mut buf = String::new();
         query.deparse(&mut buf);
 
@@ -5877,15 +5970,13 @@ mod tests {
 
         let select = query.as_select().unwrap();
         match &select.from[0] {
-            TableSource::Join(join) => {
-                match (&*join.left, &*join.right) {
-                    (TableSource::CteRef(left), TableSource::CteRef(right)) => {
-                        assert_eq!(left.cte_name, "a");
-                        assert_eq!(right.cte_name, "b");
-                    }
-                    other => panic!("expected two CteRefs, got {other:?}"),
+            TableSource::Join(join) => match (&*join.left, &*join.right) {
+                (TableSource::CteRef(left), TableSource::CteRef(right)) => {
+                    assert_eq!(left.cte_name, "a");
+                    assert_eq!(right.cte_name, "b");
                 }
-            }
+                other => panic!("expected two CteRefs, got {other:?}"),
+            },
             other => panic!("expected Join, got {other:?}"),
         }
     }
@@ -5910,14 +6001,17 @@ mod tests {
 
         assert_eq!(branches.len(), 2);
         // Both branches of a UNION are Direct
-        assert!(branches.iter().all(|(_, src)| *src == UpdateQuerySource::Direct));
+        assert!(
+            branches
+                .iter()
+                .all(|(_, src)| *src == UpdateQuerySource::Direct)
+        );
     }
 
     #[test]
     fn test_select_nodes_with_source_where_in() {
-        let query = parse_query(
-            "SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)",
-        );
+        let query =
+            parse_query("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
         let branches = query.select_nodes_with_source();
 
         // Outer SELECT (Direct) + IN subquery (Inclusion)
@@ -5931,9 +6025,8 @@ mod tests {
 
     #[test]
     fn test_select_nodes_with_source_not_in() {
-        let query = parse_query(
-            "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)",
-        );
+        let query =
+            parse_query("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)");
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
@@ -5980,9 +6073,7 @@ mod tests {
 
     #[test]
     fn test_select_nodes_with_source_scalar_in_where() {
-        let query = parse_query(
-            "SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)",
-        );
+        let query = parse_query("SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)");
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
@@ -6051,9 +6142,7 @@ mod tests {
     fn test_select_nodes_cte_no_duplication() {
         // Both select_nodes() and select_nodes_with_source() collect CTE bodies
         // via CteRef references only, avoiding duplication from CTE definitions
-        let query = parse_query(
-            "WITH x AS (SELECT id FROM users) SELECT * FROM x",
-        );
+        let query = parse_query("WITH x AS (SELECT id FROM users) SELECT * FROM x");
 
         let with_source = query.select_nodes_with_source();
         let without_source = query.select_nodes();

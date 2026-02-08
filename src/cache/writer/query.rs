@@ -3,12 +3,12 @@ use std::time::Instant;
 use rootcause::Report;
 use tracing::{debug, error, info, instrument, trace};
 
+use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::query::ast::TableNode;
 use crate::query::constraints::analyze_query_constraints;
 use crate::query::resolved::{ResolvedTableNode, query_expr_resolve};
 use crate::query::transform::query_table_update_queries;
-use crate::catalog::TableMetadata;
 
 use super::super::{
     CacheError, CacheResult, ReportExt,
@@ -160,11 +160,7 @@ impl CacheWriter {
 
         // Extract SELECT branches for population
         // Each branch is processed independently, which handles set operations correctly
-        let branches: Vec<_> = resolved
-            .select_nodes()
-            .into_iter()
-            .cloned()
-            .collect();
+        let branches: Vec<_> = resolved.select_nodes().into_iter().cloned().collect();
 
         // Collect all unique table OIDs across all branches for metadata lookup
         let branch_relation_oids: Vec<u32> = branches

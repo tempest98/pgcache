@@ -533,8 +533,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("active_users", 1002));
 
-        let sql =
-            "SELECT * FROM users WHERE id IN (SELECT id FROM active_users) AND id = 1 AND name = 'alice'";
+        let sql = "SELECT * FROM users WHERE id IN (SELECT id FROM active_users) AND id = 1 AND name = 'alice'";
         let resolved = resolve_sql(sql, &tables);
 
         let constraints = analyze_query_constraints(&resolved);

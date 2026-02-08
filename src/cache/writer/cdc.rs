@@ -29,7 +29,13 @@ impl CacheWriter {
         metrics::counter!(names::CACHE_HANDLE_INSERTS).increment(1);
 
         let fp_list = self
-            .update_queries_check_invalidate(relation_oid, &None, &row_data, None, CdcEventKind::Insert)
+            .update_queries_check_invalidate(
+                relation_oid,
+                &None,
+                &row_data,
+                None,
+                CdcEventKind::Insert,
+            )
             .attach_loc("checking for query invalidations")?;
 
         let invalidation_count = fp_list.len() as u64;
@@ -162,7 +168,11 @@ impl CacheWriter {
         if self.cache.update_queries.contains_key(&relation_oid) {
             let fp_list = self
                 .update_queries_check_invalidate(
-                    relation_oid, &None, &row_data, None, CdcEventKind::Delete,
+                    relation_oid,
+                    &None,
+                    &row_data,
+                    None,
+                    CdcEventKind::Delete,
                 )
                 .attach_loc("checking delete invalidations")?;
 
@@ -331,10 +341,7 @@ impl CacheWriter {
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> bool {
-        let Some(constraints) = constraints
-            .table_constraints
-            .get(&table_metadata.name)
-        else {
+        let Some(constraints) = constraints.table_constraints.get(&table_metadata.name) else {
             return true;
         };
 
@@ -408,7 +415,8 @@ impl CacheWriter {
             UpdateQuerySource::Subquery(kind) => {
                 // Check constraints — if row doesn't match constraints for this
                 // table, it's not relevant to the cached query
-                if !self.row_constraints_match(&update_query.constraints, table_metadata, row_data) {
+                if !self.row_constraints_match(&update_query.constraints, table_metadata, row_data)
+                {
                     return false;
                 }
 

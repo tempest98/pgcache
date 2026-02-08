@@ -6,11 +6,7 @@ use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
 use crate::{
     catalog::TableMetadata,
-    query::{
-        ast::QueryExpr,
-        constraints::QueryConstraints,
-        resolved::ResolvedQueryExpr,
-    },
+    query::{ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr},
     settings::Settings,
 };
 

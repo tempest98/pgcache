@@ -287,7 +287,6 @@ impl ResolvedWhereExpr {
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => {}
         }
     }
-
 }
 
 impl Deparse for ResolvedWhereExpr {
@@ -590,7 +589,6 @@ impl ResolvedColumnExpr {
             }
         }
     }
-
 }
 
 impl ResolvedCaseExpr {
@@ -753,7 +751,6 @@ impl ResolvedSelectColumns {
         }
         // ResolvedSelectColumns::All only contains ResolvedColumnNode (no subqueries)
     }
-
 }
 
 impl Deparse for ResolvedSelectColumns {
@@ -826,7 +823,6 @@ impl ResolvedTableSource {
             }
         }
     }
-
 }
 
 impl Deparse for ResolvedTableSource {
@@ -1018,7 +1014,6 @@ impl ResolvedSelectNode {
             .unwrap_or(0);
         (join_count * 3) + predicate_count
     }
-
 }
 
 impl Deparse for ResolvedSelectNode {
@@ -1353,7 +1348,8 @@ impl<'a> ResolutionScope<'a> {
             indexes: Vec::new(),
         };
 
-        self.derived_tables.push((synthetic_metadata, alias.to_owned()));
+        self.derived_tables
+            .push((synthetic_metadata, alias.to_owned()));
     }
 
     /// Find all tables in scope that contain a given column (for unqualified column resolution).
@@ -1435,10 +1431,9 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
 
     match &select.columns {
         ResolvedSelectColumns::None => Vec::new(),
-        ResolvedSelectColumns::All(cols) => cols
-            .iter()
-            .map(|col| col.column_metadata.clone())
-            .collect(),
+        ResolvedSelectColumns::All(cols) => {
+            cols.iter().map(|col| col.column_metadata.clone()).collect()
+        }
         ResolvedSelectColumns::Columns(cols) => cols
             .iter()
             .enumerate()

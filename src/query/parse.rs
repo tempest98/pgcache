@@ -81,14 +81,15 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
 fn sublink_convert(sub_link: &SubLink) -> Result<WhereExpr, WhereParseError> {
     // Parse the subquery SELECT statement
     let query = match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
-        Some(NodeEnum::SelectStmt(select_stmt)) => select_stmt_to_query_expr(select_stmt)
-            .map_err(|e| WhereParseError::SubqueryError {
+        Some(NodeEnum::SelectStmt(select_stmt)) => {
+            select_stmt_to_query_expr(select_stmt).map_err(|e| WhereParseError::SubqueryError {
                 error: e.to_string(),
-            })?,
+            })?
+        }
         _ => {
             return Err(WhereParseError::Other {
                 error: "SubLink missing or invalid subselect".to_owned(),
-            })
+            });
         }
     };
 
@@ -101,10 +102,11 @@ fn sublink_convert(sub_link: &SubLink) -> Result<WhereExpr, WhereParseError> {
         .map(Box::new);
 
     // Convert the SubLink type
-    let sublink_type =
-        SubLinkType::try_from(sub_link.sub_link_type()).map_err(|e| WhereParseError::SubqueryError {
+    let sublink_type = SubLinkType::try_from(sub_link.sub_link_type()).map_err(|e| {
+        WhereParseError::SubqueryError {
             error: e.to_string(),
-        })?;
+        }
+    })?;
 
     Ok(WhereExpr::Subquery {
         query: Box::new(query),
@@ -126,7 +128,7 @@ fn null_test_convert(null_test: &NullTest) -> Result<WhereExpr, WhereParseError>
         NullTestType::Undefined => {
             return Err(WhereParseError::UnsupportedAExpr {
                 expr: "Undefined NullTest type".to_owned(),
-            })
+            });
         }
     };
 
@@ -310,10 +312,7 @@ fn in_list_extract(node: &pg_query::Node) -> Result<Vec<WhereExpr>, WhereParseEr
         });
     };
 
-    list.items
-        .iter()
-        .map(node_convert_to_expr)
-        .collect()
+    list.items.iter().map(node_convert_to_expr).collect()
 }
 
 /// Extract operator from pg_query operator name nodes
@@ -951,9 +950,8 @@ mod tests {
 
     #[test]
     fn where_clause_in_with_strings() {
-        let result = where_clause_parse(
-            "SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')",
-        );
+        let result =
+            where_clause_parse("SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();

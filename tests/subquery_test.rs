@@ -730,11 +730,8 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     // Row was NOT in cache (was false) → uncached path → constraint matches →
     // Subquery(Inclusion) + Update → invalidate.
     // Charlie's department (Sales, id=3) becomes active.
-    ctx.origin_query(
-        "UPDATE departments SET active = true WHERE id = 3",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("UPDATE departments SET active = true WHERE id = 3", &[])
+        .await?;
 
     wait_for_cdc().await;
 

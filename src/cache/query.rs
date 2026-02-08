@@ -172,7 +172,10 @@ fn is_supported_join(join: &JoinNode, ctx: ExprContext) -> Result<(), Cacheabili
 }
 
 /// Check if a table source (in a join) is supported.
-fn is_supported_table_source(source: &TableSource, ctx: ExprContext) -> Result<(), CacheabilityError> {
+fn is_supported_table_source(
+    source: &TableSource,
+    ctx: ExprContext,
+) -> Result<(), CacheabilityError> {
     match source {
         TableSource::Join(nested) => is_supported_join(nested, ctx),
         TableSource::Table(_) => Ok(()),
@@ -262,9 +265,7 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
             ExprContext::FromClause | ExprContext::WhereClause => {
                 Err(CacheabilityError::UnsupportedWhereClause)
             }
-            ExprContext::SelectList => args
-                .iter()
-                .try_for_each(|arg| is_cacheable_expr(arg, ctx)),
+            ExprContext::SelectList => args.iter().try_for_each(|arg| is_cacheable_expr(arg, ctx)),
         },
         WhereExpr::Subquery {
             query,
@@ -506,7 +507,10 @@ mod tests {
         // Scalar subqueries in SELECT list are now cacheable
         let sql = "SELECT id, (SELECT x FROM other WHERE id = 1) FROM t WHERE id = 1";
         let result = check_cacheable(sql);
-        assert!(result.is_ok(), "Scalar subquery in SELECT list should be cacheable");
+        assert!(
+            result.is_ok(),
+            "Scalar subquery in SELECT list should be cacheable"
+        );
     }
 
     #[test]
@@ -514,7 +518,10 @@ mod tests {
         // Derived tables (non-LATERAL subqueries) in FROM are now cacheable
         let sql = "SELECT * FROM (SELECT id FROM users) sub WHERE id = 1";
         let result = check_cacheable(sql);
-        assert!(result.is_ok(), "Subquery in FROM clause should be cacheable");
+        assert!(
+            result.is_ok(),
+            "Subquery in FROM clause should be cacheable"
+        );
     }
 
     #[test]
@@ -530,21 +537,32 @@ mod tests {
         // IN subqueries in WHERE are now cacheable
         let sql = "SELECT * FROM t WHERE id IN (SELECT id FROM other)";
         let result = check_cacheable(sql);
-        assert!(result.is_ok(), "Subquery in WHERE clause should be cacheable");
+        assert!(
+            result.is_ok(),
+            "Subquery in WHERE clause should be cacheable"
+        );
     }
 
     #[test]
     fn test_subquery_exists_cacheable() {
         let sql = "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)";
         let result = check_cacheable(sql);
-        assert!(result.is_ok(), "EXISTS subquery should be cacheable, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "EXISTS subquery should be cacheable, got: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_subquery_scalar_in_where_cacheable() {
         let sql = "SELECT * FROM users WHERE id > (SELECT AVG(id) FROM users)";
         let result = check_cacheable(sql);
-        assert!(result.is_ok(), "Scalar subquery in WHERE should be cacheable, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Scalar subquery in WHERE should be cacheable, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -680,7 +698,10 @@ mod tests {
         let sql = "WITH active AS (SELECT id, name FROM users WHERE active = true) \
                     SELECT u.id, a.name FROM users u JOIN active a ON u.id = a.id WHERE u.id = 1";
         let result = check_cacheable(sql);
-        assert!(result.is_ok(), "CTE in join should be cacheable: {result:?}");
+        assert!(
+            result.is_ok(),
+            "CTE in join should be cacheable: {result:?}"
+        );
     }
 
     #[test]
