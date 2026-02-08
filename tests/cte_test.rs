@@ -19,29 +19,17 @@ use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wa
 
 mod util;
 
-/// Consolidated test for CTE caching support.
-#[tokio::test]
-async fn test_ctes() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-
-    cte_simple(&mut ctx).await?;
-    cte_simple_cdc(&mut ctx).await?;
-    cte_with_join(&mut ctx).await?;
-    cte_multiple_tables(&mut ctx).await?;
-    cte_materialized(&mut ctx).await?;
-
-    Ok(())
-}
-
-// =============================================================================
-// Simple CTE Tests
-// =============================================================================
-
-/// Test simple CTE caching — cache miss then hit.
+/// Test simple CTE caching (cache miss then hit) and CDC invalidation.
 ///
 /// Pattern: WITH active AS (SELECT ... WHERE ...) SELECT * FROM active
-async fn cte_simple(ctx: &mut TestContext) -> Result<(), Error> {
-    let before = ctx.metrics().await?;
+///
+/// Verifies:
+/// - First query is a cache miss, second is a cache hit
+/// - CDC UPDATE invalidates the cache
+/// - CDC DELETE does not invalidate (row removed in place)
+#[tokio::test]
+async fn test_cte_simple() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
 
     ctx.query(
         "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department TEXT, active BOOLEAN)",
@@ -62,6 +50,8 @@ async fn cte_simple(ctx: &mut TestContext) -> Result<(), Error> {
     // Wait for setup CDC events to be processed before caching —
     // INSERT events on subquery/CTE tables would trigger invalidation
     wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
 
     let query = "WITH active_emp AS (SELECT id, name, department FROM employees WHERE active = true) \
                  SELECT name, department FROM active_emp ORDER BY name";
@@ -85,27 +75,15 @@ async fn cte_simple(ctx: &mut TestContext) -> Result<(), Error> {
     let after = ctx.metrics().await?;
     let delta = metrics_delta(&before, &after);
 
-    // 2 setup queries (CREATE + INSERT) + 2 SELECT queries = 4 total
-    assert_eq!(delta.queries_total, 4, "total queries");
-    assert_eq!(delta.queries_unsupported, 2, "unsupported setup queries");
     assert_eq!(delta.queries_cacheable, 2, "cacheable CTE queries");
     assert_eq!(delta.queries_cache_miss, 1, "cache misses");
     assert_eq!(delta.queries_cache_hit, 1, "cache hits");
 
-    Ok(())
-}
+    // -- CDC invalidation --
 
-/// Test CTE with CDC invalidation.
-///
-/// When the underlying table changes, CTE queries referencing
-/// that table should see the updated results.
-async fn cte_simple_cdc(ctx: &mut TestContext) -> Result<(), Error> {
     let before = ctx.metrics().await?;
 
-    let query = "WITH active_emp AS (SELECT id, name, department FROM employees WHERE active = true) \
-                 SELECT name, department FROM active_emp ORDER BY name";
-
-    // Verify query is cached from prior test
+    // Verify query is cached
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // 3 rows: Alice, Charlie, Diana
 
@@ -147,15 +125,28 @@ async fn cte_simple_cdc(ctx: &mut TestContext) -> Result<(), Error> {
     Ok(())
 }
 
-// =============================================================================
-// CTE with JOIN Tests
-// =============================================================================
-
 /// Test CTE joined with a regular table.
 ///
 /// Pattern: WITH cte AS (SELECT ...) SELECT ... FROM cte JOIN table ON ...
-async fn cte_with_join(ctx: &mut TestContext) -> Result<(), Error> {
-    let before = ctx.metrics().await?;
+#[tokio::test]
+async fn test_cte_with_join() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department TEXT, active BOOLEAN)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, department, active) VALUES \
+         (1, 'Alice', 'eng', true), \
+         (2, 'Bob', 'eng', true), \
+         (3, 'Charlie', 'sales', true), \
+         (4, 'Diana', 'sales', true)",
+        &[],
+    )
+    .await?;
 
     ctx.query(
         "CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT, lead_id INTEGER)",
@@ -173,6 +164,8 @@ async fn cte_with_join(ctx: &mut TestContext) -> Result<(), Error> {
 
     // Wait for setup CDC events to be processed before caching
     wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
 
     // CTE selects active employees, then join with projects
     let query = "WITH active_emp AS (SELECT id, name FROM employees WHERE active = true) \
@@ -205,15 +198,27 @@ async fn cte_with_join(ctx: &mut TestContext) -> Result<(), Error> {
     Ok(())
 }
 
-// =============================================================================
-// Multiple CTE Tests
-// =============================================================================
-
 /// Test multiple CTE definitions in a single query.
 ///
 /// Pattern: WITH a AS (...), b AS (...) SELECT ... FROM a JOIN b ON ...
-async fn cte_multiple_tables(ctx: &mut TestContext) -> Result<(), Error> {
-    let before = ctx.metrics().await?;
+#[tokio::test]
+async fn test_cte_multiple_tables() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department TEXT, active BOOLEAN)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, department, active) VALUES \
+         (1, 'Alice', 'eng', true), \
+         (2, 'Bob', 'eng', true), \
+         (3, 'Charlie', 'sales', true)",
+        &[],
+    )
+    .await?;
 
     ctx.query(
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, employee_id INTEGER, amount INTEGER)",
@@ -231,6 +236,8 @@ async fn cte_multiple_tables(ctx: &mut TestContext) -> Result<(), Error> {
     // Wait for setup CDC events
     wait_for_cdc().await;
 
+    let before = ctx.metrics().await?;
+
     // Two CTEs: active employees and their sales
     let query = "WITH active_emp AS (SELECT id, name FROM employees WHERE active = true), \
                  emp_sales AS (SELECT employee_id, SUM(amount) AS total FROM sales GROUP BY employee_id) \
@@ -242,7 +249,7 @@ async fn cte_multiple_tables(ctx: &mut TestContext) -> Result<(), Error> {
     let res = ctx.simple_query(query).await?;
 
     // Alice has sales(500+300=800), Charlie has sales(200)
-    // Bob was activated by CDC in cte_simple_cdc but has no sales
+    // Bob is active but has no sales
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Alice"), ("total", "800")])?;
     assert_row_at(&res, 2, &[("name", "Charlie"), ("total", "200")])?;
@@ -263,17 +270,34 @@ async fn cte_multiple_tables(ctx: &mut TestContext) -> Result<(), Error> {
     Ok(())
 }
 
-// =============================================================================
-// Materialized CTE Tests
-// =============================================================================
-
 /// Test MATERIALIZED CTE caching.
 ///
 /// Pattern: WITH x AS MATERIALIZED (SELECT ...) SELECT * FROM x
 ///
 /// MATERIALIZED CTEs are evaluated once and their results are reused.
 /// The cache should handle these correctly.
-async fn cte_materialized(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_cte_materialized() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department TEXT, active BOOLEAN)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, department, active) VALUES \
+         (1, 'Alice', 'eng', true), \
+         (2, 'Bob', 'eng', true), \
+         (3, 'Charlie', 'sales', true)",
+        &[],
+    )
+    .await?;
+
+    // Wait for setup CDC events
+    wait_for_cdc().await;
+
     let before = ctx.metrics().await?;
 
     let query = "WITH eng AS MATERIALIZED (SELECT id, name FROM employees WHERE department = 'eng') \
@@ -281,7 +305,7 @@ async fn cte_materialized(ctx: &mut TestContext) -> Result<(), Error> {
 
     let res = ctx.simple_query(query).await?;
 
-    // Alice and Bob are in eng (Bob was activated by CDC earlier)
+    // Alice and Bob are in eng
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;

@@ -7,26 +7,12 @@ use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wa
 
 mod util;
 
-/// Consolidated test for search_path resolution functionality.
-/// Combines 6 individual tests into one to reduce setup overhead.
-#[tokio::test]
-async fn test_search_path() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-
-    search_path_custom_schema(&mut ctx).await?;
-    search_path_schema_priority(&mut ctx).await?;
-    search_path_explicit_schema(&mut ctx).await?;
-    search_path_default(&mut ctx).await?;
-    search_path_cache_invalidation(&mut ctx).await?;
-    search_path_join(&mut ctx).await?;
-
-    Ok(())
-}
-
 /// Test that tables in custom schemas are correctly resolved via search_path.
 /// Creates a table in a non-public schema, sets search_path, and verifies
 /// unqualified queries resolve to the correct schema.
-async fn search_path_custom_schema(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_search_path_custom_schema() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Must be done BEFORE creating the schema/table so pgcache picks it up
@@ -77,7 +63,9 @@ async fn search_path_custom_schema(ctx: &mut TestContext) -> Result<(), Error> {
 
 /// Test that same table name in different schemas resolves correctly based on search_path order.
 /// Creates tables with same name in two schemas, verifies search_path priority.
-async fn search_path_schema_priority(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_search_path_schema_priority() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Create two schemas with same table name but different data
@@ -142,7 +130,9 @@ async fn search_path_schema_priority(ctx: &mut TestContext) -> Result<(), Error>
 
 /// Test that schema-qualified queries work regardless of search_path.
 /// Even with search_path set to one schema, explicit qualification accesses other schema.
-async fn search_path_explicit_schema(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_search_path_explicit_schema() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Create schema and table
@@ -189,7 +179,9 @@ async fn search_path_explicit_schema(ctx: &mut TestContext) -> Result<(), Error>
 
 /// Test that the default search_path ("$user", public) works correctly.
 /// With default search_path, tables in public schema should be accessible.
-async fn search_path_default(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_search_path_default() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Create table in public schema (default)
@@ -232,7 +224,10 @@ async fn search_path_default(ctx: &mut TestContext) -> Result<(), Error> {
 
 /// Test cache invalidation works correctly with custom schemas.
 /// CDC events from tables in non-public schemas should invalidate cache.
-async fn search_path_cache_invalidation(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_search_path_cache_invalidation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     // Create schema and table
     ctx.origin_query("CREATE SCHEMA app_invalidation", &[])
         .await?;
@@ -281,7 +276,9 @@ async fn search_path_cache_invalidation(ctx: &mut TestContext) -> Result<(), Err
 }
 
 /// Test join queries across tables in custom schemas.
-async fn search_path_join(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_search_path_join() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Create schema with related tables

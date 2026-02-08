@@ -3,7 +3,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_row_at, wait_for_cdc};
+use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wait_for_cdc};
 
 mod util;
 
@@ -12,26 +12,11 @@ mod util;
 // (whether invalidation occurred). Would be useful to expose invalidation metrics
 // or events for testing the optimization behavior directly.
 
-/// Consolidated test for cache constraint invalidation functionality.
-/// Combines 5 individual tests into one to reduce setup overhead.
+/// Test that INSERT with matching constraints properly caches the row
 #[tokio::test]
-async fn test_cache_constraint_invalidation() -> Result<(), Error> {
+async fn test_insert_matching_constraint() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    insert_matching_constraint(&mut ctx).await?;
-    insert_non_matching_constraint(&mut ctx).await?;
-    update_entering_result_set(&mut ctx).await?;
-    update_leaving_result_set(&mut ctx).await?;
-    update_non_join_column(&mut ctx).await?;
-    update_where_column_entering_result_set(&mut ctx).await?;
-    update_where_column_leaving_result_set(&mut ctx).await?;
-    update_non_pk_column_unconstrained_table_not_in_cache(&mut ctx).await?;
-
-    Ok(())
-}
-
-/// Test that INSERT with matching constraints properly caches the row
-async fn insert_matching_constraint(ctx: &mut TestContext) -> Result<(), Error> {
     ctx.query(
         "create table test_match (id integer primary key, data text)",
         &[],
@@ -94,7 +79,10 @@ async fn insert_matching_constraint(ctx: &mut TestContext) -> Result<(), Error> 
 }
 
 /// Test that INSERT with non-matching constraints is optimized (no invalidation)
-async fn insert_non_matching_constraint(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_insert_non_matching_constraint() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table test_nonmatch (id integer primary key, data text)",
         &[],
@@ -157,7 +145,10 @@ async fn insert_non_matching_constraint(ctx: &mut TestContext) -> Result<(), Err
 
 /// Test UPDATE where JOIN column changes from non-matching to matching value
 /// This should invalidate because row is entering the result set
-async fn update_entering_result_set(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_update_entering_result_set() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table test_enter (id integer primary key, data text)",
         &[],
@@ -221,7 +212,10 @@ async fn update_entering_result_set(ctx: &mut TestContext) -> Result<(), Error> 
 
 /// Test UPDATE where JOIN column changes from matching to non-matching value
 /// This should NOT invalidate because row is leaving the result set (UPDATE handles removal)
-async fn update_leaving_result_set(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_update_leaving_result_set() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table test_leave (id integer primary key, data text)",
         &[],
@@ -283,7 +277,10 @@ async fn update_leaving_result_set(ctx: &mut TestContext) -> Result<(), Error> {
 
 /// Test UPDATE where non-JOIN column changes (data field)
 /// This should NOT invalidate because JOIN key is unchanged
-async fn update_non_join_column(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_update_non_join_column() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table test_nonjoin (id integer primary key, data text)",
         &[],
@@ -353,7 +350,10 @@ async fn update_non_join_column(ctx: &mut TestContext) -> Result<(), Error> {
 ///
 /// Scenario: SELECT * FROM orders JOIN users ON orders.user_id = users.id WHERE users.status = 'active'
 /// If users.status changes from 'inactive' to 'active', the user's orders should now appear.
-async fn update_where_column_entering_result_set(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_update_where_column_entering_result_set() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table users_where (id integer primary key, status text)",
         &[],
@@ -452,8 +452,9 @@ async fn update_where_column_entering_result_set(ctx: &mut TestContext) -> Resul
 ///
 /// Scenario: SELECT * FROM orders JOIN users ON orders.user_id = users.id WHERE users.status = 'active'
 /// If users.status changes from 'active' to 'inactive', the user's orders should no longer appear.
-async fn update_where_column_leaving_result_set(ctx: &mut TestContext) -> Result<(), Error> {
-    use crate::util::{metrics_delta, wait_cache_load};
+#[tokio::test]
+async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
 
     ctx.query(
         "create table users_leave (id integer primary key, status text)",
@@ -480,6 +481,10 @@ async fn update_where_column_leaving_result_set(ctx: &mut TestContext) -> Result
         &[],
     )
     .await?;
+
+    // Wait for setup CDC events to be processed before caching —
+    // INSERT events on cached tables would trigger invalidation
+    wait_for_cdc().await;
 
     let metrics_before = ctx.metrics().await?;
 
@@ -591,10 +596,9 @@ async fn update_where_column_leaving_result_set(ctx: &mut TestContext) -> Result
 /// - Update a non-PK column on an actor NOT in the cached result (not in film 19)
 /// - Since: row not in cache, no WHERE constraints on actor, join col = PK, PK unchanged
 /// - Optimization: skip invalidation, cache should still hit
-async fn update_non_pk_column_unconstrained_table_not_in_cache(
-    ctx: &mut TestContext,
-) -> Result<(), Error> {
-    use crate::util::{metrics_delta, wait_cache_load};
+#[tokio::test]
+async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
 
     // Create actor table with actor_id as PK
     ctx.query(

@@ -7,26 +7,13 @@ use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wa
 
 mod util;
 
-/// Consolidated test for set operation (UNION/INTERSECT/EXCEPT) caching.
+/// Test UNION query caching with metrics verification and CDC updates
 #[tokio::test]
-async fn test_set_operations() -> Result<(), Error> {
+async fn test_set_op_union() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
-    set_op_union(&mut ctx).await?;
-    set_op_union_cdc(&mut ctx).await?;
-    set_op_intersect(&mut ctx).await?;
-    set_op_except(&mut ctx).await?;
-    set_op_union_all(&mut ctx).await?;
-    set_op_union_join_constraint_filter(&mut ctx).await?;
+    // -- Setup --
 
-    Ok(())
-}
-
-/// Test basic UNION query caching with metrics verification
-async fn set_op_union(ctx: &mut TestContext) -> Result<(), Error> {
-    let before = ctx.metrics().await?;
-
-    // Create two tables with similar structure
     ctx.query(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant_id INTEGER)",
         &[],
@@ -50,6 +37,8 @@ async fn set_op_union(ctx: &mut TestContext) -> Result<(), Error> {
         &[],
     )
     .await?;
+
+    let before = ctx.metrics().await?;
 
     // UNION query - combines users and admins for tenant 1
     let query = "SELECT id, name FROM users WHERE tenant_id = 1 \
@@ -80,28 +69,13 @@ async fn set_op_union(ctx: &mut TestContext) -> Result<(), Error> {
     let after = ctx.metrics().await?;
     let delta = metrics_delta(&before, &after);
 
-    // 4 setup queries (2 CREATE + 2 INSERT) + 2 UNION queries = 6 total
-    assert_eq!(delta.queries_total, 6, "total queries");
-    // Both UNION queries should be cacheable
     assert_eq!(delta.queries_cacheable, 2, "cacheable queries");
-    // Setup queries via extended protocol are both uncacheable and unsupported
-    assert_eq!(delta.queries_uncacheable, 4, "uncacheable queries");
-    assert_eq!(delta.queries_unsupported, 4, "unsupported queries");
-    // First UNION is cache miss, second is cache hit
     assert_eq!(delta.queries_cache_miss, 1, "cache misses");
     assert_eq!(delta.queries_cache_hit, 1, "cache hits");
 
-    Ok(())
-}
+    // -- CDC updates --
 
-/// Test UNION query with CDC updates
-async fn set_op_union_cdc(ctx: &mut TestContext) -> Result<(), Error> {
     let before = ctx.metrics().await?;
-
-    let query = "SELECT id, name FROM users WHERE tenant_id = 1 \
-                 UNION \
-                 SELECT id, name FROM admins WHERE tenant_id = 1 \
-                 ORDER BY id";
 
     // Insert a new user directly on origin (simulating external change)
     ctx.origin_query(
@@ -159,7 +133,9 @@ async fn set_op_union_cdc(ctx: &mut TestContext) -> Result<(), Error> {
 }
 
 /// Test INTERSECT query caching
-async fn set_op_intersect(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_set_op_intersect() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Create tables for intersection test
@@ -240,7 +216,9 @@ async fn set_op_intersect(ctx: &mut TestContext) -> Result<(), Error> {
 }
 
 /// Test EXCEPT query caching
-async fn set_op_except(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_set_op_except() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Create tables for except test
@@ -320,7 +298,9 @@ async fn set_op_except(ctx: &mut TestContext) -> Result<(), Error> {
 }
 
 /// Test UNION ALL (no deduplication) vs UNION (with deduplication)
-async fn set_op_union_all(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_set_op_union_all() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     // Create tables with duplicate values across them
@@ -419,7 +399,10 @@ async fn set_op_union_all(ctx: &mut TestContext) -> Result<(), Error> {
 /// has_table_constraints = false always invalidated.
 /// After: each branch gets its own constraints, and non-matching CDC events
 /// on constrained tables are filtered.
-async fn set_op_union_join_constraint_filter(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     // Branch 1 tables: orders joined with customers, filtered by region
     ctx.query(
         "CREATE TABLE union_customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT)",

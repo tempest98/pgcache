@@ -7,25 +7,10 @@ use crate::util::{TestContext, metrics_delta, wait_cache_load, wait_for_cdc};
 
 mod util;
 
-/// Consolidated test for extended protocol (prepared statements) functionality.
-/// Combines 7 individual tests into one to reduce setup overhead.
-#[tokio::test]
-async fn test_extended_protocol() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-
-    extended_protocol_basic(&mut ctx).await?;
-    extended_protocol_statement_reuse(&mut ctx).await?;
-    extended_protocol_multiple_params(&mut ctx).await?;
-    extended_protocol_null_parameter(&mut ctx).await?;
-    extended_protocol_unnamed_statement(&mut ctx).await?;
-    extended_protocol_insert_returning(&mut ctx).await?;
-    extended_protocol_parameterized_cache_hit(&mut ctx).await?;
-
-    Ok(())
-}
-
 /// Test basic extended protocol with parameterized query
-async fn extended_protocol_basic(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_extended_protocol_basic() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     ctx.query(
@@ -66,7 +51,9 @@ async fn extended_protocol_basic(ctx: &mut TestContext) -> Result<(), Error> {
 }
 
 /// Test statement reuse with different parameter values
-async fn extended_protocol_statement_reuse(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     ctx.query(
@@ -116,7 +103,9 @@ async fn extended_protocol_statement_reuse(ctx: &mut TestContext) -> Result<(), 
 }
 
 /// Test query with multiple parameters
-async fn extended_protocol_multiple_params(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     ctx.query(
@@ -164,7 +153,10 @@ async fn extended_protocol_multiple_params(ctx: &mut TestContext) -> Result<(), 
 }
 
 /// Test NULL parameter handling
-async fn extended_protocol_null_parameter(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_extended_protocol_null_parameter() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table test_null (id integer primary key, data text)",
         &[],
@@ -191,7 +183,10 @@ async fn extended_protocol_null_parameter(ctx: &mut TestContext) -> Result<(), E
 }
 
 /// Test unnamed (inline) statements
-async fn extended_protocol_unnamed_statement(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_extended_protocol_unnamed_statement() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table test_unnamed (id integer primary key, data text)",
         &[],
@@ -219,7 +214,10 @@ async fn extended_protocol_unnamed_statement(ctx: &mut TestContext) -> Result<()
 }
 
 /// Test INSERT RETURNING statement
-async fn extended_protocol_insert_returning(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_extended_protocol_insert_returning() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     ctx.query(
         "create table test_returning (id serial primary key, data text)",
         &[],
@@ -244,7 +242,9 @@ async fn extended_protocol_insert_returning(ctx: &mut TestContext) -> Result<(),
 }
 
 /// Test parameterized cache hit with CDC updates
-async fn extended_protocol_parameterized_cache_hit(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     ctx.query(

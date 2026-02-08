@@ -10,21 +10,10 @@ use crate::util::{
 
 mod util;
 
-/// Consolidated test for cache functionality.
-/// Combines individual tests into one to reduce setup overhead.
-#[tokio::test]
-async fn test_cache() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-
-    cache_simple(&mut ctx).await?;
-    cache_join(&mut ctx).await?;
-    cache_index_creation(&mut ctx).await?;
-
-    Ok(())
-}
-
 /// Test basic caching with simple queries
-async fn cache_simple(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_cache_simple() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     ctx.query(
@@ -85,7 +74,9 @@ async fn cache_simple(ctx: &mut TestContext) -> Result<(), Error> {
 }
 
 /// Test caching with join queries
-async fn cache_join(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_cache_join() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
     let before = ctx.metrics().await?;
 
     ctx.query(
@@ -222,7 +213,10 @@ async fn cache_join(ctx: &mut TestContext) -> Result<(), Error> {
 }
 
 /// Test that indexes from the origin table are created on the cache table
-async fn cache_index_creation(ctx: &mut TestContext) -> Result<(), Error> {
+#[tokio::test]
+async fn test_cache_index_creation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
     // Create table with multiple indexes on origin
     ctx.query(
         "CREATE TABLE test_indexed (
