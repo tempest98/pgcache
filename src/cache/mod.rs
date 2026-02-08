@@ -29,7 +29,7 @@ pub use messages::{
 };
 pub use runtime::cache_run;
 pub use types::{
-    Cache, CachedQuery, CachedQueryState, CdcEventKind, SubqueryKind, UpdateQueries, UpdateQuery,
+    Cache, CachedQuery, CachedQueryState, SubqueryKind, UpdateQueries, UpdateQuery,
     UpdateQuerySource,
 };
 

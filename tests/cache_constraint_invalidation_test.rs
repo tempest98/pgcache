@@ -616,34 +616,16 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
 
     // Insert actors
     ctx.query(
-        "insert into actor_opt (actor_id, first_name, last_name) values (1, 'John', 'Doe')",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "insert into actor_opt (actor_id, first_name, last_name) values (2, 'Jane', 'Smith')",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "insert into actor_opt (actor_id, first_name, last_name) values (3, 'Bob', 'Wilson')",
+        "insert into actor_opt (actor_id, first_name, last_name) \
+        values (1, 'John', 'Doe'), (2, 'Jane', 'Smith'), (3, 'Bob', 'Wilson')",
         &[],
     )
     .await?;
 
     // Film 19 has actors 1, 2; Film 20 has actor 3
     ctx.query(
-        "insert into film_actor_opt (film_id, actor_id) values (19, 1)",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "insert into film_actor_opt (film_id, actor_id) values (19, 2)",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "insert into film_actor_opt (film_id, actor_id) values (20, 3)",
+        "insert into film_actor_opt (film_id, actor_id) \
+        values (19, 1), (19, 2), (20, 3)",
         &[],
     )
     .await?;
@@ -733,6 +715,152 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
         2,
         &[("film_id", "19"), ("actor_id", "2"), ("first_name", "Jane")],
     )?;
+
+    // Verify cache hit (optimization worked - no invalidation)
+    let metrics_after_update = ctx.metrics().await?;
+    let delta = metrics_delta(&metrics_after_hit, &metrics_after_update);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "Query after update should be cache hit (optimization: no invalidation)"
+    );
+    assert_eq!(
+        delta.queries_cache_miss, 0,
+        "Should not have cache miss after optimized update"
+    );
+
+    Ok(())
+}
+
+/// Test UPDATE of inclusive subquery of non-PK column on an unconstrained table where
+/// the row is NOT in cache.
+#[tokio::test]
+async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in_cache()
+-> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    // Create actor table with actor_id as PK
+    ctx.query(
+        "create table actor (id integer primary key, first_name text, last_name text)",
+        &[],
+    )
+    .await?;
+
+    // Create film_actor as a mapping table with serial PK
+    ctx.query(
+        "create table film_actor (id serial primary key, film_id integer, actor_id integer)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "create table film (film_id integer primary key, title text)",
+        &[],
+    )
+    .await?;
+
+    // Insert actors
+    ctx.query(
+        "insert into actor (id, first_name, last_name) \
+        values (1, 'John', 'Doe'), (2, 'Jane', 'Smith'), (3, 'Bob', 'Wilson')",
+        &[],
+    )
+    .await?;
+
+    // Film 19 has actors 1, 2; Film 20 has actor 3
+    ctx.query(
+        "insert into film_actor (film_id, actor_id) \
+        values (19, 1), (19, 2), (20, 3)",
+        &[],
+    )
+    .await?;
+
+    // Film titles
+    ctx.query(
+        "insert into film (film_id, title) \
+        values (19, 'nineteen'), (20, 'twenty')",
+        &[],
+    )
+    .await?;
+
+    // Wait for initial data to settle
+    wait_for_cdc().await;
+
+    let metrics_before = ctx.metrics().await?;
+
+    // Prime cache: query for film titles
+    let res = ctx
+        .simple_query(
+            "select film_id, title from film where film_id in ( \
+                select fa.film_id \
+                from film_actor fa join actor a on fa.actor_id = a.id \
+                where a.id in (1, 3) \
+            ) \
+            order by film_id",
+        )
+        .await?;
+
+    // RowDescription + 2 data rows + CommandComplete = 4
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("film_id", "19"), ("title", "nineteen")])?;
+    assert_row_at(&res, 2, &[("film_id", "20"), ("title", "twenty")])?;
+
+    // Verify cache miss (first query)
+    let metrics_after_prime = ctx.metrics().await?;
+    let delta = metrics_delta(&metrics_before, &metrics_after_prime);
+    assert_eq!(
+        delta.queries_cache_miss, 1,
+        "First query should be cache miss"
+    );
+
+    // Wait for cache to load (use longer wait for reliability)
+    wait_cache_load().await;
+    wait_cache_load().await;
+
+    // Verify cache hit
+    let _ = ctx
+        .simple_query(
+            "select film_id, title from film where film_id in ( \
+                select fa.film_id \
+                from film_actor fa join actor a on fa.actor_id = a.id \
+                where a.id in (1, 3) \
+            ) \
+            order by film_id",
+        )
+        .await?;
+
+    let metrics_after_hit = ctx.metrics().await?;
+    let delta = metrics_delta(&metrics_after_prime, &metrics_after_hit);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "Second query should be cache hit"
+    );
+
+    // UPDATE: Change actor 2's last_name
+    // Optimization should kick in:
+    // - row_changes.is_none() (actor 2 not in cache)
+    // - row is filtered out be constraints on actor
+    // => Skip invalidation
+    ctx.origin_query("update actor set last_name = 'Updated' where id = 2", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    // Query again - should still be a cache hit (not invalidated)
+    let res = ctx
+        .simple_query(
+            "select film_id, title from film where film_id in ( \
+                select fa.film_id \
+                from film_actor fa join actor a on fa.actor_id = a.id \
+                where a.id in (1, 3) \
+            ) \
+            order by film_id",
+        )
+        .await?;
+
+    // Verify still 2 rows (correct result)
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("film_id", "19"), ("title", "nineteen")])?;
+    assert_row_at(&res, 2, &[("film_id", "20"), ("title", "twenty")])?;
 
     // Verify cache hit (optimization worked - no invalidation)
     let metrics_after_update = ctx.metrics().await?;

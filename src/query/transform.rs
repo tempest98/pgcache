@@ -811,6 +811,7 @@ pub fn query_table_update_queries(
 mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::wildcard_enum_match_arm)]
+    #![allow(clippy::unwrap_used)]
 
     use crate::cache::SubqueryKind;
     use crate::query::ast::{Deparse, query_expr_convert};
@@ -1838,6 +1839,148 @@ mod tests {
             result[0].2,
             UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
             "FROM subquery table should be Subquery(Inclusion)"
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_nested_in_in() {
+        // Double-nested: IN inside IN — all inner tables are Inclusion
+        let sql = "SELECT name FROM products \
+                   WHERE store_id IN ( \
+                       SELECT id FROM stores \
+                       WHERE region_id IN ( \
+                           SELECT id FROM regions WHERE name = 'East' \
+                       ) \
+                   )";
+        let cacheable = parse_cacheable(sql);
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 3);
+
+        let products = result.iter().find(|(t, _, _)| t.name == "products").unwrap();
+        assert_eq!(products.2, UpdateQuerySource::Direct);
+
+        let stores = result.iter().find(|(t, _, _)| t.name == "stores").unwrap();
+        assert_eq!(
+            stores.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "IN subquery table should be Inclusion"
+        );
+
+        let regions = result.iter().find(|(t, _, _)| t.name == "regions").unwrap();
+        assert_eq!(
+            regions.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "Nested IN inside IN should still be Inclusion"
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_nested_not_in_inside_in() {
+        // NOT IN nested inside IN:
+        // The outer IN context is not negated, so the inner NOT IN is Exclusion
+        let sql = "SELECT name FROM products \
+                   WHERE store_id IN ( \
+                       SELECT id FROM stores \
+                       WHERE region_id NOT IN ( \
+                           SELECT region_id FROM excluded_regions \
+                       ) \
+                   )";
+        let cacheable = parse_cacheable(sql);
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 3);
+
+        let products = result.iter().find(|(t, _, _)| t.name == "products").unwrap();
+        assert_eq!(products.2, UpdateQuerySource::Direct);
+
+        let stores = result.iter().find(|(t, _, _)| t.name == "stores").unwrap();
+        assert_eq!(
+            stores.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "Outer IN subquery table should be Inclusion"
+        );
+
+        let excluded = result
+            .iter()
+            .find(|(t, _, _)| t.name == "excluded_regions")
+            .unwrap();
+        assert_eq!(
+            excluded.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+            "NOT IN inside IN should be Exclusion"
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_nested_in_inside_not_in() {
+        // IN nested inside NOT IN:
+        // The NOT IN sets negated=true, so the inner IN inherits negated → Exclusion
+        let sql = "SELECT name FROM products \
+                   WHERE id NOT IN ( \
+                       SELECT product_id FROM blacklist \
+                       WHERE category_id IN ( \
+                           SELECT id FROM categories WHERE name = 'Restricted' \
+                       ) \
+                   )";
+        let cacheable = parse_cacheable(sql);
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 3);
+
+        let products = result.iter().find(|(t, _, _)| t.name == "products").unwrap();
+        assert_eq!(products.2, UpdateQuerySource::Direct);
+
+        let blacklist = result.iter().find(|(t, _, _)| t.name == "blacklist").unwrap();
+        assert_eq!(
+            blacklist.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+            "NOT IN subquery table should be Exclusion"
+        );
+
+        let categories = result
+            .iter()
+            .find(|(t, _, _)| t.name == "categories")
+            .unwrap();
+        assert_eq!(
+            categories.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+            "IN inside NOT IN should be Exclusion (negated flips Inclusion → Exclusion)"
+        );
+    }
+
+    #[test]
+    fn test_update_query_source_nested_not_in_inside_not_in() {
+        // NOT IN inside NOT IN:
+        // Outer NOT IN sets negated=true, inner NOT IN (ALL) with negated=true → Inclusion
+        // Double negation: NOT IN under NOT IN flips back to Inclusion
+        let sql = "SELECT name FROM products \
+                   WHERE id NOT IN ( \
+                       SELECT product_id FROM blacklist \
+                       WHERE category_id NOT IN ( \
+                           SELECT id FROM excluded_categories \
+                       ) \
+                   )";
+        let cacheable = parse_cacheable(sql);
+        let result = query_table_update_queries(&cacheable);
+
+        assert_eq!(result.len(), 3);
+
+        let blacklist = result.iter().find(|(t, _, _)| t.name == "blacklist").unwrap();
+        assert_eq!(
+            blacklist.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
+            "Outer NOT IN table should be Exclusion"
+        );
+
+        let excluded = result
+            .iter()
+            .find(|(t, _, _)| t.name == "excluded_categories")
+            .unwrap();
+        assert_eq!(
+            excluded.2,
+            UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            "NOT IN inside NOT IN should be Inclusion (double negation)"
         );
     }
 }

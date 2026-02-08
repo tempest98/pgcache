@@ -84,14 +84,6 @@ pub enum UpdateQuerySource {
     Subquery(SubqueryKind),
 }
 
-/// CDC event type, used to determine invalidation direction for subquery tables
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CdcEventKind {
-    Insert,
-    Update,
-    Delete,
-}
-
 /// Query used to update cached results when data changes
 #[derive(Debug, Clone)]
 pub struct UpdateQuery {

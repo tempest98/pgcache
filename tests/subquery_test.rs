@@ -439,6 +439,432 @@ async fn test_subquery_nested() -> Result<(), Error> {
 }
 
 // =============================================================================
+// Double-Nested Subquery CDC Tests
+// =============================================================================
+
+/// Test double-nested IN subqueries with CDC invalidation at each level.
+///
+/// Pattern: SELECT ... WHERE col IN (SELECT ... WHERE col IN (SELECT ...))
+///
+/// All three subquery levels are Inclusion:
+/// - Outer: products (Direct)
+/// - Middle: stores (Subquery/Inclusion)
+/// - Inner: regions (Subquery/Inclusion)
+///
+/// CDC INSERT at any level should invalidate (Inclusion = growth invalidates).
+/// CDC DELETE at inner levels should NOT invalidate (Inclusion = shrinkage safe).
+#[tokio::test]
+async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE stores (id INTEGER PRIMARY KEY, region_id INTEGER, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, store_id INTEGER, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO regions (id, name) VALUES (1, 'East'), (2, 'West')",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO stores (id, region_id, name) VALUES \
+         (10, 1, 'NYC'), (11, 1, 'Boston'), (12, 2, 'LA')",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO products (id, store_id, name) VALUES \
+         (100, 10, 'Widget'), (101, 11, 'Gadget'), \
+         (102, 12, 'Gizmo'), (103, 10, 'Doohickey')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
+
+    // products in stores in East region
+    let query = "SELECT name FROM products \
+                 WHERE store_id IN ( \
+                     SELECT id FROM stores \
+                     WHERE region_id IN ( \
+                         SELECT id FROM regions WHERE name = 'East' \
+                     ) \
+                 ) \
+                 ORDER BY name";
+
+    // --- Initial cache miss ---
+    let res = ctx.simple_query(query).await?;
+    // East(1) → NYC(10), Boston(11) → Widget, Gadget, Doohickey
+    assert_eq!(res.len(), 5);
+    assert_row_at(&res, 1, &[("name", "Doohickey")])?;
+    assert_row_at(&res, 2, &[("name", "Gadget")])?;
+    assert_row_at(&res, 3, &[("name", "Widget")])?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5);
+
+    // --- CDC INSERT at innermost level (regions): Inclusion → invalidate ---
+    // Add a new store in the East region.
+
+    // --- CDC INSERT at middle level (stores): Inclusion → invalidate ---
+    ctx.origin_query(
+        "INSERT INTO stores (id, region_id, name) VALUES (13, 1, 'Philly')",
+        &[],
+    )
+    .await?;
+
+    ctx.origin_query(
+        "INSERT INTO products (id, store_id, name) VALUES (104, 13, 'Thingamajig')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Stores insert (Inclusion) should invalidate
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 6); // Doohickey, Gadget, Thingamajig, Widget
+    assert_row_at(&res, 1, &[("name", "Doohickey")])?;
+    assert_row_at(&res, 2, &[("name", "Gadget")])?;
+    assert_row_at(&res, 3, &[("name", "Thingamajig")])?;
+    assert_row_at(&res, 4, &[("name", "Widget")])?;
+
+    wait_cache_load().await;
+
+    // --- CDC DELETE at middle level (stores): Inclusion → no invalidation ---
+    // Remove Philly store — shrinkage is safe for Inclusion
+    ctx.origin_query("DELETE FROM stores WHERE id = 13", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    // Cache hit — Inclusion DELETE does not invalidate.
+    // Thingamajig's store is gone, so Thingamajig won't be included in results.
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // back to Doohickey, Gadget, Widget
+    assert_row_at(&res, 1, &[("name", "Doohickey")])?;
+    assert_row_at(&res, 2, &[("name", "Gadget")])?;
+    assert_row_at(&res, 3, &[("name", "Widget")])?;
+
+    // --- CDC INSERT at innermost level (regions): Inclusion → invalidate ---
+    // Update an existing region to become 'East'
+    ctx.origin_query("UPDATE regions SET name = 'East' WHERE id = 2", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    // Now both regions are 'East', so LA(12) is included → Gizmo appears
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 6); // Doohickey, Gadget, Gizmo, Widget
+    assert_row_at(&res, 1, &[("name", "Doohickey")])?;
+    assert_row_at(&res, 2, &[("name", "Gadget")])?;
+    assert_row_at(&res, 3, &[("name", "Gizmo")])?;
+    assert_row_at(&res, 4, &[("name", "Widget")])?;
+
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_cacheable, 5, "cacheable queries");
+    // miss, hit, miss (stores INSERT), hit (stores DELETE), miss (regions UPDATE)
+    assert_eq!(delta.queries_cache_miss, 3, "cache misses");
+    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+
+    Ok(())
+}
+
+/// Test NOT IN nested inside IN with CDC invalidation.
+///
+/// Pattern: SELECT ... WHERE col IN (SELECT ... WHERE col NOT IN (SELECT ...))
+///
+/// Source types:
+/// - Outer: products (Direct)
+/// - Middle: stores via IN (Subquery/Inclusion)
+/// - Inner: excluded_regions via NOT IN (Subquery/Exclusion)
+///
+/// The inner NOT IN has Exclusion semantics:
+/// - INSERT into excluded_regions → does NOT invalidate (exclusion set grows, result can only shrink)
+/// - DELETE from excluded_regions → invalidates (exclusion set shrinks, result may grow)
+#[tokio::test]
+async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE excluded_regions (id INTEGER PRIMARY KEY, region_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE stores (id INTEGER PRIMARY KEY, region_id INTEGER, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, store_id INTEGER, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    // Regions: East(1), West(2), South(3)
+    ctx.query(
+        "INSERT INTO regions (id, name) VALUES (1, 'East'), (2, 'West'), (3, 'South')",
+        &[],
+    )
+    .await?;
+
+    // Exclude West(2) — only East and South are non-excluded
+    ctx.query(
+        "INSERT INTO excluded_regions (id, region_id) VALUES (1, 2)",
+        &[],
+    )
+    .await?;
+
+    // Stores: NYC(East), LA(West), Miami(South)
+    ctx.query(
+        "INSERT INTO stores (id, region_id, name) VALUES \
+         (10, 1, 'NYC'), (11, 2, 'LA'), (12, 3, 'Miami')",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO products (id, store_id, name) VALUES \
+         (100, 10, 'Widget'), (101, 11, 'Gizmo'), (102, 12, 'Gadget')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
+
+    // Products in stores whose region is NOT excluded
+    // stores WHERE region_id IN (regions WHERE id NOT IN (excluded_regions))
+    let query = "SELECT name FROM products \
+                 WHERE store_id IN ( \
+                     SELECT id FROM stores \
+                     WHERE region_id IN ( \
+                         SELECT id FROM regions \
+                         WHERE id NOT IN (SELECT region_id FROM excluded_regions) \
+                     ) \
+                 ) \
+                 ORDER BY name";
+
+    // Non-excluded regions: East(1), South(3) → stores NYC(10), Miami(12) → Widget, Gadget
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("name", "Gadget")])?;
+    assert_row_at(&res, 2, &[("name", "Widget")])?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+
+    // --- CDC INSERT into excluded_regions: Exclusion → no invalidation ---
+    // Exclude South(3) too — exclusion set grows, result can only shrink
+    ctx.origin_query(
+        "INSERT INTO excluded_regions (id, region_id) VALUES (2, 3)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Exclusion INSERT does not invalidate → cache hit
+    // But cache tables are updated: South is now excluded, so
+    // Miami/Gadget should be removed from cache in-place.
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3); // Only Widget remains
+    assert_row_at(&res, 1, &[("name", "Widget")])?;
+
+    // --- CDC DELETE from excluded_regions: Exclusion → invalidates ---
+    // Un-exclude West(2) — exclusion set shrinks, result may grow
+    ctx.origin_query("DELETE FROM excluded_regions WHERE region_id = 2", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    // Exclusion DELETE invalidates → cache miss
+    // Non-excluded: East(1), West(2) → NYC, LA → Widget, Gizmo
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("name", "Gizmo")])?;
+    assert_row_at(&res, 2, &[("name", "Widget")])?;
+
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
+    // miss, hit, hit (exclusion INSERT), miss (exclusion DELETE)
+    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
+    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+
+    Ok(())
+}
+
+/// Test IN nested inside NOT IN with CDC invalidation.
+///
+/// Pattern: SELECT ... WHERE col NOT IN (SELECT ... WHERE col IN (SELECT ...))
+///
+/// Source types:
+/// - Outer: products (Direct)
+/// - Middle: blacklist via NOT IN (Subquery/Exclusion)
+/// - Inner: categories via IN (inherits negated=true → Subquery/Exclusion)
+///
+/// The NOT IN wrapping flips the inner IN's semantics:
+/// - Inner IN under NOT IN → negated=true → Exclusion
+/// - So INSERT into inner table does NOT invalidate (same as Exclusion)
+/// - DELETE from inner table → invalidates (Exclusion shrinkage)
+#[tokio::test]
+async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE blacklisted_products (id INTEGER PRIMARY KEY, product_id INTEGER, category_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    // Categories: Electronics(1), Toys(2), Books(3)
+    ctx.query(
+        "INSERT INTO categories (id, name) VALUES (1, 'Electronics'), (2, 'Toys'), (3, 'Books')",
+        &[],
+    )
+    .await?;
+
+    // Blacklisted products in 'restricted' categories (Electronics)
+    // Product 100 is blacklisted because it's in category Electronics
+    ctx.query(
+        "INSERT INTO blacklisted_products (id, product_id, category_id) VALUES \
+         (1, 100, 1), (2, 102, 1)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO products (id, name) VALUES \
+         (100, 'Laptop'), (101, 'Teddy Bear'), (102, 'Phone'), (103, 'Novel')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let before = ctx.metrics().await?;
+
+    // Products NOT in the blacklist for Electronics category
+    // NOT IN (blacklisted WHERE category_id IN (categories WHERE name = 'Electronics'))
+    let query = "SELECT name FROM products \
+                 WHERE id NOT IN ( \
+                     SELECT product_id FROM blacklisted_products \
+                     WHERE category_id IN ( \
+                         SELECT id FROM categories WHERE name = 'Electronics' \
+                     ) \
+                 ) \
+                 ORDER BY name";
+
+    // Blacklisted for Electronics: product 100 (Laptop), 102 (Phone)
+    // Remaining: Novel, Teddy Bear
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("name", "Novel")])?;
+    assert_row_at(&res, 2, &[("name", "Teddy Bear")])?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+
+    // --- CDC INSERT into blacklisted_products: Exclusion → no invalidation ---
+    // Add product 101 (Teddy Bear) to Electronics blacklist
+    // The NOT IN exclusion set grows → result can only shrink → safe
+    ctx.origin_query(
+        "INSERT INTO blacklisted_products (id, product_id, category_id) VALUES (3, 101, 1)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Exclusion INSERT: no invalidation → cache hit
+    // But Teddy Bear should be removed from cache in-place
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3); // Only Novel remains
+    assert_row_at(&res, 1, &[("name", "Novel")])?;
+
+    // --- CDC DELETE from blacklisted_products: Exclusion → invalidates ---
+    // Remove Laptop(100) from blacklist — exclusion set shrinks
+    ctx.origin_query(
+        "DELETE FROM blacklisted_products WHERE product_id = 100",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Exclusion DELETE invalidates → cache miss
+    // Blacklisted for Electronics: 101 (Teddy Bear), 102 (Phone)
+    // Remaining: Laptop, Novel
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("name", "Laptop")])?;
+    assert_row_at(&res, 2, &[("name", "Novel")])?;
+
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+
+    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
+    // miss, hit, hit (exclusion INSERT), miss (exclusion DELETE)
+    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
+    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+
+    Ok(())
+}
+
+// =============================================================================
 // Multi-Table Subquery Dependencies
 // =============================================================================
 
