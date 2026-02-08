@@ -46,8 +46,9 @@ pub struct CdcProcessor {
 
     last_received_lsn: u64,
     last_applied_lsn: u64,
+    last_flushed_lsn: u64,
     keep_alive_timer: Interval,
-    last_keep_alive_sent: Option<Instant>,
+    last_flush_sent: Option<Instant>,
     keep_alive_sent_count: u64,
 }
 
@@ -74,8 +75,9 @@ impl CdcProcessor {
             active_relations: HashSet::new(),
             last_received_lsn: 0,
             last_applied_lsn: 0,
+            last_flushed_lsn: 0,
             keep_alive_timer: timer,
-            last_keep_alive_sent: None,
+            last_flush_sent: None,
             keep_alive_sent_count: 0,
         })
     }
@@ -107,6 +109,8 @@ impl CdcProcessor {
                                 error!("Error processing replication message: {}", e);
                                 // Continue processing despite errors
                             }
+                            // Flush LSN progress to PostgreSQL periodically while processing
+                            self.status_update_throttled(stream.as_mut()).await;
                         }
                         Some(Err(e)) => {
                             error!("Replication stream error: {}", e);
@@ -132,7 +136,7 @@ impl CdcProcessor {
         Ok(())
     }
 
-    /// Updates the last received LSN from XLogData message and records time-based lag.
+    /// Updates the last received LSN from XLogData message and records lag metrics.
     async fn update_lsn(&mut self, xlog_data: &XLogDataBody<LogicalReplicationMessage>) {
         let lsn = xlog_data.wal_start();
         self.last_received_lsn = lsn;
@@ -143,12 +147,37 @@ impl CdcProcessor {
         let lag_micros = now.saturating_sub(server_timestamp);
         let lag_seconds = lag_micros as f64 / 1_000_000.0;
         metrics::gauge!(names::CDC_LAG_SECONDS).set(lag_seconds);
+
+        // Byte-based lag: difference between WAL end and our last acknowledged position
+        let wal_end = xlog_data.wal_end();
+        let lag_bytes = wal_end.saturating_sub(self.last_flushed_lsn);
+        metrics::gauge!(names::CDC_LAG_BYTES).set(lag_bytes as f64);
+
+        // How long since we last acknowledged our position to PostgreSQL
+        let flush_staleness = self
+            .last_flush_sent
+            .map_or(0.0, |t| t.elapsed().as_secs_f64());
+        metrics::gauge!(names::CDC_FLUSH_STALENESS_SECONDS).set(flush_staleness);
     }
 
     /// Marks the current LSN as fully applied after successful processing.
     fn mark_lsn_applied(&mut self) {
         let received = self.last_received_lsn;
         self.last_applied_lsn = received;
+    }
+
+    /// Send a standby status update if at least 5 seconds have elapsed since the last one.
+    async fn status_update_throttled(
+        &mut self,
+        stream: std::pin::Pin<&mut LogicalReplicationStream>,
+    ) {
+        let should_send = self
+            .last_flush_sent
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+
+        if should_send && let Err(e) = self.send_standby_status_update(stream, false).await {
+            error!("Error sending throttled status update: {e}");
+        }
     }
 
     /// Gets the current PostgreSQL timestamp in microseconds since PostgreSQL epoch (2000-01-01).
@@ -175,15 +204,12 @@ impl CdcProcessor {
             .await
         {
             Ok(()) => {
-                // Update keep-alive tracking on successful send
-                self.last_keep_alive_sent = Some(Instant::now());
-                let count = {
-                    let mut counter = self.keep_alive_sent_count;
-                    counter += 1;
-                    counter
-                };
+                // Update tracking on successful send
+                self.last_flushed_lsn = applied_lsn;
+                self.last_flush_sent = Some(Instant::now());
+                self.keep_alive_sent_count += 1;
+                let count = self.keep_alive_sent_count;
 
-                // Debug logging for successful keep-alive
                 debug!("Sent keep-alive #{count} (LSN: {applied_lsn}, reply: {reply_flag})");
 
                 Ok(())
@@ -208,11 +234,7 @@ impl CdcProcessor {
     ) -> Result<(), Error> {
         // Check if PostgreSQL requested a reply
         let reply_requested = keep_alive.reply() == 1;
-
-        // Update byte-based lag metric: difference between server's WAL end and our applied position
         let wal_end = keep_alive.wal_end();
-        let lag_bytes = wal_end.saturating_sub(self.last_applied_lsn);
-        metrics::gauge!(names::CDC_LAG_BYTES).set(lag_bytes as f64);
 
         debug!(
             "Received keep-alive from PostgreSQL (wal_end: {}, reply_requested: {})",
@@ -271,7 +293,7 @@ impl CdcProcessor {
 
     /// Gets keep-alive statistics for debugging purposes.
     fn get_keep_alive_stats(&self) -> (Option<Instant>, u64) {
-        let last_sent = self.last_keep_alive_sent;
+        let last_sent = self.last_flush_sent;
         let count = self.keep_alive_sent_count;
         (last_sent, count)
     }

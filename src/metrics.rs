@@ -33,6 +33,7 @@ pub mod names {
     pub const CDC_DELETES: &str = "pgcache.cdc.deletes";
     pub const CDC_LAG_BYTES: &str = "pgcache.cdc.lag_bytes";
     pub const CDC_LAG_SECONDS: &str = "pgcache.cdc.lag_seconds";
+    pub const CDC_FLUSH_STALENESS_SECONDS: &str = "pgcache.cdc.flush_staleness_seconds";
 
     // Cache performance metrics
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
