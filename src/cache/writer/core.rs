@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
@@ -17,7 +18,7 @@ use crate::settings::Settings;
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcCommand, QueryCommand},
-    types::{Cache, CacheStateView, CachedQueryState, CachedQueryView},
+    types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView},
 };
 use super::population::population_worker;
 
@@ -51,12 +52,15 @@ pub struct CacheWriter {
     pub(super) populate_next: usize,
     /// Pool of cache connections for concurrent CDC update execution.
     pub(super) cache_pool: Vec<Rc<Client>>,
+    /// Shared set of relation OIDs with active cached queries (read by CDC processor).
+    active_relations: ActiveRelations,
 }
 
 impl CacheWriter {
     pub async fn new(
         settings: &Settings,
         state_view: Arc<RwLock<CacheStateView>>,
+        active_relations: ActiveRelations,
         query_tx: UnboundedSender<QueryCommand>,
     ) -> CacheResult<Self> {
         let (cache_client, cache_connection) = Config::new()
@@ -140,6 +144,7 @@ impl CacheWriter {
             populate_txs,
             populate_next: 0,
             cache_pool,
+            active_relations,
         })
     }
 
@@ -228,24 +233,23 @@ impl CacheWriter {
                     error!("cdc truncate failed: {e}");
                 }
             }
-            CdcCommand::RelationCheck {
-                relation_oid,
-                response_tx,
-            } => {
-                let exists = self.cached_queries_exist(relation_oid);
-                let _ = response_tx.send(exists);
-            }
         }
         self.state_gauges_update();
         Ok(())
     }
 
-    /// Check if there are any cached queries for a specific table.
-    pub fn cached_queries_exist(&self, relation_oid: u32) -> bool {
-        self.cache
+    /// Rebuild the shared active relations set from current cached queries.
+    pub(super) fn active_relations_rebuild(&self) {
+        let oids: HashSet<u32> = self
+            .cache
             .cached_queries
             .iter()
-            .any(|query| query.relation_oids.contains(&relation_oid))
+            .flat_map(|q| q.relation_oids.iter().copied())
+            .collect();
+
+        if let Ok(mut set) = self.active_relations.write() {
+            *set = oids;
+        }
     }
 
     // Helper methods
@@ -328,6 +332,7 @@ pub fn writer_run(
     mut query_rx: UnboundedReceiver<QueryCommand>,
     mut cdc_rx: UnboundedReceiver<CdcCommand>,
     state_view: Arc<RwLock<CacheStateView>>,
+    active_relations: ActiveRelations,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -342,7 +347,8 @@ pub fn writer_run(
         LocalSet::new()
             .run_until(async move {
                 // Create writer inside LocalSet so spawn_local works for population workers
-                let mut writer = CacheWriter::new(settings, state_view, query_tx).await?;
+                let mut writer =
+                    CacheWriter::new(settings, state_view, active_relations, query_tx).await?;
 
                 loop {
                     tokio::select! {

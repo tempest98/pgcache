@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use iddqd::BiHashMap;
@@ -21,7 +20,7 @@ use tokio_postgres::{Client, Error};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
 
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error};
 
 use crate::catalog::{ColumnMetadata, TableMetadata, cache_type_name_resolve};
@@ -32,6 +31,7 @@ use crate::settings::Settings;
 use super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcMessage, CdcMessageUpdate},
+    types::ActiveRelations,
 };
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
@@ -42,7 +42,8 @@ pub struct CdcProcessor {
     slot_name: String,
 
     cdc_tx: UnboundedSender<CdcMessage>,
-    active_relations: HashSet<u32>,
+    /// Shared set of relation OIDs with active cached queries (maintained by writer).
+    active_relations: ActiveRelations,
 
     last_received_lsn: u64,
     last_applied_lsn: u64,
@@ -57,6 +58,7 @@ impl CdcProcessor {
     pub async fn new(
         settings: &Settings,
         cdc_tx: UnboundedSender<CdcMessage>,
+        active_relations: ActiveRelations,
     ) -> CacheResult<Self> {
         let origin_cdc_client = connect_replication(&settings.replication, "CDC replication")
             .await
@@ -72,7 +74,7 @@ impl CdcProcessor {
             publication_name: settings.cdc.publication_name.clone(),
             slot_name: settings.cdc.slot_name.clone(),
             cdc_tx,
-            active_relations: HashSet::new(),
+            active_relations,
             last_received_lsn: 0,
             last_applied_lsn: 0,
             last_flushed_lsn: 0,
@@ -343,7 +345,7 @@ impl CdcProcessor {
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
-        if !self.is_relation_active(relation_oid).await {
+        if !self.is_relation_active(relation_oid) {
             return Ok(()); // No cached queries for this table
         }
 
@@ -365,7 +367,7 @@ impl CdcProcessor {
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
-        if !self.is_relation_active(relation_oid).await {
+        if !self.is_relation_active(relation_oid) {
             return Ok(()); // No cached queries for this table
         }
 
@@ -391,7 +393,7 @@ impl CdcProcessor {
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
-        if !self.is_relation_active(relation_oid).await {
+        if !self.is_relation_active(relation_oid) {
             return Ok(()); // No cached queries for this table
         }
 
@@ -411,7 +413,7 @@ impl CdcProcessor {
     async fn process_truncate(&mut self, body: &TruncateBody) -> Result<(), Error> {
         let mut ids: Vec<u32> = Vec::with_capacity(body.rel_ids().len());
         for &id in body.rel_ids() {
-            if self.is_relation_active(id).await {
+            if self.is_relation_active(id) {
                 ids.push(id);
             }
         }
@@ -567,33 +569,11 @@ impl CdcProcessor {
     }
 
     /// Check if there are any cached queries for a specific table by relation OID.
-    pub async fn is_relation_active(&mut self, relation_oid: u32) -> bool {
-        if self.active_relations.contains(&relation_oid) {
-            return true;
-        }
-
-        let (resp_tx, resp_rx) = oneshot::channel();
-
-        if let Err(e) = self
-            .cdc_tx
-            .send(CdcMessage::RelationCheck(relation_oid, resp_tx))
-        {
-            //todo, halt use of cache and fallback to proxy only mode
-            error!("Failed to handle DELETE for relation {relation_oid}: {e:?}");
-            return true;
-        }
-
-        match resp_rx.await {
-            Ok(has_queries) => {
-                if has_queries {
-                    self.active_relations.insert(relation_oid);
-                }
-                has_queries
-            }
-            Err(_) => {
-                error!("the sender dropped");
-                false
-            }
-        }
+    /// Reads the shared active relations set maintained by the writer — no messaging needed.
+    fn is_relation_active(&self, relation_oid: u32) -> bool {
+        self.active_relations
+            .read()
+            .map(|set| set.contains(&relation_oid))
+            .unwrap_or(false)
     }
 }

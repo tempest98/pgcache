@@ -18,7 +18,7 @@ use crate::{
         cdc::CdcProcessor,
         messages::{CacheReply, CdcCommand, CdcMessage, ProxyMessage},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
-        types::CacheStateView,
+        types::{ActiveRelations, CacheStateView},
         worker::handle_cached_query,
         writer::writer_run,
     },
@@ -72,10 +72,6 @@ fn handle_cdc_message(cdc_cmd_tx: &UnboundedSender<CdcCommand>, msg: CdcMessage)
             row_data,
         },
         CdcMessage::Truncate(relation_oids) => CdcCommand::Truncate { relation_oids },
-        CdcMessage::RelationCheck(relation_oid, reply_tx) => CdcCommand::RelationCheck {
-            relation_oid,
-            response_tx: reply_tx,
-        },
     };
 
     if let Err(e) = cdc_cmd_tx.send(cmd) {
@@ -246,16 +242,27 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
         // Create shared state view for coordinator to read cache state
         let state_view = Arc::new(RwLock::new(CacheStateView::default()));
 
+        // Shared set of active relation OIDs (writer writes, CDC reads)
+        let active_relations: ActiveRelations =
+            Arc::new(RwLock::new(std::collections::HashSet::new()));
+
         // Spawn writer thread (owns Cache, serializes all mutations)
         // Two channels: one for query registration, one for CDC commands
         let (query_tx, query_rx) = unbounded_channel();
         let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
         let state_view_writer = Arc::clone(&state_view);
+        let active_relations_writer = Arc::clone(&active_relations);
         let settings_writer = settings.clone();
         let _writer_handle = thread::Builder::new()
             .name("cache writer".to_owned())
             .spawn_scoped(scope, move || {
-                writer_run(&settings_writer, query_rx, cdc_cmd_rx, state_view_writer)
+                writer_run(
+                    &settings_writer,
+                    query_rx,
+                    cdc_cmd_rx,
+                    state_view_writer,
+                    active_relations_writer,
+                )
             })
             .map_into_report::<CacheError>()
             .attach_loc("spawning writer thread")?;
@@ -270,9 +277,12 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
 
         // Spawn CDC thread
         let (cdc_tx, mut cdc_rx) = unbounded_channel();
+        let active_relations_cdc = Arc::clone(&active_relations);
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
-            .spawn_scoped(scope, move || cdc_run(settings, cdc_tx))
+            .spawn_scoped(scope, move || {
+                cdc_run(settings, cdc_tx, active_relations_cdc)
+            })
             .map_into_report::<CacheError>()
             .attach_loc("spawning CDC thread")?;
 
@@ -392,7 +402,11 @@ fn worker_run(
 
 /// CDC runtime - processes change data capture events.
 /// The CDC processor should run indefinitely, so any exit is considered a failure.
-fn cdc_run(settings: &Settings, cdc_tx: UnboundedSender<CdcMessage>) -> CacheResult<()> {
+fn cdc_run(
+    settings: &Settings,
+    cdc_tx: UnboundedSender<CdcMessage>,
+    active_relations: ActiveRelations,
+) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -400,7 +414,7 @@ fn cdc_run(settings: &Settings, cdc_tx: UnboundedSender<CdcMessage>) -> CacheRes
 
     debug!("cdc loop");
     rt.block_on(async {
-        let mut cdc = CdcProcessor::new(settings, cdc_tx)
+        let mut cdc = CdcProcessor::new(settings, cdc_tx, active_relations)
             .await
             .attach_loc("initializing CDC processor")?;
 

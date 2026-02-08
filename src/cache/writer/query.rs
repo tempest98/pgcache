@@ -158,6 +158,7 @@ impl CacheWriter {
         };
 
         self.cache.cached_queries.insert_overwrite(cached_query);
+        self.active_relations_rebuild();
         trace!("cached query loading");
 
         // Extract SELECT branches for population
@@ -244,6 +245,7 @@ impl CacheWriter {
                 view.cached_queries.remove(&fingerprint);
             }
 
+            self.active_relations_rebuild();
             debug!("cleaned up failed query {fingerprint}");
         }
     }

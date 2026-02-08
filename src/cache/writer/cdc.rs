@@ -225,6 +225,7 @@ impl CacheWriter {
         };
 
         debug!("invalidating query {fingerprint}");
+        self.active_relations_rebuild();
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
 

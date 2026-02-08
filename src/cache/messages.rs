@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use tokio::sync::{mpsc::Sender, oneshot};
+use tokio::sync::mpsc::Sender;
 use tokio_util::bytes::BytesMut;
 
 use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
@@ -140,7 +140,6 @@ pub(crate) enum CdcMessage {
     Update(CdcMessageUpdate),
     Delete(u32, Vec<Option<String>>),
     Truncate(Vec<u32>),
-    RelationCheck(u32, oneshot::Sender<bool>),
 }
 
 /// Message from proxy containing query and connection details
@@ -203,10 +202,4 @@ pub enum CdcCommand {
 
     /// CDC Truncate operation
     Truncate { relation_oids: Vec<u32> },
-
-    /// Check if any cached queries reference a relation (for CDC filtering)
-    RelationCheck {
-        relation_oid: u32,
-        response_tx: oneshot::Sender<bool>,
-    },
 }

@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
@@ -167,6 +168,10 @@ impl Cache {
             .unwrap_or(self.generation_counter)
     }
 }
+
+/// Shared set of relation OIDs that have active cached queries.
+/// Written by the writer thread, read by the CDC processor.
+pub type ActiveRelations = Arc<RwLock<HashSet<u32>>>;
 
 /// Lightweight read-only view of cache state for the coordinator.
 /// Updated by the writer thread after each mutation.
