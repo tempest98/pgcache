@@ -3,7 +3,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
+    wait_for_cdc,
+};
 
 mod util;
 
@@ -38,8 +41,6 @@ async fn test_set_op_union() -> Result<(), Error> {
     )
     .await?;
 
-    let before = ctx.metrics().await?;
-
     // UNION query - combines users and admins for tenant 1
     let query = "SELECT id, name FROM users WHERE tenant_id = 1 \
                  UNION \
@@ -47,6 +48,7 @@ async fn test_set_op_union() -> Result<(), Error> {
                  ORDER BY id";
 
     // First query - cache miss, populates cache
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Should have 3 results: Alice (1), Bob (2), Admin1 (10)
@@ -54,6 +56,7 @@ async fn test_set_op_union() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("name", "Bob")])?;
     assert_row_at(&res, 3, &[("id", "10"), ("name", "Admin1")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -64,18 +67,9 @@ async fn test_set_op_union() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("name", "Bob")])?;
     assert_row_at(&res, 3, &[("id", "10"), ("name", "Admin1")])?;
-
-    // Verify metrics
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 2, "cacheable queries");
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // -- CDC updates --
-
-    let before = ctx.metrics().await?;
 
     // Insert a new user directly on origin (simulating external change)
     ctx.origin_query(
@@ -86,7 +80,7 @@ async fn test_set_op_union() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    // Query should now include Dave (cache was invalidated by CDC)
+    // CDC updates cache in place → cache hit, Dave now included
     let res = ctx.simple_query(query).await?;
 
     assert_eq!(res.len(), 6); // 4 rows now
@@ -94,6 +88,7 @@ async fn test_set_op_union() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "2"), ("name", "Bob")])?;
     assert_row_at(&res, 3, &[("id", "4"), ("name", "Dave")])?;
     assert_row_at(&res, 4, &[("id", "10"), ("name", "Admin1")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Insert a new admin on origin
     ctx.origin_query(
@@ -104,11 +99,12 @@ async fn test_set_op_union() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    // Query should now include Admin3
+    // CDC updates cache in place → cache hit, Admin3 now included
     let res = ctx.simple_query(query).await?;
 
     assert_eq!(res.len(), 7); // 5 rows now
     assert_row_at(&res, 5, &[("id", "12"), ("name", "Admin3")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Delete a user
     ctx.origin_query("DELETE FROM users WHERE id = 4", &[])
@@ -116,18 +112,10 @@ async fn test_set_op_union() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    // Dave should be gone
+    // CDC DELETE updates cache in place → cache hit, Dave gone
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 6); // back to 4 rows
-
-    // Verify metrics - CDC updates the cache in place, so queries still hit cache
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    // 3 UNION queries after CDC changes
-    assert_eq!(delta.queries_cacheable, 3, "cacheable queries");
-    // CDC updates cache in place, so queries are cache hits (not misses)
-    assert_eq!(delta.queries_cache_hit, 3, "cache hits after CDC updates");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -136,7 +124,6 @@ async fn test_set_op_union() -> Result<(), Error> {
 #[tokio::test]
 async fn test_set_op_intersect() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Create tables for intersection test
     ctx.query(
@@ -170,18 +157,21 @@ async fn test_set_op_intersect() -> Result<(), Error> {
                  SELECT sku FROM products_b \
                  ORDER BY sku";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Should have SKU-002 and SKU-003 (the overlap)
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("sku", "SKU-002")])?;
     assert_row_at(&res, 2, &[("sku", "SKU-003")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Add a new overlapping product via CDC
     ctx.origin_query(
@@ -192,25 +182,11 @@ async fn test_set_op_intersect() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    // Now SKU-004 should also be in the intersection
+    // CDC updates cache in place → cache hit, SKU-004 now in intersection
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // 3 rows now
     assert_row_at(&res, 3, &[("sku", "SKU-004")])?;
-
-    // Verify metrics
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    // 4 setup + 3 INTERSECT queries = 7 total
-    assert_eq!(delta.queries_total, 7, "total queries");
-    // INTERSECT queries are cacheable
-    assert_eq!(delta.queries_cacheable, 3, "cacheable INTERSECT queries");
-    // Setup queries are both uncacheable and unsupported
-    assert_eq!(delta.queries_uncacheable, 4, "uncacheable queries");
-    assert_eq!(delta.queries_unsupported, 4, "unsupported queries");
-    // First query: miss, second and third (after CDC): hits (CDC updates cache in place)
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -219,7 +195,6 @@ async fn test_set_op_intersect() -> Result<(), Error> {
 #[tokio::test]
 async fn test_set_op_except() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Create tables for except test
     ctx.query(
@@ -252,18 +227,21 @@ async fn test_set_op_except() -> Result<(), Error> {
                  SELECT item FROM excluded_items \
                  ORDER BY item";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Should have Apple and Cherry (not Banana or Date)
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("item", "Apple")])?;
     assert_row_at(&res, 2, &[("item", "Cherry")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Add Cherry to excluded via CDC - should disappear from result
     ctx.origin_query(
@@ -274,25 +252,11 @@ async fn test_set_op_except() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    // Now only Apple should remain
+    // CDC updates cache in place → cache hit, Cherry removed
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // 1 row
     assert_row_at(&res, 1, &[("item", "Apple")])?;
-
-    // Verify metrics
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    // 4 setup + 3 EXCEPT queries = 7 total
-    assert_eq!(delta.queries_total, 7, "total queries");
-    // EXCEPT queries are cacheable
-    assert_eq!(delta.queries_cacheable, 3, "cacheable EXCEPT queries");
-    // Setup queries are both uncacheable and unsupported
-    assert_eq!(delta.queries_uncacheable, 4, "uncacheable queries");
-    assert_eq!(delta.queries_unsupported, 4, "unsupported queries");
-    // First: miss, second and third (after CDC): hits (CDC updates cache in place)
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -301,7 +265,6 @@ async fn test_set_op_except() -> Result<(), Error> {
 #[tokio::test]
 async fn test_set_op_union_all() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Create tables with duplicate values across them
     ctx.query(
@@ -335,11 +298,13 @@ async fn test_set_op_union_all() -> Result<(), Error> {
                        SELECT value FROM list_b \
                        ORDER BY value";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query_union).await?;
     assert_eq!(res.len(), 5); // 3 rows (deduplicated)
     assert_row_at(&res, 1, &[("value", "X")])?;
     assert_row_at(&res, 2, &[("value", "Y")])?;
     assert_row_at(&res, 3, &[("value", "Z")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -355,30 +320,18 @@ async fn test_set_op_union_all() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("value", "Y")])?;
     assert_row_at(&res, 3, &[("value", "Y")])?; // duplicate
     assert_row_at(&res, 4, &[("value", "Z")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Verify both queries hit cache on subsequent runs
     let res = ctx.simple_query(query_union).await?;
     assert_eq!(res.len(), 5);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     let res = ctx.simple_query(query_union_all).await?;
     assert_eq!(res.len(), 6);
-
-    // Verify metrics
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    // 4 setup + 4 UNION/UNION ALL queries = 8 total
-    assert_eq!(delta.queries_total, 8, "total queries");
-    // All UNION/UNION ALL queries are cacheable
-    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
-    // Setup queries are both uncacheable and unsupported
-    assert_eq!(delta.queries_uncacheable, 4, "uncacheable queries");
-    assert_eq!(delta.queries_unsupported, 4, "unsupported queries");
-    // First UNION: miss, UNION ALL: miss, second UNION: hit, second UNION ALL: hit
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -460,8 +413,6 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
     // Wait for setup CDC events to settle
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // UNION with JOINs in each branch, both filtered by region = 'east'
     //
     // Branch 1 constraints: {union_customers.region = 'east'}
@@ -476,16 +427,19 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
                  ORDER BY amount";
 
     // First query — cache miss
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // 2 rows (100, 500) + RowDesc + CommandComplete
     assert_row_at(&res, 1, &[("amount", "100")])?;
     assert_row_at(&res, 2, &[("amount", "500")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- Non-matching INSERT on constrained table: region = 'west' ---
     // union_customers.region = 'west' does NOT match constraint 'east'
@@ -501,6 +455,7 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
     // Cache hit — non-matching INSERT on constrained table was filtered
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // still 100, 500
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- Matching INSERT on constrained table: region = 'east' ---
     // union_customers.region = 'east' DOES match constraint
@@ -517,14 +472,7 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
     // Result unchanged (Stark has no orders) but invalidation occurred
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // still 100, 500 (Stark has no orders)
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
-    // miss, hit, hit (non-matching filtered), miss (matching invalidated)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }

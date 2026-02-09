@@ -15,7 +15,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
+    wait_for_cdc,
+};
 
 mod util;
 
@@ -51,18 +54,18 @@ async fn test_cte_simple() -> Result<(), Error> {
     // INSERT events on subquery/CTE tables would trigger invalidation
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     let query = "WITH active_emp AS (SELECT id, name, department FROM employees WHERE active = true) \
                  SELECT name, department FROM active_emp ORDER BY name";
 
     // First query — cache miss, populates cache
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     assert_eq!(res.len(), 5); // 3 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Alice"), ("department", "eng")])?;
     assert_row_at(&res, 2, &[("name", "Charlie"), ("department", "sales")])?;
     assert_row_at(&res, 3, &[("name", "Diana"), ("department", "sales")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -71,21 +74,14 @@ async fn test_cte_simple() -> Result<(), Error> {
 
     assert_eq!(res.len(), 5);
     assert_row_at(&res, 1, &[("name", "Alice"), ("department", "eng")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 2, "cacheable CTE queries");
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // -- CDC invalidation --
-
-    let before = ctx.metrics().await?;
 
     // Verify query is cached
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // 3 rows: Alice, Charlie, Diana
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Activate Bob via origin (CDC)
     ctx.origin_query("UPDATE employees SET active = true WHERE id = 2", &[])
@@ -99,6 +95,7 @@ async fn test_cte_simple() -> Result<(), Error> {
     assert_eq!(res.len(), 6); // 4 rows now
     assert_row_at(&res, 1, &[("name", "Alice"), ("department", "eng")])?;
     assert_row_at(&res, 2, &[("name", "Bob"), ("department", "eng")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -112,15 +109,7 @@ async fn test_cte_simple() -> Result<(), Error> {
     // Row removed from cache table, query re-evaluates correctly
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // back to 3 rows
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 3, "cacheable CTE queries");
-    // First: hit (cached), second: miss (CDC UPDATE invalidated),
-    // third: hit (CDC DELETE doesn't invalidate)
-    assert_eq!(delta.queries_cache_miss, 1, "cache miss after CDC update");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits after CDC");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -165,8 +154,6 @@ async fn test_cte_with_join() -> Result<(), Error> {
     // Wait for setup CDC events to be processed before caching
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // CTE selects active employees, then join with projects
     let query = "WITH active_emp AS (SELECT id, name FROM employees WHERE active = true) \
                  SELECT p.name AS project, ae.name AS lead \
@@ -175,25 +162,21 @@ async fn test_cte_with_join() -> Result<(), Error> {
                  ORDER BY p.name";
 
     // First query — cache miss
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Alpha led by Alice(1), Beta led by Charlie(3)
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("project", "Alpha"), ("lead", "Alice")])?;
     assert_row_at(&res, 2, &[("project", "Beta"), ("lead", "Charlie")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 2, "cacheable CTE+JOIN queries");
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -236,8 +219,6 @@ async fn test_cte_multiple_tables() -> Result<(), Error> {
     // Wait for setup CDC events
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Two CTEs: active employees and their sales
     let query = "WITH active_emp AS (SELECT id, name FROM employees WHERE active = true), \
                  emp_sales AS (SELECT employee_id, SUM(amount) AS total FROM sales GROUP BY employee_id) \
@@ -246,6 +227,7 @@ async fn test_cte_multiple_tables() -> Result<(), Error> {
                  JOIN emp_sales es ON es.employee_id = ae.id \
                  ORDER BY ae.name";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Alice has sales(500+300=800), Charlie has sales(200)
@@ -253,19 +235,14 @@ async fn test_cte_multiple_tables() -> Result<(), Error> {
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Alice"), ("total", "800")])?;
     assert_row_at(&res, 2, &[("name", "Charlie"), ("total", "200")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 2, "cacheable multi-CTE queries");
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -298,33 +275,24 @@ async fn test_cte_materialized() -> Result<(), Error> {
     // Wait for setup CDC events
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     let query = "WITH eng AS MATERIALIZED (SELECT id, name FROM employees WHERE department = 'eng') \
                  SELECT name FROM eng ORDER BY name";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Alice and Bob are in eng
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(
-        delta.queries_cacheable, 2,
-        "cacheable MATERIALIZED CTE queries"
-    );
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }

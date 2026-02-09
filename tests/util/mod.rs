@@ -608,6 +608,30 @@ pub async fn connect_cache_db(dbs: &TempDBs) -> Result<Client, Error> {
     Ok(client)
 }
 
+/// Assert the last cacheable query was a cache miss. Returns updated snapshot.
+pub async fn assert_cache_miss(
+    ctx: &mut TestContext,
+    before: MetricsSnapshot,
+) -> Result<MetricsSnapshot, Error> {
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+    assert_eq!(delta.queries_cache_miss, 1, "expected cache miss");
+    assert_eq!(delta.queries_cache_hit, 0, "unexpected cache hit");
+    Ok(after)
+}
+
+/// Assert the last cacheable query was a cache hit. Returns updated snapshot.
+pub async fn assert_cache_hit(
+    ctx: &mut TestContext,
+    before: MetricsSnapshot,
+) -> Result<MetricsSnapshot, Error> {
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+    assert_eq!(delta.queries_cache_hit, 1, "expected cache hit");
+    assert_eq!(delta.queries_cache_miss, 0, "unexpected cache miss");
+    Ok(after)
+}
+
 /// Calculate metrics delta between two snapshots.
 /// Useful for asserting metrics within a consolidated test where metrics accumulate.
 pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> MetricsSnapshot {

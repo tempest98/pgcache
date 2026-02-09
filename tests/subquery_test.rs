@@ -21,7 +21,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
+    wait_for_cdc,
+};
 
 mod util;
 
@@ -61,17 +64,16 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     // INSERT events on subquery tables would trigger invalidation
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     let query = "SELECT name, price FROM (SELECT * FROM products WHERE category = 'gadgets') AS gadget_products ORDER BY price";
 
     // First query — cache miss, populates cache
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
-
     assert_eq!(res.len(), 5); // 3 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Widget"), ("price", "100")])?;
     assert_row_at(&res, 2, &[("name", "Doodad"), ("price", "150")])?;
     assert_row_at(&res, 3, &[("name", "Gizmo"), ("price", "200")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -79,6 +81,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5);
     assert_row_at(&res, 1, &[("name", "Widget"), ("price", "100")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC INSERT: derived table (Inclusion) → invalidates ---
 
@@ -95,6 +98,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     assert_eq!(res.len(), 6); // 4 rows now
     assert_row_at(&res, 1, &[("name", "NewGadget"), ("price", "75")])?;
     assert_row_at(&res, 2, &[("name", "Widget"), ("price", "100")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -109,14 +113,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     // Row removed from cache table, query re-evaluates correctly
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // back to 3 rows (Gizmo gone)
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
-    // miss, hit, miss (CDC INSERT invalidated), hit (CDC DELETE doesn't invalidate)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -165,23 +162,24 @@ async fn test_subquery_where_in() -> Result<(), Error> {
     // Wait for setup CDC events to be processed before caching
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Query: customers who have placed orders
     let query =
         "SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders) ORDER BY name";
 
     // Cache miss
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // Alice, Bob
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC INSERT: IN subquery table (Inclusion) → invalidates ---
 
@@ -200,14 +198,7 @@ async fn test_subquery_where_in() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;
     assert_row_at(&res, 3, &[("name", "Charlie")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 3, "cacheable IN subqueries");
-    // miss, hit, miss (CDC INSERT invalidated)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -257,29 +248,23 @@ async fn test_subquery_where_not_in() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Query: products NOT on sale
     let query = "SELECT name FROM products WHERE id NOT IN (SELECT product_id FROM sale_items) ORDER BY name";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Products 1 (Widget) and 3 (Thing) are on sale; remaining: Doodad, Gizmo
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Doodad")])?;
     assert_row_at(&res, 2, &[("name", "Gizmo")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     let res_cached = ctx.simple_query(query).await?;
     assert_eq!(res.len(), res_cached.len(), "cache returns same results");
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 2, "cacheable NOT IN subqueries");
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -316,33 +301,24 @@ async fn test_subquery_scalar_in_where() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Query: products with price above average
     // Average = (100 + 200 + 50 + 150) / 4 = 125
     let query = "SELECT name, price FROM products WHERE price > (SELECT AVG(price) FROM products) ORDER BY price";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Doodad(150) and Gizmo(200) are above average
     assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Doodad"), ("price", "150")])?;
     assert_row_at(&res, 2, &[("name", "Gizmo"), ("price", "200")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     let res_cached = ctx.simple_query(query).await?;
     assert_eq!(res.len(), res_cached.len(), "cache returns same results");
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(
-        delta.queries_cacheable, 2,
-        "cacheable scalar WHERE subqueries"
-    );
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -402,8 +378,6 @@ async fn test_subquery_nested() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Nested IN subqueries across 3 tables:
     // find products in stores that belong to the 'East' region
     let query = "SELECT name FROM products \
@@ -415,6 +389,7 @@ async fn test_subquery_nested() -> Result<(), Error> {
                  ) \
                  ORDER BY name";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // East region (id=1) → stores NYC(10), Boston(11) → products Widget, Gadget, Doohickey
@@ -422,18 +397,13 @@ async fn test_subquery_nested() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Doohickey")])?;
     assert_row_at(&res, 2, &[("name", "Gadget")])?;
     assert_row_at(&res, 3, &[("name", "Widget")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     let res_cached = ctx.simple_query(query).await?;
     assert_eq!(res.len(), res_cached.len(), "cache returns same results");
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 2, "cacheable nested subqueries");
-    assert_eq!(delta.queries_cache_miss, 1, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -498,8 +468,6 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // products in stores in East region
     let query = "SELECT name FROM products \
                  WHERE store_id IN ( \
@@ -511,21 +479,21 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
                  ORDER BY name";
 
     // --- Initial cache miss ---
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     // East(1) → NYC(10), Boston(11) → Widget, Gadget, Doohickey
     assert_eq!(res.len(), 5);
     assert_row_at(&res, 1, &[("name", "Doohickey")])?;
     assert_row_at(&res, 2, &[("name", "Gadget")])?;
     assert_row_at(&res, 3, &[("name", "Widget")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5);
-
-    // --- CDC INSERT at innermost level (regions): Inclusion → invalidate ---
-    // Add a new store in the East region.
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC INSERT at middle level (stores): Inclusion → invalidate ---
     ctx.origin_query(
@@ -549,6 +517,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Gadget")])?;
     assert_row_at(&res, 3, &[("name", "Thingamajig")])?;
     assert_row_at(&res, 4, &[("name", "Widget")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -566,8 +535,9 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Doohickey")])?;
     assert_row_at(&res, 2, &[("name", "Gadget")])?;
     assert_row_at(&res, 3, &[("name", "Widget")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // --- CDC INSERT at innermost level (regions): Inclusion → invalidate ---
+    // --- CDC UPDATE at innermost level (regions): Inclusion → invalidate ---
     // Update an existing region to become 'East'
     ctx.origin_query("UPDATE regions SET name = 'East' WHERE id = 2", &[])
         .await?;
@@ -581,14 +551,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Gadget")])?;
     assert_row_at(&res, 3, &[("name", "Gizmo")])?;
     assert_row_at(&res, 4, &[("name", "Widget")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 5, "cacheable queries");
-    // miss, hit, miss (stores INSERT), hit (stores DELETE), miss (regions UPDATE)
-    assert_eq!(delta.queries_cache_miss, 3, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -664,8 +627,6 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Products in stores whose region is NOT excluded
     // stores WHERE region_id IN (regions WHERE id NOT IN (excluded_regions))
     let query = "SELECT name FROM products \
@@ -679,16 +640,19 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
                  ORDER BY name";
 
     // Non-excluded regions: East(1), South(3) → stores NYC(10), Miami(12) → Widget, Gadget
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("name", "Gadget")])?;
     assert_row_at(&res, 2, &[("name", "Widget")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC INSERT into excluded_regions: Exclusion → no invalidation ---
     // Exclude South(3) too — exclusion set grows, result can only shrink
@@ -706,6 +670,7 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // Only Widget remains
     assert_row_at(&res, 1, &[("name", "Widget")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC DELETE from excluded_regions: Exclusion → invalidates ---
     // Un-exclude West(2) — exclusion set shrinks, result may grow
@@ -720,14 +685,7 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("name", "Gizmo")])?;
     assert_row_at(&res, 2, &[("name", "Widget")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
-    // miss, hit, hit (exclusion INSERT), miss (exclusion DELETE)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -792,8 +750,6 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
 
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Products NOT in the blacklist for Electronics category
     // NOT IN (blacklisted WHERE category_id IN (categories WHERE name = 'Electronics'))
     let query = "SELECT name FROM products \
@@ -807,16 +763,19 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
 
     // Blacklisted for Electronics: product 100 (Laptop), 102 (Phone)
     // Remaining: Novel, Teddy Bear
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("name", "Novel")])?;
     assert_row_at(&res, 2, &[("name", "Teddy Bear")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC INSERT into blacklisted_products: Exclusion → no invalidation ---
     // Add product 101 (Teddy Bear) to Electronics blacklist
@@ -834,6 +793,7 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // Only Novel remains
     assert_row_at(&res, 1, &[("name", "Novel")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC DELETE from blacklisted_products: Exclusion → invalidates ---
     // Remove Laptop(100) from blacklist — exclusion set shrinks
@@ -852,14 +812,7 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("name", "Laptop")])?;
     assert_row_at(&res, 2, &[("name", "Novel")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
-    // miss, hit, hit (exclusion INSERT), miss (exclusion DELETE)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -917,8 +870,6 @@ async fn test_subquery_multi_table_dependency() -> Result<(), Error> {
     // Wait for setup CDC events to be processed before caching
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Get items in active categories that have inventory
     let query = "SELECT i.name, inv.quantity \
                  FROM items i \
@@ -928,18 +879,21 @@ async fn test_subquery_multi_table_dependency() -> Result<(), Error> {
                  ) \
                  ORDER BY i.name";
 
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
 
     // Only Electronics items (Laptop, Phone)
     assert_eq!(res.len(), 4); // 2 rows
     assert_row_at(&res, 1, &[("name", "Laptop"), ("quantity", "10")])?;
     assert_row_at(&res, 2, &[("name", "Phone"), ("quantity", "5")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Now change category active status via CDC
     ctx.origin_query("UPDATE categories SET active = true WHERE id = 2", &[])
@@ -951,18 +905,7 @@ async fn test_subquery_multi_table_dependency() -> Result<(), Error> {
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // 3 rows now
     assert_row_at(&res, 1, &[("name", "Chair"), ("quantity", "20")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    // All 3 SELECT queries should be cacheable
-    assert_eq!(
-        delta.queries_cacheable, 3,
-        "cacheable multi-table subqueries"
-    );
-    // First miss, second hit, third miss (CDC UPDATE on subquery table invalidates)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 1, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -1005,8 +948,6 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
     // Wait for setup CDC events to settle before caching
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // Derived table with inner predicate: dept = 'kitchen'
     // The inner SELECT produces constraint {appliances.dept = 'kitchen'} on
     // the UpdateQuery for the appliances table (source = Subquery(Inclusion)).
@@ -1015,17 +956,20 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
                  ORDER BY price";
 
     // First query — cache miss, populates cache
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // 3 rows + RowDescription + CommandComplete
     assert_row_at(&res, 1, &[("name", "Toaster"), ("price", "40")])?;
     assert_row_at(&res, 2, &[("name", "Mixer"), ("price", "60")])?;
     assert_row_at(&res, 3, &[("name", "Blender"), ("price", "80")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- Non-matching INSERT: dept = 'workshop' does NOT match constraint ---
     // row_constraints_match returns false → row_uncached_invalidation_check returns false
@@ -1041,6 +985,7 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
     // Cache hit — non-matching INSERT was filtered by constraint
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // still 3 kitchen rows
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- Matching INSERT: dept = 'kitchen' DOES match constraint ---
     // row_constraints_match returns true → Subquery(Inclusion) + Insert → invalidate
@@ -1059,14 +1004,7 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Kettle"), ("price", "50")])?;
     assert_row_at(&res, 3, &[("name", "Mixer"), ("price", "60")])?;
     assert_row_at(&res, 4, &[("name", "Blender"), ("price", "80")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
-    // miss, hit, hit (non-matching filtered), miss (matching invalidated)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -1116,8 +1054,6 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     // Wait for setup CDC events to settle
     wait_for_cdc().await;
 
-    let before = ctx.metrics().await?;
-
     // IN subquery with inner predicate: active = true
     // The inner SELECT produces constraint {departments.active = true} on
     // the departments UpdateQuery (source = Subquery(Inclusion)).
@@ -1126,16 +1062,19 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
                  ORDER BY e.name";
 
     // First query — cache miss
+    let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // Alice, Bob + RowDesc + CommandComplete
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- Non-matching INSERT on inner table: active = false ---
     // row_constraints_match returns false → no invalidation
@@ -1150,6 +1089,7 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     // Cache hit — non-matching INSERT on inner table was filtered
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // still Alice, Bob
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- Matching UPDATE on inner table: active changes to true ---
     // New data has active = true which matches constraint.
@@ -1168,14 +1108,7 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;
     assert_row_at(&res, 3, &[("name", "Charlie")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-
-    assert_eq!(delta.queries_cacheable, 4, "cacheable queries");
-    // miss, hit, hit (non-matching filtered), miss (matching invalidated)
-    assert_eq!(delta.queries_cache_miss, 2, "cache misses");
-    assert_eq!(delta.queries_cache_hit, 2, "cache hits");
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }

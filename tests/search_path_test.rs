@@ -3,7 +3,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
+    wait_for_cdc,
+};
 
 mod util;
 
@@ -13,7 +16,6 @@ mod util;
 #[tokio::test]
 async fn test_search_path_custom_schema() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Must be done BEFORE creating the schema/table so pgcache picks it up
     ctx.query("SET search_path TO myapp_custom, public", &[])
@@ -33,12 +35,14 @@ async fn test_search_path_custom_schema() -> Result<(), Error> {
     .await?;
 
     // First query with unqualified table name - should resolve to myapp_custom.users via search_path
+    let m = ctx.metrics().await?;
     let res = ctx
         .simple_query("SELECT id, name FROM users WHERE id = 1")
         .await?;
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -49,14 +53,7 @@ async fn test_search_path_custom_schema() -> Result<(), Error> {
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(
-        delta.queries_cache_hit, 1,
-        "Expected 1 cache hit, got {}",
-        delta.queries_cache_hit
-    );
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -66,7 +63,6 @@ async fn test_search_path_custom_schema() -> Result<(), Error> {
 #[tokio::test]
 async fn test_search_path_schema_priority() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Create two schemas with same table name but different data
     ctx.origin_query("CREATE SCHEMA schema_a_priority", &[])
@@ -104,12 +100,14 @@ async fn test_search_path_schema_priority() -> Result<(), Error> {
     .await?;
 
     // Query should resolve to schema_a_priority.config (first in search_path)
+    let m = ctx.metrics().await?;
     let res = ctx
         .simple_query("SELECT id, value FROM config WHERE id = 1")
         .await?;
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -120,10 +118,7 @@ async fn test_search_path_schema_priority() -> Result<(), Error> {
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_cache_hit, 1);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -133,7 +128,6 @@ async fn test_search_path_schema_priority() -> Result<(), Error> {
 #[tokio::test]
 async fn test_search_path_explicit_schema() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Create schema and table
     ctx.origin_query("CREATE SCHEMA hidden_explicit", &[])
@@ -153,12 +147,14 @@ async fn test_search_path_explicit_schema() -> Result<(), Error> {
     ctx.query("SET search_path TO public", &[]).await?;
 
     // Schema-qualified query should still work
+    let m = ctx.metrics().await?;
     let res = ctx
         .simple_query("SELECT id, data FROM hidden_explicit.secrets WHERE id = 1")
         .await?;
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("data", "secret_value")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -169,10 +165,7 @@ async fn test_search_path_explicit_schema() -> Result<(), Error> {
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("data", "secret_value")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_cache_hit, 1);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -182,7 +175,6 @@ async fn test_search_path_explicit_schema() -> Result<(), Error> {
 #[tokio::test]
 async fn test_search_path_default() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Create table in public schema (default)
     ctx.origin_query(
@@ -197,12 +189,14 @@ async fn test_search_path_default() -> Result<(), Error> {
     .await?;
 
     // Default search_path should include public
+    let m = ctx.metrics().await?;
     let res = ctx
         .simple_query("SELECT id, name FROM items_default WHERE id = 1")
         .await?;
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("name", "widget")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -213,11 +207,7 @@ async fn test_search_path_default() -> Result<(), Error> {
 
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("name", "widget")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_cache_hit, 1);
-    assert_eq!(delta.queries_cache_miss, 1);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -279,7 +269,6 @@ async fn test_search_path_cache_invalidation() -> Result<(), Error> {
 #[tokio::test]
 async fn test_search_path_join() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     // Create schema with related tables
     ctx.origin_query("CREATE SCHEMA store_join", &[]).await?;
@@ -311,6 +300,7 @@ async fn test_search_path_join() -> Result<(), Error> {
     wait_for_cdc().await;
 
     // Join query with unqualified table names
+    let m = ctx.metrics().await?;
     let res = ctx
         .simple_query(
             "SELECT c.id, c.name, o.total FROM customers c \
@@ -322,6 +312,7 @@ async fn test_search_path_join() -> Result<(), Error> {
     assert_eq!(res.len(), 4); // 2 rows + CommandComplete + ReadyForQuery
     assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice"), ("total", "100")])?;
     assert_row_at(&res, 2, &[("id", "1"), ("name", "Alice"), ("total", "200")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
@@ -336,10 +327,7 @@ async fn test_search_path_join() -> Result<(), Error> {
 
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice"), ("total", "100")])?;
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_cache_hit, 1);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }

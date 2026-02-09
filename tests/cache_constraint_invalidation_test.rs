@@ -3,7 +3,10 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_row_at, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
+    wait_for_cdc,
+};
 
 mod util;
 
@@ -486,18 +489,15 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
     // INSERT events on cached tables would trigger invalidation
     wait_for_cdc().await;
 
-    let metrics_before = ctx.metrics().await?;
+    let query_str = "select o.id, o.user_id, o.amount, u.status \
+            from orders_leave o join users_leave u on o.user_id = u.id \
+            where u.status = 'active' \
+            order by o.id";
 
     // Prime the cache with join query filtering by users.status = 'active'
     // Should return all 4 orders (both users are active)
-    let res = ctx
-        .simple_query(
-            "select o.id, o.user_id, o.amount, u.status \
-            from orders_leave o join users_leave u on o.user_id = u.id \
-            where u.status = 'active' \
-            order by o.id",
-        )
-        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
 
     // RowDescription + 4 data rows + CommandComplete = 6
     assert_eq!(res.len(), 6);
@@ -521,34 +521,14 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
         4,
         &[("user_id", "2"), ("amount", "400"), ("status", "active")],
     )?;
-
-    // Verify this was a cache miss (first query, priming the cache)
-    let metrics_after_prime = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_before, &metrics_after_prime);
-    assert_eq!(
-        delta.queries_cache_miss, 1,
-        "First query should be cache miss"
-    );
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     // Wait for cache to be populated
     wait_cache_load().await;
 
     // Run same query again to verify cache hit
-    let _ = ctx
-        .simple_query(
-            "select o.id, o.user_id, o.amount, u.status \
-            from orders_leave o join users_leave u on o.user_id = u.id \
-            where u.status = 'active' \
-            order by o.id",
-        )
-        .await?;
-
-    let metrics_after_hit = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_after_prime, &metrics_after_hit);
-    assert_eq!(
-        delta.queries_cache_hit, 1,
-        "Second query should be cache hit"
-    );
+    let _ = ctx.simple_query(query_str).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     // UPDATE: Change user 1's status from 'active' to 'inactive'
     // User 1's row IS in the cache, so row_changes will be Some
@@ -562,14 +542,7 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
     wait_for_cdc().await;
 
     // Query should now return only 2 orders (only user 2 is active)
-    let res = ctx
-        .simple_query(
-            "select o.id, o.user_id, o.amount, u.status \
-            from orders_leave o join users_leave u on o.user_id = u.id \
-            where u.status = 'active' \
-            order by o.id",
-        )
-        .await?;
+    let res = ctx.simple_query(query_str).await?;
 
     // RowDescription + 2 data rows + CommandComplete = 4
     assert_eq!(res.len(), 4);
@@ -633,14 +606,11 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
     // Wait for initial data to settle
     wait_for_cdc().await;
 
-    let metrics_before = ctx.metrics().await?;
+    let query_str = "select fa.film_id, a.actor_id, a.first_name, a.last_name from film_actor_opt fa join actor_opt a on fa.actor_id = a.actor_id where fa.film_id = 19 order by a.actor_id";
 
     // Prime cache: query for film 19 (actors 1, 2)
-    let res = ctx
-        .simple_query(
-            "select fa.film_id, a.actor_id, a.first_name, a.last_name from film_actor_opt fa join actor_opt a on fa.actor_id = a.actor_id where fa.film_id = 19 order by a.actor_id",
-        )
-        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
 
     // RowDescription + 2 data rows + CommandComplete = 4
     assert_eq!(res.len(), 4);
@@ -654,32 +624,15 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
         2,
         &[("film_id", "19"), ("actor_id", "2"), ("first_name", "Jane")],
     )?;
-
-    // Verify cache miss (first query)
-    let metrics_after_prime = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_before, &metrics_after_prime);
-    assert_eq!(
-        delta.queries_cache_miss, 1,
-        "First query should be cache miss"
-    );
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     // Wait for cache to load (use longer wait for reliability)
     wait_cache_load().await;
     wait_cache_load().await;
 
     // Verify cache hit
-    let _ = ctx
-        .simple_query(
-            "select fa.film_id, a.actor_id, a.first_name, a.last_name from film_actor_opt fa join actor_opt a on fa.actor_id = a.actor_id where fa.film_id = 19 order by a.actor_id",
-        )
-        .await?;
-
-    let metrics_after_hit = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_after_prime, &metrics_after_hit);
-    assert_eq!(
-        delta.queries_cache_hit, 1,
-        "Second query should be cache hit"
-    );
+    let _ = ctx.simple_query(query_str).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // UPDATE: Change actor 3's last_name (actor NOT in cached result - not in film 19)
     // Optimization should kick in:
@@ -697,11 +650,7 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
     wait_for_cdc().await;
 
     // Query again - should still be a cache hit (not invalidated)
-    let res = ctx
-        .simple_query(
-            "select fa.film_id, a.actor_id, a.first_name, a.last_name from film_actor_opt fa join actor_opt a on fa.actor_id = a.actor_id where fa.film_id = 19 order by a.actor_id",
-        )
-        .await?;
+    let res = ctx.simple_query(query_str).await?;
 
     // Verify still 2 rows (correct result)
     assert_eq!(res.len(), 4);
@@ -715,18 +664,7 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
         2,
         &[("film_id", "19"), ("actor_id", "2"), ("first_name", "Jane")],
     )?;
-
-    // Verify cache hit (optimization worked - no invalidation)
-    let metrics_after_update = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_after_hit, &metrics_after_update);
-    assert_eq!(
-        delta.queries_cache_hit, 1,
-        "Query after update should be cache hit (optimization: no invalidation)"
-    );
-    assert_eq!(
-        delta.queries_cache_miss, 0,
-        "Should not have cache miss after optimized update"
-    );
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -785,55 +723,30 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
     // Wait for initial data to settle
     wait_for_cdc().await;
 
-    let metrics_before = ctx.metrics().await?;
-
-    // Prime cache: query for film titles
-    let res = ctx
-        .simple_query(
-            "select film_id, title from film where film_id in ( \
+    let query_str = "select film_id, title from film where film_id in ( \
                 select fa.film_id \
                 from film_actor fa join actor a on fa.actor_id = a.id \
                 where a.id in (1, 3) \
             ) \
-            order by film_id",
-        )
-        .await?;
+            order by film_id";
+
+    // Prime cache: query for film titles
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
 
     // RowDescription + 2 data rows + CommandComplete = 4
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("film_id", "19"), ("title", "nineteen")])?;
     assert_row_at(&res, 2, &[("film_id", "20"), ("title", "twenty")])?;
-
-    // Verify cache miss (first query)
-    let metrics_after_prime = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_before, &metrics_after_prime);
-    assert_eq!(
-        delta.queries_cache_miss, 1,
-        "First query should be cache miss"
-    );
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
     // Wait for cache to load (use longer wait for reliability)
     wait_cache_load().await;
     wait_cache_load().await;
 
     // Verify cache hit
-    let _ = ctx
-        .simple_query(
-            "select film_id, title from film where film_id in ( \
-                select fa.film_id \
-                from film_actor fa join actor a on fa.actor_id = a.id \
-                where a.id in (1, 3) \
-            ) \
-            order by film_id",
-        )
-        .await?;
-
-    let metrics_after_hit = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_after_prime, &metrics_after_hit);
-    assert_eq!(
-        delta.queries_cache_hit, 1,
-        "Second query should be cache hit"
-    );
+    let _ = ctx.simple_query(query_str).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // UPDATE: Change actor 2's last_name
     // Optimization should kick in:
@@ -846,33 +759,13 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
     wait_for_cdc().await;
 
     // Query again - should still be a cache hit (not invalidated)
-    let res = ctx
-        .simple_query(
-            "select film_id, title from film where film_id in ( \
-                select fa.film_id \
-                from film_actor fa join actor a on fa.actor_id = a.id \
-                where a.id in (1, 3) \
-            ) \
-            order by film_id",
-        )
-        .await?;
+    let res = ctx.simple_query(query_str).await?;
 
     // Verify still 2 rows (correct result)
     assert_eq!(res.len(), 4);
     assert_row_at(&res, 1, &[("film_id", "19"), ("title", "nineteen")])?;
     assert_row_at(&res, 2, &[("film_id", "20"), ("title", "twenty")])?;
-
-    // Verify cache hit (optimization worked - no invalidation)
-    let metrics_after_update = ctx.metrics().await?;
-    let delta = metrics_delta(&metrics_after_hit, &metrics_after_update);
-    assert_eq!(
-        delta.queries_cache_hit, 1,
-        "Query after update should be cache hit (optimization: no invalidation)"
-    );
-    assert_eq!(
-        delta.queries_cache_miss, 0,
-        "Should not have cache miss after optimized update"
-    );
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }

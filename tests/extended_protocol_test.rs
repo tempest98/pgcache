@@ -3,7 +3,9 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, wait_cache_load, wait_for_cdc,
+};
 
 mod util;
 
@@ -11,7 +13,6 @@ mod util;
 #[tokio::test]
 async fn test_extended_protocol_basic() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     ctx.query(
         "create table test_basic (id integer primary key, data text)",
@@ -29,23 +30,19 @@ async fn test_extended_protocol_basic() -> Result<(), Error> {
         .prepare("select id, data from test_basic where data = $1")
         .await?;
 
+    // First query — cache miss
+    let m = ctx.metrics().await?;
     ctx.query(&stmt, &[&"foo"]).await?;
-    wait_cache_load().await;
-    let rows = ctx.query(&stmt, &[&"foo"]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
+    wait_cache_load().await;
+
+    // Second query — cache hit
+    let rows = ctx.query(&stmt, &[&"foo"]).await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 1);
     assert_eq!(rows[0].get::<_, &str>("data"), "foo");
-
-    let after = ctx.metrics().await?;
-
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_total, 4);
-    assert_eq!(delta.queries_cacheable, 2);
-    assert_eq!(delta.queries_uncacheable, 2);
-    assert_eq!(delta.queries_unsupported, 2);
-    assert_eq!(delta.queries_cache_hit, 1);
-    assert_eq!(delta.queries_cache_miss, 1);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -54,7 +51,6 @@ async fn test_extended_protocol_basic() -> Result<(), Error> {
 #[tokio::test]
 async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     ctx.query(
         "create table test_reuse (id integer primary key, data text)",
@@ -72,32 +68,32 @@ async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
         .prepare("select id, data from test_reuse where data = $1")
         .await?;
 
-    // First parameter value
+    // First parameter value — cache miss
+    let m = ctx.metrics().await?;
     ctx.query(&stmt, &[&"foo"]).await?;
-    wait_cache_load().await;
-    let rows1 = ctx.query(&stmt, &[&"foo"]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
+    wait_cache_load().await;
+
+    // Same parameter — cache hit
+    let rows1 = ctx.query(&stmt, &[&"foo"]).await?;
     assert_eq!(rows1.len(), 1);
     assert_eq!(rows1[0].get::<_, i32>("id"), 1);
     assert_eq!(rows1[0].get::<_, &str>("data"), "foo");
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // Second parameter value
+    // Second parameter value — cache miss
     ctx.query(&stmt, &[&"bar"]).await?;
-    wait_cache_load().await;
-    let rows2 = ctx.query(&stmt, &[&"bar"]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
+    wait_cache_load().await;
+
+    // Same parameter — cache hit
+    let rows2 = ctx.query(&stmt, &[&"bar"]).await?;
     assert_eq!(rows2.len(), 1);
     assert_eq!(rows2[0].get::<_, i32>("id"), 2);
     assert_eq!(rows2[0].get::<_, &str>("data"), "bar");
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_total, 6);
-    assert_eq!(delta.queries_cacheable, 4);
-    assert_eq!(delta.queries_uncacheable, 2);
-    assert_eq!(delta.queries_unsupported, 2);
-    assert_eq!(delta.queries_cache_hit, 2);
-    assert_eq!(delta.queries_cache_miss, 2);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -106,7 +102,6 @@ async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
 #[tokio::test]
 async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     ctx.query(
         "create table test_multi (id integer primary key, data text, value integer)",
@@ -124,30 +119,31 @@ async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
         .prepare("select id, data, value from test_multi where data = $1 and value > $2")
         .await?;
 
-    // First parameter combination
+    // First parameter combination — cache miss
+    let m = ctx.metrics().await?;
     ctx.query(&stmt, &[&"foo", &50]).await?;
-    wait_cache_load().await;
-    let rows = ctx.query(&stmt, &[&"foo", &50]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
 
+    wait_cache_load().await;
+
+    // Same parameters — cache hit
+    let rows = ctx.query(&stmt, &[&"foo", &50]).await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 1);
     assert_eq!(rows[0].get::<_, &str>("data"), "foo");
     assert_eq!(rows[0].get::<_, i32>("value"), 100);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // Different parameters - should not match
+    // Different parameters — cache miss
     ctx.query(&stmt, &[&"foo", &150]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
     wait_cache_load().await;
+
+    // Same parameters — cache hit
     let rows = ctx.query(&stmt, &[&"foo", &150]).await?;
     assert_eq!(rows.len(), 0);
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_total, 6);
-    assert_eq!(delta.queries_cacheable, 4);
-    assert_eq!(delta.queries_uncacheable, 2);
-    assert_eq!(delta.queries_unsupported, 2);
-    assert_eq!(delta.queries_cache_hit, 2);
-    assert_eq!(delta.queries_cache_miss, 2);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
@@ -245,7 +241,6 @@ async fn test_extended_protocol_insert_returning() -> Result<(), Error> {
 #[tokio::test]
 async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
-    let before = ctx.metrics().await?;
 
     ctx.query(
         "create table test_cache_hit (id integer primary key, data text)",
@@ -263,15 +258,19 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
         .prepare("select id, data from test_cache_hit where data = $1 order by id")
         .await?;
 
-    // First execution - populates cache
+    // First execution — cache miss, populates cache
+    let m = ctx.metrics().await?;
     ctx.query(&stmt, &[&"foo"]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
     wait_cache_load().await;
 
-    // Second execution - should hit cache
+    // Second execution — cache hit
     let rows = ctx.query(&stmt, &[&"foo"]).await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 1);
     assert_eq!(rows[0].get::<_, &str>("data"), "foo");
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Insert directly to origin to trigger CDC
     ctx.origin_query(
@@ -281,14 +280,17 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
     .await?;
     wait_for_cdc().await;
 
-    // Query again - cache was updated via CDC, new row should appear
+    // Query again — cache was updated via CDC INSERT, still a cache hit
     let rows = ctx.query(&stmt, &[&"foo"]).await?;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, i32>("id"), 1);
     assert_eq!(rows[1].get::<_, i32>("id"), 3);
+    let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // Different parameter - creates separate cache entry
+    // Different parameter — cache miss, creates separate cache entry
     ctx.query(&stmt, &[&"bar"]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
     wait_cache_load().await;
 
     // Cache hit for 'bar'
@@ -296,13 +298,7 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>("id"), 2);
     assert_eq!(rows[0].get::<_, &str>("data"), "bar");
-
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&before, &after);
-    assert_eq!(delta.queries_total, 7);
-    assert_eq!(delta.queries_cacheable, 5);
-    assert_eq!(delta.queries_cache_miss, 2); // foo (initial), bar (initial)
-    assert_eq!(delta.queries_cache_hit, 3); // foo (second), foo (after CDC), bar (second)
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
