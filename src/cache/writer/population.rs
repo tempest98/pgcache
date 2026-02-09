@@ -78,6 +78,7 @@ pub async fn population_worker(
 /// For queries with multiple SELECT branches (set operations), each branch is
 /// processed independently. This correctly handles UNION/INTERSECT/EXCEPT where
 /// different branches may reference different tables with different columns.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn population_task(
     fingerprint: u64,
     generation: u64,

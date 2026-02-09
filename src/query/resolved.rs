@@ -229,6 +229,33 @@ impl ResolvedWhereExpr {
         current.chain(children)
     }
 
+    /// Compute the maximum subquery nesting depth in this WHERE expression.
+    /// Returns 0 if there are no subqueries.
+    pub fn subquery_depth(&self) -> usize {
+        match self {
+            ResolvedWhereExpr::Binary(b) => {
+                b.lexpr.subquery_depth().max(b.rexpr.subquery_depth())
+            }
+            ResolvedWhereExpr::Unary(u) => u.expr.subquery_depth(),
+            ResolvedWhereExpr::Multi(m) => {
+                m.exprs.iter().map(|e| e.subquery_depth()).max().unwrap_or(0)
+            }
+            ResolvedWhereExpr::Function { args, .. } => {
+                args.iter().map(|a| a.subquery_depth()).max().unwrap_or(0)
+            }
+            ResolvedWhereExpr::Subquery {
+                query, test_expr, ..
+            } => {
+                let inner = 1 + query.subquery_depth();
+                let test = test_expr
+                    .as_ref()
+                    .map_or(0, |t| t.subquery_depth());
+                inner.max(test)
+            }
+            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
+        }
+    }
+
     /// Count the number of leaf predicates (comparisons) in this expression.
     /// AND/OR nodes are not counted themselves, only their leaf children.
     pub fn predicate_count(&self) -> usize {
@@ -557,6 +584,33 @@ impl ResolvedColumnExpr {
         current.chain(children)
     }
 
+    /// Compute the maximum subquery nesting depth in this column expression.
+    fn subquery_depth(&self) -> usize {
+        match self {
+            ResolvedColumnExpr::Column(_)
+            | ResolvedColumnExpr::Identifier(_)
+            | ResolvedColumnExpr::Literal(_) => 0,
+            ResolvedColumnExpr::Function { args, .. } => {
+                args.iter().map(|a| a.subquery_depth()).max().unwrap_or(0)
+            }
+            ResolvedColumnExpr::Case(case) => {
+                let arg_depth = case.arg.as_ref().map_or(0, |a| a.subquery_depth());
+                let when_depth = case
+                    .whens
+                    .iter()
+                    .map(|w| w.condition.subquery_depth().max(w.result.subquery_depth()))
+                    .max()
+                    .unwrap_or(0);
+                let default_depth = case.default.as_ref().map_or(0, |d| d.subquery_depth());
+                arg_depth.max(when_depth).max(default_depth)
+            }
+            ResolvedColumnExpr::Arithmetic(arith) => {
+                arith.left.subquery_depth().max(arith.right.subquery_depth())
+            }
+            ResolvedColumnExpr::Subquery(query) => 1 + query.subquery_depth(),
+        }
+    }
+
     /// Recursively collect SELECT branches from subqueries in this column expression.
     fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
@@ -742,6 +796,17 @@ impl ResolvedSelectColumns {
         current.chain(children)
     }
 
+    /// Compute the maximum subquery nesting depth in the SELECT list.
+    fn subquery_depth(&self) -> usize {
+        match self {
+            ResolvedSelectColumns::Columns(columns) => {
+                columns.iter().map(|c| c.expr.subquery_depth()).max().unwrap_or(0)
+            }
+            // All and None contain no subqueries
+            ResolvedSelectColumns::None | ResolvedSelectColumns::All(_) => 0,
+        }
+    }
+
     /// Recursively collect SELECT branches from subqueries in the SELECT list.
     fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         if let ResolvedSelectColumns::Columns(columns) = self {
@@ -803,6 +868,24 @@ impl ResolvedTableSource {
             ResolvedTableSource::Join(join) => {
                 join.left.direct_table_nodes_collect(tables);
                 join.right.direct_table_nodes_collect(tables);
+            }
+        }
+    }
+
+    /// Compute the maximum subquery nesting depth from this table source.
+    fn subquery_depth(&self) -> usize {
+        match self {
+            ResolvedTableSource::Table(_) => 0,
+            ResolvedTableSource::Subquery(sub) => 1 + sub.query.subquery_depth(),
+            ResolvedTableSource::Join(join) => {
+                let condition_depth = join
+                    .condition
+                    .as_ref()
+                    .map_or(0, |c| c.subquery_depth());
+                join.left
+                    .subquery_depth()
+                    .max(join.right.subquery_depth())
+                    .max(condition_depth)
             }
         }
     }
@@ -1003,16 +1086,48 @@ impl ResolvedSelectNode {
         matches!(self.from.as_slice(), [ResolvedTableSource::Table(_)])
     }
 
+    /// Compute the maximum subquery nesting depth in this SELECT.
+    /// A flat query returns 0, one level of subquery returns 1, etc.
+    pub fn subquery_depth(&self) -> usize {
+        let from_depth = self
+            .from
+            .iter()
+            .map(|s| s.subquery_depth())
+            .max()
+            .unwrap_or(0);
+        let where_depth = self
+            .where_clause
+            .as_ref()
+            .map_or(0, |w| w.subquery_depth());
+        let having_depth = self.having.as_ref().map_or(0, |h| h.subquery_depth());
+        let columns_depth = self.columns.subquery_depth();
+        from_depth
+            .max(where_depth)
+            .max(having_depth)
+            .max(columns_depth)
+    }
+
     /// Compute a complexity score for this query.
+    ///
+    /// Higher scores indicate more complex queries. Update queries are sorted
+    /// by complexity (ascending) so simpler/inner queries are tried first during
+    /// CDC processing — this ensures inner subquery tables are populated in
+    /// the cache before outer queries that depend on them.
+    ///
+    /// Components:
+    /// - Joins: each join adds 3 (joins require matching across tables)
+    /// - Predicates: each WHERE clause comparison adds 1
+    /// - Subquery depth: each nesting level adds 5 (outer queries depend on inner)
     pub fn complexity(&self) -> usize {
-        let table_count = self.nodes::<ResolvedTableNode>().count();
-        let join_count = table_count.saturating_sub(1);
+        let direct_table_count = self.direct_table_nodes().len();
+        let join_count = direct_table_count.saturating_sub(1);
         let predicate_count = self
             .where_clause
             .as_ref()
             .map(|w| w.predicate_count())
             .unwrap_or(0);
-        (join_count * 3) + predicate_count
+        let subquery_depth = self.subquery_depth();
+        (join_count * 3) + predicate_count + (subquery_depth * 5)
     }
 }
 
@@ -1172,6 +1287,17 @@ impl ResolvedQueryExpr {
         match &self.body {
             ResolvedQueryBody::Select(select) => Some(select),
             ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => None,
+        }
+    }
+
+    /// Compute the maximum subquery nesting depth in this query.
+    pub fn subquery_depth(&self) -> usize {
+        match &self.body {
+            ResolvedQueryBody::Select(select) => select.subquery_depth(),
+            ResolvedQueryBody::Values(_) => 0,
+            ResolvedQueryBody::SetOp(set_op) => {
+                set_op.left.subquery_depth().max(set_op.right.subquery_depth())
+            }
         }
     }
 
@@ -3039,6 +3165,85 @@ mod tests {
         // Verify ordering: simple < with_where < with_join
         assert!(resolved1.complexity() < resolved2.complexity());
         assert!(resolved2.complexity() < resolved3.complexity());
+    }
+
+    #[test]
+    fn test_complexity_subquery_depth() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        // No subquery: complexity = 1 predicate
+        let flat = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
+        assert_eq!(flat.subquery_depth(), 0);
+
+        // One level of subquery: depth 1
+        let one_deep = resolve_sql(
+            "SELECT * FROM users WHERE id IN (SELECT id FROM orders)",
+            &tables,
+        );
+        assert_eq!(one_deep.subquery_depth(), 1);
+
+        // Subquery adds 5 per depth level, so one_deep > flat
+        assert!(
+            one_deep.complexity() > flat.complexity(),
+            "subquery should increase complexity: {} > {}",
+            one_deep.complexity(),
+            flat.complexity()
+        );
+    }
+
+    #[test]
+    fn test_complexity_nested_subquery_depth() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("products", 1001));
+        tables.insert_overwrite(test_table_metadata("stores", 1002));
+        tables.insert_overwrite(test_table_metadata("regions", 1003));
+
+        // Double-nested: depth 2
+        let double_nested = resolve_sql(
+            "SELECT * FROM products WHERE id IN (SELECT id FROM stores WHERE id IN (SELECT id FROM regions))",
+            &tables,
+        );
+        assert_eq!(double_nested.subquery_depth(), 2);
+
+        // Single-nested: depth 1
+        let single_nested = resolve_sql(
+            "SELECT * FROM stores WHERE id IN (SELECT id FROM regions)",
+            &tables,
+        );
+        assert_eq!(single_nested.subquery_depth(), 1);
+
+        // Inner query (no subqueries): depth 0
+        let inner = resolve_sql("SELECT * FROM regions", &tables);
+        assert_eq!(inner.subquery_depth(), 0);
+
+        // Verify ordering: inner < single_nested < double_nested
+        assert!(
+            inner.complexity() < single_nested.complexity(),
+            "inner ({}) < single_nested ({})",
+            inner.complexity(),
+            single_nested.complexity()
+        );
+        assert!(
+            single_nested.complexity() < double_nested.complexity(),
+            "single_nested ({}) < double_nested ({})",
+            single_nested.complexity(),
+            double_nested.complexity()
+        );
+    }
+
+    #[test]
+    fn test_complexity_from_subquery_depth() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        // FROM subquery: depth 1
+        let from_sub = resolve_sql(
+            "SELECT * FROM (SELECT * FROM users WHERE id = 1) sub",
+            &tables,
+        );
+        assert_eq!(from_sub.subquery_depth(), 1);
     }
 
     #[test]
