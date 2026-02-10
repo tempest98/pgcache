@@ -200,6 +200,19 @@ async fn population_stream(
         .map(|c| format!("{c} = EXCLUDED.{c}"))
         .collect();
 
+    // Pre-compute primary key column positions for NULL-row detection.
+    // LEFT/RIGHT JOINs produce NULL-padded rows for the optional side when there's
+    // no match. These phantom rows have NULL primary keys and must be skipped.
+    let pkey_positions: Vec<usize> = table
+        .primary_key_columns
+        .iter()
+        .filter_map(|pk| {
+            row_description
+                .iter()
+                .position(|c| c.name() == pk.as_str())
+        })
+        .collect();
+
     let columns_joined = columns.join(",");
     let pkey_joined = pkey_columns.join(",");
     let update_joined = update_columns.join(", ");
@@ -211,12 +224,9 @@ async fn population_stream(
     let mut batch: Vec<String> = Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
 
     // Pre-compute the fixed prefix and suffix for INSERT statements
-    let insert_prefix = format!(
-        "INSERT INTO \"{schema}\".\"{table_name}\"({columns_joined}) VALUES ("
-    );
-    let insert_suffix = format!(
-        ") ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}"
-    );
+    let insert_prefix =
+        format!("INSERT INTO \"{schema}\".\"{table_name}\"({columns_joined}) VALUES (");
+    let insert_suffix = format!(") ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}");
 
     let num_columns = row_description.len();
     let mut values: Vec<String> = Vec::with_capacity(num_columns);
@@ -226,6 +236,12 @@ async fn population_stream(
     loop {
         match stream.next().await {
             Some(Ok(SimpleQueryMessage::Row(row))) => {
+                // Skip NULL-padded phantom rows from outer joins.
+                // A NULL primary key means this table had no matching row.
+                if pkey_positions.iter().any(|&pos| row.get(pos).is_none()) {
+                    continue;
+                }
+
                 values.clear();
                 for idx in 0..num_columns {
                     let value = row.get(idx);

@@ -1839,7 +1839,12 @@ impl JoinNode {
 impl Deparse for JoinNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         self.left.deparse(buf);
-        buf.push_str(" JOIN");
+        match self.join_type {
+            JoinType::Inner => buf.push_str(" JOIN"),
+            JoinType::Left => buf.push_str(" LEFT JOIN"),
+            JoinType::Right => buf.push_str(" RIGHT JOIN"),
+            JoinType::Full => buf.push_str(" FULL JOIN"),
+        }
         self.right.deparse(buf);
         if let Some(condition) = &self.condition {
             buf.push_str(" ON ");
@@ -3687,6 +3692,37 @@ mod tests {
         let sql = "SELECT first_name, last_name, film_id FROM actor a \
                 JOIN film_actor fa ON a.actor_id = fa.actor_id \
                 WHERE a.actor_id = 1";
+        let ast = parse_query(sql);
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_left_join() {
+        let sql = "SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1";
+        let ast = parse_query(sql);
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_right_join() {
+        let sql = "SELECT a.id, b.name FROM a RIGHT JOIN b ON a.id = b.a_id WHERE b.id = 1";
+        let ast = parse_query(sql);
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+        assert_eq!(buf, sql);
+    }
+
+    #[test]
+    fn test_select_deparse_mixed_joins() {
+        let sql =
+            "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id WHERE a.id = 1";
         let ast = parse_query(sql);
 
         let mut buf = String::with_capacity(1024);

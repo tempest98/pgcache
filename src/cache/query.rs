@@ -1,9 +1,15 @@
+use std::collections::HashSet;
+
 use crate::{
     cache::QueryParameters,
     query::{
         ast::{
             BinaryOp, CteRefNode, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode,
             SetOpNode, SubLinkType, TableSource, TableSubqueryNode, WhereExpr,
+        },
+        resolved::{
+            ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
+            ResolvedWhereExpr,
         },
         transform::{AstTransformResult, query_expr_parameters_replace},
     },
@@ -141,22 +147,14 @@ fn is_cacheable_table_subquery(
 }
 
 fn is_supported_join(join: &JoinNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
-    // Only INNER joins are cacheable
-    if join.join_type != JoinType::Inner {
+    // FULL OUTER JOINs are not cacheable — both sides are optional
+    if join.join_type == JoinType::Full {
         return Err(CacheabilityError::UnsupportedFrom);
     }
 
-    // Validate join condition: must be simple equality or absent
+    // Validate join condition: must be equality, AND of equalities, or absent
     let condition_valid = match &join.condition {
-        Some(WhereExpr::Binary(binary_expr)) => binary_expr.op == BinaryOp::Equal,
-        Some(
-            WhereExpr::Value(_)
-            | WhereExpr::Column(_)
-            | WhereExpr::Unary(_)
-            | WhereExpr::Multi(_)
-            | WhereExpr::Function { .. }
-            | WhereExpr::Subquery { .. },
-        ) => false,
+        Some(expr) => join_condition_is_valid(expr),
         None => true,
     };
 
@@ -169,6 +167,32 @@ fn is_supported_join(join: &JoinNode, ctx: ExprContext) -> Result<(), Cacheabili
     is_supported_table_source(&join.right, ctx)?;
 
     Ok(())
+}
+
+/// Check if a join condition contains only equalities or AND of equalities.
+fn join_condition_is_valid(expr: &WhereExpr) -> bool {
+    match expr {
+        WhereExpr::Binary(b) => match b.op {
+            BinaryOp::Equal => true,
+            BinaryOp::And => join_condition_is_valid(&b.lexpr) && join_condition_is_valid(&b.rexpr),
+            BinaryOp::Or
+            | BinaryOp::NotEqual
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual
+            | BinaryOp::Like
+            | BinaryOp::ILike
+            | BinaryOp::NotLike
+            | BinaryOp::NotILike => false,
+        },
+        WhereExpr::Value(_)
+        | WhereExpr::Column(_)
+        | WhereExpr::Unary(_)
+        | WhereExpr::Multi(_)
+        | WhereExpr::Function { .. }
+        | WhereExpr::Subquery { .. } => false,
+    }
 }
 
 /// Check if a table source (in a join) is supported.
@@ -361,16 +385,171 @@ fn is_cacheable_column_expr(
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Outer join terminality analysis
+// ──────────────────────────────────────────────────────────────────────
+
+/// Categorizes optional-side tables in outer joins as terminal or non-terminal.
+///
+/// - **Terminal**: columns don't appear in WHERE or other join conditions.
+///   CDC INSERT/DELETE handled in place — the preserved side already has the row,
+///   changes here only affect NULL-padded columns.
+/// - **Non-terminal**: columns appear in WHERE or other join conditions.
+///   CDC events trigger full query invalidation (conservative but correct).
+///
+/// Uses the resolved AST where column references carry the real table name
+/// (not aliases), eliminating alias ambiguity.
+pub fn outer_join_optional_tables(
+    select: &ResolvedSelectNode,
+) -> (HashSet<String>, HashSet<String>) {
+    let join = match select.from.as_slice() {
+        [ResolvedTableSource::Join(join)] => join,
+        _ => return (HashSet::new(), HashSet::new()),
+    };
+
+    // Pass 1: collect real table names from WHERE clause column references.
+    // GROUP BY, HAVING, and SELECT list are excluded — population queries strip
+    // GROUP BY/HAVING, and all three are re-evaluated at retrieval time against
+    // cached rows.
+    let mut non_terminal_refs = HashSet::new();
+    if let Some(where_clause) = &select.where_clause {
+        resolved_column_table_refs_collect(where_clause, &mut non_terminal_refs);
+    }
+
+    // Pass 2: walk the join tree, collecting all optional-side tables and
+    // identifying which are non-terminal
+    let mut all_optional = HashSet::new();
+    let mut non_terminal = HashSet::new();
+    resolved_join_terminality_walk(join, &non_terminal_refs, &mut all_optional, &mut non_terminal);
+
+    let terminal = all_optional.difference(&non_terminal).cloned().collect();
+    (terminal, non_terminal)
+}
+
+/// Collect real table names from all column references in a resolved WHERE expression.
+fn resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, tables: &mut HashSet<String>) {
+    for col in expr.nodes::<ResolvedColumnNode>() {
+        tables.insert(col.table.clone());
+    }
+}
+
+/// Collect the real table names from all table nodes in a resolved table source subtree.
+/// Traverses JOINs but not subqueries.
+fn resolved_source_table_names_collect(source: &ResolvedTableSource, names: &mut HashSet<String>) {
+    match source {
+        ResolvedTableSource::Table(table) => {
+            names.insert(table.name.clone());
+        }
+        ResolvedTableSource::Join(join) => {
+            resolved_source_table_names_collect(&join.left, names);
+            resolved_source_table_names_collect(&join.right, names);
+        }
+        ResolvedTableSource::Subquery(_) => {}
+    }
+}
+
+/// Recursive walk of the resolved join tree to collect optional-side tables
+/// and identify which are non-terminal.
+///
+/// `non_terminal_refs` accumulates: WHERE column table refs + ancestor join
+/// condition column table refs. At each outer join, the optional side's tables
+/// are checked against this set.
+///
+/// The current join's own ON condition is NOT in `non_terminal_refs` during the
+/// check — it's only merged before recursing into children. This correctly
+/// excludes a join's own condition from the terminal definition.
+fn resolved_join_terminality_walk(
+    join: &ResolvedJoinNode,
+    non_terminal_refs: &HashSet<String>,
+    all_optional: &mut HashSet<String>,
+    non_terminal: &mut HashSet<String>,
+) {
+    // Collect optional-side tables at this level
+    if matches!(join.join_type, JoinType::Left | JoinType::Right) {
+        let optional_side = match join.join_type {
+            JoinType::Left => &join.right,
+            JoinType::Right => &join.left,
+            JoinType::Inner | JoinType::Full => unreachable!(),
+        };
+
+        let mut optional_tables = HashSet::new();
+        resolved_source_table_names_collect(optional_side, &mut optional_tables);
+        for table in &optional_tables {
+            all_optional.insert(table.clone());
+            if non_terminal_refs.contains(table) {
+                non_terminal.insert(table.clone());
+            }
+        }
+    }
+
+    // Before recursing, merge this join's condition refs so children see them
+    // as "ancestor join conditions"
+    let mut child_refs = non_terminal_refs.clone();
+    if let Some(condition) = &join.condition {
+        resolved_column_table_refs_collect(condition, &mut child_refs);
+    }
+
+    // Recurse into nested joins
+    if let ResolvedTableSource::Join(left) = &join.left {
+        resolved_join_terminality_walk(left, &child_refs, all_optional, non_terminal);
+    }
+    if let ResolvedTableSource::Join(right) = &join.right {
+        resolved_join_terminality_walk(right, &child_refs, all_optional, non_terminal);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use iddqd::BiHashMap;
+    use tokio_postgres::types::Type;
+
     use super::*;
+    use crate::catalog::{ColumnMetadata, TableMetadata};
     use crate::query::ast::query_expr_convert;
+    use crate::query::resolved::select_node_resolve;
 
     /// Parse SQL and check cacheability
     fn check_cacheable(sql: &str) -> Result<CacheableQuery, CacheabilityError> {
         let ast = pg_query::parse(sql).expect("parse");
         let query_expr = query_expr_convert(&ast).expect("convert");
         CacheableQuery::try_from(&query_expr)
+    }
+
+    /// Create test table metadata with given column names.
+    /// First column is the primary key (INT4), rest are TEXT.
+    fn test_table(name: &str, relation_oid: u32, column_names: &[&str]) -> TableMetadata {
+        let mut columns = BiHashMap::new();
+        for (i, col_name) in column_names.iter().enumerate() {
+            let is_pk = i == 0;
+            columns.insert_overwrite(ColumnMetadata {
+                name: (*col_name).to_owned(),
+                position: (i + 1) as i16,
+                type_oid: if is_pk { 23 } else { 25 },
+                data_type: if is_pk { Type::INT4 } else { Type::TEXT },
+                type_name: if is_pk { "int4" } else { "text" }.to_owned(),
+                cache_type_name: if is_pk { "int4" } else { "text" }.to_owned(),
+                is_primary_key: is_pk,
+            });
+        }
+        TableMetadata {
+            relation_oid,
+            name: name.to_owned(),
+            schema: "public".to_owned(),
+            primary_key_columns: vec![column_names[0].to_owned()],
+            columns,
+            indexes: Vec::new(),
+        }
+    }
+
+    /// Parse SQL and resolve the SELECT node using the given tables.
+    fn resolve_select(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
+        let ast = pg_query::parse(sql).expect("parse");
+        let query_expr = query_expr_convert(&ast).expect("convert");
+        let select = match query_expr.body {
+            QueryBody::Select(s) => s,
+            _ => panic!("expected SELECT"),
+        };
+        select_node_resolve(&select, tables, &["public"]).expect("resolve")
     }
 
     #[test]
@@ -395,33 +574,75 @@ mod tests {
     }
 
     #[test]
-    fn test_left_join_not_cacheable() {
+    fn test_left_join_cacheable() {
         let sql = "SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE a.id = 1";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
-            "LEFT JOIN should not be cacheable"
-        );
+        assert!(result.is_ok(), "LEFT JOIN should be cacheable");
     }
 
     #[test]
-    fn test_mixed_join_types_not_cacheable() {
+    fn test_right_join_cacheable() {
+        let sql = "SELECT * FROM a RIGHT JOIN b ON a.id = b.id WHERE b.id = 1";
+        let result = check_cacheable(sql);
+        assert!(result.is_ok(), "RIGHT JOIN should be cacheable");
+    }
+
+    #[test]
+    fn test_mixed_join_types_cacheable() {
         let sql = "SELECT * FROM a JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id WHERE a.id = 1";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
-            "Mixed join types (INNER + LEFT) should not be cacheable"
+            result.is_ok(),
+            "Mixed join types (INNER + LEFT) should be cacheable"
         );
     }
 
     #[test]
-    fn test_nested_left_join_not_cacheable() {
+    fn test_chained_left_joins_cacheable() {
         let sql =
             "SELECT * FROM a LEFT JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id WHERE a.id = 1";
         let result = check_cacheable(sql);
+        assert!(result.is_ok(), "Chained LEFT JOINs should be cacheable");
+    }
+
+    #[test]
+    fn test_non_terminal_left_join_cacheable() {
+        let sql = "SELECT * FROM a LEFT JOIN b ON a.id = b.id WHERE b.status = 'active'";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "Non-terminal LEFT JOIN should be cacheable (CDC handles correctness)"
+        );
+    }
+
+    #[test]
+    fn test_full_join_not_cacheable() {
+        let sql = "SELECT * FROM a FULL JOIN b ON a.id = b.id WHERE a.id = 1";
+        let result = check_cacheable(sql);
         assert!(
             matches!(result, Err(CacheabilityError::UnsupportedFrom)),
-            "All LEFT JOINs should not be cacheable"
+            "FULL JOIN should not be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_join_and_condition_cacheable() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id AND a.tenant = b.tenant WHERE a.id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "AND of equalities in join condition should be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_left_join_and_condition_cacheable() {
+        let sql =
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND a.tenant = b.tenant WHERE a.id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "LEFT JOIN with AND condition should be cacheable"
         );
     }
 
@@ -674,14 +895,11 @@ mod tests {
     }
 
     #[test]
-    fn test_union_with_left_join_not_cacheable() {
+    fn test_union_with_left_join_cacheable() {
         let sql = "SELECT a.id FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.tenant_id = 1 \
                    UNION SELECT id FROM c WHERE tenant_id = 1";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
-            "UNION with LEFT JOIN should not be cacheable"
-        );
+        assert!(result.is_ok(), "UNION with LEFT JOIN should be cacheable");
     }
 
     // CTE cacheability tests
@@ -746,5 +964,192 @@ mod tests {
             matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
             "Function in WHERE clause should not be cacheable: {result:?}"
         );
+    }
+
+    // ==================== Outer Join Terminality Tests ====================
+
+    /// Create standard test tables for terminality tests:
+    /// a(id, name, status), b(id, a_id, name, status, val, x), c(id, b_id, val, x)
+    fn terminality_test_tables() -> BiHashMap<TableMetadata> {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table("a", 1, &["id", "name", "status"]));
+        tables.insert_overwrite(test_table("b", 2, &["id", "a_id", "name", "status", "val", "x"]));
+        tables.insert_overwrite(test_table("c", 3, &["id", "b_id", "val", "x"]));
+        tables
+    }
+
+    #[test]
+    fn test_terminal_left_join() {
+        let tables = terminality_test_tables();
+        // b is terminal: only appears in its own ON clause and SELECT list
+        let select = resolve_select(
+            "SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
+        assert!(
+            terminal.contains("b"),
+            "b should be terminal: {terminal:?}"
+        );
+    }
+
+    #[test]
+    fn test_non_terminal_where_reference() {
+        let tables = terminality_test_tables();
+        // b is non-terminal: b.status appears in WHERE
+        let select = resolve_select(
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status = 'active'",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(
+            non_terminal.contains("b"),
+            "b should be non-terminal: {non_terminal:?}"
+        );
+        assert!(terminal.is_empty(), "no terminal: {terminal:?}");
+    }
+
+    #[test]
+    fn test_non_terminal_chained_join() {
+        let tables = terminality_test_tables();
+        // b is non-terminal: b.val appears in the downstream INNER JOIN condition
+        // c is not on an outer join's optional side
+        let select = resolve_select(
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id JOIN c ON b.val = c.val",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(
+            non_terminal.contains("b"),
+            "b should be non-terminal: {non_terminal:?}"
+        );
+        assert!(terminal.is_empty(), "no terminal: {terminal:?}");
+    }
+
+    #[test]
+    fn test_chained_outer_joins() {
+        let tables = terminality_test_tables();
+        // a LEFT JOIN b ... LEFT JOIN c ON b.x = c.x
+        // b is non-terminal: appears in the outer LEFT JOIN's condition (ancestor)
+        // c is terminal: only appears in its own ON clause
+        let select = resolve_select(
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id LEFT JOIN c ON b.x = c.x",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(
+            non_terminal.contains("b"),
+            "b should be non-terminal: {non_terminal:?}"
+        );
+        assert!(
+            terminal.contains("c"),
+            "c should be terminal: {terminal:?}"
+        );
+    }
+
+    #[test]
+    fn test_terminal_right_join() {
+        let tables = terminality_test_tables();
+        // a is terminal optional side (RIGHT JOIN makes left side optional)
+        let select = resolve_select(
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id WHERE b.id = 1",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
+        assert!(
+            terminal.contains("a"),
+            "a should be terminal: {terminal:?}"
+        );
+    }
+
+    #[test]
+    fn test_non_terminal_right_join() {
+        let tables = terminality_test_tables();
+        // a is non-terminal optional side: a.status in WHERE
+        let select = resolve_select(
+            "SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id WHERE a.status = 'active'",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(
+            non_terminal.contains("a"),
+            "a should be non-terminal: {non_terminal:?}"
+        );
+        assert!(terminal.is_empty(), "no terminal: {terminal:?}");
+    }
+
+    #[test]
+    fn test_inner_join_no_optional() {
+        let tables = terminality_test_tables();
+        // INNER JOIN has no optional side
+        let select = resolve_select(
+            "SELECT * FROM a JOIN b ON a.id = b.id WHERE b.x = 1",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(terminal.is_empty(), "no terminal: {terminal:?}");
+        assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
+    }
+
+    #[test]
+    fn test_terminal_with_alias() {
+        let tables = terminality_test_tables();
+        // Aliased table on optional side, terminal.
+        // Resolved AST resolves alias "t" back to real table name "b".
+        let select = resolve_select(
+            "SELECT a.id, t.name FROM a LEFT JOIN b t ON a.id = t.a_id WHERE a.id = 1",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
+        assert!(
+            terminal.contains("b"),
+            "aliased b should be terminal by real name: {terminal:?}"
+        );
+    }
+
+    #[test]
+    fn test_non_terminal_with_alias() {
+        let tables = terminality_test_tables();
+        // Aliased table on optional side, non-terminal (alias used in WHERE).
+        // Resolved AST uses real table name "b" (not alias "t").
+        let select = resolve_select(
+            "SELECT * FROM a LEFT JOIN b t ON a.id = t.a_id WHERE t.status = 'active'",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(
+            non_terminal.contains("b"),
+            "aliased b should be non-terminal by real name: {non_terminal:?}"
+        );
+        assert!(terminal.is_empty(), "no terminal: {terminal:?}");
+    }
+
+    #[test]
+    fn test_mixed_inner_and_terminal_left() {
+        let tables = terminality_test_tables();
+        // a JOIN b is inner, LEFT JOIN c is terminal
+        let select = resolve_select(
+            "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id WHERE a.id = 1",
+            &tables,
+        );
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
+        assert!(
+            terminal.contains("c"),
+            "c should be terminal: {terminal:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_join_no_optional() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table("users", 1, &["id", "name"]));
+        let select = resolve_select("SELECT * FROM users WHERE id = 1", &tables);
+        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        assert!(terminal.is_empty());
+        assert!(non_terminal.is_empty());
     }
 }

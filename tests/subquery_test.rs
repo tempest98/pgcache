@@ -22,8 +22,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-    wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
 };
 
 mod util;

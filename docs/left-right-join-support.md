@@ -1,10 +1,12 @@
 # LEFT and RIGHT JOIN Support
 
+## Status: Implemented
+
 ## Background
 
-pgcache currently supports only INNER JOINs for cached queries. The cacheability gate in `cache/query.rs` (`is_supported_join`) rejects any join where `join_type != JoinType::Inner`. LEFT and RIGHT JOINs are common in application queries, and rejecting them forces those queries through the pass-through path to origin on every execution.
+pgcache previously supported only INNER JOINs for cached queries. The cacheability gate in `cache/query.rs` (`is_supported_join`) rejected any join where `join_type != JoinType::Inner`. LEFT and RIGHT JOINs are common in application queries, and rejecting them forced those queries through the pass-through path to origin on every execution.
 
-The parsing and resolution layers already handle all join types. The AST (`JoinType::Left`, `JoinType::Right`), parser, and resolver all accept and represent outer joins. `ResolvedJoinNode::deparse` correctly emits `LEFT JOIN` / `RIGHT JOIN` syntax. The work is in cacheability analysis and CDC invalidation.
+The parsing and resolution layers already handled all join types. The AST (`JoinType::Left`, `JoinType::Right`), parser, and resolver all accept and represent outer joins. `ResolvedJoinNode::deparse` correctly emits `LEFT JOIN` / `RIGHT JOIN` syntax.
 
 ## How the Cache Works
 
@@ -24,7 +26,7 @@ Outer joins introduce asymmetry between the **preserved side** (always contribut
 
 - **UPDATE on the optional side**: Combination of the above. If join columns change, the row may start or stop matching, handled by the existing upsert-then-delete-stale mechanism.
 
-These operations are safe **when the optional-side table is terminal**.
+These operations are safe **when the optional-side table is terminal** — CDC can handle them in place without query invalidation.
 
 ## The Chained Join Problem
 
@@ -66,70 +68,110 @@ An optional-side table is **terminal** when its columns do not appear in:
 
 1. Any other join condition (not its own ON clause)
 2. The WHERE clause
-3. GROUP BY columns
-4. HAVING clause
 
-The SELECT list is fine — selecting columns from the optional side doesn't affect result set membership.
+GROUP BY, HAVING, and the SELECT list are excluded from the check. Population queries strip GROUP BY and HAVING — the row set before aggregation is stored, and these clauses are re-evaluated at retrieval time against cached rows. Similarly, SELECT expressions don't affect result set membership.
 
-If a table is terminal, changes to it cannot cascade into affecting other tables' membership in the result set. The existing CDC mechanisms work correctly because:
-- The preserved-side result set never changes
-- The optional-side data is either present or NULL-padded, determined at retrieval time by the LEFT JOIN against cache tables
-- No downstream join or filter depends on the optional-side values
+If a table is terminal, changes to it cannot cascade into affecting other tables' membership in the result set.
 
-## Strategy
+## Implementation
 
-Support LEFT and RIGHT JOINs where the optional-side table is terminal. Reject outer joins where the optional side feeds into downstream joins or predicates (pass-through).
+### Approach
 
-RIGHT JOINs can be normalized to LEFT JOINs by swapping sides. This simplifies all downstream logic to only reason about LEFT JOINs.
+All LEFT and RIGHT JOINs are cacheable. FULL OUTER JOINs are rejected. The terminal vs non-terminal distinction determines CDC behavior, not cacheability:
 
-### Terminal table check
-
-The resolved AST supports this check directly. `ResolvedColumnNode` carries the real table name (not alias), and `nodes::<ResolvedColumnNode>()` extracts all column references from any subtree.
-
-For each outer join in the join tree:
-
-1. Collect the set of table names on the optional side (right side for LEFT JOIN)
-2. Verify none of those table names appear in column references in the WHERE clause, any ancestor or sibling join condition, GROUP BY, or HAVING
-
-Two-pass approach:
-1. Collect all column references from WHERE, GROUP BY, and HAVING into a set of table names
-2. Walk the join tree recursively. At each outer join, collect the optional-side table names and check for overlap. Additionally check ancestor join conditions by threading down the set of tables referenced by join conditions above the current node.
-
-### CDC invalidation
-
-No changes to the core CDC handlers. The existing mechanisms work for terminal optional-side tables:
-
-- `handle_insert`: The upsert mechanism adds the row to the optional-side cache table if it matches. The LEFT JOIN at retrieval fills in previously NULL columns.
-- `handle_delete`: Removes the row from the optional-side cache table. The LEFT JOIN at retrieval produces NULLs.
-- `handle_update`: Upsert + conditional delete. Correct for the same reasons.
-
-The invalidation checks need review:
-
-- `row_uncached_invalidation_check`: The "PK didn't change and all join columns are PK" stability optimization assumes INNER JOIN semantics. For the optional side of a LEFT JOIN, a row not being in cache means the preserved side gets NULL-padded, which is handled correctly by retrieval-time LEFT JOIN. The existing logic should work as-is for terminal optional-side tables but needs verification.
-
-- `row_cached_invalidation_check`: Checks if join columns changed. Applies equally to outer joins.
-
-### Constraint propagation
-
-`constraints.rs` propagates equality constraints through join equivalences uniformly. For the terminal case, propagation in both directions is safe. No changes needed.
+- **Terminal** optional-side tables (`OuterJoinTerminal`): CDC INSERT/DELETE handled in place — the preserved side already has the row, changes here only affect which values fill the NULL-padded columns
+- **Non-terminal** optional-side tables (`OuterJoinOptional`): CDC events trigger full query invalidation (conservative but correct)
+- **Preserved side**: Remains `Direct` — INSERT triggers invalidation because optional-side rows matching the new preserved-side row may not be in cache
 
 ### AST deparse fix
 
-`JoinNode::deparse` in `ast.rs` hardcodes `" JOIN"` without the type qualifier. This must emit `" LEFT JOIN"` / `" RIGHT JOIN"` to match the resolved-level deparse. This is used by `query_table_update_queries` in `transform.rs` for generating CDC check queries.
+`JoinNode::deparse` in `ast.rs` was hardcoding `" JOIN"` without the type qualifier. Fixed to emit `" LEFT JOIN"` / `" RIGHT JOIN"` / `" FULL JOIN"` to match the resolved-level deparse. This is used by `query_table_update_queries` in `transform.rs` for generating CDC check queries.
 
-## Files to Change
+### Cacheability gate
 
-- `src/cache/query.rs`: Relax `is_supported_join`, add terminal table check
-- `src/query/ast.rs`: Fix `JoinNode::deparse` to emit join type qualifier
+`is_supported_join` in `cache/query.rs` changed from rejecting all non-Inner joins to only rejecting Full:
 
-## Files to Review
+```rust
+if join.join_type == JoinType::Full {
+    return Err(CacheabilityError::UnsupportedFrom);
+}
+```
 
-- `src/cache/writer/cdc.rs`: Confirm invalidation checks are correct for terminal outer joins
-- `src/query/constraints.rs`: Confirm propagation is safe for terminal case
-- `src/cache/writer/population.rs`: Confirm per-table fetching works
-- `src/query/transform.rs`: Confirm update query generation works with outer join syntax
+### AND of equalities in join conditions
+
+Previously only single equality join conditions were accepted. An `ON a.id = b.id AND a.tenant = b.tenant` condition parsed as a `Binary { op: And, ... }` which was rejected. Added a recursive helper `join_condition_is_valid` that accepts equalities and AND-of-equalities.
+
+### Terminality analysis
+
+Added `outer_join_optional_tables(select: &ResolvedSelectNode) -> (HashSet<String>, HashSet<String>)` in `cache/query.rs`. Returns `(terminal, non_terminal)` sets. Operates on the resolved AST where `ResolvedColumnNode.table` always carries the real table name (not alias), eliminating alias ambiguity. Called during update query generation, not during cacheability checking.
+
+Two-pass algorithm:
+
+**Pass 1** — Collect real table names from `ResolvedColumnNode` references in the WHERE clause into a `non_terminal_refs` set.
+
+**Pass 2** — Walk the resolved join tree top-down via `resolved_join_terminality_walk`, threading `non_terminal_refs` (which accumulates ancestor join condition refs at each level):
+- At each outer join, collect ALL optional-side table names into `all_optional`
+- Check if any optional-side table appears in `non_terminal_refs` — if so, add to `non_terminal`
+- Before recursing into children, merge current join condition's column table refs into `non_terminal_refs`
+- After the walk: `terminal = all_optional - non_terminal`
+
+The current join's own ON condition is NOT in `non_terminal_refs` at check time (merged only for children), correctly excluding a join's own condition from making it non-terminal.
+
+Helpers:
+- `resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, ...)` — walks the expression tree collecting real table names from `ResolvedColumnNode`s
+- `resolved_source_table_names_collect(source: &ResolvedTableSource, ...)` — recursively collects real table names from `ResolvedTableNode`s
+
+### Update query source tagging
+
+`UpdateQuerySource` in `cache/types.rs`:
+
+```rust
+pub enum UpdateQuerySource {
+    Direct,
+    Subquery(SubqueryKind),
+    OuterJoinTerminal,
+    OuterJoinOptional,
+}
+```
+
+`query_table_update_queries` in `transform.rs` takes the `ResolvedQueryExpr` as an additional parameter. Resolved branches are paired with AST branches by position. For each table, the real table name is checked against the terminal and non-terminal sets:
+- In `non_terminal` → `OuterJoinOptional`
+- In `terminal` → `OuterJoinTerminal`
+- Neither → original source (`Direct` or `Subquery`)
+
+### CDC invalidation
+
+In `cache/writer/cdc.rs`:
+
+**`row_uncached_invalidation_check`** (row not currently in cache):
+- `OuterJoinTerminal`: Returns `false` — no invalidation needed. The preserved side already has the row; changes on the terminal optional side only affect NULL-padded columns. The row is added to cache in place via update query execution.
+- `OuterJoinOptional`: Uses constraint matching — if the row matches constraints, invalidate the query.
+
+**`row_cached_invalidation_check`** (row currently in cache):
+- `OuterJoinTerminal`: Falls through to `Direct` logic — checks join column changes.
+- `OuterJoinOptional`: Always returns `true` — any change to a cached non-terminal optional-side row could cascade.
+
+After invalidation, the query is removed from `cached_queries`. The next client request for the same query triggers re-registration and re-population.
+
+### Population: NULL-padded row skipping
+
+LEFT/RIGHT JOINs produce NULL-padded rows for the optional side when there's no matching row. During population, these phantom rows have NULL primary keys. `population_stream` in `cache/writer/population.rs` detects rows where any primary key column is NULL and skips them — a NULL PK indicates the row doesn't exist on the optional side.
+
+### Constraint propagation
+
+`constraints.rs` propagates equality constraints through join equivalences uniformly. For both terminal and non-terminal cases, propagation in both directions is safe. No changes were needed.
+
+## Files Changed
+
+| File | Changes |
+|------|---------|
+| `src/query/ast.rs` | Fix `JoinNode::deparse` to emit join type qualifier |
+| `src/cache/query.rs` | Allow Left/Right in `is_supported_join`, AND-of-equalities via `join_condition_is_valid`, `outer_join_optional_tables` function with helpers, tests |
+| `src/cache/types.rs` | Add `OuterJoinTerminal` and `OuterJoinOptional` variants to `UpdateQuerySource` |
+| `src/query/transform.rs` | Tag optional-side tables with `OuterJoinTerminal` or `OuterJoinOptional`, tests |
+| `src/cache/writer/cdc.rs` | Handle `OuterJoinTerminal` and `OuterJoinOptional` in invalidation check functions |
+| `src/cache/writer/population.rs` | Skip NULL-padded phantom rows (NULL PK) during population |
 
 ## Future Work
 
-- **Non-terminal outer joins**: Could support with a conservative invalidation strategy — any CDC event on the optional side that changes join-relevant columns triggers full re-population. Correct but pessimistic.
-- **FULL OUTER JOIN**: Both sides are optional. Terminal check would need to apply to both sides. Less common in practice.
+- **FULL OUTER JOIN**: Both sides are optional. Terminal check would need to apply to both sides. Less common in practice — currently rejected at cacheability gate.

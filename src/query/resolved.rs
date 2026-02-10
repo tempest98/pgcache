@@ -233,13 +233,14 @@ impl ResolvedWhereExpr {
     /// Returns 0 if there are no subqueries.
     pub fn subquery_depth(&self) -> usize {
         match self {
-            ResolvedWhereExpr::Binary(b) => {
-                b.lexpr.subquery_depth().max(b.rexpr.subquery_depth())
-            }
+            ResolvedWhereExpr::Binary(b) => b.lexpr.subquery_depth().max(b.rexpr.subquery_depth()),
             ResolvedWhereExpr::Unary(u) => u.expr.subquery_depth(),
-            ResolvedWhereExpr::Multi(m) => {
-                m.exprs.iter().map(|e| e.subquery_depth()).max().unwrap_or(0)
-            }
+            ResolvedWhereExpr::Multi(m) => m
+                .exprs
+                .iter()
+                .map(|e| e.subquery_depth())
+                .max()
+                .unwrap_or(0),
             ResolvedWhereExpr::Function { args, .. } => {
                 args.iter().map(|a| a.subquery_depth()).max().unwrap_or(0)
             }
@@ -247,9 +248,7 @@ impl ResolvedWhereExpr {
                 query, test_expr, ..
             } => {
                 let inner = 1 + query.subquery_depth();
-                let test = test_expr
-                    .as_ref()
-                    .map_or(0, |t| t.subquery_depth());
+                let test = test_expr.as_ref().map_or(0, |t| t.subquery_depth());
                 inner.max(test)
             }
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
@@ -604,9 +603,10 @@ impl ResolvedColumnExpr {
                 let default_depth = case.default.as_ref().map_or(0, |d| d.subquery_depth());
                 arg_depth.max(when_depth).max(default_depth)
             }
-            ResolvedColumnExpr::Arithmetic(arith) => {
-                arith.left.subquery_depth().max(arith.right.subquery_depth())
-            }
+            ResolvedColumnExpr::Arithmetic(arith) => arith
+                .left
+                .subquery_depth()
+                .max(arith.right.subquery_depth()),
             ResolvedColumnExpr::Subquery(query) => 1 + query.subquery_depth(),
         }
     }
@@ -799,9 +799,11 @@ impl ResolvedSelectColumns {
     /// Compute the maximum subquery nesting depth in the SELECT list.
     fn subquery_depth(&self) -> usize {
         match self {
-            ResolvedSelectColumns::Columns(columns) => {
-                columns.iter().map(|c| c.expr.subquery_depth()).max().unwrap_or(0)
-            }
+            ResolvedSelectColumns::Columns(columns) => columns
+                .iter()
+                .map(|c| c.expr.subquery_depth())
+                .max()
+                .unwrap_or(0),
             // All and None contain no subqueries
             ResolvedSelectColumns::None | ResolvedSelectColumns::All(_) => 0,
         }
@@ -878,10 +880,7 @@ impl ResolvedTableSource {
             ResolvedTableSource::Table(_) => 0,
             ResolvedTableSource::Subquery(sub) => 1 + sub.query.subquery_depth(),
             ResolvedTableSource::Join(join) => {
-                let condition_depth = join
-                    .condition
-                    .as_ref()
-                    .map_or(0, |c| c.subquery_depth());
+                let condition_depth = join.condition.as_ref().map_or(0, |c| c.subquery_depth());
                 join.left
                     .subquery_depth()
                     .max(join.right.subquery_depth())
@@ -1095,10 +1094,7 @@ impl ResolvedSelectNode {
             .map(|s| s.subquery_depth())
             .max()
             .unwrap_or(0);
-        let where_depth = self
-            .where_clause
-            .as_ref()
-            .map_or(0, |w| w.subquery_depth());
+        let where_depth = self.where_clause.as_ref().map_or(0, |w| w.subquery_depth());
         let having_depth = self.having.as_ref().map_or(0, |h| h.subquery_depth());
         let columns_depth = self.columns.subquery_depth();
         from_depth
@@ -1295,9 +1291,10 @@ impl ResolvedQueryExpr {
         match &self.body {
             ResolvedQueryBody::Select(select) => select.subquery_depth(),
             ResolvedQueryBody::Values(_) => 0,
-            ResolvedQueryBody::SetOp(set_op) => {
-                set_op.left.subquery_depth().max(set_op.right.subquery_depth())
-            }
+            ResolvedQueryBody::SetOp(set_op) => set_op
+                .left
+                .subquery_depth()
+                .max(set_op.right.subquery_depth()),
         }
     }
 
@@ -1551,8 +1548,11 @@ impl<'a> ResolutionScope<'a> {
 fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<ColumnMetadata> {
     let select = match &resolved_query.body {
         ResolvedQueryBody::Select(select) => select,
-        // For set operations and VALUES, we can't easily determine output columns
-        ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => return Vec::new(),
+        // Set operation output columns are defined by the leftmost SELECT
+        ResolvedQueryBody::SetOp(set_op) => {
+            return derived_table_columns_extract(&set_op.left);
+        }
+        ResolvedQueryBody::Values(_) => return Vec::new(),
     };
 
     match &select.columns {

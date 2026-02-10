@@ -127,9 +127,7 @@ async fn connection_pool_create(
             .await
             .attach_loc("creating cache connection")?;
 
-        tx.send(conn)
-            .await
-            .map_err(|_| CacheError::NoConnection)?;
+        tx.send(conn).await.map_err(|_| CacheError::NoConnection)?;
     }
 
     debug!("Created {} connections", size);

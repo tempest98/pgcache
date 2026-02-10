@@ -97,7 +97,7 @@ impl CacheWriter {
             .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
             .attach_loc("resolving query expression")?;
 
-        for (table_node, update_query_expr, source) in query_table_update_queries(cacheable_query) {
+        for (table_node, update_query_expr, source) in query_table_update_queries(cacheable_query, &resolved) {
             let schema = self
                 .table_schema_resolve(
                     table_node.name.as_str(),

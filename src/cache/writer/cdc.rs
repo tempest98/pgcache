@@ -437,6 +437,20 @@ impl CacheWriter {
                     (SubqueryKind::Exclusion, CdcOperation::Delete) => true,
                 }
             }
+            UpdateQuerySource::OuterJoinTerminal => {
+                // Terminal optional side of an outer join. Changes here only
+                // affect NULL-padded columns — the preserved side already has
+                // the row. No cross-table dependencies, so the update query
+                // execution handles it (upsert into cache table).
+                false
+            }
+            UpdateQuerySource::OuterJoinOptional => {
+                // Non-terminal optional side of an outer join. Changes here can
+                // cascade to affect other tables' result set membership (e.g. a
+                // new match may activate a downstream join path that was previously
+                // NULL-padded). Invalidate if the row is relevant to this query.
+                self.row_constraints_match(&update_query.constraints, table_metadata, row_data)
+            }
         }
     }
 
@@ -449,9 +463,13 @@ impl CacheWriter {
         row_data: &[Option<String>],
         row_changes: &Row,
     ) -> bool {
-        // Subquery tables: always invalidate on UPDATE — column changes
-        // could shift set membership in either direction
-        if matches!(update_query.source, UpdateQuerySource::Subquery(_)) {
+        // Subquery and non-terminal outer join tables: always invalidate on
+        // UPDATE — column changes could shift set membership or cascade to
+        // affect downstream joins/predicates
+        if matches!(
+            update_query.source,
+            UpdateQuerySource::Subquery(_) | UpdateQuerySource::OuterJoinOptional
+        ) {
             return true;
         }
 

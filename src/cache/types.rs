@@ -82,6 +82,16 @@ pub enum UpdateQuerySource {
     Direct,
     /// Table appears inside a subquery, CTE, or derived table
     Subquery(SubqueryKind),
+    /// Table is on the terminal optional side of an outer join.
+    /// Its columns don't appear in WHERE or other join conditions, so
+    /// CDC INSERT/DELETE can be handled in place without invalidation.
+    /// The preserved side already has the row — changes here only affect
+    /// which values fill the NULL-padded columns.
+    OuterJoinTerminal,
+    /// Table is on the non-terminal optional side of an outer join
+    /// (its columns appear in WHERE or other join conditions).
+    /// CDC events trigger full query invalidation rather than row-level updates.
+    OuterJoinOptional,
 }
 
 /// Query used to update cached results when data changes

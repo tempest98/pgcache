@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::settings::PgSettings;
 
-use super::protocol::backend::{PgBackendMessageCodec, PgBackendMessageType, AUTHENTICATION_OK};
+use super::protocol::backend::{AUTHENTICATION_OK, PgBackendMessageCodec, PgBackendMessageType};
 use super::protocol::frontend::simple_query_message_build;
 
 /// Raw TCP connection to the cache database with PG protocol framing.
