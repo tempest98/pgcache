@@ -21,7 +21,7 @@ use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
 
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use crate::catalog::{ColumnMetadata, TableMetadata, cache_type_name_resolve};
 use crate::metrics::names;
@@ -105,6 +105,7 @@ impl CdcProcessor {
             tokio::select! {
                 // Handle incoming replication messages
                 msg_result = stream.next() => {
+                    trace!("cdc stream result {msg_result:?}");
                     match msg_result {
                         Some(Ok(msg)) => {
                             if let Err(e) = self.process_replication_message(msg, stream.as_mut()).await {

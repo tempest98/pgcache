@@ -479,14 +479,18 @@ pub fn select_node_columns_replace(node: &SelectNode, columns: SelectColumns) ->
 
 /// Replace SELECT columns in a ResolvedSelectNode for cache population fetches.
 ///
-/// This strips aggregation-related clauses (GROUP BY, HAVING) and DISTINCT because
-/// we want raw rows for caching, with aggregation performed at cache retrieval time.
+/// Strips aggregation-related clauses (GROUP BY, HAVING) because we want raw rows
+/// for caching, with aggregation performed at cache retrieval time.
+///
+/// Enables DISTINCT to deduplicate rows that appear multiple times due to JOIN fan-out.
+/// Population fetches each table independently using the full query (including JOINs),
+/// so a single table row can appear once per matching row in the joined table.
 pub fn resolved_select_node_replace(
     resolved: &ResolvedSelectNode,
     columns: ResolvedSelectColumns,
 ) -> ResolvedSelectNode {
     ResolvedSelectNode {
-        distinct: false,
+        distinct: true,
         columns,
         from: resolved.from.clone(),
         where_clause: resolved.where_clause.clone(),

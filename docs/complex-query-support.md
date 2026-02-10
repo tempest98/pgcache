@@ -360,13 +360,12 @@ limit
 
 ### Target Query Cacheability
 
-This query **cannot be cached** due to several design-level blockers:
+This query **cannot be cached** due to two remaining design-level blockers:
 
-- **LEFT JOIN** — `left join tb_accounts`, `left join tb_entities` — not cacheable (NULL semantics)
 - **LIMIT/OFFSET** — `limit 100 offset 0` — not cacheable at top level
 - **Non-deterministic functions** — `date_trunc('day', now())` — result changes over time
 
-The target query is useful as a parsing benchmark (can we parse all features?) but will need structural changes to become cacheable. A cacheable version would need to replace LEFT JOINs with INNER JOINs, remove LIMIT, and eliminate non-deterministic functions.
+LEFT JOINs are now cacheable (see below). A cacheable version would need to remove LIMIT and eliminate non-deterministic functions.
 
 ## Feature Status
 
@@ -375,6 +374,8 @@ The target query is useful as a parsing benchmark (can we parse all features?) b
 | Feature | Parsing | Resolution | Cacheability | Integration Tests |
 |---------|---------|------------|--------------|-------------------|
 | INNER JOINs (equality conditions) | `ast.rs` | `resolved.rs` | `query.rs` | multiple |
+| LEFT / RIGHT JOINs | `ast.rs` `JoinType` | `resolved.rs` `ResolvedJoinNode` | `query.rs` `is_supported_join` | `outer_join_test.rs` |
+| AND-of-equalities join conditions | `ast.rs` | `resolved.rs` | `query.rs` `join_condition_is_valid` | `outer_join_test.rs` |
 | Basic WHERE (`=`, `>=`, `<=`, `AND`, `OR`, `NOT`) | `parse.rs` | `resolved.rs` | `query.rs` | multiple |
 | IS NULL / IS NOT NULL in WHERE | `parse.rs` `null_test_convert` | `resolved.rs` | `query.rs` | multiple |
 | IN clause (value list) | `parse.rs` `a_expr_convert` | `resolved.rs` | `query.rs` | multiple |
@@ -388,7 +389,9 @@ The target query is useful as a parsing benchmark (can we parse all features?) b
 | CASE expressions (searched and simple) | `ast.rs` `CaseExpr` | `resolved.rs` `ResolvedCaseExpr` | `query.rs` | unit |
 | Arithmetic expressions (`+`, `-`, `*`, `/`) | `ast.rs` `ArithmeticExpr` | `resolved.rs` `ResolvedArithmeticExpr` | `query.rs` | unit |
 | Function calls in SELECT | `ast.rs` `FunctionCall` | `resolved.rs` | `query.rs` | unit |
+| Function calls in CASE WHEN | `parse.rs` `func_call_to_where_expr` | `resolved.rs` `ResolvedWhereExpr::Function` | `query.rs` — allowed in `SelectList` context only | unit |
 | GROUP BY | `ast.rs` | `resolved.rs` | `query.rs` — cacheable, aggregation at retrieval | unit |
+| HAVING | `ast.rs` `SelectNode.having` | `resolved.rs` | `query.rs` — re-evaluated at retrieval | unit |
 | Subqueries in FROM (derived tables) | `ast.rs` `TableSubqueryNode` | `resolved.rs` `ResolvedTableSubqueryNode` | `query.rs` `is_cacheable_table_subquery` | `subquery_test.rs` |
 | UNION / UNION ALL / INTERSECT / EXCEPT | `ast.rs` `SetOpNode` | `resolved.rs` `ResolvedSetOpNode` | `query.rs` `is_cacheable_set_op` | `set_operations_test.rs` |
 | CTEs (WITH ... AS) | `ast.rs` `CteDefinition`, `CteRefNode` | `resolved.rs` via `ResolvedTableSubqueryNode` | `query.rs` `is_cacheable_cte_ref` | `cte_test.rs` |
@@ -401,14 +404,14 @@ The target query is useful as a parsing benchmark (can we parse all features?) b
 | Feature | Reason | Notes |
 |---------|--------|-------|
 | LIMIT / OFFSET (top level) | Cache keys would vary per limit value | Allowed inside derived tables |
-| LEFT JOIN | NULL semantics on right side make cache invalidation unreliable | Parsed and resolved, rejected at cacheability |
+| FULL OUTER JOIN | Both sides optional — terminal analysis would need to apply to both sides | Less common in practice |
 | GROUP BY + LIMIT | Combined constraint | GROUP BY alone is cacheable |
 
 ### Not Supported
 
 | Feature | Parse | Resolve | Notes |
 |---------|-------|---------|-------|
-| FuncCall in WHERE/HAVING | No | No | `node_convert_to_expr` doesn't handle `NodeEnum::FuncCall`. `WhereExpr::Function` variant exists but is never produced. Needed for `HAVING SUM(x) > ...` |
+| FuncCall in WHERE/FROM | Parsed via `func_call_to_where_expr` | Resolved via `ResolvedWhereExpr::Function` | Rejected at cacheability in `WhereClause` and `FromClause` contexts. Allowed in `SelectList` context (CASE WHEN conditions in SELECT) |
 | Correlated subqueries | Yes | No — rejected with `CorrelatedSubqueryNotSupported` | Subqueries that reference outer table columns (e.g., `WHERE t2.id = t1.id`). Includes correlated EXISTS, NOT EXISTS, and scalar-in-SELECT |
 | RECURSIVE CTEs | No — rejected at parse time | No | `WITH RECURSIVE` explicitly rejected |
 | LATERAL subqueries | Yes | No | Rejected at cacheability (`is_cacheable_table_subquery` checks for lateral) |
@@ -416,7 +419,20 @@ The target query is useful as a parsing benchmark (can we parse all features?) b
 | Aggregate FILTER clause | No | No | `FILTER (WHERE ...)` on aggregates not parsed |
 | Non-deterministic functions | Parsed as regular functions | Resolved | Not detected — `now()`, `random()` etc. are cached as if deterministic |
 
-## CDC Invalidation for Subqueries
+## CDC Invalidation
+
+### Update Query Sources
+
+Tables are tracked via `UpdateQuerySource` which determines CDC behavior:
+
+| UpdateQuerySource | Description | CDC Behavior |
+|-------------------|-------------|--------------|
+| **Direct** | FROM clause tables, preserved side of outer joins | Standard invalidation checks |
+| **Subquery(kind)** | Tables within subqueries/CTEs | Directional based on SubqueryKind (see below) |
+| **OuterJoinTerminal** | Optional-side tables whose columns don't appear in WHERE or other join conditions | Row-level updates in place — no query invalidation needed |
+| **OuterJoinOptional** | Optional-side tables whose columns appear in WHERE or downstream joins | Conservative — triggers full query invalidation |
+
+### Subquery CDC Direction
 
 Subqueries and CTEs track `SubqueryKind` for directional CDC invalidation:
 
@@ -426,7 +442,13 @@ Subqueries and CTEs track `SubqueryKind` for directional CDC invalidation:
 | **Exclusion** (NOT IN) | Skips | Invalidates | Invalidates |
 | **Scalar** | Invalidates | Invalidates | Invalidates |
 
-Tables are tracked as either `Direct` (FROM clause) or `Subquery` (within a subquery/CTE) via `UpdateQuerySource`.
+### Outer Join CDC Semantics
+
+See [left-right-join-support.md](left-right-join-support.md) for full details. Summary:
+
+- **Terminal optional-side**: CDC INSERT/DELETE handled in place. The preserved side already has the row; changes only affect which values fill the NULL-padded columns.
+- **Non-terminal optional-side**: CDC events trigger full query invalidation (conservative but correct — changes could cascade into other tables' membership).
+- **Preserved side**: Remains `Direct`. INSERT triggers invalidation because optional-side rows matching the new preserved-side row may not be in cache.
 
 ## Integration Test Coverage
 
@@ -446,6 +468,13 @@ Tables are tracked as either `Direct` (FROM clause) or `Subquery` (within a subq
 | `tests/set_operations_test.rs` | `set_op_union` | UNION cache miss/hit |
 | | `set_op_union_cdc` | UNION with CDC updates |
 | | `set_op_union_all` | UNION ALL vs UNION deduplication |
+| `tests/outer_join_test.rs` | `test_left_join_terminal_cache_hit` | Terminal LEFT JOIN cache miss/hit |
+| | `test_left_join_terminal_cdc_insert_optional_side` | Terminal LEFT JOIN CDC INSERT — row added in place |
+| | `test_left_join_null_padding` | NULL padding then INSERT fills NULLs |
+| | `test_left_join_terminal_cdc_delete_optional_side` | Terminal LEFT JOIN CDC DELETE — row removed in place |
+| | `test_right_join_terminal_cache_hit` | Terminal RIGHT JOIN cache miss/hit |
+| | `test_left_join_non_terminal_cdc_invalidation` | Non-terminal optional-side CDC triggers full invalidation |
+| | `test_left_join_cdc_insert_preserved_side` | Preserved-side INSERT triggers invalidation |
 
 ### Not Tested (correlated subqueries — not supported)
 

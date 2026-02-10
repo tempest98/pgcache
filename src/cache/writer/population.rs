@@ -206,11 +206,7 @@ async fn population_stream(
     let pkey_positions: Vec<usize> = table
         .primary_key_columns
         .iter()
-        .filter_map(|pk| {
-            row_description
-                .iter()
-                .position(|c| c.name() == pk.as_str())
-        })
+        .filter_map(|pk| row_description.iter().position(|c| c.name() == pk.as_str()))
         .collect();
 
     let columns_joined = columns.join(",");
@@ -221,18 +217,19 @@ async fn population_stream(
     let table_name = &table.name;
 
     let mut cached_bytes: usize = 0;
-    let mut batch: Vec<String> = Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
+    let mut value_tuples: Vec<String> = Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
 
-    // Pre-compute the fixed prefix and suffix for INSERT statements
+    // Pre-compute the fixed prefix and suffix for the multi-row INSERT statement.
+    // Each batch produces a single: INSERT INTO ... VALUES (...), (...), ... ON CONFLICT ... DO UPDATE SET ...
     let insert_prefix =
-        format!("INSERT INTO \"{schema}\".\"{table_name}\"({columns_joined}) VALUES (");
-    let insert_suffix = format!(") ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}");
+        format!("INSERT INTO \"{schema}\".\"{table_name}\"({columns_joined}) VALUES ");
+    let insert_suffix = format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}");
 
     let num_columns = row_description.len();
     let mut values: Vec<String> = Vec::with_capacity(num_columns);
-    let mut insert_sql = String::new();
+    let mut tuple_buf = String::new();
 
-    // Consume stream, batching rows into INSERT statements
+    // Consume stream, batching rows into a single multi-row INSERT
     loop {
         match stream.next().await {
             Some(Ok(SimpleQueryMessage::Row(row))) => {
@@ -253,19 +250,21 @@ async fn population_stream(
                     );
                 }
 
-                insert_sql.clear();
-                insert_sql.push_str(&insert_prefix);
-                insert_sql.push_str(&values.join(","));
-                insert_sql.push_str(&insert_suffix);
+                tuple_buf.clear();
+                tuple_buf.push('(');
+                tuple_buf.push_str(&values.join(","));
+                tuple_buf.push(')');
 
-                batch.push(insert_sql.clone());
+                value_tuples.push(tuple_buf.clone());
 
-                if batch.len() >= POPULATION_INSERT_BATCH_SIZE {
-                    db_cache
-                        .batch_execute(&batch.join(";"))
-                        .await
-                        .map_into_report::<CacheError>()?;
-                    batch.clear();
+                if value_tuples.len() >= POPULATION_INSERT_BATCH_SIZE {
+                    population_batch_flush(
+                        db_cache,
+                        &insert_prefix,
+                        &insert_suffix,
+                        &mut value_tuples,
+                    )
+                    .await?;
                 }
             }
             Some(Ok(SimpleQueryMessage::CommandComplete(_))) => break,
@@ -276,12 +275,34 @@ async fn population_stream(
     }
 
     // Flush remaining rows
-    if !batch.is_empty() {
-        db_cache
-            .batch_execute(&batch.join(";"))
-            .await
-            .map_into_report::<CacheError>()?;
+    if !value_tuples.is_empty() {
+        population_batch_flush(db_cache, &insert_prefix, &insert_suffix, &mut value_tuples).await?;
     }
 
     Ok(cached_bytes)
+}
+
+/// Flush a batch of value tuples as a single multi-row INSERT statement.
+async fn population_batch_flush(
+    db_cache: &Client,
+    insert_prefix: &str,
+    insert_suffix: &str,
+    value_tuples: &mut Vec<String>,
+) -> CacheResult<()> {
+    let mut sql = String::with_capacity(
+        insert_prefix.len()
+            + insert_suffix.len()
+            + value_tuples.iter().map(|t| t.len() + 1).sum::<usize>(),
+    );
+    sql.push_str(insert_prefix);
+    sql.push_str(&value_tuples.join(","));
+    sql.push_str(insert_suffix);
+
+    db_cache
+        .batch_execute(&sql)
+        .await
+        .map_into_report::<CacheError>()?;
+
+    value_tuples.clear();
+    Ok(())
 }
