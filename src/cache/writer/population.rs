@@ -118,7 +118,7 @@ async fn population_task(
                 })?;
 
             let stream_start = Instant::now();
-            let bytes = population_stream(&db_origin, db_cache, table, branch).await?;
+            let bytes = population_stream(&db_origin, db_cache, table, table_node, branch).await?;
             let stream_elapsed = stream_start.elapsed();
 
             total_bytes += bytes;
@@ -154,15 +154,11 @@ async fn population_stream(
     db_origin: &Client,
     db_cache: &Client,
     table: &TableMetadata,
+    table_node: &ResolvedTableNode,
     branch: &ResolvedSelectNode,
 ) -> CacheResult<usize> {
     // Build the SELECT query
-    let maybe_alias = branch
-        .nodes::<ResolvedTableNode>()
-        .find(|tn| tn.relation_oid == table.relation_oid)
-        .and_then(|t| t.alias.as_deref());
-
-    let select_columns = table.resolved_select_columns(maybe_alias);
+    let select_columns = table.resolved_select_columns(table_node.alias.as_deref());
     let new_ast = resolved_select_node_replace(branch, select_columns);
     let mut buf = String::with_capacity(1024);
     new_ast.deparse(&mut buf);

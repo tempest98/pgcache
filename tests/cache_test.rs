@@ -201,6 +201,98 @@ async fn test_cache_join() -> Result<(), Error> {
     Ok(())
 }
 
+/// Test caching with self-join queries where the same table appears multiple
+/// times with different aliases. Exercises a bug where population would always
+/// use the first alias for a table, producing wrong data for subsequent instances.
+#[tokio::test]
+async fn test_cache_self_join() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table test_self (id integer primary key, data text)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "create table test_map_self (id serial primary key, test_id integer, data text)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "insert into test_self (id, data) values (1, 'foo'), (2, 'bar'), (3, 'bar')",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "insert into test_map_self (test_id, data) values (1, 'foo'), (2, 'foo')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Self-join: test_self appears as both t0 and t1, joined on data.
+    // t0 is filtered via test_map_self, t1 fans out on matching data.
+    // Before the fix, population used alias t0 for both instances of test_self,
+    // so the cache table for t1 would be populated with t0's rows instead.
+    let query_str = "\
+        select t0.id as t0_id, t0.data as t0_data, \
+        tm.id as tm_id, tm.test_id, tm.data as tm_data, \
+        t1.id as t1_id, t1.data as t1_data \
+        from test_self t0 \
+        inner join test_map_self tm on tm.test_id = t0.id \
+        inner join test_self t1 on t1.data = t0.data \
+        where tm.data = 'foo' \
+        order by t0.id, t1.id";
+
+    // Expected results:
+    //   t0(1,'foo') + tm(1,1,'foo') + t1(1,'foo')  -- only t1 with data='foo' is id=1
+    //   t0(2,'bar') + tm(2,2,'foo') + t1(2,'bar')  -- t1 with data='bar': id=2
+    //   t0(2,'bar') + tm(2,2,'foo') + t1(3,'bar')  -- t1 with data='bar': id=3
+
+    // First query — cache miss
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 5); // 3 rows + RowDescription + CommandComplete
+    assert_row_at(&res, 1, &[("t0_id", "1"), ("t0_data", "foo"), ("t1_id", "1"), ("t1_data", "foo")])?;
+    assert_row_at(&res, 2, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "2"), ("t1_data", "bar")])?;
+    assert_row_at(&res, 3, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "3"), ("t1_data", "bar")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // Second query — cache hit with identical data
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 5);
+    assert_row_at(&res, 1, &[("t0_id", "1"), ("t0_data", "foo"), ("t1_id", "1"), ("t1_data", "foo")])?;
+    assert_row_at(&res, 2, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "2"), ("t1_data", "bar")])?;
+    assert_row_at(&res, 3, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "3"), ("t1_data", "bar")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // CDC: insert a new row that joins into the self-join via data='bar'
+    ctx.origin_query(
+        "insert into test_self (id, data) values (4, 'bar')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Query after CDC — cache miss, now t1 has an additional match for data='bar'
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 6); // 4 rows now
+    assert_row_at(&res, 1, &[("t0_id", "1"), ("t1_id", "1")])?;
+    assert_row_at(&res, 2, &[("t0_id", "2"), ("t1_id", "2")])?;
+    assert_row_at(&res, 3, &[("t0_id", "2"), ("t1_id", "3")])?;
+    assert_row_at(&res, 4, &[("t0_id", "2"), ("t1_id", "4"), ("t1_data", "bar")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
 /// Test that indexes from the origin table are created on the cache table
 #[tokio::test]
 async fn test_cache_index_creation() -> Result<(), Error> {
