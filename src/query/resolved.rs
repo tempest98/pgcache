@@ -330,19 +330,43 @@ impl Deparse for ResolvedWhereExpr {
                     }
                     UnaryOp::Not => {
                         // Prefix operator: NOT expr
+                        // NOT has higher precedence than AND/OR, so NOT applied
+                        // to a logical binary expression needs parentheses.
+                        let needs_parens = matches!(
+                            unary.expr.as_ref(),
+                            ResolvedWhereExpr::Binary(child) if child.op.is_logical()
+                        );
                         unary.op.deparse(buf);
                         buf.push(' ');
+                        if needs_parens { buf.push('('); }
                         unary.expr.deparse(buf);
+                        if needs_parens { buf.push(')'); }
                     }
                 }
                 buf
             }
             ResolvedWhereExpr::Binary(binary) => {
+                let left_needs_parens = matches!(
+                    (&binary.op, binary.lexpr.as_ref()),
+                    (BinaryOp::And, ResolvedWhereExpr::Binary(child)) if child.op == BinaryOp::Or
+                );
+                let right_needs_parens = matches!(
+                    (&binary.op, binary.rexpr.as_ref()),
+                    (BinaryOp::And, ResolvedWhereExpr::Binary(child)) if child.op == BinaryOp::Or
+                );
+
+                if left_needs_parens { buf.push('('); }
                 binary.lexpr.deparse(buf);
+                if left_needs_parens { buf.push(')'); }
+
                 buf.push(' ');
                 binary.op.deparse(buf);
                 buf.push(' ');
+
+                if right_needs_parens { buf.push('('); }
                 binary.rexpr.deparse(buf);
+                if right_needs_parens { buf.push(')'); }
+
                 buf
             }
             ResolvedWhereExpr::Multi(multi) => {

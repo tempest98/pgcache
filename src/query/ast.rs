@@ -252,6 +252,13 @@ impl Deparse for BinaryOp {
     }
 }
 
+impl BinaryOp {
+    /// Returns true if this is a logical operator (AND/OR).
+    pub fn is_logical(&self) -> bool {
+        matches!(self, BinaryOp::And | BinaryOp::Or)
+    }
+}
+
 // Multi-operand operators (one subject with multiple values)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
 #[strum(serialize_all = "UPPERCASE")]
@@ -298,9 +305,18 @@ impl Deparse for UnaryExpr {
             }
             UnaryOp::Not => {
                 // Prefix operator: NOT expr
+                // NOT has higher precedence than AND/OR, so NOT applied to a
+                // logical binary expression needs parentheses to preserve
+                // semantics: NOT (a AND b) != NOT a AND b
+                let needs_parens = matches!(
+                    self.expr.as_ref(),
+                    WhereExpr::Binary(child) if child.op.is_logical()
+                );
                 self.op.deparse(buf);
                 buf.push(' ');
+                if needs_parens { buf.push('('); }
                 self.expr.deparse(buf);
+                if needs_parens { buf.push(')'); }
             }
         }
         buf
@@ -320,15 +336,40 @@ impl BinaryExpr {
         let children = self.lexpr.nodes().chain(self.rexpr.nodes());
         current.chain(children)
     }
+
+    /// Whether a child expression needs parentheses to preserve semantics.
+    /// This occurs when the child is a logical op with lower precedence than
+    /// the parent (i.e., OR nested inside AND).
+    fn child_needs_parens(&self, child: &WhereExpr) -> bool {
+        if let WhereExpr::Binary(child_expr) = child {
+            matches!((&self.op, &child_expr.op), (BinaryOp::And, BinaryOp::Or))
+        } else {
+            false
+        }
+    }
 }
 
 impl Deparse for BinaryExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.lexpr.deparse(buf);
+        if self.child_needs_parens(&self.lexpr) {
+            buf.push('(');
+            self.lexpr.deparse(buf);
+            buf.push(')');
+        } else {
+            self.lexpr.deparse(buf);
+        }
+
         buf.push(' ');
         self.op.deparse(buf);
         buf.push(' ');
-        self.rexpr.deparse(buf);
+
+        if self.child_needs_parens(&self.rexpr) {
+            buf.push('(');
+            self.rexpr.deparse(buf);
+            buf.push(')');
+        } else {
+            self.rexpr.deparse(buf);
+        }
 
         buf
     }
@@ -3648,6 +3689,37 @@ mod tests {
     }
 
     #[test]
+    fn test_deparse_not_with_and() {
+        // NOT has higher precedence than AND, so NOT (a AND b) must keep parens.
+        // Without them: NOT a AND b → (NOT a) AND b — different semantics.
+        let sql = "SELECT * FROM t WHERE NOT (x = 1 AND y = 2)";
+        let ast = parse_query(sql);
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+
+        assert!(
+            buf.contains("NOT (x = 1 AND y = 2)"),
+            "expected parentheses after NOT around AND, got: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_deparse_not_with_or() {
+        // Same issue: NOT (a OR b) must keep parens.
+        let sql = "SELECT * FROM t WHERE NOT (x = 1 OR y = 2)";
+        let ast = parse_query(sql);
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+
+        assert!(
+            buf.contains("NOT (x = 1 OR y = 2)"),
+            "expected parentheses after NOT around OR, got: {buf}"
+        );
+    }
+
+    #[test]
     fn test_select_deparse_with_where() {
         let sql = "SELECT * FROM users WHERE id = 1";
         let ast = parse_query(sql);
@@ -6172,6 +6244,41 @@ mod tests {
         let inner_tables = branches[1].0.direct_table_nodes();
         assert_eq!(inner_tables.len(), 1);
         assert_eq!(inner_tables[0].name, "users");
+    }
+
+    #[test]
+    fn test_deparse_or_inside_and_preserves_parentheses() {
+        // When an OR expression is nested inside an AND chain, parentheses must
+        // be emitted to preserve semantics. Without them:
+        //   a AND (b OR c) AND d  →  a AND b OR c AND d
+        // which changes evaluation due to AND binding tighter than OR.
+        let sql = "SELECT * FROM t WHERE (x = 1 OR y = 2) AND z = 3";
+        let ast = parse_query(sql);
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+
+        assert!(
+            buf.contains("(x = 1 OR y = 2)"),
+            "expected parentheses around OR inside AND chain, got: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_deparse_and_inside_or_no_unnecessary_parentheses() {
+        // AND inside OR doesn't need parentheses because AND already binds
+        // tighter than OR. The parser produces the same AST with or without
+        // parens, so the deparse should not add unnecessary ones.
+        let sql = "SELECT * FROM t WHERE x = 1 OR (y = 2 AND z = 3)";
+        let ast = parse_query(sql);
+
+        let mut buf = String::with_capacity(1024);
+        ast.deparse(&mut buf);
+
+        assert_eq!(
+            buf, "SELECT * FROM t WHERE x = 1 OR y = 2 AND z = 3",
+            "should not add unnecessary parentheses around AND inside OR"
+        );
     }
 
     #[test]
