@@ -344,7 +344,7 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
             {
                 replication_cleanup(settings)
                     .await
-                    .map_err(|r| Report::from(ConnectionError::CdcError(r.into_current_context())))
+                    .map_err(|r| r.context_transform(ConnectionError::CdcError))
                     .attach_loc("cleaning up replication")?;
                 Ok(())
             }

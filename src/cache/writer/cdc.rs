@@ -698,7 +698,7 @@ impl CacheWriter {
             table_metadata,
             row_data,
         )
-        .map_err(|e| CacheError::from(e.into_current_context()))?;
+        .map_err(|e| e.context_transform(CacheError::from))?;
         let mut select = String::with_capacity(1024);
         crate::query::ast::Deparse::deparse(&value_select, &mut select);
 

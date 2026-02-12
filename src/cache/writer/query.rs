@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use rootcause::Report;
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::catalog::TableMetadata;
@@ -94,7 +93,7 @@ impl CacheWriter {
         }
 
         let resolved = query_expr_resolve(&cacheable_query.query, &self.cache.tables, search_path)
-            .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
+            .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("resolving query expression")?;
 
         for (table_node, update_query_expr, source) in query_table_update_queries(cacheable_query, &resolved) {
@@ -117,7 +116,7 @@ impl CacheWriter {
 
             let update_resolved =
                 query_expr_resolve(&update_query_expr, &self.cache.tables, search_path)
-                    .map_err(|e| Report::from(CacheError::from(e.into_current_context())))
+                    .map_err(|e| e.context_transform(CacheError::from))
                     .attach_loc("resolving update query expression")?;
 
             let constraints = update_resolved
