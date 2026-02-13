@@ -272,6 +272,36 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
 
             Ok(WhereExpr::Multi(MultiExpr { op, exprs }))
         }
+        AExprKind::AexprBetween
+        | AExprKind::AexprNotBetween
+        | AExprKind::AexprBetweenSym
+        | AExprKind::AexprNotBetweenSym => {
+            // Handle BETWEEN / NOT BETWEEN / BETWEEN SYMMETRIC / NOT BETWEEN SYMMETRIC
+            // pg_query: lexpr = tested expression, rexpr = List([low, high])
+            let op = match expr.kind() {
+                AExprKind::AexprBetween => MultiOp::Between,
+                AExprKind::AexprNotBetween => MultiOp::NotBetween,
+                AExprKind::AexprBetweenSym => MultiOp::BetweenSymmetric,
+                _ => MultiOp::NotBetweenSymmetric,
+            };
+
+            let lexpr = expr
+                .lexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+            let rexpr = expr
+                .rexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+
+            let left_expr = node_convert_to_expr(lexpr)?;
+            let bounds = between_bounds_extract(rexpr)?;
+
+            Ok(WhereExpr::Multi(MultiExpr {
+                op,
+                exprs: vec![left_expr, bounds.0, bounds.1],
+            }))
+        }
         unsupported_kind => {
             dbg!(unsupported_kind);
             Err(WhereParseError::UnsupportedAExpr {
@@ -313,6 +343,28 @@ fn in_list_extract(node: &pg_query::Node) -> Result<Vec<WhereExpr>, WhereParseEr
     };
 
     list.items.iter().map(node_convert_to_expr).collect()
+}
+
+/// Extract lower and upper bounds from BETWEEN list (pg_query List with exactly 2 items)
+fn between_bounds_extract(
+    node: &pg_query::Node,
+) -> Result<(WhereExpr, WhereExpr), WhereParseError> {
+    let Some(NodeEnum::List(list)) = &node.node else {
+        return Err(WhereParseError::Other {
+            error: "BETWEEN clause: expected List on right side".to_owned(),
+        });
+    };
+
+    let [low, high] = list.items.as_slice() else {
+        return Err(WhereParseError::Other {
+            error: format!(
+                "BETWEEN clause: expected exactly 2 bounds, got {}",
+                list.items.len()
+            ),
+        });
+    };
+
+    Ok((node_convert_to_expr(low)?, node_convert_to_expr(high)?))
 }
 
 /// Extract operator from pg_query operator name nodes
@@ -1091,5 +1143,167 @@ mod tests {
             panic!("expected UnaryExpr on right side");
         };
         assert_eq!(unary.op, UnaryOp::IsNull);
+    }
+
+    #[test]
+    fn where_clause_between_integers() {
+        let result = where_clause_parse("SELECT * FROM t WHERE id BETWEEN 1 AND 10");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, MultiOp::Between);
+        assert_eq!(multi.exprs.len(), 3);
+
+        let WhereExpr::Column(col) = &multi.exprs[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "id");
+
+        let WhereExpr::Value(LiteralValue::Integer(low)) = &multi.exprs[1] else {
+            panic!("expected integer low bound");
+        };
+        assert_eq!(*low, 1);
+
+        let WhereExpr::Value(LiteralValue::Integer(high)) = &multi.exprs[2] else {
+            panic!("expected integer high bound");
+        };
+        assert_eq!(*high, 10);
+    }
+
+    #[test]
+    fn where_clause_not_between() {
+        let result = where_clause_parse("SELECT * FROM t WHERE price NOT BETWEEN 100 AND 200");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, MultiOp::NotBetween);
+        assert_eq!(multi.exprs.len(), 3);
+    }
+
+    #[test]
+    fn where_clause_between_with_parameters() {
+        let result = where_clause_parse("SELECT * FROM t WHERE created_at BETWEEN $1 AND $2");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, MultiOp::Between);
+        assert_eq!(multi.exprs.len(), 3);
+
+        let WhereExpr::Value(LiteralValue::Parameter(p1)) = &multi.exprs[1] else {
+            panic!("expected parameter low bound");
+        };
+        assert_eq!(p1, "$1");
+
+        let WhereExpr::Value(LiteralValue::Parameter(p2)) = &multi.exprs[2] else {
+            panic!("expected parameter high bound");
+        };
+        assert_eq!(p2, "$2");
+    }
+
+    #[test]
+    fn where_clause_between_combined_with_and() {
+        let result = where_clause_parse(
+            "SELECT * FROM t WHERE tenant_id = 1 AND price BETWEEN 10 AND 50",
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::And);
+
+        let WhereExpr::Multi(multi) = binary.rexpr.as_ref() else {
+            panic!("expected MultiExpr on right side");
+        };
+        assert_eq!(multi.op, MultiOp::Between);
+    }
+
+    #[test]
+    fn where_clause_between_strings() {
+        let result =
+            where_clause_parse("SELECT * FROM t WHERE name BETWEEN 'alice' AND 'charlie'");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, MultiOp::Between);
+
+        let WhereExpr::Value(LiteralValue::String(low)) = &multi.exprs[1] else {
+            panic!("expected string low bound");
+        };
+        assert_eq!(low, "alice");
+
+        let WhereExpr::Value(LiteralValue::String(high)) = &multi.exprs[2] else {
+            panic!("expected string high bound");
+        };
+        assert_eq!(high, "charlie");
+    }
+
+    #[test]
+    fn where_clause_between_symmetric() {
+        let result = where_clause_parse("SELECT * FROM t WHERE id BETWEEN SYMMETRIC 10 AND 1");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, MultiOp::BetweenSymmetric);
+        assert_eq!(multi.exprs.len(), 3);
+
+        let WhereExpr::Column(col) = &multi.exprs[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "id");
+
+        let WhereExpr::Value(LiteralValue::Integer(low)) = &multi.exprs[1] else {
+            panic!("expected integer low bound");
+        };
+        assert_eq!(*low, 10);
+
+        let WhereExpr::Value(LiteralValue::Integer(high)) = &multi.exprs[2] else {
+            panic!("expected integer high bound");
+        };
+        assert_eq!(*high, 1);
+    }
+
+    #[test]
+    fn where_clause_not_between_symmetric() {
+        let result =
+            where_clause_parse("SELECT * FROM t WHERE id NOT BETWEEN SYMMETRIC 10 AND 1");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(multi.op, MultiOp::NotBetweenSymmetric);
+        assert_eq!(multi.exprs.len(), 3);
     }
 }

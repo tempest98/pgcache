@@ -269,15 +269,18 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
         WhereExpr::Value(_) => Ok(()),
         WhereExpr::Column(_) => Ok(()),
         WhereExpr::Multi(multi_expr) => match multi_expr.op {
-            MultiOp::In | MultiOp::NotIn => {
+            MultiOp::In
+            | MultiOp::NotIn
+            | MultiOp::Between
+            | MultiOp::NotBetween
+            | MultiOp::BetweenSymmetric
+            | MultiOp::NotBetweenSymmetric => {
                 for e in &multi_expr.exprs {
                     is_cacheable_expr(e, ctx)?;
                 }
                 Ok(())
             }
-            MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => {
-                Err(CacheabilityError::UnsupportedWhereClause)
-            }
+            MultiOp::Any | MultiOp::All => Err(CacheabilityError::UnsupportedWhereClause),
         },
         WhereExpr::Unary(unary_expr) => is_cacheable_expr(&unary_expr.expr, ctx),
         WhereExpr::Function { args, .. } => match ctx {

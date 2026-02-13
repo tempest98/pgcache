@@ -269,6 +269,10 @@ pub enum MultiOp {
     Between,
     #[strum(to_string = "NOT BETWEEN")]
     NotBetween,
+    #[strum(to_string = "BETWEEN SYMMETRIC")]
+    BetweenSymmetric,
+    #[strum(to_string = "NOT BETWEEN SYMMETRIC")]
+    NotBetweenSymmetric,
     Any,
     All,
 }
@@ -408,7 +412,23 @@ impl Deparse for MultiExpr {
         match self.op {
             MultiOp::In => buf.push_str(" IN ("),
             MultiOp::NotIn => buf.push_str(" NOT IN ("),
-            MultiOp::Between | MultiOp::NotBetween | MultiOp::Any | MultiOp::All => {
+            MultiOp::Between
+            | MultiOp::NotBetween
+            | MultiOp::BetweenSymmetric
+            | MultiOp::NotBetweenSymmetric => {
+                buf.push(' ');
+                self.op.deparse(buf);
+                buf.push(' ');
+                // BETWEEN low AND high — exactly 2 bounds
+                let mut sep = "";
+                for expr in rest {
+                    buf.push_str(sep);
+                    expr.deparse(buf);
+                    sep = " AND ";
+                }
+                return buf;
+            }
+            MultiOp::Any | MultiOp::All => {
                 buf.push(' ');
                 self.op.deparse(buf);
                 buf.push_str(" (");
