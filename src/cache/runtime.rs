@@ -4,8 +4,9 @@ use std::time::Instant;
 
 use tokio::{
     runtime::Builder,
-    sync::mpsc::{
-        Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+    sync::{
+        mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel},
+        oneshot,
     },
     task::{LocalSet, spawn_local},
 };
@@ -16,7 +17,7 @@ use crate::{
     cache::{
         CacheError, CacheResult, MapIntoReport, ReportExt,
         cdc::CdcProcessor,
-        messages::{CacheReply, CdcCommand, CdcMessage, ProxyMessage},
+        messages::{CacheReply, CdcCommand, ProxyMessage},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
         types::{ActiveRelations, CacheStateView},
         worker::handle_cached_query,
@@ -52,31 +53,6 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
             // Forward to origin when parameter conversion fails
             let _ = proxy_msg.reply_tx.send(CacheReply::Forward(data)).await;
         }
-    }
-}
-
-/// Handles a CDC message by forwarding to the writer thread
-fn handle_cdc_message(cdc_cmd_tx: &UnboundedSender<CdcCommand>, msg: CdcMessage) {
-    let cmd = match msg {
-        CdcMessage::Register(table_metadata) => CdcCommand::TableRegister(table_metadata),
-        CdcMessage::Insert(relation_oid, row_data) => CdcCommand::Insert {
-            relation_oid,
-            row_data,
-        },
-        CdcMessage::Update(update) => CdcCommand::Update {
-            relation_oid: update.relation_oid,
-            key_data: update.key_data,
-            row_data: update.row_data,
-        },
-        CdcMessage::Delete(relation_oid, row_data) => CdcCommand::Delete {
-            relation_oid,
-            row_data,
-        },
-        CdcMessage::Truncate(relation_oids) => CdcCommand::Truncate { relation_oids },
-    };
-
-    if let Err(e) = cdc_cmd_tx.send(cmd) {
-        error!("failed to send to writer: {e}");
     }
 }
 
@@ -265,13 +241,15 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
             .map_into_report::<CacheError>()
             .attach_loc("spawning worker thread")?;
 
-        // Spawn CDC thread
-        let (cdc_tx, mut cdc_rx) = unbounded_channel();
+        // Spawn CDC thread -- sends CdcCommand directly to writer
+        let (cdc_exit_tx, mut cdc_exit_rx) = oneshot::channel::<()>();
         let active_relations_cdc = Arc::clone(&active_relations);
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
             .spawn_scoped(scope, move || {
-                cdc_run(settings, cdc_tx, active_relations_cdc)
+                // cdc_exit_tx drops when this closure returns, signaling the runtime
+                let _cdc_exit = cdc_exit_tx;
+                cdc_run(settings, cdc_cmd_tx, active_relations_cdc)
             })
             .map_into_report::<CacheError>()
             .attach_loc("spawning CDC thread")?;
@@ -297,14 +275,9 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                                 error!("writer thread exited unexpectedly");
                                 return Err(CacheError::WriterFailure.into());
                             }
-                            msg = cdc_rx.recv() => {
-                                match msg {
-                                    Some(msg) => handle_cdc_message(&cdc_cmd_tx, msg),
-                                    None => {
-                                        error!("CDC channel closed unexpectedly");
-                                        return Err(CacheError::CdcFailure.into());
-                                    }
-                                }
+                            _ = &mut cdc_exit_rx => {
+                                error!("CDC thread exited unexpectedly");
+                                return Err(CacheError::CdcFailure.into());
                             }
                             msg = cache_rx.recv() => {
                                 match msg {
@@ -322,7 +295,6 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
                             }
                         }
 
-                        metrics::gauge!(names::CACHE_CDC_MESSAGE_QUEUE).set(cdc_rx.len() as f64);
                         metrics::gauge!(names::CACHE_PROXY_MESSAGE_QUEUE)
                             .set(cache_rx.len() as f64);
                     }
@@ -394,7 +366,7 @@ fn worker_run(
 /// The CDC processor should run indefinitely, so any exit is considered a failure.
 fn cdc_run(
     settings: &Settings,
-    cdc_tx: UnboundedSender<CdcMessage>,
+    cdc_tx: UnboundedSender<CdcCommand>,
     active_relations: ActiveRelations,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()

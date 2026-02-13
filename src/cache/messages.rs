@@ -124,24 +124,6 @@ pub enum CacheReply {
     Error(BytesMut),
 }
 
-/// CDC update message containing both key and row data
-#[derive(Debug)]
-pub struct CdcMessageUpdate {
-    pub relation_oid: u32,
-    pub key_data: Vec<Option<String>>,
-    pub row_data: Vec<Option<String>>,
-}
-
-/// Messages for CDC (Change Data Capture) processing
-#[derive(Debug)]
-pub(crate) enum CdcMessage {
-    Register(crate::catalog::TableMetadata),
-    Insert(u32, Vec<Option<String>>),
-    Update(CdcMessageUpdate),
-    Delete(u32, Vec<Option<String>>),
-    Truncate(Vec<u32>),
-}
-
 /// Message from proxy containing query and connection details
 pub struct ProxyMessage {
     pub message: CacheMessage,

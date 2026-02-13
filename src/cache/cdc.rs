@@ -30,7 +30,7 @@ use crate::settings::Settings;
 
 use super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{CdcMessage, CdcMessageUpdate},
+    messages::CdcCommand,
     types::ActiveRelations,
 };
 
@@ -41,7 +41,7 @@ pub struct CdcProcessor {
     publication_name: String,
     slot_name: String,
 
-    cdc_tx: UnboundedSender<CdcMessage>,
+    cdc_tx: UnboundedSender<CdcCommand>,
     /// Shared set of relation OIDs with active cached queries (maintained by writer).
     active_relations: ActiveRelations,
 
@@ -57,7 +57,7 @@ impl CdcProcessor {
     /// Creates a new CdcProcessor with the provided CDC client and cache.
     pub async fn new(
         settings: &Settings,
-        cdc_tx: UnboundedSender<CdcMessage>,
+        cdc_tx: UnboundedSender<CdcCommand>,
         active_relations: ActiveRelations,
     ) -> CacheResult<Self> {
         let origin_cdc_client = connect_replication(&settings.replication, "CDC replication")
@@ -327,7 +327,7 @@ impl CdcProcessor {
         let table_metadata = self.parse_relation_to_table_metadata(body);
 
         // Register table metadata in cache
-        if let Err(e) = self.cdc_tx.send(CdcMessage::Register(table_metadata)) {
+        if let Err(e) = self.cdc_tx.send(CdcCommand::TableRegister(table_metadata)) {
             //todo, halt use of cache and fallback to proxy only mode
             error!("Failed to register table from CDC: {e:?}");
         }
@@ -354,7 +354,10 @@ impl CdcProcessor {
         let row_data = self.parse_insert_row_data(body)?;
 
         // Let cache handle the insert with query-aware filtering
-        if let Err(e) = self.cdc_tx.send(CdcMessage::Insert(relation_oid, row_data)) {
+        if let Err(e) = self.cdc_tx.send(CdcCommand::Insert {
+            relation_oid,
+            row_data,
+        }) {
             //todo, halt use of cache and fallback to proxy only mode
             error!("Failed to handle INSERT for relation {relation_oid}: {e:?}");
         }
@@ -376,11 +379,11 @@ impl CdcProcessor {
         let (key_data, new_row_data) = self.parse_update_row_data(body)?;
 
         // Let cache handle the update with query-aware filtering
-        if let Err(e) = self.cdc_tx.send(CdcMessage::Update(CdcMessageUpdate {
+        if let Err(e) = self.cdc_tx.send(CdcCommand::Update {
             relation_oid,
             key_data,
             row_data: new_row_data,
-        })) {
+        }) {
             //todo, halt use of cache and fallback to proxy only mode
             error!("Failed to handle UPDATE for relation {relation_oid}: {e:?}");
         }
@@ -402,7 +405,10 @@ impl CdcProcessor {
         let row_data = self.parse_delete_row_data(body)?;
 
         // Let cache handle the delete with query-aware filtering
-        if let Err(e) = self.cdc_tx.send(CdcMessage::Delete(relation_oid, row_data)) {
+        if let Err(e) = self.cdc_tx.send(CdcCommand::Delete {
+            relation_oid,
+            row_data,
+        }) {
             //todo, halt use of cache and fallback to proxy only mode
             error!("Failed to handle DELETE for relation {relation_oid}: {e:?}");
         }
@@ -418,7 +424,9 @@ impl CdcProcessor {
                 ids.push(id);
             }
         }
-        if let Err(e) = self.cdc_tx.send(CdcMessage::Truncate(ids)) {
+        if let Err(e) = self.cdc_tx.send(CdcCommand::Truncate {
+            relation_oids: ids,
+        }) {
             //todo, halt use of cache and fallback to proxy only mode
             error!("Failed to handle truncate from CDC: {e:?}");
         }

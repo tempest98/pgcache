@@ -1827,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "pgcache"
-version = "0.1.0"
+version = "0.3.4"
 dependencies = [
  "async-stream",
  "criterion",

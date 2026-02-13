@@ -44,7 +44,6 @@ pub mod names {
     pub const CACHE_WRITER_CDC_QUEUE: &str = "pgcache.cache.writer_cdc_queue";
     pub const CACHE_WRITER_INTERNAL_QUEUE: &str = "pgcache.cache.writer_internal_queue";
     pub const CACHE_WORKER_QUEUE: &str = "pgcache.cache.worker_queue";
-    pub const CACHE_CDC_MESSAGE_QUEUE: &str = "pgcache.cache.cdc_message_queue";
     pub const CACHE_POPULATION_WORKER_QUEUE: &str = "pgcache.cache.population_worker_queue";
     pub const CACHE_PROXY_MESSAGE_QUEUE: &str = "pgcache.cache.proxy_message_queue";
     pub const PROXY_WORKER_QUEUE: &str = "pgcache.proxy.worker_queue";
