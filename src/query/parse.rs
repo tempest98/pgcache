@@ -302,6 +302,26 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
                 exprs: vec![left_expr, bounds.0, bounds.1],
             }))
         }
+        AExprKind::AexprLike | AExprKind::AexprIlike => {
+            // Handle LIKE / ILIKE / NOT LIKE / NOT ILIKE
+            // pg_query name: "~~" LIKE, "!~~" NOT LIKE, "~~*" ILIKE, "!~~*" NOT ILIKE
+            let op = like_operator_extract(&expr.name)?;
+
+            let lexpr = expr
+                .lexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+            let rexpr = expr
+                .rexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+
+            Ok(WhereExpr::Binary(BinaryExpr {
+                op,
+                lexpr: Box::new(node_convert_to_expr(lexpr)?),
+                rexpr: Box::new(node_convert_to_expr(rexpr)?),
+            }))
+        }
         AExprKind::AexprOpAny | AExprKind::AexprOpAll => {
             // Handle col = ANY(...) / col = ALL(...)
             // pg_query: name = operator (e.g. "="), lexpr = tested expression,
@@ -409,6 +429,34 @@ fn any_all_rexpr_convert(node: &pg_query::Node) -> Result<WhereExpr, WhereParseE
             Ok(WhereExpr::Array(elems))
         }
         _ => node_convert_to_expr(node),
+    }
+}
+
+/// Extract LIKE/ILIKE operator from pg_query name nodes.
+///
+/// pg_query uses internal operator names: `~~` (LIKE), `!~~` (NOT LIKE),
+/// `~~*` (ILIKE), `!~~*` (NOT ILIKE).
+fn like_operator_extract(name_nodes: &[pg_query::Node]) -> Result<BinaryOp, WhereParseError> {
+    let [name_node] = name_nodes else {
+        return Err(WhereParseError::Other {
+            error: "LIKE operator: expected single name node".to_owned(),
+        });
+    };
+
+    let Some(NodeEnum::String(name_str)) = &name_node.node else {
+        return Err(WhereParseError::Other {
+            error: "LIKE operator: expected string node".to_owned(),
+        });
+    };
+
+    match name_str.sval.as_str() {
+        "~~" => Ok(BinaryOp::Like),
+        "!~~" => Ok(BinaryOp::NotLike),
+        "~~*" => Ok(BinaryOp::ILike),
+        "!~~*" => Ok(BinaryOp::NotILike),
+        other => Err(WhereParseError::UnsupportedOperator {
+            operator: format!("LIKE with operator '{other}'"),
+        }),
     }
 }
 
@@ -867,18 +915,27 @@ mod tests {
     }
 
     #[test]
-    fn where_clause_unsupported_operator() {
-        let result = where_clause_parse("SELECT id FROM test WHERE id LIKE 'test%'");
+    fn where_clause_like() {
+        let result = where_clause_parse("SELECT id FROM test WHERE name LIKE 'test%'");
 
-        assert!(result.is_err());
-        // LIKE uses AexprLike, not AexprOp, so it fails with UnsupportedAExpr
-        assert!(
-            matches!(
-                result.unwrap_err(),
-                AstError::WhereParseError(WhereParseError::UnsupportedAExpr { .. })
-            ),
-            "Expected UnsupportedAExpr error for LIKE"
-        );
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::Like);
+
+        let WhereExpr::Column(col) = binary.lexpr.as_ref() else {
+            panic!("expected Column on left");
+        };
+        assert_eq!(col.column, "name");
+
+        let WhereExpr::Value(LiteralValue::String(pattern)) = binary.rexpr.as_ref() else {
+            panic!("expected string pattern on right");
+        };
+        assert_eq!(pattern, "test%");
     }
 
     #[test]
@@ -1262,9 +1319,8 @@ mod tests {
 
     #[test]
     fn where_clause_between_combined_with_and() {
-        let result = where_clause_parse(
-            "SELECT * FROM t WHERE tenant_id = 1 AND price BETWEEN 10 AND 50",
-        );
+        let result =
+            where_clause_parse("SELECT * FROM t WHERE tenant_id = 1 AND price BETWEEN 10 AND 50");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1283,8 +1339,7 @@ mod tests {
 
     #[test]
     fn where_clause_between_strings() {
-        let result =
-            where_clause_parse("SELECT * FROM t WHERE name BETWEEN 'alice' AND 'charlie'");
+        let result = where_clause_parse("SELECT * FROM t WHERE name BETWEEN 'alice' AND 'charlie'");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1338,8 +1393,7 @@ mod tests {
 
     #[test]
     fn where_clause_not_between_symmetric() {
-        let result =
-            where_clause_parse("SELECT * FROM t WHERE id NOT BETWEEN SYMMETRIC 10 AND 1");
+        let result = where_clause_parse("SELECT * FROM t WHERE id NOT BETWEEN SYMMETRIC 10 AND 1");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1458,9 +1512,8 @@ mod tests {
 
     #[test]
     fn where_clause_any_combined_with_and() {
-        let result = where_clause_parse(
-            "SELECT * FROM t WHERE tenant_id = 1 AND id = ANY(ARRAY[10, 20])",
-        );
+        let result =
+            where_clause_parse("SELECT * FROM t WHERE tenant_id = 1 AND id = ANY(ARRAY[10, 20])");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();
@@ -1482,4 +1535,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn where_clause_not_like() {
+        let result = where_clause_parse("SELECT * FROM t WHERE name NOT LIKE '%test%'");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::NotLike);
+    }
+
+    #[test]
+    fn where_clause_ilike() {
+        let result = where_clause_parse("SELECT * FROM t WHERE name ILIKE '%test%'");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::ILike);
+    }
+
+    #[test]
+    fn where_clause_not_ilike() {
+        let result = where_clause_parse("SELECT * FROM t WHERE name NOT ILIKE '%test%'");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::NotILike);
+    }
+
+    #[test]
+    fn where_clause_like_with_parameter() {
+        let result = where_clause_parse("SELECT * FROM t WHERE name LIKE $1");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::Like);
+
+        let WhereExpr::Value(LiteralValue::Parameter(p)) = binary.rexpr.as_ref() else {
+            panic!("expected parameter on right");
+        };
+        assert_eq!(p, "$1");
+    }
+
+    #[test]
+    fn where_clause_like_combined_with_and() {
+        let result =
+            where_clause_parse("SELECT * FROM t WHERE tenant_id = 1 AND name LIKE 'test%'");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::And);
+
+        let WhereExpr::Binary(right) = binary.rexpr.as_ref() else {
+            panic!("expected BinaryExpr on right side");
+        };
+        assert_eq!(right.op, BinaryOp::Like);
+    }
 }

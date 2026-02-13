@@ -264,7 +264,8 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
                 is_cacheable_expr(&binary_expr.rexpr, ctx)
             }
             BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => {
-                Err(CacheabilityError::UnsupportedWhereClause)
+                is_cacheable_expr(&binary_expr.lexpr, ctx)?;
+                is_cacheable_expr(&binary_expr.rexpr, ctx)
             }
         },
         WhereExpr::Value(_) => Ok(()),
