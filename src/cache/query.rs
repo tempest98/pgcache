@@ -186,6 +186,7 @@ fn join_condition_is_valid(expr: &WhereExpr) -> bool {
         | WhereExpr::Column(_)
         | WhereExpr::Unary(_)
         | WhereExpr::Multi(_)
+        | WhereExpr::Array(_)
         | WhereExpr::Function { .. }
         | WhereExpr::Subquery { .. } => false,
     }
@@ -280,8 +281,14 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
                 }
                 Ok(())
             }
-            MultiOp::Any | MultiOp::All => Err(CacheabilityError::UnsupportedWhereClause),
+            MultiOp::Any { .. } | MultiOp::All { .. } => {
+                for e in &multi_expr.exprs {
+                    is_cacheable_expr(e, ctx)?;
+                }
+                Ok(())
+            }
         },
+        WhereExpr::Array(elems) => elems.iter().try_for_each(|e| is_cacheable_expr(e, ctx)),
         WhereExpr::Unary(unary_expr) => is_cacheable_expr(&unary_expr.expr, ctx),
         WhereExpr::Function { args, .. } => match ctx {
             ExprContext::FromClause | ExprContext::WhereClause => {

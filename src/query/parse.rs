@@ -302,6 +302,33 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
                 exprs: vec![left_expr, bounds.0, bounds.1],
             }))
         }
+        AExprKind::AexprOpAny | AExprKind::AexprOpAll => {
+            // Handle col = ANY(...) / col = ALL(...)
+            // pg_query: name = operator (e.g. "="), lexpr = tested expression,
+            // rexpr = array expression (AArrayExpr, ParamRef, or ColumnRef)
+            let comparison = operator_extract(&expr.name)?;
+            let op = match expr.kind() {
+                AExprKind::AexprOpAny => MultiOp::Any { comparison },
+                _ => MultiOp::All { comparison },
+            };
+
+            let lexpr = expr
+                .lexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+            let rexpr = expr
+                .rexpr
+                .as_ref()
+                .ok_or(WhereParseError::MissingExpression)?;
+
+            let left_expr = node_convert_to_expr(lexpr)?;
+            let right_expr = any_all_rexpr_convert(rexpr)?;
+
+            Ok(WhereExpr::Multi(MultiExpr {
+                op,
+                exprs: vec![left_expr, right_expr],
+            }))
+        }
         unsupported_kind => {
             dbg!(unsupported_kind);
             Err(WhereParseError::UnsupportedAExpr {
@@ -365,6 +392,24 @@ fn between_bounds_extract(
     };
 
     Ok((node_convert_to_expr(low)?, node_convert_to_expr(high)?))
+}
+
+/// Convert the right-hand side of ANY/ALL to a WhereExpr.
+///
+/// The rexpr can be an array constructor (ARRAY[1,2,3]) → `WhereExpr::Array`,
+/// or a single expression (parameter $1, column ref) → passed through as-is.
+fn any_all_rexpr_convert(node: &pg_query::Node) -> Result<WhereExpr, WhereParseError> {
+    match &node.node {
+        Some(NodeEnum::AArrayExpr(array_expr)) => {
+            let elems = array_expr
+                .elements
+                .iter()
+                .map(node_convert_to_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(WhereExpr::Array(elems))
+        }
+        _ => node_convert_to_expr(node),
+    }
 }
 
 /// Extract operator from pg_query operator name nodes
@@ -1306,4 +1351,135 @@ mod tests {
         assert_eq!(multi.op, MultiOp::NotBetweenSymmetric);
         assert_eq!(multi.exprs.len(), 3);
     }
+
+    #[test]
+    fn where_clause_any_with_array() {
+        let result = where_clause_parse("SELECT * FROM t WHERE id = ANY(ARRAY[1, 2, 3])");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(
+            multi.op,
+            MultiOp::Any {
+                comparison: BinaryOp::Equal
+            }
+        );
+        // [col, ARRAY[1, 2, 3]]
+        assert_eq!(multi.exprs.len(), 2);
+
+        let WhereExpr::Column(col) = &multi.exprs[0] else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "id");
+
+        let WhereExpr::Array(elems) = &multi.exprs[1] else {
+            panic!("expected Array");
+        };
+        assert_eq!(elems.len(), 3);
+
+        let WhereExpr::Value(LiteralValue::Integer(v1)) = &elems[0] else {
+            panic!("expected integer");
+        };
+        assert_eq!(*v1, 1);
+    }
+
+    #[test]
+    fn where_clause_any_with_parameter() {
+        let result = where_clause_parse("SELECT * FROM t WHERE id = ANY($1)");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(
+            multi.op,
+            MultiOp::Any {
+                comparison: BinaryOp::Equal
+            }
+        );
+        // [col, $1] — parameter passed through as single value
+        assert_eq!(multi.exprs.len(), 2);
+
+        let WhereExpr::Value(LiteralValue::Parameter(p)) = &multi.exprs[1] else {
+            panic!("expected parameter");
+        };
+        assert_eq!(p, "$1");
+    }
+
+    #[test]
+    fn where_clause_all_with_array() {
+        let result = where_clause_parse("SELECT * FROM t WHERE score > ALL(ARRAY[80, 90])");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(
+            multi.op,
+            MultiOp::All {
+                comparison: BinaryOp::GreaterThan
+            }
+        );
+        // [col, ARRAY[80, 90]]
+        assert_eq!(multi.exprs.len(), 2);
+    }
+
+    #[test]
+    fn where_clause_any_not_equal() {
+        let result = where_clause_parse("SELECT * FROM t WHERE status <> ANY(ARRAY['a', 'b'])");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Multi(multi) = where_clause else {
+            panic!("expected MultiExpr");
+        };
+
+        assert_eq!(
+            multi.op,
+            MultiOp::Any {
+                comparison: BinaryOp::NotEqual
+            }
+        );
+        // [col, ARRAY['a', 'b']]
+        assert_eq!(multi.exprs.len(), 2);
+    }
+
+    #[test]
+    fn where_clause_any_combined_with_and() {
+        let result = where_clause_parse(
+            "SELECT * FROM t WHERE tenant_id = 1 AND id = ANY(ARRAY[10, 20])",
+        );
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::And);
+
+        let WhereExpr::Multi(multi) = binary.rexpr.as_ref() else {
+            panic!("expected MultiExpr on right side");
+        };
+        assert_eq!(
+            multi.op,
+            MultiOp::Any {
+                comparison: BinaryOp::Equal
+            }
+        );
+    }
+
 }

@@ -200,6 +200,11 @@ fn where_expr_parameters_replace(
                 where_expr_parameters_replace(expr, parameters)?;
             }
         }
+        WhereExpr::Array(elems) => {
+            for elem in elems {
+                where_expr_parameters_replace(elem, parameters)?;
+            }
+        }
         WhereExpr::Function { args, .. } => {
             for arg in args {
                 where_expr_parameters_replace(arg, parameters)?;
@@ -672,6 +677,11 @@ fn resolved_where_column_alias_update(
         ResolvedWhereExpr::Multi(multi) => {
             for e in &mut multi.exprs {
                 resolved_where_column_alias_update(e, schema, table, alias);
+            }
+        }
+        ResolvedWhereExpr::Array(elems) => {
+            for elem in elems {
+                resolved_where_column_alias_update(elem, schema, table, alias);
             }
         }
         ResolvedWhereExpr::Function { args, .. } => {

@@ -260,26 +260,38 @@ impl BinaryOp {
 }
 
 // Multi-operand operators (one subject with multiple values)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, AsRefStr)]
-#[strum(serialize_all = "UPPERCASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MultiOp {
     In,
-    #[strum(to_string = "NOT IN")]
     NotIn,
     Between,
-    #[strum(to_string = "NOT BETWEEN")]
     NotBetween,
-    #[strum(to_string = "BETWEEN SYMMETRIC")]
     BetweenSymmetric,
-    #[strum(to_string = "NOT BETWEEN SYMMETRIC")]
     NotBetweenSymmetric,
-    Any,
-    All,
+    /// `expr op ANY (values)` — comparison operator determines the test
+    Any { comparison: BinaryOp },
+    /// `expr op ALL (values)` — comparison operator determines the test
+    All { comparison: BinaryOp },
 }
 
 impl Deparse for MultiOp {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        buf.push_str(self.as_ref());
+        match self {
+            MultiOp::In => buf.push_str("IN"),
+            MultiOp::NotIn => buf.push_str("NOT IN"),
+            MultiOp::Between => buf.push_str("BETWEEN"),
+            MultiOp::NotBetween => buf.push_str("NOT BETWEEN"),
+            MultiOp::BetweenSymmetric => buf.push_str("BETWEEN SYMMETRIC"),
+            MultiOp::NotBetweenSymmetric => buf.push_str("NOT BETWEEN SYMMETRIC"),
+            MultiOp::Any { comparison } => {
+                comparison.deparse(buf);
+                buf.push_str(" ANY");
+            }
+            MultiOp::All { comparison } => {
+                comparison.deparse(buf);
+                buf.push_str(" ALL");
+            }
+        }
         buf
     }
 }
@@ -428,7 +440,7 @@ impl Deparse for MultiExpr {
                 }
                 return buf;
             }
-            MultiOp::Any | MultiOp::All => {
+            MultiOp::Any { .. } | MultiOp::All { .. } => {
                 buf.push(' ');
                 self.op.deparse(buf);
                 buf.push_str(" (");
@@ -459,6 +471,9 @@ pub enum WhereExpr {
     Binary(BinaryExpr),
     Multi(MultiExpr),
 
+    // Array literal: ARRAY[val1, val2, ...]
+    Array(Vec<WhereExpr>),
+
     // Function calls (for extensibility)
     Function {
         name: String,
@@ -488,6 +503,7 @@ impl WhereExpr {
                 WhereExpr::Unary(unary) => (unary as &dyn Any).downcast_ref::<N>(),
                 WhereExpr::Binary(binary) => (binary as &dyn Any).downcast_ref::<N>(),
                 WhereExpr::Multi(multi) => (multi as &dyn Any).downcast_ref::<N>(),
+                WhereExpr::Array(_) => None,
                 WhereExpr::Function { .. } => None,
                 WhereExpr::Subquery { .. } => None,
             }))
@@ -498,6 +514,7 @@ impl WhereExpr {
             WhereExpr::Unary(unary) => Box::new(unary.expr.nodes()) as Box<dyn Iterator<Item = &N>>,
             WhereExpr::Binary(binary) => Box::new(binary.lexpr.nodes().chain(binary.rexpr.nodes())),
             WhereExpr::Multi(multi) => Box::new(multi.exprs.iter().flat_map(|expr| expr.nodes())),
+            WhereExpr::Array(elems) => Box::new(elems.iter().flat_map(|expr| expr.nodes())),
             WhereExpr::Function { args, .. } => Box::new(args.iter().flat_map(|expr| expr.nodes())),
             WhereExpr::Subquery {
                 query, test_expr, ..
@@ -520,6 +537,7 @@ impl WhereExpr {
             }
             WhereExpr::Unary(unary) => unary.expr.has_subqueries(),
             WhereExpr::Multi(multi) => multi.exprs.iter().any(|e| e.has_subqueries()),
+            WhereExpr::Array(elems) => elems.iter().any(|e| e.has_subqueries()),
             WhereExpr::Function { args, .. } => args.iter().any(|e| e.has_subqueries()),
             WhereExpr::Subquery { .. } => true,
             WhereExpr::Value(_) | WhereExpr::Column(_) => false,
@@ -551,6 +569,11 @@ impl WhereExpr {
             WhereExpr::Multi(multi) => {
                 for expr in &multi.exprs {
                     expr.subquery_nodes_collect(branches, negated);
+                }
+            }
+            WhereExpr::Array(elems) => {
+                for elem in elems {
+                    elem.subquery_nodes_collect(branches, negated);
                 }
             }
             WhereExpr::Function { args, .. } => {
@@ -608,6 +631,16 @@ impl Deparse for WhereExpr {
             }
             WhereExpr::Multi(expr) => {
                 expr.deparse(buf);
+            }
+            WhereExpr::Array(elems) => {
+                buf.push_str("ARRAY[");
+                let mut sep = "";
+                for elem in elems {
+                    buf.push_str(sep);
+                    elem.deparse(buf);
+                    sep = ", ";
+                }
+                buf.push(']');
             }
             WhereExpr::Function { name, args } => {
                 buf.push_str(name);

@@ -192,6 +192,8 @@ pub enum ResolvedWhereExpr {
     Binary(ResolvedBinaryExpr),
     /// Multi-operand expression
     Multi(ResolvedMultiExpr),
+    /// Array literal: ARRAY[val1, val2, ...]
+    Array(Vec<ResolvedWhereExpr>),
     /// Function call (for future support)
     Function {
         name: String,
@@ -215,6 +217,9 @@ impl ResolvedWhereExpr {
             ResolvedWhereExpr::Unary(unary) => Box::new(unary.nodes()),
             ResolvedWhereExpr::Binary(binary) => Box::new(binary.nodes()),
             ResolvedWhereExpr::Multi(multi) => Box::new(multi.nodes()),
+            ResolvedWhereExpr::Array(elems) => {
+                Box::new(elems.iter().flat_map(|elem| elem.nodes()))
+            }
             ResolvedWhereExpr::Function { args, .. } => {
                 Box::new(args.iter().flat_map(|arg| arg.nodes()))
             }
@@ -241,6 +246,9 @@ impl ResolvedWhereExpr {
                 .map(|e| e.subquery_depth())
                 .max()
                 .unwrap_or(0),
+            ResolvedWhereExpr::Array(elems) => {
+                elems.iter().map(|e| e.subquery_depth()).max().unwrap_or(0)
+            }
             ResolvedWhereExpr::Function { args, .. } => {
                 args.iter().map(|a| a.subquery_depth()).max().unwrap_or(0)
             }
@@ -276,6 +284,7 @@ impl ResolvedWhereExpr {
             },
             ResolvedWhereExpr::Multi(_) => 1, // Multi ops (IN, BETWEEN, etc.) are single predicates
             ResolvedWhereExpr::Unary(u) => u.expr.predicate_count(),
+            ResolvedWhereExpr::Array(_) => 0,            // Array literals are not predicates
             ResolvedWhereExpr::Function { .. } => 1, // Treat function calls as single predicate
             ResolvedWhereExpr::Subquery { .. } => 1, // Treat subqueries as single predicate
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
@@ -295,6 +304,11 @@ impl ResolvedWhereExpr {
             ResolvedWhereExpr::Multi(multi) => {
                 for expr in &multi.exprs {
                     expr.subquery_nodes_collect(branches);
+                }
+            }
+            ResolvedWhereExpr::Array(elems) => {
+                for elem in elems {
+                    elem.subquery_nodes_collect(branches);
                 }
             }
             ResolvedWhereExpr::Function { args, .. } => {
@@ -409,7 +423,7 @@ impl Deparse for ResolvedWhereExpr {
                         }
                         return buf;
                     }
-                    MultiOp::Any | MultiOp::All => {
+                    MultiOp::Any { .. } | MultiOp::All { .. } => {
                         buf.push(' ');
                         multi.op.deparse(buf);
                         buf.push_str(" (");
@@ -424,6 +438,17 @@ impl Deparse for ResolvedWhereExpr {
                     sep = ", ";
                 }
                 buf.push(')');
+                buf
+            }
+            ResolvedWhereExpr::Array(elems) => {
+                buf.push_str("ARRAY[");
+                let mut sep = "";
+                for elem in elems {
+                    buf.push_str(sep);
+                    elem.deparse(buf);
+                    sep = ", ";
+                }
+                buf.push(']');
                 buf
             }
             ResolvedWhereExpr::Function { name, args } => {
@@ -1787,6 +1812,13 @@ fn where_expr_resolve(
                 op: multi.op,
                 exprs: resolved_exprs,
             }))
+        }
+        WhereExpr::Array(elems) => {
+            let resolved_elems = elems
+                .iter()
+                .map(|e| where_expr_resolve(e, scope))
+                .collect::<ResolveResult<Vec<_>>>()?;
+            Ok(ResolvedWhereExpr::Array(resolved_elems))
         }
         WhereExpr::Function { name, args } => {
             let resolved_args = args

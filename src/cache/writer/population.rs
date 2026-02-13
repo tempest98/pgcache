@@ -2,6 +2,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use postgres_protocol::escape;
+use rootcause::prelude::ResultExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -185,7 +186,10 @@ async fn population_stream(
     let row_description = match stream.next().await {
         Some(Ok(SimpleQueryMessage::RowDescription(cols))) => cols,
         Some(Ok(_)) => return Err(CacheError::InvalidMessage.into()),
-        Some(Err(e)) => return Err(CacheError::from(e).into()),
+        Some(Err(e)) => {
+            let report: CacheResult<usize> = Err(CacheError::from(e).into());
+            return report.attach(buf);
+        }
         None => return Ok(0),
     };
 

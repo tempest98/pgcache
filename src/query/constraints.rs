@@ -104,6 +104,7 @@ fn analyze_equality_expr(
         | ResolvedWhereExpr::Unary(_)
         | ResolvedWhereExpr::Binary(_)
         | ResolvedWhereExpr::Multi(_)
+        | ResolvedWhereExpr::Array(_)
         | ResolvedWhereExpr::Function { .. }
         | ResolvedWhereExpr::Subquery { .. } => {}
     }
