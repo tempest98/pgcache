@@ -7,7 +7,7 @@ use tracing::{error, instrument, trace};
 
 use crate::metrics::names;
 
-use crate::query::ast::query_expr_fingerprint;
+use crate::query::ast::{LimitClause, query_expr_fingerprint};
 use crate::query::resolved::ResolvedQueryExpr;
 use crate::settings::Settings;
 use crate::timing::QueryTiming;
@@ -15,7 +15,7 @@ use crate::timing::QueryTiming;
 use super::{
     CacheError, CacheResult,
     messages::{CacheReply, QueryCommand},
-    query::CacheableQuery,
+    query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     types::{CacheStateView, CachedQueryState, CachedQueryView},
 };
 use crate::proxy::ClientSocket;
@@ -52,6 +52,8 @@ pub struct WorkerRequest {
     pub reply_tx: Sender<CacheReply>,
     /// Per-query timing data
     pub timing: QueryTiming,
+    /// Incoming query's LIMIT clause, appended to SQL at serve time
+    pub limit: Option<LimitClause>,
 }
 
 /// Query cache coordinator - routes queries and delegates writes to the writer thread.
@@ -79,9 +81,12 @@ impl QueryCache {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> CacheResult<()> {
-        // Generate fingerprint from AST
+        // Generate fingerprint from AST (excludes LIMIT/OFFSET)
         let fingerprint = query_expr_fingerprint(&msg.cacheable_query.query);
         trace!("{fingerprint}");
+
+        // Compute rows needed for this query's LIMIT
+        let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
 
         // Measure cache lookup latency
         let lookup_start = Instant::now();
@@ -98,77 +103,108 @@ impl QueryCache {
         metrics::histogram!(names::CACHE_LOOKUP_LATENCY_SECONDS)
             .record(lookup_duration.as_secs_f64());
 
-        // Cache hit: Ready state with resolved query
+        // Cache hit: Ready state with resolved query — check if cached rows are sufficient
         if let Some(CachedQueryView {
             state: CachedQueryState::Ready,
             generation,
             resolved: Some(resolved),
-        }) = cache_entry
+            max_limit,
+        }) = &cache_entry
         {
-            // Record lookup completion time
-            let timing = {
-                let mut t = msg.timing;
-                t.lookup_complete_at = Some(Instant::now());
-                t
-            };
+            if limit_is_sufficient(*max_limit, rows_needed) {
+                // Sufficient rows cached — serve from cache
+                let timing = {
+                    let mut t = msg.timing;
+                    t.lookup_complete_at = Some(Instant::now());
+                    t
+                };
 
-            let worker_request = WorkerRequest {
-                query_type: msg.query_type,
-                data: msg.data,
-                resolved,
-                generation,
-                result_formats: msg.result_formats,
-                client_socket: msg.client_socket,
-                reply_tx: msg.reply_tx,
-                timing,
-            };
-            self.worker_tx.send(worker_request).map_err(|e| {
-                error!("worker send {e} {fingerprint}");
-                CacheError::WorkerSend.into()
-            })
-        } else {
-            // Cache miss or Loading - forward to origin
-            trace!("cache miss {fingerprint}");
+                let worker_request = WorkerRequest {
+                    query_type: msg.query_type,
+                    data: msg.data,
+                    resolved: resolved.clone(),
+                    generation: *generation,
+                    result_formats: msg.result_formats,
+                    client_socket: msg.client_socket,
+                    reply_tx: msg.reply_tx,
+                    timing,
+                    limit: msg.cacheable_query.query.limit.clone(),
+                };
+                return self.worker_tx.send(worker_request).map_err(|e| {
+                    error!("worker send {e} {fingerprint}");
+                    CacheError::WorkerSend.into()
+                });
+            }
+
+            // Insufficient rows — forward to origin and request re-population
+            // with the higher limit
+            trace!("limit bump {fingerprint} cached={max_limit:?} needed={rows_needed:?}");
+
+            // Set state to Loading immediately to prevent duplicate LimitBump
+            // commands from racing before the writer processes this one
+            if let Ok(mut view) = self.state_view.write()
+                && let Some(entry) = view.cached_queries.get_mut(&fingerprint)
+            {
+                entry.state = CachedQueryState::Loading;
+            }
 
             msg.reply_tx
                 .send(CacheReply::Forward(msg.data))
                 .await
                 .map_err(|_| CacheError::Reply)?;
 
-            trace!("cache_entry check {fingerprint}");
+            self.query_tx
+                .send(QueryCommand::LimitBump {
+                    fingerprint,
+                    max_limit: rows_needed,
+                })
+                .map_err(|_| CacheError::WorkerSend)?;
 
-            // Register only if not already in cache (prevents duplicate registrations)
-            if cache_entry.is_none() {
-                // Insert Loading placeholder to prevent races
-                if let Ok(mut view) = self.state_view.write() {
-                    view.cached_queries.insert(
-                        fingerprint,
-                        CachedQueryView {
-                            state: CachedQueryState::Loading,
-                            generation: 0,
-                            resolved: None,
-                        },
-                    );
-                }
+            return Ok(());
+        }
 
-                trace!("send to writer {fingerprint}");
+        // Cache miss or Loading - forward to origin
+        trace!("cache miss {fingerprint}");
 
-                self.query_tx
-                    .send(QueryCommand::Register {
-                        fingerprint,
-                        cacheable_query: msg.cacheable_query,
-                        search_path: msg.search_path,
-                        started_at: Instant::now(),
-                    })
-                    .map_err(|_| {
-                        trace!("query registration error {fingerprint}");
-                        CacheError::WorkerSend
-                    })?;
+        msg.reply_tx
+            .send(CacheReply::Forward(msg.data))
+            .await
+            .map_err(|_| CacheError::Reply)?;
 
-                trace!("sent to writer {fingerprint}");
+        trace!("cache_entry check {fingerprint}");
+
+        // Register only if not already in cache (prevents duplicate registrations)
+        if cache_entry.is_none() {
+            // Insert Loading placeholder to prevent races
+            if let Ok(mut view) = self.state_view.write() {
+                view.cached_queries.insert(
+                    fingerprint,
+                    CachedQueryView {
+                        state: CachedQueryState::Loading,
+                        generation: 0,
+                        resolved: None,
+                        max_limit: None,
+                    },
+                );
             }
 
-            Ok(())
+            trace!("send to writer {fingerprint}");
+
+            self.query_tx
+                .send(QueryCommand::Register {
+                    fingerprint,
+                    cacheable_query: msg.cacheable_query,
+                    search_path: msg.search_path,
+                    started_at: Instant::now(),
+                })
+                .map_err(|_| {
+                    trace!("query registration error {fingerprint}");
+                    CacheError::WorkerSend
+                })?;
+
+            trace!("sent to writer {fingerprint}");
         }
+
+        Ok(())
     }
 }

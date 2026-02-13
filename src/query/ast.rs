@@ -314,9 +314,13 @@ impl Deparse for UnaryExpr {
                 );
                 self.op.deparse(buf);
                 buf.push(' ');
-                if needs_parens { buf.push('('); }
+                if needs_parens {
+                    buf.push('(');
+                }
                 self.expr.deparse(buf);
-                if needs_parens { buf.push(')'); }
+                if needs_parens {
+                    buf.push(')');
+                }
             }
         }
         buf
@@ -2051,6 +2055,20 @@ pub struct LimitClause {
     pub offset: Option<LiteralValue>,
 }
 
+impl Deparse for LimitClause {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        if let Some(count) = &self.count {
+            buf.push_str(" LIMIT ");
+            count.deparse(buf);
+        }
+        if let Some(offset) = &self.offset {
+            buf.push_str(" OFFSET ");
+            offset.deparse(buf);
+        }
+        buf
+    }
+}
+
 /// Convert a pg_query ParseResult into a QueryExpr
 pub fn query_expr_convert(ast: &ParseResult) -> Result<QueryExpr, AstError> {
     let [raw_stmt] = ast.protobuf.stmts.as_slice() else {
@@ -3040,9 +3058,15 @@ pub fn select_node_fingerprint(node: &SelectNode) -> u64 {
 
 /// Generate a fingerprint hash for a QueryExpr.
 /// This is used for cache key generation.
+///
+/// Intentionally excludes LIMIT/OFFSET so that queries differing only
+/// in LIMIT/OFFSET share a cache entry. The cache coordinator tracks
+/// `max_limit` separately to decide when cached rows are sufficient.
 pub fn query_expr_fingerprint(query: &QueryExpr) -> u64 {
     let mut hasher = DefaultHasher::new();
-    query.hash(&mut hasher);
+    query.ctes.hash(&mut hasher);
+    query.body.hash(&mut hasher);
+    query.order_by.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -6293,5 +6317,57 @@ mod tests {
         // Both should have 2 (outer + CteRef body)
         assert_eq!(with_source.len(), 2);
         assert_eq!(without_source.len(), 2);
+    }
+
+    #[test]
+    fn test_fingerprint_excludes_limit() {
+        let q1 = parse_query("SELECT * FROM t WHERE id = 1");
+        let q2 = parse_query("SELECT * FROM t WHERE id = 1 LIMIT 10");
+        let q3 = parse_query("SELECT * FROM t WHERE id = 1 LIMIT 10 OFFSET 20");
+        let q4 = parse_query("SELECT * FROM t WHERE id = 1 OFFSET 5");
+
+        let fp1 = query_expr_fingerprint(&q1);
+        let fp2 = query_expr_fingerprint(&q2);
+        let fp3 = query_expr_fingerprint(&q3);
+        let fp4 = query_expr_fingerprint(&q4);
+
+        assert_eq!(fp1, fp2, "LIMIT should not affect fingerprint");
+        assert_eq!(fp1, fp3, "LIMIT+OFFSET should not affect fingerprint");
+        assert_eq!(fp1, fp4, "OFFSET should not affect fingerprint");
+
+        // Different base queries should still produce different fingerprints
+        let q_different = parse_query("SELECT * FROM t WHERE id = 2");
+        assert_ne!(
+            fp1,
+            query_expr_fingerprint(&q_different),
+            "different WHERE should produce different fingerprint"
+        );
+    }
+
+    #[test]
+    fn test_limit_clause_deparse() {
+        let limit = LimitClause {
+            count: Some(LiteralValue::Integer(10)),
+            offset: Some(LiteralValue::Integer(5)),
+        };
+        let mut buf = String::new();
+        limit.deparse(&mut buf);
+        assert_eq!(buf, " LIMIT 10 OFFSET 5");
+
+        let limit_only = LimitClause {
+            count: Some(LiteralValue::Integer(10)),
+            offset: None,
+        };
+        let mut buf = String::new();
+        limit_only.deparse(&mut buf);
+        assert_eq!(buf, " LIMIT 10");
+
+        let offset_only = LimitClause {
+            count: None,
+            offset: Some(LiteralValue::Integer(5)),
+        };
+        let mut buf = String::new();
+        offset_only.deparse(&mut buf);
+        assert_eq!(buf, " OFFSET 5");
     }
 }

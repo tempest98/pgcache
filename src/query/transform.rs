@@ -802,7 +802,12 @@ pub fn query_table_update_queries<'a>(
     let resolved_branches = resolved.select_nodes();
 
     // For each SELECT branch in the query, with its source context
-    for (i, (branch, source)) in cacheable_query.query.select_nodes_with_source().into_iter().enumerate() {
+    for (i, (branch, source)) in cacheable_query
+        .query
+        .select_nodes_with_source()
+        .into_iter()
+        .enumerate()
+    {
         // Categorize optional-side tables using resolved AST
         let (terminal, non_terminal) = resolved_branches
             .get(i)
@@ -903,14 +908,34 @@ mod tests {
         tables.insert_overwrite(test_table(
             "b",
             2,
-            &["id", "name", "a_id", "x", "val", "b_id", "user_id", "tenant_id", "status"],
+            &[
+                "id",
+                "name",
+                "a_id",
+                "x",
+                "val",
+                "b_id",
+                "user_id",
+                "tenant_id",
+                "status",
+            ],
         ));
         tables.insert_overwrite(test_table("c", 3, &["id", "x", "b_id", "val", "tenant_id"]));
         tables.insert_overwrite(test_table("d", 4, &["id"]));
         tables.insert_overwrite(test_table(
             "users",
             10,
-            &["id", "name", "email", "user_id", "status", "active", "uuid", "age", "tenant_id"],
+            &[
+                "id",
+                "name",
+                "email",
+                "user_id",
+                "status",
+                "active",
+                "uuid",
+                "age",
+                "tenant_id",
+            ],
         ));
         tables.insert_overwrite(test_table("location", 11, &["user_id"]));
         tables.insert_overwrite(test_table(
@@ -943,8 +968,7 @@ mod tests {
     fn update_queries(sql: &str) -> Vec<(String, QueryExpr, UpdateQuerySource)> {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
-        let resolved =
-            query_expr_resolve(&cacheable.query, &tables, &["public"]).expect("resolve");
+        let resolved = query_expr_resolve(&cacheable.query, &tables, &["public"]).expect("resolve");
         query_table_update_queries(&cacheable, &resolved)
             .into_iter()
             .map(|(t, q, s)| (t.name.clone(), q, s))
@@ -1897,10 +1921,7 @@ mod tests {
         let users = result.iter().find(|(t, _, _)| t == "users").unwrap();
         assert_eq!(users.2, UpdateQuerySource::Direct);
 
-        let active = result
-            .iter()
-            .find(|(t, _, _)| t == "active_users")
-            .unwrap();
+        let active = result.iter().find(|(t, _, _)| t == "active_users").unwrap();
         assert_eq!(
             active.2,
             UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
@@ -1915,10 +1936,7 @@ mod tests {
 
         assert_eq!(result.len(), 2);
 
-        let banned = result
-            .iter()
-            .find(|(t, _, _)| t == "banned_users")
-            .unwrap();
+        let banned = result.iter().find(|(t, _, _)| t == "banned_users").unwrap();
         assert_eq!(
             banned.2,
             UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
@@ -1944,8 +1962,7 @@ mod tests {
 
     #[test]
     fn test_update_query_source_from_subquery() {
-        let result =
-            update_queries("SELECT * FROM (SELECT id FROM users WHERE id = 1) sub");
+        let result = update_queries("SELECT * FROM (SELECT id FROM users WHERE id = 1) sub");
 
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -1970,10 +1987,7 @@ mod tests {
 
         assert_eq!(result.len(), 3);
 
-        let products = result
-            .iter()
-            .find(|(t, _, _)| t == "products")
-            .unwrap();
+        let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
         assert_eq!(products.2, UpdateQuerySource::Direct);
 
         let stores = result.iter().find(|(t, _, _)| t == "stores").unwrap();
@@ -2007,10 +2021,7 @@ mod tests {
 
         assert_eq!(result.len(), 3);
 
-        let products = result
-            .iter()
-            .find(|(t, _, _)| t == "products")
-            .unwrap();
+        let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
         assert_eq!(products.2, UpdateQuerySource::Direct);
 
         let stores = result.iter().find(|(t, _, _)| t == "stores").unwrap();
@@ -2047,26 +2058,17 @@ mod tests {
 
         assert_eq!(result.len(), 3);
 
-        let products = result
-            .iter()
-            .find(|(t, _, _)| t == "products")
-            .unwrap();
+        let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
         assert_eq!(products.2, UpdateQuerySource::Direct);
 
-        let blacklist = result
-            .iter()
-            .find(|(t, _, _)| t == "blacklist")
-            .unwrap();
+        let blacklist = result.iter().find(|(t, _, _)| t == "blacklist").unwrap();
         assert_eq!(
             blacklist.2,
             UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
             "NOT IN subquery table should be Exclusion"
         );
 
-        let categories = result
-            .iter()
-            .find(|(t, _, _)| t == "categories")
-            .unwrap();
+        let categories = result.iter().find(|(t, _, _)| t == "categories").unwrap();
         assert_eq!(
             categories.2,
             UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
@@ -2091,10 +2093,7 @@ mod tests {
 
         assert_eq!(result.len(), 3);
 
-        let blacklist = result
-            .iter()
-            .find(|(t, _, _)| t == "blacklist")
-            .unwrap();
+        let blacklist = result.iter().find(|(t, _, _)| t == "blacklist").unwrap();
         assert_eq!(
             blacklist.2,
             UpdateQuerySource::Subquery(SubqueryKind::Exclusion),

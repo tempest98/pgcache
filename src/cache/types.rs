@@ -26,6 +26,10 @@ pub struct CachedQuery {
     pub relation_oids: Vec<u32>,
     pub query: QueryExpr,
     pub resolved: ResolvedQueryExpr,
+    /// Maximum rows cached for this fingerprint.
+    /// `None` = all rows cached (query seen without LIMIT, or OFFSET-only).
+    /// `Some(n)` = up to `n` rows cached (max LIMIT+OFFSET across all variants seen).
+    pub max_limit: Option<u64>,
     /// Estimated size of cached data in bytes (sum of raw value bytes)
     pub cached_bytes: usize,
     /// Timestamp when registration started (for latency metrics)
@@ -107,6 +111,9 @@ pub struct UpdateQuery {
     pub source: UpdateQuerySource,
     /// WHERE clause constraints for CDC invalidation filtering
     pub constraints: QueryConstraints,
+    /// Whether the parent cached query has a LIMIT (max_limit.is_some()).
+    /// Used by CDC to determine if DELETE should trigger invalidation.
+    pub has_limit: bool,
 }
 
 /// Collection of update queries for a specific relation
@@ -187,4 +194,6 @@ pub struct CachedQueryView {
     pub generation: u64,
     /// Resolved query (None for Loading placeholder before writer resolves)
     pub resolved: Option<ResolvedQueryExpr>,
+    /// Maximum rows cached for this fingerprint (None = all rows)
+    pub max_limit: Option<u64>,
 }

@@ -379,6 +379,12 @@ impl CacheWriter {
     ) -> bool {
         match update_query.source {
             UpdateQuerySource::Direct => {
+                // DELETE on a limited query's table: cached result may have fewer
+                // rows than the LIMIT window. Invalidate to trigger re-population.
+                if update_query.has_limit && operation == CdcOperation::Delete {
+                    return true;
+                }
+
                 // Single-table queries don't need invalidation for uncached rows
                 if update_query.resolved.is_single_table() {
                     return false;

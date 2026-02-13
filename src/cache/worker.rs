@@ -116,6 +116,10 @@ async fn handle_cached_query_text(
 
     let mut sql = String::new();
     msg.resolved.deparse(&mut sql);
+    // Append incoming query's LIMIT/OFFSET (the stored resolved query has no LIMIT)
+    if let Some(limit) = &msg.limit {
+        limit.deparse(&mut sql);
+    }
     let combined_sql = format!("SET mem.query_generation = {}; {};", msg.generation, &sql);
 
     #[cfg(feature = "hotpath")]
@@ -270,6 +274,10 @@ async fn handle_cached_query_binary(
     // Generate SQL query from resolved AST
     let mut sql = String::new();
     msg.resolved.deparse(&mut sql);
+    // Append incoming query's LIMIT/OFFSET (the stored resolved query has no LIMIT)
+    if let Some(limit) = &msg.limit {
+        limit.deparse(&mut sql);
+    }
     let set_sql = format!("SET mem.query_generation = {}", msg.generation);
 
     // Send pipelined: SET (simple query) + Parse/Bind/Execute/Sync (extended query)

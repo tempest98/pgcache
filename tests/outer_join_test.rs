@@ -70,8 +70,16 @@ async fn test_left_join_terminal_cache_hit() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // RowDescription + 2 rows + CommandComplete
-    assert_row_at(&res, 1, &[("id", "1"), ("customer", "Alice"), ("item", "Widget")])?;
-    assert_row_at(&res, 2, &[("id", "1"), ("customer", "Alice"), ("item", "Gizmo")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[("id", "1"), ("customer", "Alice"), ("item", "Widget")],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[("id", "1"), ("customer", "Alice"), ("item", "Gizmo")],
+    )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
@@ -79,8 +87,16 @@ async fn test_left_join_terminal_cache_hit() -> Result<(), Error> {
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
-    assert_row_at(&res, 1, &[("id", "1"), ("customer", "Alice"), ("item", "Widget")])?;
-    assert_row_at(&res, 2, &[("id", "1"), ("customer", "Alice"), ("item", "Gizmo")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[("id", "1"), ("customer", "Alice"), ("item", "Widget")],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[("id", "1"), ("customer", "Alice"), ("item", "Gizmo")],
+    )?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
@@ -129,7 +145,11 @@ async fn test_left_join_terminal_cdc_insert_optional_side() -> Result<(), Error>
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // 1 row
-    assert_row_at(&res, 1, &[("id", "1"), ("customer", "Alice"), ("item", "Widget")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[("id", "1"), ("customer", "Alice"), ("item", "Widget")],
+    )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
@@ -146,8 +166,16 @@ async fn test_left_join_terminal_cdc_insert_optional_side() -> Result<(), Error>
     // Cache hit — new row appears via LEFT JOIN at retrieval
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // 2 rows now
-    assert_row_at(&res, 1, &[("id", "1"), ("customer", "Alice"), ("item", "Widget")])?;
-    assert_row_at(&res, 2, &[("id", "1"), ("customer", "Alice"), ("item", "Gizmo")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[("id", "1"), ("customer", "Alice"), ("item", "Widget")],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[("id", "1"), ("customer", "Alice"), ("item", "Gizmo")],
+    )?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
@@ -331,8 +359,16 @@ async fn test_right_join_terminal_cache_hit() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // 2 rows
-    assert_row_at(&res, 1, &[("item", "Widget"), ("id", "1"), ("customer", "Alice")])?;
-    assert_row_at(&res, 2, &[("item", "Gizmo"), ("id", "1"), ("customer", "Alice")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[("item", "Widget"), ("id", "1"), ("customer", "Alice")],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[("item", "Gizmo"), ("id", "1"), ("customer", "Alice")],
+    )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
@@ -512,7 +548,11 @@ async fn test_left_join_cdc_insert_preserved_side() -> Result<(), Error> {
     let row2 = util::extract_row(&res, 2)?;
     assert_eq!(row2.get::<&str>("id"), Some("2"));
     assert_eq!(row2.get::<&str>("customer"), Some("Alice"));
-    assert_eq!(row2.get::<&str>("item"), None, "new order should have NULL item");
+    assert_eq!(
+        row2.get::<&str>("item"),
+        None,
+        "new order should have NULL item"
+    );
     let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())

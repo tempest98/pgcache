@@ -4,8 +4,9 @@ use crate::{
     cache::QueryParameters,
     query::{
         ast::{
-            BinaryOp, CteRefNode, JoinNode, JoinType, MultiOp, QueryBody, QueryExpr, SelectNode,
-            SetOpNode, SubLinkType, TableSource, TableSubqueryNode, WhereExpr,
+            BinaryOp, CteRefNode, JoinNode, JoinType, LimitClause, LiteralValue, MultiOp,
+            QueryBody, QueryExpr, SelectNode, SetOpNode, SubLinkType, TableSource,
+            TableSubqueryNode, WhereExpr,
         },
         resolved::{
             ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
@@ -59,11 +60,6 @@ impl TryFrom<&QueryExpr> for CacheableQuery {
     type Error = CacheabilityError;
 
     fn try_from(query: &QueryExpr) -> Result<Self, Self::Error> {
-        // LIMIT/OFFSET at top level makes queries non-cacheable
-        if query.limit.is_some() {
-            return Err(CacheabilityError::HasLimit);
-        }
-
         // Validate the query body (SELECT, VALUES, or SetOp)
         is_cacheable_body(&query.body)?;
 
@@ -220,7 +216,6 @@ fn is_cacheable_cte_ref(cte_ref: &CteRefNode, _ctx: ExprContext) -> Result<(), C
 /// - GROUP BY and HAVING (aggregation performed on cached rows at retrieval time)
 /// - Non-correlated subqueries (EXISTS, IN, scalar)
 ///
-/// Note: LIMIT/OFFSET check is done separately in TryFrom
 fn is_cacheable_where(select: &SelectNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
     match &select.where_clause {
         Some(where_expr) => is_cacheable_expr(where_expr, ctx),
@@ -420,7 +415,12 @@ pub fn outer_join_optional_tables(
     // identifying which are non-terminal
     let mut all_optional = HashSet::new();
     let mut non_terminal = HashSet::new();
-    resolved_join_terminality_walk(join, &non_terminal_refs, &mut all_optional, &mut non_terminal);
+    resolved_join_terminality_walk(
+        join,
+        &non_terminal_refs,
+        &mut all_optional,
+        &mut non_terminal,
+    );
 
     let terminal = all_optional.difference(&non_terminal).cloned().collect();
     (terminal, non_terminal)
@@ -498,14 +498,48 @@ fn resolved_join_terminality_walk(
     }
 }
 
+/// Extract the total rows needed from a LIMIT clause.
+///
+/// Returns `None` if there is no LIMIT count (= unlimited rows needed).
+/// Returns `Some(limit + offset)` when a LIMIT count is present.
+pub fn limit_rows_needed(limit: &Option<LimitClause>) -> Option<u64> {
+    let limit_clause = limit.as_ref()?;
+    let count = match &limit_clause.count {
+        Some(LiteralValue::Integer(n)) => *n as u64,
+        _ => return None,
+    };
+    let offset = match &limit_clause.offset {
+        Some(LiteralValue::Integer(n)) => *n as u64,
+        _ => 0,
+    };
+    Some(count + offset)
+}
+
+/// Check whether the cached `max_limit` is sufficient for the incoming `needed` rows.
+///
+/// - `cached_max`: `None` means all rows are cached.
+/// - `needed`: `None` means all rows needed (no LIMIT).
+pub fn limit_is_sufficient(cached_max: Option<u64>, needed: Option<u64>) -> bool {
+    match (cached_max, needed) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(cached), Some(needed)) => cached >= needed,
+    }
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::wildcard_enum_match_arm
+)]
 mod tests {
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 
     use super::*;
     use crate::catalog::{ColumnMetadata, TableMetadata};
-    use crate::query::ast::query_expr_convert;
+    use crate::query::ast::{query_expr_convert, query_expr_fingerprint};
     use crate::query::resolved::select_node_resolve;
 
     /// Parse SQL and check cacheability
@@ -692,33 +726,24 @@ mod tests {
     }
 
     #[test]
-    fn test_limit_not_cacheable() {
+    fn test_limit_cacheable() {
         let sql = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::HasLimit)),
-            "LIMIT should not be cacheable yet"
-        );
+        assert!(result.is_ok(), "LIMIT should be cacheable");
     }
 
     #[test]
-    fn test_offset_not_cacheable() {
+    fn test_offset_cacheable() {
         let sql = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::HasLimit)),
-            "OFFSET should not be cacheable yet"
-        );
+        assert!(result.is_ok(), "OFFSET should be cacheable");
     }
 
     #[test]
-    fn test_group_by_with_limit_not_cacheable() {
+    fn test_group_by_with_limit_cacheable() {
         let sql = "SELECT status FROM orders WHERE tenant_id = 1 GROUP BY status LIMIT 5";
         let result = check_cacheable(sql);
-        assert!(
-            matches!(result, Err(CacheabilityError::HasLimit)),
-            "GROUP BY with LIMIT should not be cacheable"
-        );
+        assert!(result.is_ok(), "GROUP BY with LIMIT should be cacheable");
     }
 
     // ==================== Subquery Tests ====================
@@ -794,13 +819,12 @@ mod tests {
     }
 
     #[test]
-    fn test_subquery_with_limit_in_outer_not_cacheable() {
-        // LIMIT at outer level still makes query not cacheable
+    fn test_subquery_with_limit_in_outer_cacheable() {
         let sql = "SELECT * FROM (SELECT id FROM users) sub LIMIT 10";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::HasLimit)),
-            "Outer LIMIT should make query not cacheable"
+            result.is_ok(),
+            "Outer LIMIT on simple SELECT should be cacheable"
         );
     }
 
@@ -863,14 +887,15 @@ mod tests {
     }
 
     #[test]
-    fn test_union_with_outer_limit_not_cacheable() {
+    fn test_union_with_outer_limit_cacheable() {
         let sql = "SELECT id FROM a WHERE tenant_id = 1 \
                    UNION SELECT id FROM b WHERE tenant_id = 1 \
                    LIMIT 10";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::HasLimit)),
-            "UNION with outer LIMIT should not be cacheable"
+            result.is_ok(),
+            "UNION with outer LIMIT should be cacheable — \
+             all rows are populated per-branch, LIMIT applied at serve time"
         );
     }
 
@@ -973,7 +998,11 @@ mod tests {
     fn terminality_test_tables() -> BiHashMap<TableMetadata> {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table("a", 1, &["id", "name", "status"]));
-        tables.insert_overwrite(test_table("b", 2, &["id", "a_id", "name", "status", "val", "x"]));
+        tables.insert_overwrite(test_table(
+            "b",
+            2,
+            &["id", "a_id", "name", "status", "val", "x"],
+        ));
         tables.insert_overwrite(test_table("c", 3, &["id", "b_id", "val", "x"]));
         tables
     }
@@ -988,10 +1017,7 @@ mod tests {
         );
         let (terminal, non_terminal) = outer_join_optional_tables(&select);
         assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
-        assert!(
-            terminal.contains("b"),
-            "b should be terminal: {terminal:?}"
-        );
+        assert!(terminal.contains("b"), "b should be terminal: {terminal:?}");
     }
 
     #[test]
@@ -1042,10 +1068,7 @@ mod tests {
             non_terminal.contains("b"),
             "b should be non-terminal: {non_terminal:?}"
         );
-        assert!(
-            terminal.contains("c"),
-            "c should be terminal: {terminal:?}"
-        );
+        assert!(terminal.contains("c"), "c should be terminal: {terminal:?}");
     }
 
     #[test]
@@ -1058,10 +1081,7 @@ mod tests {
         );
         let (terminal, non_terminal) = outer_join_optional_tables(&select);
         assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
-        assert!(
-            terminal.contains("a"),
-            "a should be terminal: {terminal:?}"
-        );
+        assert!(terminal.contains("a"), "a should be terminal: {terminal:?}");
     }
 
     #[test]
@@ -1137,10 +1157,7 @@ mod tests {
         );
         let (terminal, non_terminal) = outer_join_optional_tables(&select);
         assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
-        assert!(
-            terminal.contains("c"),
-            "c should be terminal: {terminal:?}"
-        );
+        assert!(terminal.contains("c"), "c should be terminal: {terminal:?}");
     }
 
     #[test]
@@ -1151,5 +1168,92 @@ mod tests {
         let (terminal, non_terminal) = outer_join_optional_tables(&select);
         assert!(terminal.is_empty());
         assert!(non_terminal.is_empty());
+    }
+
+    // ==================== LIMIT Helper Tests ====================
+
+    #[test]
+    fn test_limit_rows_needed() {
+        use crate::query::ast::{LimitClause, LiteralValue};
+
+        // No limit clause
+        assert_eq!(limit_rows_needed(&None), None);
+
+        // LIMIT 10
+        assert_eq!(
+            limit_rows_needed(&Some(LimitClause {
+                count: Some(LiteralValue::Integer(10)),
+                offset: None,
+            })),
+            Some(10)
+        );
+
+        // LIMIT 10 OFFSET 5
+        assert_eq!(
+            limit_rows_needed(&Some(LimitClause {
+                count: Some(LiteralValue::Integer(10)),
+                offset: Some(LiteralValue::Integer(5)),
+            })),
+            Some(15)
+        );
+
+        // OFFSET only (no count) = unlimited
+        assert_eq!(
+            limit_rows_needed(&Some(LimitClause {
+                count: None,
+                offset: Some(LiteralValue::Integer(5)),
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_limit_is_sufficient() {
+        // All rows cached → always sufficient
+        assert!(limit_is_sufficient(None, None));
+        assert!(limit_is_sufficient(None, Some(100)));
+
+        // Some rows cached, need unlimited → insufficient
+        assert!(!limit_is_sufficient(Some(50), None));
+
+        // Some rows cached, need fewer → sufficient
+        assert!(limit_is_sufficient(Some(50), Some(30)));
+        assert!(limit_is_sufficient(Some(50), Some(50)));
+
+        // Some rows cached, need more → insufficient
+        assert!(!limit_is_sufficient(Some(50), Some(51)));
+    }
+
+    #[test]
+    fn test_limit_offset_fingerprint_match() {
+
+        let base = "SELECT * FROM orders WHERE tenant_id = 1";
+        let with_limit = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10";
+        let with_offset = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
+        let with_both = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10 OFFSET 5";
+
+        let fp_base = {
+            let ast = pg_query::parse(base).unwrap();
+            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
+        };
+        let fp_limit = {
+            let ast = pg_query::parse(with_limit).unwrap();
+            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
+        };
+        let fp_offset = {
+            let ast = pg_query::parse(with_offset).unwrap();
+            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
+        };
+        let fp_both = {
+            let ast = pg_query::parse(with_both).unwrap();
+            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
+        };
+
+        assert_eq!(fp_base, fp_limit, "LIMIT should not affect fingerprint");
+        assert_eq!(fp_base, fp_offset, "OFFSET should not affect fingerprint");
+        assert_eq!(
+            fp_base, fp_both,
+            "LIMIT+OFFSET should not affect fingerprint"
+        );
     }
 }

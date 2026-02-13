@@ -338,9 +338,13 @@ impl Deparse for ResolvedWhereExpr {
                         );
                         unary.op.deparse(buf);
                         buf.push(' ');
-                        if needs_parens { buf.push('('); }
+                        if needs_parens {
+                            buf.push('(');
+                        }
                         unary.expr.deparse(buf);
-                        if needs_parens { buf.push(')'); }
+                        if needs_parens {
+                            buf.push(')');
+                        }
                     }
                 }
                 buf
@@ -355,17 +359,25 @@ impl Deparse for ResolvedWhereExpr {
                     (BinaryOp::And, ResolvedWhereExpr::Binary(child)) if child.op == BinaryOp::Or
                 );
 
-                if left_needs_parens { buf.push('('); }
+                if left_needs_parens {
+                    buf.push('(');
+                }
                 binary.lexpr.deparse(buf);
-                if left_needs_parens { buf.push(')'); }
+                if left_needs_parens {
+                    buf.push(')');
+                }
 
                 buf.push(' ');
                 binary.op.deparse(buf);
                 buf.push(' ');
 
-                if right_needs_parens { buf.push('('); }
+                if right_needs_parens {
+                    buf.push('(');
+                }
                 binary.rexpr.deparse(buf);
-                if right_needs_parens { buf.push(')'); }
+                if right_needs_parens {
+                    buf.push(')');
+                }
 
                 buf
             }

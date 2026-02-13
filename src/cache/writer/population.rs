@@ -40,6 +40,7 @@ pub async fn population_worker(
             work.generation,
             &work.branches,
             &work.table_metadata,
+            work.max_limit,
             Rc::clone(&db_origin),
             &db_cache,
         )
@@ -89,6 +90,7 @@ async fn population_task(
     generation: u64,
     branches: &[ResolvedSelectNode],
     table_metadata: &[TableMetadata],
+    max_limit: Option<u64>,
     db_origin: Rc<Client>,
     db_cache: &Client,
 ) -> CacheResult<usize> {
@@ -118,7 +120,9 @@ async fn population_task(
                 })?;
 
             let stream_start = Instant::now();
-            let bytes = population_stream(&db_origin, db_cache, table, table_node, branch).await?;
+            let bytes =
+                population_stream(&db_origin, db_cache, table, table_node, branch, max_limit)
+                    .await?;
             let stream_elapsed = stream_start.elapsed();
 
             total_bytes += bytes;
@@ -156,12 +160,19 @@ async fn population_stream(
     table: &TableMetadata,
     table_node: &ResolvedTableNode,
     branch: &ResolvedSelectNode,
+    max_limit: Option<u64>,
 ) -> CacheResult<usize> {
     // Build the SELECT query
     let select_columns = table.resolved_select_columns(table_node.alias.as_deref());
     let new_ast = resolved_select_node_replace(branch, select_columns);
     let mut buf = String::with_capacity(1024);
     new_ast.deparse(&mut buf);
+
+    // Append LIMIT to population query when max_limit is set
+    if let Some(limit) = max_limit {
+        use std::fmt::Write;
+        write!(buf, " LIMIT {limit}").ok();
+    }
 
     // Start streaming from origin
     let stream = db_origin

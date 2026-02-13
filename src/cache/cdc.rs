@@ -29,9 +29,7 @@ use crate::pg::cdc::connect_replication;
 use crate::settings::Settings;
 
 use super::{
-    CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::CdcCommand,
-    types::ActiveRelations,
+    CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::ActiveRelations,
 };
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
@@ -424,9 +422,10 @@ impl CdcProcessor {
                 ids.push(id);
             }
         }
-        if let Err(e) = self.cdc_tx.send(CdcCommand::Truncate {
-            relation_oids: ids,
-        }) {
+        if let Err(e) = self
+            .cdc_tx
+            .send(CdcCommand::Truncate { relation_oids: ids })
+        {
             //todo, halt use of cache and fallback to proxy only mode
             error!("Failed to handle truncate from CDC: {e:?}");
         }

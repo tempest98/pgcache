@@ -2,9 +2,10 @@ use std::time::Instant;
 
 use tracing::{debug, error, info, instrument, trace};
 
+use crate::cache::query::limit_rows_needed;
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
-use crate::query::ast::TableNode;
+use crate::query::ast::{QueryBody, TableNode};
 use crate::query::constraints::analyze_query_constraints;
 use crate::query::resolved::{ResolvedTableNode, query_expr_resolve};
 use crate::query::transform::query_table_update_queries;
@@ -76,7 +77,22 @@ impl CacheWriter {
     ) -> CacheResult<()> {
         let mut relation_oids = Vec::new();
 
-        for table_node in cacheable_query.query.nodes::<TableNode>() {
+        // Extract max_limit from the incoming query's LIMIT clause,
+        // then strip LIMIT from the stored query (base query only).
+        // For set operations, force max_limit = None — population runs per-branch
+        // so a top-level LIMIT can't be applied during population. All rows are
+        // cached, and the incoming LIMIT is applied at serve time.
+        let is_set_op = matches!(cacheable_query.query.body, QueryBody::SetOp(_));
+        let max_limit = if is_set_op {
+            None
+        } else {
+            limit_rows_needed(&cacheable_query.query.limit)
+        };
+        let has_limit = max_limit.is_some();
+        let mut base_query = cacheable_query.query.clone();
+        base_query.limit = None;
+
+        for table_node in base_query.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
             let schema = self
                 .table_schema_resolve(table_name, table_node.schema.as_deref(), search_path)
@@ -92,11 +108,19 @@ impl CacheWriter {
             }
         }
 
-        let resolved = query_expr_resolve(&cacheable_query.query, &self.cache.tables, search_path)
+        let resolved = query_expr_resolve(&base_query, &self.cache.tables, search_path)
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("resolving query expression")?;
 
-        for (table_node, update_query_expr, source) in query_table_update_queries(cacheable_query, &resolved) {
+        // Build a temporary CacheableQuery with the base (limit-stripped) query
+        // for update query generation
+        let base_cacheable = CacheableQuery {
+            query: base_query.clone(),
+        };
+
+        for (table_node, update_query_expr, source) in
+            query_table_update_queries(&base_cacheable, &resolved)
+        {
             let schema = self
                 .table_schema_resolve(
                     table_node.name.as_str(),
@@ -131,6 +155,7 @@ impl CacheWriter {
                 complexity,
                 source,
                 constraints,
+                has_limit,
             };
 
             self.update_query_register(relation_oid, update_query);
@@ -147,8 +172,9 @@ impl CacheWriter {
             fingerprint,
             generation,
             relation_oids: relation_oids.clone(),
-            query: cacheable_query.query.clone(),
+            query: base_query,
             resolved: resolved.clone(),
+            max_limit,
             cached_bytes: 0,
             registration_started_at: Some(started_at),
         };
@@ -182,6 +208,7 @@ impl CacheWriter {
             generation,
             table_metadata,
             branches,
+            max_limit,
         };
 
         self.populate_work_dispatch(work)?;
@@ -197,12 +224,17 @@ impl CacheWriter {
         {
             query.cached_bytes = cached_bytes;
             let started_at = query.registration_started_at.take();
-            Some((query.generation, query.resolved.clone(), started_at))
+            Some((
+                query.generation,
+                query.resolved.clone(),
+                query.max_limit,
+                started_at,
+            ))
         } else {
             None
         };
 
-        if let Some((generation, resolved, started_at)) = update_info {
+        if let Some((generation, resolved, max_limit, started_at)) = update_info {
             // Record registration latency metric
             if let Some(started) = started_at {
                 let latency = started.elapsed();
@@ -211,7 +243,13 @@ impl CacheWriter {
             }
 
             // Update shared state view
-            self.state_view_update(fingerprint, CachedQueryState::Ready, generation, &resolved);
+            self.state_view_update(
+                fingerprint,
+                CachedQueryState::Ready,
+                generation,
+                &resolved,
+                max_limit,
+            );
             trace!("cached query ready, cached_bytes={cached_bytes} {fingerprint}");
         }
     }
@@ -240,6 +278,90 @@ impl CacheWriter {
             self.active_relations_rebuild();
             debug!("cleaned up failed query {fingerprint}");
         }
+    }
+
+    /// Handle a limit bump: re-populate with a higher limit.
+    ///
+    /// Bumps the generation number, updates max_limit, and re-populates.
+    /// During re-population the query state goes to Loading.
+    #[instrument(skip_all)]
+    pub async fn limit_bump_handle(
+        &mut self,
+        fingerprint: u64,
+        new_max_limit: Option<u64>,
+    ) -> CacheResult<()> {
+        let Some(cached_query) = self.cache.cached_queries.get1(&fingerprint) else {
+            trace!("limit bump: query {fingerprint} not found, skipping");
+            return Ok(());
+        };
+
+        // Collect data needed before mutating
+        let resolved = cached_query.resolved.clone();
+        let relation_oids = cached_query.relation_oids.clone();
+        let old_generation = cached_query.generation;
+
+        // Bump generation
+        self.cache.generation_counter += 1;
+        let new_generation = self.cache.generation_counter;
+        self.cache.generations.insert(new_generation);
+        self.cache.generations.remove(&old_generation);
+
+        // Update cached query — must remove and reinsert because generation is key2
+        if let Some(mut cached) = self.cache.cached_queries.remove1(&fingerprint) {
+            cached.generation = new_generation;
+            cached.max_limit = new_max_limit;
+            cached.registration_started_at = Some(Instant::now());
+            self.cache.cached_queries.insert_overwrite(cached);
+        }
+
+        // Update has_limit on update queries
+        let has_limit = new_max_limit.is_some();
+        for oid in &relation_oids {
+            if let Some(mut queries) = self.cache.update_queries.get_mut(oid) {
+                for uq in &mut queries.queries {
+                    if uq.fingerprint == fingerprint {
+                        uq.has_limit = has_limit;
+                    }
+                }
+            }
+        }
+
+        // Set state to Loading while re-populating
+        self.state_view_update(
+            fingerprint,
+            CachedQueryState::Loading,
+            new_generation,
+            &resolved,
+            new_max_limit,
+        );
+
+        // Extract SELECT branches for population
+        let branches: Vec<_> = resolved.select_nodes().into_iter().cloned().collect();
+
+        let branch_relation_oids: Vec<u32> = branches
+            .iter()
+            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
+            .map(|tn| tn.relation_oid)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let table_metadata: Vec<TableMetadata> = branch_relation_oids
+            .iter()
+            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
+            .collect();
+
+        let work = PopulationWork {
+            fingerprint,
+            generation: new_generation,
+            table_metadata,
+            branches,
+            max_limit: new_max_limit,
+        };
+
+        self.populate_work_dispatch(work)?;
+        trace!("limit bump population queued for query {fingerprint}");
+        Ok(())
     }
 
     /// Register table metadata from CDC processing.

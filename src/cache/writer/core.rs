@@ -37,6 +37,8 @@ pub struct PopulationWork {
     /// For simple SELECT queries, this contains one branch.
     /// For set operations (UNION/INTERSECT/EXCEPT), contains all branches.
     pub branches: Vec<ResolvedSelectNode>,
+    /// Maximum rows to fetch during population. `None` = fetch all rows.
+    pub max_limit: Option<u64>,
 }
 
 /// Cache writer that owns the Cache and serializes all mutations.
@@ -190,6 +192,15 @@ impl CacheWriter {
             QueryCommand::Failed { fingerprint } => {
                 self.query_failed_cleanup(fingerprint);
             }
+            QueryCommand::LimitBump {
+                fingerprint,
+                max_limit,
+            } => {
+                trace!("command limit bump {fingerprint} max_limit={max_limit:?}");
+                if let Err(e) = self.limit_bump_handle(fingerprint, max_limit).await {
+                    error!("limit bump failed: {e} {fingerprint}");
+                }
+            }
         }
         self.state_gauges_update();
         Ok(())
@@ -260,6 +271,7 @@ impl CacheWriter {
         state: CachedQueryState,
         generation: u64,
         resolved: &ResolvedQueryExpr,
+        max_limit: Option<u64>,
     ) {
         if let Ok(mut view) = self.state_view.write() {
             view.cached_queries.insert(
@@ -268,6 +280,7 @@ impl CacheWriter {
                     state,
                     generation,
                     resolved: Some(resolved.clone()),
+                    max_limit,
                 },
             );
         }

@@ -257,9 +257,36 @@ async fn test_cache_self_join() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query_str).await?;
     assert_eq!(res.len(), 5); // 3 rows + RowDescription + CommandComplete
-    assert_row_at(&res, 1, &[("t0_id", "1"), ("t0_data", "foo"), ("t1_id", "1"), ("t1_data", "foo")])?;
-    assert_row_at(&res, 2, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "2"), ("t1_data", "bar")])?;
-    assert_row_at(&res, 3, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "3"), ("t1_data", "bar")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[
+            ("t0_id", "1"),
+            ("t0_data", "foo"),
+            ("t1_id", "1"),
+            ("t1_data", "foo"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[
+            ("t0_id", "2"),
+            ("t0_data", "bar"),
+            ("t1_id", "2"),
+            ("t1_data", "bar"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        3,
+        &[
+            ("t0_id", "2"),
+            ("t0_data", "bar"),
+            ("t1_id", "3"),
+            ("t1_data", "bar"),
+        ],
+    )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
@@ -267,17 +294,41 @@ async fn test_cache_self_join() -> Result<(), Error> {
     // Second query — cache hit with identical data
     let res = ctx.simple_query(query_str).await?;
     assert_eq!(res.len(), 5);
-    assert_row_at(&res, 1, &[("t0_id", "1"), ("t0_data", "foo"), ("t1_id", "1"), ("t1_data", "foo")])?;
-    assert_row_at(&res, 2, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "2"), ("t1_data", "bar")])?;
-    assert_row_at(&res, 3, &[("t0_id", "2"), ("t0_data", "bar"), ("t1_id", "3"), ("t1_data", "bar")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[
+            ("t0_id", "1"),
+            ("t0_data", "foo"),
+            ("t1_id", "1"),
+            ("t1_data", "foo"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[
+            ("t0_id", "2"),
+            ("t0_data", "bar"),
+            ("t1_id", "2"),
+            ("t1_data", "bar"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        3,
+        &[
+            ("t0_id", "2"),
+            ("t0_data", "bar"),
+            ("t1_id", "3"),
+            ("t1_data", "bar"),
+        ],
+    )?;
     let m = assert_cache_hit(&mut ctx, m).await?;
 
     // CDC: insert a new row that joins into the self-join via data='bar'
-    ctx.origin_query(
-        "insert into test_self (id, data) values (4, 'bar')",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("insert into test_self (id, data) values (4, 'bar')", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -287,7 +338,11 @@ async fn test_cache_self_join() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("t0_id", "1"), ("t1_id", "1")])?;
     assert_row_at(&res, 2, &[("t0_id", "2"), ("t1_id", "2")])?;
     assert_row_at(&res, 3, &[("t0_id", "2"), ("t1_id", "3")])?;
-    assert_row_at(&res, 4, &[("t0_id", "2"), ("t1_id", "4"), ("t1_data", "bar")])?;
+    assert_row_at(
+        &res,
+        4,
+        &[("t0_id", "2"), ("t1_id", "4"), ("t1_data", "bar")],
+    )?;
     let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())

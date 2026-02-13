@@ -155,6 +155,14 @@ pub enum QueryCommand {
 
     /// Query population failed
     Failed { fingerprint: u64 },
+
+    /// Bump the max_limit for a cached query and re-populate with higher limit.
+    /// Sent when an incoming query needs more rows than currently cached.
+    LimitBump {
+        fingerprint: u64,
+        /// New max_limit value (None = unlimited)
+        max_limit: Option<u64>,
+    },
 }
 
 /// Commands for CDC mutations and relation tracking, sent to the writer thread
