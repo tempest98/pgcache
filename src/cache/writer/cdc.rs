@@ -11,6 +11,7 @@ use crate::catalog::TableMetadata;
 use crate::metrics::names;
 
 use crate::query::constraints::QueryConstraints;
+use crate::query::transform::resolved_select_node_table_replace_with_values;
 
 use super::super::types::{SubqueryKind, UpdateQuery, UpdateQuerySource};
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
@@ -699,7 +700,7 @@ impl CacheWriter {
             }
         }
 
-        let value_select = crate::query::transform::resolved_select_node_table_replace_with_values(
+        let value_select = resolved_select_node_table_replace_with_values(
             resolved_select,
             table_metadata,
             row_data,

@@ -585,9 +585,10 @@ pub fn resolved_select_node_table_replace_with_values(
     for column_meta in &table_metadata.columns {
         let position = column_meta.position as usize - 1;
         if let Some(row_value) = row_data.get(position) {
-            let value = row_value.as_deref().map_or(LiteralValue::Null, |v| {
-                LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone())
-            });
+            let value = row_value.as_deref().map_or(
+                LiteralValue::NullWithCast(column_meta.type_name.clone()),
+                |v| LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone()),
+            );
             values.push(value);
             column_names.push(column_meta.name.clone());
         }

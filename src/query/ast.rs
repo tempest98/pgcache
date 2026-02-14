@@ -87,6 +87,7 @@ pub enum LiteralValue {
     Float(NotNan<f64>),
     Boolean(bool),
     Null,
+    NullWithCast(String),
     Parameter(String), // For $1, $2, etc.
 }
 
@@ -100,6 +101,7 @@ impl LiteralValue {
     pub fn matches(&self, row_value: &Option<String>) -> bool {
         match (row_value, self) {
             (None, LiteralValue::Null) => true,
+            (None, LiteralValue::NullWithCast(_)) => true,
             (None, _) => false,
             (Some(row_str), LiteralValue::String(constraint_str)) => row_str == constraint_str,
             (Some(row_str), LiteralValue::StringWithCast(constraint_str, _)) => {
@@ -124,6 +126,7 @@ impl LiteralValue {
                 }
             }
             (Some(_), LiteralValue::Null) => false,
+            (Some(_), LiteralValue::NullWithCast(_)) => false,
             (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints
         }
     }
@@ -163,6 +166,10 @@ impl Deparse for LiteralValue {
             }
             LiteralValue::Null => {
                 buf.push_str("NULL");
+            }
+            LiteralValue::NullWithCast(cast) => {
+                buf.push_str("NULL::");
+                buf.push_str(cast);
             }
             LiteralValue::Parameter(p) => {
                 buf.push_str(p);
@@ -269,9 +276,13 @@ pub enum MultiOp {
     BetweenSymmetric,
     NotBetweenSymmetric,
     /// `expr op ANY (values)` — comparison operator determines the test
-    Any { comparison: BinaryOp },
+    Any {
+        comparison: BinaryOp,
+    },
     /// `expr op ALL (values)` — comparison operator determines the test
-    All { comparison: BinaryOp },
+    All {
+        comparison: BinaryOp,
+    },
 }
 
 impl Deparse for MultiOp {
@@ -3086,6 +3097,7 @@ fn limit_node_extract(node: Option<&Node>) -> Result<Option<LiteralValue>, AstEr
                 | LiteralValue::Float(_)
                 | LiteralValue::Boolean(_)
                 | LiteralValue::Null
+                | LiteralValue::NullWithCast(_)
                 | LiteralValue::Parameter(_) => Err(AstError::UnsupportedFeature {
                     feature: format!("LIMIT/OFFSET value: {value:?}"),
                 }),

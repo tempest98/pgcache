@@ -7,9 +7,9 @@ log_level = "debug"
 host = "localhost"
 port = 5432
 user = "postgres"
-database = "origin"
+#database = "origin"
 #database = "pagila"
-#database = "conta_azul"
+database = "conta_azul"
 
 #host = "ep-orange-river-afs4ceae.c-2.us-west-2.aws.neon.tech"
 #port = 5432
