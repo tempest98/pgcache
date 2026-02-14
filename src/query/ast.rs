@@ -264,6 +264,38 @@ impl BinaryOp {
     pub fn is_logical(&self) -> bool {
         matches!(self, BinaryOp::And | BinaryOp::Or)
     }
+
+    /// Returns true if this is a comparison operator (=, !=, <, <=, >, >=).
+    pub fn is_comparison(&self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::LessThan
+                | BinaryOp::LessThanOrEqual
+                | BinaryOp::GreaterThan
+                | BinaryOp::GreaterThanOrEqual
+        )
+    }
+
+    /// Flip a comparison operator for `value op column` → `column op' value` normalization.
+    /// Returns `None` for non-comparison ops.
+    pub fn op_flip(&self) -> Option<BinaryOp> {
+        match self {
+            BinaryOp::Equal => Some(BinaryOp::Equal),
+            BinaryOp::NotEqual => Some(BinaryOp::NotEqual),
+            BinaryOp::LessThan => Some(BinaryOp::GreaterThan),
+            BinaryOp::LessThanOrEqual => Some(BinaryOp::GreaterThanOrEqual),
+            BinaryOp::GreaterThan => Some(BinaryOp::LessThan),
+            BinaryOp::GreaterThanOrEqual => Some(BinaryOp::LessThanOrEqual),
+            BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Like
+            | BinaryOp::ILike
+            | BinaryOp::NotLike
+            | BinaryOp::NotILike => None,
+        }
+    }
 }
 
 // Multi-operand operators (one subject with multiple values)

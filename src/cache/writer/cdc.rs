@@ -11,6 +11,7 @@ use crate::catalog::TableMetadata;
 use crate::metrics::names;
 
 use crate::query::constraints::QueryConstraints;
+use crate::query::evaluate::where_value_compare_string;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
 use super::super::types::{SubqueryKind, UpdateQuery, UpdateQuerySource};
@@ -354,13 +355,22 @@ impl CacheWriter {
             return true;
         };
 
-        for (column_name, constraint_value) in constraints {
+        for (column_name, op, constraint_value) in constraints {
             if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str()) {
                 let position = column_meta.position as usize - 1;
-                if let Some(row_value) = row_data.get(position)
-                    && !constraint_value.matches(row_value)
-                {
-                    return false;
+                if let Some(row_value) = row_data.get(position) {
+                    let matches = match row_value {
+                        Some(row_str) => {
+                            where_value_compare_string(constraint_value, row_str, *op)
+                        }
+                        // NULL: comparison operators never match NULL values
+                        // (only IS NULL / IS NOT NULL can test for NULL, and those
+                        // are UnaryOps not extracted as constraints)
+                        None => false,
+                    };
+                    if !matches {
+                        return false;
+                    }
                 }
             }
         }

@@ -83,7 +83,7 @@ fn expr_comparison_evaluate(
 }
 
 /// Compare a string value from row data with a LiteralValue using the specified operator.
-fn where_value_compare_string(
+pub fn where_value_compare_string(
     filter_value: &LiteralValue,
     row_value_str: &str,
     op: BinaryOp,
