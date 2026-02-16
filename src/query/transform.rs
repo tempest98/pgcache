@@ -868,6 +868,8 @@ mod tests {
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 
+    use std::collections::HashMap;
+
     use crate::cache::SubqueryKind;
     use crate::catalog::{ColumnMetadata, TableMetadata};
     use crate::query::ast::{Deparse, query_expr_convert};
@@ -879,7 +881,7 @@ mod tests {
     fn parse_cacheable(sql: &str) -> CacheableQuery {
         let ast = pg_query::parse(sql).expect("parse SQL");
         let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
-        CacheableQuery::try_from(&query_expr).expect("query to be cacheable")
+        CacheableQuery::try_new(&query_expr, &HashMap::new()).expect("query to be cacheable")
     }
 
     /// Create test table metadata with given column names.

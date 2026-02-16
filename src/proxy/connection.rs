@@ -7,6 +7,8 @@ use std::{
     time::Instant,
 };
 
+use crate::catalog::FunctionVolatility;
+
 use rootcause::Report;
 use tokio::{
     io::AsyncWriteExt,
@@ -142,10 +144,16 @@ pub(super) struct ConnectionState {
 
     /// Per-query timing data for the current query
     current_timing: Option<QueryTiming>,
+
+    /// Function volatility map for cacheability checks
+    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
 }
 
 impl ConnectionState {
-    fn new(client_socket_source: ClientSocketSource) -> Self {
+    fn new(
+        client_socket_source: ClientSocketSource,
+        func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+    ) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
             client_write_buf: VecDeque::new(),
@@ -164,6 +172,7 @@ impl ConnectionState {
             query_start: None,
             origin_query_start: None,
             current_timing: None,
+            func_volatility,
         }
     }
 }
@@ -182,7 +191,7 @@ impl ConnectionState {
 
                 if !self.in_transaction {
                     self.proxy_mode =
-                        match handle_query(&msg.data, &mut self.fingerprint_cache).await {
+                        match handle_query(&msg.data, &mut self.fingerprint_cache, &self.func_volatility).await {
                             Ok(Action::Forward(reason)) => {
                                 match reason {
                                     ForwardReason::UnsupportedStatement => {
@@ -441,7 +450,7 @@ impl ConnectionState {
             // Analyze SQL type (regardless of transaction state - deferred to Execute)
             let sql_type = match pg_query::parse(&parsed.sql) {
                 Ok(ast) => match crate::query::ast::query_expr_convert(&ast) {
-                    Ok(query) => match CacheableQuery::try_from(&query) {
+                    Ok(query) => match CacheableQuery::try_new(&query, &self.func_volatility) {
                         Ok(cacheable_query) => StatementType::Cacheable(Box::new(cacheable_query)),
                         Err(_) => StatementType::UncacheableSelect,
                     },
@@ -823,6 +832,7 @@ async fn handle_connection(
     ssl_mode: SslMode,
     server_name: &str,
     cache_sender: CacheSender,
+    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
 ) -> ConnectionResult<()> {
     // Track active connections - guard ensures decrement on any exit path
     metrics::gauge!(names::CONNECTIONS_ACTIVE).increment(1.0);
@@ -845,7 +855,7 @@ async fn handle_connection(
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
 
     // Initialize connection state with socket source
-    let mut state = ConnectionState::new(client_socket_source);
+    let mut state = ConnectionState::new(client_socket_source, func_volatility);
 
     tokio::pin!(origin_framed_read);
     tokio::pin!(client_framed_read);
@@ -977,6 +987,7 @@ pub fn connection_run(
     mut rx: UnboundedReceiver<TcpStream>,
     cache_sender: CacheSender,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
 ) -> ConnectionResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -1007,6 +1018,7 @@ pub fn connection_run(
                     let server_name = server_name.clone();
                     let cache_sender = cache_sender.clone();
                     let tls_acceptor = tls_acceptor.clone();
+                    let func_volatility = Arc::clone(&func_volatility);
                     spawn_local(async move {
                         debug!("task spawn");
 
@@ -1035,6 +1047,7 @@ pub fn connection_run(
                             ssl_mode,
                             &server_name,
                             cache_sender,
+                            func_volatility,
                         )
                         .await;
 

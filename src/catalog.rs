@@ -4,8 +4,11 @@
 //! These structures are used by both the cache subsystem (for tracking tables)
 //! and the query resolution subsystem (for name resolution and type information).
 
+use std::collections::HashMap;
+
 use iddqd::{BiHashItem, BiHashMap, bi_upcast};
 use tokio_postgres::types::{Kind, Type};
+use tokio_postgres::{Client, Error};
 
 use crate::cache::CacheError;
 
@@ -184,6 +187,60 @@ pub struct IndexMetadata {
     pub method: String,
     /// Ordered list of column names in the index
     pub columns: Vec<String>,
+}
+
+/// PostgreSQL function volatility classification.
+///
+/// Determines whether a function's result depends only on its inputs (immutable),
+/// on inputs plus database state (stable), or can vary between calls (volatile).
+/// Used to decide whether functions in WHERE/FROM clauses are safe for caching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionVolatility {
+    Immutable,
+    Stable,
+    Volatile,
+}
+
+/// Load function volatilities from pg_proc.
+///
+/// Queries the origin database for all scalar functions and builds a map
+/// from unqualified function name to worst-case volatility across all
+/// overloads and schemas. Aggregate and window functions are excluded.
+///
+/// The map is keyed by lowercase function name to match PostgreSQL's
+/// case-insensitive identifier handling.
+pub async fn function_volatility_map_load(
+    client: &Client,
+) -> Result<HashMap<String, FunctionVolatility>, Error> {
+    let rows = client
+        .query(
+            "SELECT p.proname,
+                    MAX(CASE p.provolatile
+                        WHEN 'v' THEN 2
+                        WHEN 's' THEN 1
+                        ELSE 0
+                    END) AS worst_volatility
+             FROM pg_proc p
+             JOIN pg_namespace n ON p.pronamespace = n.oid
+             WHERE p.prokind NOT IN ('a', 'w')
+             GROUP BY p.proname",
+            &[],
+        )
+        .await?;
+
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let name: &str = row.get(0);
+        let worst: i32 = row.get(1);
+        let volatility = match worst {
+            0 => FunctionVolatility::Immutable,
+            1 => FunctionVolatility::Stable,
+            _ => FunctionVolatility::Volatile,
+        };
+        map.insert(name.to_owned(), volatility);
+    }
+
+    Ok(map)
 }
 
 /// Resolves a PostgreSQL Type to its cache-compatible storage type name.

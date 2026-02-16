@@ -8,6 +8,7 @@ use tracing::trace;
 
 use crate::{
     cache::query::CacheableQuery,
+    catalog::FunctionVolatility,
     query::ast::{AstError, query_expr_convert},
 };
 
@@ -29,6 +30,7 @@ pub(super) enum Action {
 pub(super) async fn handle_query(
     data: &BytesMut,
     fp_cache: &mut HashMap<u64, Result<Box<CacheableQuery>, ForwardReason>>,
+    func_volatility: &HashMap<String, FunctionVolatility>,
 ) -> Result<Action, ParseError> {
     let len_bytes: [u8; 4] = data
         .get(1..5)
@@ -59,7 +61,7 @@ pub(super) async fn handle_query(
             match query_expr_convert(&ast) {
                 Ok(query) => {
                     // Successfully parsed as SELECT
-                    if let Ok(cacheable_query) = CacheableQuery::try_from(&query) {
+                    if let Ok(cacheable_query) = CacheableQuery::try_new(&query, func_volatility) {
                         fp_cache.insert(fingerprint, Ok(Box::new(cacheable_query.clone())));
                         Ok(Action::CacheCheck(Box::new(cacheable_query)))
                     } else {

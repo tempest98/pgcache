@@ -440,7 +440,11 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::unwrap_used)]
 
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::cache::query::CacheableQuery;
+    use crate::query::ast::{QueryBody, query_expr_convert};
 
     #[test]
     fn test_parse_parse_message() {
@@ -633,12 +637,9 @@ mod tests {
         assert_eq!(result.parameter_oids, vec![23]);
 
         // Test that this SQL would be cacheable
-        use crate::cache::query::CacheableQuery;
-        use crate::query::ast::query_expr_convert;
-
         let ast = pg_query::parse(&result.sql).unwrap();
         let query = query_expr_convert(&ast).unwrap();
-        let cacheable = CacheableQuery::try_from(&query);
+        let cacheable = CacheableQuery::try_new(&query, &HashMap::new());
         assert!(
             cacheable.is_ok(),
             "Simple SELECT with equality should be cacheable"
@@ -662,9 +663,6 @@ mod tests {
         assert_eq!(result.statement_name, "");
 
         // Test that this SQL parses and IS cacheable (non-correlated subquery)
-        use crate::cache::query::CacheableQuery;
-        use crate::query::ast::{QueryBody, query_expr_convert};
-
         let ast = pg_query::parse(&result.sql).unwrap();
         let query = query_expr_convert(&ast).expect("subquery should parse to AST");
 
@@ -678,7 +676,7 @@ mod tests {
         );
 
         // Verify cacheability check accepts it (non-correlated subqueries are now cacheable)
-        let cacheable_result = CacheableQuery::try_from(&query);
+        let cacheable_result = CacheableQuery::try_new(&query, &HashMap::new());
         assert!(
             cacheable_result.is_ok(),
             "SELECT with non-correlated subquery should be cacheable"

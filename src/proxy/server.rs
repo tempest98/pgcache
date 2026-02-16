@@ -1,7 +1,8 @@
-use std::{mem, sync::Arc, thread, time::Duration};
+use std::{collections::HashMap, mem, sync::Arc, thread, time::Duration};
 
 use rootcause::Report;
 
+use crate::catalog::FunctionVolatility;
 use crate::result::{MapIntoReport, ReportExt};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -9,7 +10,7 @@ use tokio::{
     sync::mpsc::{UnboundedSender, channel, unbounded_channel},
     time::{Sleep, sleep},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 use crate::metrics::names;
 
@@ -116,7 +117,11 @@ impl<'scope> ProxyCacheState<'scope> {
 
 use crate::{
     cache::{CacheResult, cache_run},
-    pg::cdc::{replication_cleanup, replication_provision},
+    catalog::function_volatility_map_load,
+    pg::{
+        cdc::{replication_cleanup, replication_provision},
+        connect,
+    },
     settings::Settings,
     tls,
 };
@@ -134,6 +139,7 @@ type Worker<'scope> = (
 struct WorkerResources {
     cache_sender: CacheSender,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
 }
 
 fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
@@ -152,6 +158,7 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
                 rx,
                 resources.cache_sender,
                 resources.tls_acceptor,
+                resources.func_volatility,
             )
         })
         .map_into_report::<ConnectionError>()?;
@@ -256,6 +263,44 @@ fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsA
     }
 }
 
+/// Load function volatilities from origin database.
+///
+/// Opens a temporary connection to origin, queries pg_proc for all scalar
+/// function volatilities, and returns an immutable shared map.
+async fn function_volatility_load(
+    settings: &Settings,
+) -> ConnectionResult<Arc<HashMap<String, FunctionVolatility>>> {
+    let client = connect(&settings.origin, "volatility-load")
+        .await
+        .map_err(|e| {
+            Report::from(ConnectionError::IoError(std::io::Error::other(format!(
+                "volatility load connection: {e}"
+            ))))
+        })?;
+    let map = function_volatility_map_load(&client).await.map_err(|e| {
+        Report::from(ConnectionError::IoError(std::io::Error::other(format!(
+            "volatility map load: {e}"
+        ))))
+    })?;
+    let immutable_count = map
+        .iter()
+        .filter(|(_, v)| matches!(v, FunctionVolatility::Immutable))
+        .count();
+    info!("loaded {} function volatilities ({immutable_count} immutable)", map.len());
+
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let mut names: Vec<&str> = map
+            .iter()
+            .filter(|(_, v)| matches!(v, FunctionVolatility::Immutable))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        names.sort_unstable();
+        trace!("immutable functions: {}", names.join(", "));
+    }
+
+    Ok(Arc::new(map))
+}
+
 #[tracing::instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
@@ -269,6 +314,7 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
             .map_into_report::<ConnectionError>()?;
 
         let _ = rt.block_on(async { replication_provision(settings).await });
+        let func_volatility = rt.block_on(function_volatility_load(settings))?;
 
         let (cache_handle, cache_tx) = cache_create(scope, settings)
             .map_into_report::<ConnectionError>()
@@ -279,6 +325,7 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
         let resources = WorkerResources {
             cache_sender,
             tls_acceptor,
+            func_volatility,
         };
 
         let mut workers = workers_create_all(scope, settings, resources.clone())?;

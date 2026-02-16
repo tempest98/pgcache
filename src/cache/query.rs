@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     cache::QueryParameters,
+    catalog::FunctionVolatility,
     query::{
         ast::{
             BinaryOp, CteRefNode, JoinNode, JoinType, LimitClause, LiteralValue, MultiOp,
@@ -24,9 +25,13 @@ error_set! {
         #[display("Unsupported subquery type")]
         UnsupportedSubquery,
         UnsupportedWhereClause,
+        NonImmutableFunction,
         HasLimit,
     }
 }
+
+/// Type alias for the function volatility map passed through cacheability checks.
+type FunctionVolatilityMap = HashMap<String, FunctionVolatility>;
 
 #[derive(Debug, Clone)]
 pub struct CacheableQuery {
@@ -56,12 +61,16 @@ impl CacheableQuery {
     }
 }
 
-impl TryFrom<&QueryExpr> for CacheableQuery {
-    type Error = CacheabilityError;
-
-    fn try_from(query: &QueryExpr) -> Result<Self, Self::Error> {
-        // Validate the query body (SELECT, VALUES, or SetOp)
-        is_cacheable_body(&query.body)?;
+impl CacheableQuery {
+    /// Check if a query is cacheable given the function volatility map.
+    ///
+    /// Validates the query structure and ensures all functions in WHERE/FROM
+    /// clauses are immutable. Functions in SELECT lists are always allowed.
+    pub fn try_new(
+        query: &QueryExpr,
+        fv: &FunctionVolatilityMap,
+    ) -> Result<Self, CacheabilityError> {
+        is_cacheable_body(&query.body, fv)?;
 
         Ok(CacheableQuery {
             query: query.clone(),
@@ -71,52 +80,65 @@ impl TryFrom<&QueryExpr> for CacheableQuery {
 
 /// Check if a query body is cacheable.
 /// Recursively validates SELECT nodes and set operation branches.
-fn is_cacheable_body(body: &QueryBody) -> Result<(), CacheabilityError> {
+fn is_cacheable_body(
+    body: &QueryBody,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     match body {
-        QueryBody::Select(node) => is_cacheable_select(node),
+        QueryBody::Select(node) => is_cacheable_select(node, fv),
         QueryBody::Values(_) => {
             // VALUES clauses are not cacheable as standalone queries
             Err(CacheabilityError::UnsupportedQueryType)
         }
-        QueryBody::SetOp(set_op) => is_cacheable_set_op(set_op),
+        QueryBody::SetOp(set_op) => is_cacheable_set_op(set_op, fv),
     }
 }
 
 /// Check if a SELECT node is cacheable.
-fn is_cacheable_select(node: &SelectNode) -> Result<(), CacheabilityError> {
+fn is_cacheable_select(
+    node: &SelectNode,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     // Check FROM clause (tables, joins, subqueries)
-    is_supported_from(node, ExprContext::FromClause)?;
+    is_supported_from(node, ExprContext::FromClause, fv)?;
 
     // Check WHERE clause (including any subqueries)
-    is_cacheable_where(node, ExprContext::WhereClause)?;
+    is_cacheable_where(node, ExprContext::WhereClause, fv)?;
 
     // Check SELECT list for subqueries
-    is_cacheable_select_list(node, ExprContext::SelectList)?;
+    is_cacheable_select_list(node, ExprContext::SelectList, fv)?;
 
     Ok(())
 }
 
 /// Check if a set operation (UNION/INTERSECT/EXCEPT) is cacheable.
 /// Both branches must be cacheable.
-fn is_cacheable_set_op(set_op: &SetOpNode) -> Result<(), CacheabilityError> {
+fn is_cacheable_set_op(
+    set_op: &SetOpNode,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     // LIMIT/OFFSET on branches makes them non-cacheable
     if set_op.left.limit.is_some() || set_op.right.limit.is_some() {
         return Err(CacheabilityError::HasLimit);
     }
 
     // Recursively validate both branches (subquery cacheability checked recursively)
-    is_cacheable_body(&set_op.left.body)?;
-    is_cacheable_body(&set_op.right.body)?;
+    is_cacheable_body(&set_op.left.body, fv)?;
+    is_cacheable_body(&set_op.right.body, fv)?;
 
     Ok(())
 }
 
-fn is_supported_from(select: &SelectNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
+fn is_supported_from(
+    select: &SelectNode,
+    ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     match select.from.as_slice() {
-        [TableSource::Join(join)] => is_supported_join(join, ctx),
+        [TableSource::Join(join)] => is_supported_join(join, ctx, fv),
         [TableSource::Table(_)] => Ok(()),
-        [TableSource::Subquery(sub)] => is_cacheable_table_subquery(sub, ctx),
-        [TableSource::CteRef(cte_ref)] => is_cacheable_cte_ref(cte_ref, ctx),
+        [TableSource::Subquery(sub)] => is_cacheable_table_subquery(sub, ctx, fv),
+        [TableSource::CteRef(cte_ref)] => is_cacheable_cte_ref(cte_ref, ctx, fv),
         _ => Err(CacheabilityError::UnsupportedFrom),
     }
 }
@@ -125,6 +147,7 @@ fn is_supported_from(select: &SelectNode, ctx: ExprContext) -> Result<(), Cachea
 fn is_cacheable_table_subquery(
     subquery: &TableSubqueryNode,
     _ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
     // LATERAL subqueries are not supported (they reference outer scope)
     if subquery.lateral {
@@ -139,10 +162,14 @@ fn is_cacheable_table_subquery(
     // Inner query must be cacheable
     // Note: We check the inner query for cacheability but don't check for LIMIT
     // since LIMIT in a derived table subquery is valid SQL
-    is_cacheable_body(&subquery.query.body)
+    is_cacheable_body(&subquery.query.body, fv)
 }
 
-fn is_supported_join(join: &JoinNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
+fn is_supported_join(
+    join: &JoinNode,
+    ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     // FULL OUTER JOINs are not cacheable — both sides are optional
     if join.join_type == JoinType::Full {
         return Err(CacheabilityError::UnsupportedFrom);
@@ -159,8 +186,8 @@ fn is_supported_join(join: &JoinNode, ctx: ExprContext) -> Result<(), Cacheabili
     }
 
     // Recursively validate nested joins/tables/subqueries
-    is_supported_table_source(&join.left, ctx)?;
-    is_supported_table_source(&join.right, ctx)?;
+    is_supported_table_source(&join.left, ctx, fv)?;
+    is_supported_table_source(&join.right, ctx, fv)?;
 
     Ok(())
 }
@@ -196,18 +223,23 @@ fn join_condition_is_valid(expr: &WhereExpr) -> bool {
 fn is_supported_table_source(
     source: &TableSource,
     ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
     match source {
-        TableSource::Join(nested) => is_supported_join(nested, ctx),
+        TableSource::Join(nested) => is_supported_join(nested, ctx, fv),
         TableSource::Table(_) => Ok(()),
-        TableSource::Subquery(sub) => is_cacheable_table_subquery(sub, ctx),
-        TableSource::CteRef(cte_ref) => is_cacheable_cte_ref(cte_ref, ctx),
+        TableSource::Subquery(sub) => is_cacheable_table_subquery(sub, ctx, fv),
+        TableSource::CteRef(cte_ref) => is_cacheable_cte_ref(cte_ref, ctx, fv),
     }
 }
 
 /// Check if a CTE reference is cacheable.
-fn is_cacheable_cte_ref(cte_ref: &CteRefNode, _ctx: ExprContext) -> Result<(), CacheabilityError> {
-    is_cacheable_body(&cte_ref.query.body)
+fn is_cacheable_cte_ref(
+    cte_ref: &CteRefNode,
+    _ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
+    is_cacheable_body(&cte_ref.query.body, fv)
 }
 
 /// Check if a SELECT's WHERE clause can be efficiently cached.
@@ -217,9 +249,13 @@ fn is_cacheable_cte_ref(cte_ref: &CteRefNode, _ctx: ExprContext) -> Result<(), C
 /// - GROUP BY and HAVING (aggregation performed on cached rows at retrieval time)
 /// - Non-correlated subqueries (EXISTS, IN, scalar)
 ///
-fn is_cacheable_where(select: &SelectNode, ctx: ExprContext) -> Result<(), CacheabilityError> {
+fn is_cacheable_where(
+    select: &SelectNode,
+    ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     match &select.where_clause {
-        Some(where_expr) => is_cacheable_expr(where_expr, ctx),
+        Some(where_expr) => is_cacheable_expr(where_expr, ctx, fv),
         None => Ok(()), // No WHERE clause is always cacheable
     }
 }
@@ -227,21 +263,26 @@ fn is_cacheable_where(select: &SelectNode, ctx: ExprContext) -> Result<(), Cache
 /// Where in the query tree a cacheability check is being evaluated.
 ///
 /// Functions in the SELECT list (e.g. CASE WHEN conditions) are safe — they're
-/// re-evaluated against cached rows. Functions in the WHERE clause affect row-set
-/// membership and need separate design work, so they're rejected there.
+/// re-evaluated against cached rows. Immutable functions are safe in any context.
+/// Non-immutable functions in WHERE/FROM are rejected.
 #[derive(Clone, Copy)]
 enum ExprContext {
-    /// Expression in the FROM clause — functions not yet supported
+    /// Expression in the FROM clause — only immutable functions allowed
     FromClause,
-    /// Expression in the WHERE clause — functions not yet supported
+    /// Expression in the WHERE clause — only immutable functions allowed
     WhereClause,
-    /// Expression in the SELECT list — functions allowed
+    /// Expression in the SELECT list — all functions allowed
     SelectList,
 }
 
 /// Determine if a WHERE expression can be efficiently cached.
 /// Supports simple comparisons, AND/OR of comparisons, and non-correlated subqueries.
-fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), CacheabilityError> {
+/// Functions are gated by volatility: immutable allowed everywhere, others only in SelectList.
+fn is_cacheable_expr(
+    expr: &WhereExpr,
+    ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     match expr {
         WhereExpr::Binary(binary_expr) => match binary_expr.op {
             BinaryOp::Equal
@@ -251,8 +292,8 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
             | BinaryOp::GreaterThan
             | BinaryOp::GreaterThanOrEqual => {
                 // Recursively check both sides are cacheable
-                is_cacheable_expr(&binary_expr.lexpr, ctx)?;
-                is_cacheable_expr(&binary_expr.rexpr, ctx)?;
+                is_cacheable_expr(&binary_expr.lexpr, ctx, fv)?;
+                is_cacheable_expr(&binary_expr.rexpr, ctx, fv)?;
                 // Allow comparisons where both sides are cacheable:
                 // - (Column, Value) - simple comparisons for cache filtering
                 // - (Column, Column) - join conditions in subqueries
@@ -260,12 +301,12 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
                 Ok(())
             }
             BinaryOp::And | BinaryOp::Or => {
-                is_cacheable_expr(&binary_expr.lexpr, ctx)?;
-                is_cacheable_expr(&binary_expr.rexpr, ctx)
+                is_cacheable_expr(&binary_expr.lexpr, ctx, fv)?;
+                is_cacheable_expr(&binary_expr.rexpr, ctx, fv)
             }
             BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => {
-                is_cacheable_expr(&binary_expr.lexpr, ctx)?;
-                is_cacheable_expr(&binary_expr.rexpr, ctx)
+                is_cacheable_expr(&binary_expr.lexpr, ctx, fv)?;
+                is_cacheable_expr(&binary_expr.rexpr, ctx, fv)
             }
         },
         WhereExpr::Value(_) => Ok(()),
@@ -278,36 +319,42 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
             | MultiOp::BetweenSymmetric
             | MultiOp::NotBetweenSymmetric => {
                 for e in &multi_expr.exprs {
-                    is_cacheable_expr(e, ctx)?;
+                    is_cacheable_expr(e, ctx, fv)?;
                 }
                 Ok(())
             }
             MultiOp::Any { .. } | MultiOp::All { .. } => {
                 for e in &multi_expr.exprs {
-                    is_cacheable_expr(e, ctx)?;
+                    is_cacheable_expr(e, ctx, fv)?;
                 }
                 Ok(())
             }
         },
-        WhereExpr::Array(elems) => elems.iter().try_for_each(|e| is_cacheable_expr(e, ctx)),
-        WhereExpr::Unary(unary_expr) => is_cacheable_expr(&unary_expr.expr, ctx),
-        WhereExpr::Function { args, .. } => match ctx {
-            ExprContext::FromClause | ExprContext::WhereClause => {
-                Err(CacheabilityError::UnsupportedWhereClause)
+        WhereExpr::Array(elems) => elems.iter().try_for_each(|e| is_cacheable_expr(e, ctx, fv)),
+        WhereExpr::Unary(unary_expr) => is_cacheable_expr(&unary_expr.expr, ctx, fv),
+        WhereExpr::Function { name, args } => {
+            let is_immutable = matches!(
+                fv.get(name.to_lowercase().as_str()),
+                Some(FunctionVolatility::Immutable)
+            );
+            if is_immutable || matches!(ctx, ExprContext::SelectList) {
+                args.iter()
+                    .try_for_each(|arg| is_cacheable_expr(arg, ctx, fv))
+            } else {
+                Err(CacheabilityError::NonImmutableFunction)
             }
-            ExprContext::SelectList => args.iter().try_for_each(|arg| is_cacheable_expr(arg, ctx)),
-        },
+        }
         WhereExpr::Subquery {
             query,
             sublink_type,
             test_expr,
         } => {
             // Check the inner query is cacheable
-            is_cacheable_subquery_inner(query)?;
+            is_cacheable_subquery_inner(query, fv)?;
 
             // Check test_expr (left-hand side for IN/ANY/ALL) is cacheable
             if let Some(test) = test_expr {
-                is_cacheable_expr(test, ctx)?;
+                is_cacheable_expr(test, ctx, fv)?;
             }
 
             // All supported sublink types are cacheable if inner query is cacheable
@@ -324,16 +371,19 @@ fn is_cacheable_expr(expr: &WhereExpr, ctx: ExprContext) -> Result<(), Cacheabil
 
 /// Check if a subquery's inner query is cacheable.
 /// For subqueries, we allow LIMIT since it's valid in derived tables.
-fn is_cacheable_subquery_inner(query: &QueryExpr) -> Result<(), CacheabilityError> {
+fn is_cacheable_subquery_inner(
+    query: &QueryExpr,
+    fv: &FunctionVolatilityMap,
+) -> Result<(), CacheabilityError> {
     // Check the query body (SELECT, VALUES, or SetOp)
-    is_cacheable_body(&query.body)
+    is_cacheable_body(&query.body, fv)
 }
 
 /// Check if a SELECT list contains cacheable expressions.
-/// Currently rejects functions that contain subqueries.
 fn is_cacheable_select_list(
     select: &SelectNode,
     ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
     use crate::query::ast::SelectColumns;
 
@@ -341,7 +391,7 @@ fn is_cacheable_select_list(
         SelectColumns::All | SelectColumns::None => Ok(()),
         SelectColumns::Columns(cols) => {
             for col in cols {
-                is_cacheable_column_expr(&col.expr, ctx)?;
+                is_cacheable_column_expr(&col.expr, ctx, fv)?;
             }
             Ok(())
         }
@@ -352,6 +402,7 @@ fn is_cacheable_select_list(
 fn is_cacheable_column_expr(
     expr: &crate::query::ast::ColumnExpr,
     ctx: ExprContext,
+    fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
     use crate::query::ast::ColumnExpr;
 
@@ -360,33 +411,33 @@ fn is_cacheable_column_expr(
         ColumnExpr::Function(func) => {
             // Recursively check function arguments
             for arg in &func.args {
-                is_cacheable_column_expr(arg, ctx)?;
+                is_cacheable_column_expr(arg, ctx, fv)?;
             }
             Ok(())
         }
         ColumnExpr::Case(case) => {
             // Check case argument if present
             if let Some(arg) = &case.arg {
-                is_cacheable_column_expr(arg, ctx)?;
+                is_cacheable_column_expr(arg, ctx, fv)?;
             }
             // Check when conditions and results
             for when in &case.whens {
-                is_cacheable_expr(&when.condition, ctx)?;
-                is_cacheable_column_expr(&when.result, ctx)?;
+                is_cacheable_expr(&when.condition, ctx, fv)?;
+                is_cacheable_column_expr(&when.result, ctx, fv)?;
             }
             // Check default
             if let Some(default) = &case.default {
-                is_cacheable_column_expr(default, ctx)?;
+                is_cacheable_column_expr(default, ctx, fv)?;
             }
             Ok(())
         }
         ColumnExpr::Arithmetic(arith) => {
-            is_cacheable_column_expr(&arith.left, ctx)?;
-            is_cacheable_column_expr(&arith.right, ctx)
+            is_cacheable_column_expr(&arith.left, ctx, fv)?;
+            is_cacheable_column_expr(&arith.right, ctx, fv)
         }
         ColumnExpr::Subquery(query) => {
             // Scalar subquery in SELECT list - check inner query
-            is_cacheable_subquery_inner(query)
+            is_cacheable_subquery_inner(query, fv)
         }
     }
 }
@@ -553,11 +604,38 @@ mod tests {
     use crate::query::ast::{query_expr_convert, query_expr_fingerprint};
     use crate::query::resolved::select_node_resolve;
 
-    /// Parse SQL and check cacheability
+    /// Build a test volatility map with common functions.
+    fn test_func_volatility() -> FunctionVolatilityMap {
+        let mut map = HashMap::new();
+        for name in [
+            "lower",
+            "upper",
+            "length",
+            "abs",
+            "concat",
+            "trim",
+            "btrim",
+            "ltrim",
+            "rtrim",
+            "replace",
+            "substring",
+            "date_trunc",
+        ] {
+            map.insert(name.to_owned(), FunctionVolatility::Immutable);
+        }
+        for name in ["now", "current_timestamp"] {
+            map.insert(name.to_owned(), FunctionVolatility::Stable);
+        }
+        map.insert("random".to_owned(), FunctionVolatility::Volatile);
+        map
+    }
+
+    /// Parse SQL and check cacheability using the test volatility map.
     fn check_cacheable(sql: &str) -> Result<CacheableQuery, CacheabilityError> {
+        let fv = test_func_volatility();
         let ast = pg_query::parse(sql).expect("parse");
         let query_expr = query_expr_convert(&ast).expect("convert");
-        CacheableQuery::try_from(&query_expr)
+        CacheableQuery::try_new(&query_expr, &fv)
     }
 
     /// Create test table metadata with given column names.
@@ -993,12 +1071,94 @@ mod tests {
     }
 
     #[test]
-    fn test_function_in_where_clause_not_cacheable() {
+    fn test_immutable_function_in_where_cacheable() {
         let sql = "SELECT * FROM orders WHERE date_trunc('day', created_at) = '2024-01-01'";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedWhereClause)),
-            "Function in WHERE clause should not be cacheable: {result:?}"
+            result.is_ok(),
+            "Immutable function in WHERE clause should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_immutable_lower_in_where_cacheable() {
+        let sql = "SELECT * FROM users WHERE lower(name) = 'foo'";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "lower() in WHERE should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_nested_immutable_functions_in_where_cacheable() {
+        let sql = "SELECT * FROM users WHERE lower(upper(name)) = 'foo'";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "Nested immutable functions in WHERE should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_immutable_in_select_and_where_cacheable() {
+        let sql = "SELECT lower(name) FROM users WHERE lower(name) = 'foo'";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "Immutable function in both SELECT and WHERE should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_stable_function_in_where_not_cacheable() {
+        let sql = "SELECT * FROM orders WHERE now() > created_at";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::NonImmutableFunction)),
+            "Stable function in WHERE should not be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_volatile_function_in_where_not_cacheable() {
+        let sql = "SELECT * FROM orders WHERE random() > 0.5";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::NonImmutableFunction)),
+            "Volatile function in WHERE should not be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_function_in_where_not_cacheable() {
+        let sql = "SELECT * FROM users WHERE unknown_func(col) = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            matches!(result, Err(CacheabilityError::NonImmutableFunction)),
+            "Unknown function in WHERE should not be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_stable_function_in_select_list_cacheable() {
+        // Functions in SELECT list are always allowed (re-evaluated at serve time)
+        let sql = "SELECT now() FROM orders WHERE tenant_id = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "Stable function in SELECT list should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_immutable_function_case_insensitive() {
+        // pg_query preserves case; lookup should be case-insensitive
+        let sql = "SELECT * FROM users WHERE LOWER(name) = 'foo'";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "LOWER (uppercase) in WHERE should be cacheable: {result:?}"
         );
     }
 
@@ -1237,7 +1397,6 @@ mod tests {
 
     #[test]
     fn test_limit_offset_fingerprint_match() {
-
         let base = "SELECT * FROM orders WHERE tenant_id = 1";
         let with_limit = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10";
         let with_offset = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
