@@ -1,6 +1,6 @@
 num_workers = 2
 #cache_size = 100000
-log_level = "trace"
+#log_level = "trace"
 #log_level = "debug"
 
 [origin]

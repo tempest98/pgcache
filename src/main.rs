@@ -8,11 +8,13 @@ use std::time::Duration;
 use pgcache_lib::metrics::prometheus_install;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
-use pgcache_lib::tracing_utils::SimpeFormatter;
 use rootcause::Report;
 
 use tokio::io;
 use tracing::info;
+#[cfg(not(feature = "console"))]
+use pgcache_lib::tracing_utils::SimpeFormatter;
+#[cfg(not(feature = "console"))]
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Report> {
@@ -35,19 +37,25 @@ fn main() -> Result<(), Report> {
         info!("Prometheus metrics available at http://{}/metrics", socket);
     }
 
-    // Log level precedence: CLI arg > config file > RUST_LOG env var > default (info)
-    let filter = settings
-        .log_level
-        .as_deref()
-        .map(EnvFilter::new)
-        .or_else(|| EnvFilter::try_from_default_env().ok())
-        .unwrap_or_else(|| EnvFilter::new("info"));
+    #[cfg(feature = "console")]
+    console_subscriber::init();
 
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .event_format(SimpeFormatter)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    #[cfg(not(feature = "console"))]
+    {
+        // Log level precedence: CLI arg > config file > RUST_LOG env var > default (info)
+        let filter = settings
+            .log_level
+            .as_deref()
+            .map(EnvFilter::new)
+            .or_else(|| EnvFilter::try_from_default_env().ok())
+            .unwrap_or_else(|| EnvFilter::new("info"));
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .event_format(SimpeFormatter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
 
     let sigint = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))?;
