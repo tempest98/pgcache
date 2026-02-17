@@ -7,14 +7,21 @@ use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 use crate::{
     catalog::TableMetadata,
     query::{ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr},
-    settings::Settings,
+    settings::{CachePolicy, Settings},
 };
 
 /// State of a cached query
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedQueryState {
-    Ready,
+    /// Seen but not yet admitted to cache (clock policy only).
+    /// The u32 tracks how many times this query has been seen.
+    Pending(u32),
+    /// Admitted, population in progress
     Loading,
+    /// Cached and serving hits
+    Ready,
+    /// CDC-invalidated, awaiting re-hit for fast readmission (clock policy only)
+    Invalidated,
 }
 
 /// A cached query with its metadata and state
@@ -34,6 +41,8 @@ pub struct CachedQuery {
     pub cached_bytes: usize,
     /// Timestamp when registration started (for latency metrics)
     pub registration_started_at: Option<Instant>,
+    /// True when in Invalidated state (kept in cached_queries for metadata reuse on readmission)
+    pub invalidated: bool,
 }
 
 impl BiHashItem for CachedQuery {
@@ -149,6 +158,10 @@ pub struct Cache {
     /// Size of currently cached data, updated after loading queries or purging data
     /// Actual size can drift from this value because of CDC traffic
     pub current_size: usize,
+    /// Cache eviction policy
+    pub cache_policy: CachePolicy,
+    /// Number of times a query must be seen before admission (clock policy only)
+    pub admission_threshold: u32,
 }
 
 impl Cache {
@@ -161,6 +174,8 @@ impl Cache {
             generations: BTreeSet::new(),
             cache_size: settings.cache_size,
             current_size: 0,
+            cache_policy: settings.cache_policy,
+            admission_threshold: settings.admission_threshold,
         }
     }
 
@@ -196,4 +211,6 @@ pub struct CachedQueryView {
     pub resolved: Option<ResolvedQueryExpr>,
     /// Maximum rows cached for this fingerprint (None = all rows)
     pub max_limit: Option<u64>,
+    /// CLOCK reference bit — set by coordinator on cache hit, read/cleared by writer during eviction
+    pub referenced: bool,
 }

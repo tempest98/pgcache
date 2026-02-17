@@ -66,6 +66,8 @@ impl CacheWriter {
 
     /// Registers a query in the cache and spawns background population.
     /// Registration is synchronous (updates Cache state), population is async.
+    /// If the query was previously invalidated (CLOCK policy), takes the fast
+    /// readmission path that reuses existing metadata.
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_register(
@@ -75,6 +77,13 @@ impl CacheWriter {
         search_path: &[&str],
         started_at: Instant,
     ) -> CacheResult<()> {
+        // Fast readmission: reuse metadata from invalidated entry
+        if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
+            && query.invalidated
+        {
+            return self.query_readmit(fingerprint, started_at);
+        }
+
         let mut relation_oids = Vec::new();
 
         // Extract max_limit from the incoming query's LIMIT clause,
@@ -177,6 +186,7 @@ impl CacheWriter {
             max_limit,
             cached_bytes: 0,
             registration_started_at: Some(started_at),
+            invalidated: false,
         };
 
         self.cache.cached_queries.insert_overwrite(cached_query);
@@ -213,6 +223,71 @@ impl CacheWriter {
 
         self.populate_work_dispatch(work)?;
         trace!("population work queued for query {fingerprint}");
+        Ok(())
+    }
+
+    /// Fast readmission for a CDC-invalidated query.
+    /// Reuses existing metadata (relation_oids, resolved, update_queries) and
+    /// dispatches population work without re-resolving tables.
+    fn query_readmit(&mut self, fingerprint: u64, started_at: Instant) -> CacheResult<()> {
+        info!("readmitting query {fingerprint}");
+        metrics::counter!(names::CACHE_READMISSIONS).increment(1);
+
+        // Assign new generation
+        self.cache.generation_counter += 1;
+        let new_generation = self.cache.generation_counter;
+        self.cache.generations.insert(new_generation);
+
+        // Extract data before remove/reinsert (generation is key2)
+        let Some(mut cached) = self.cache.cached_queries.remove1(&fingerprint) else {
+            return Ok(());
+        };
+
+        let resolved = cached.resolved.clone();
+        let max_limit = cached.max_limit;
+
+        cached.generation = new_generation;
+        cached.invalidated = false;
+        cached.cached_bytes = 0;
+        cached.registration_started_at = Some(started_at);
+        self.cache.cached_queries.insert_overwrite(cached);
+        self.active_relations_rebuild();
+
+        // Update state view to Loading
+        self.state_view_update(
+            fingerprint,
+            CachedQueryState::Loading,
+            new_generation,
+            &resolved,
+            max_limit,
+        );
+
+        // Extract SELECT branches for population
+        let branches: Vec<_> = resolved.select_nodes().into_iter().cloned().collect();
+
+        let branch_relation_oids: Vec<u32> = branches
+            .iter()
+            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
+            .map(|tn| tn.relation_oid)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let table_metadata: Vec<TableMetadata> = branch_relation_oids
+            .iter()
+            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
+            .collect();
+
+        let work = PopulationWork {
+            fingerprint,
+            generation: new_generation,
+            table_metadata,
+            branches,
+            max_limit,
+        };
+
+        self.populate_work_dispatch(work)?;
+        trace!("readmission population queued for query {fingerprint}");
         Ok(())
     }
 

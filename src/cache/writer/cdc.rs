@@ -14,7 +14,9 @@ use crate::query::constraints::QueryConstraints;
 use crate::query::evaluate::where_value_compare_string;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
-use super::super::types::{SubqueryKind, UpdateQuery, UpdateQuerySource};
+use crate::settings::CachePolicy;
+
+use super::super::types::{CachedQueryState, SubqueryKind, UpdateQuery, UpdateQuerySource};
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::CacheWriter;
 
@@ -50,9 +52,9 @@ impl CacheWriter {
 
         let invalidation_count = fp_list.len() as u64;
         for fp in fp_list {
-            self.cache_query_invalidate(fp)
+            self.cache_query_cdc_invalidate(fp)
                 .await
-                .attach_loc("invalidating query")?;
+                .attach_loc("cdc invalidating query")?;
         }
         if invalidation_count > 0 {
             metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
@@ -93,7 +95,7 @@ impl CacheWriter {
         trace!("invalidation_count {}", invalidation_count);
 
         for fp in fp_list {
-            self.cache_query_invalidate(fp).await?;
+            self.cache_query_cdc_invalidate(fp).await?;
         }
         if invalidation_count > 0 {
             metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
@@ -188,9 +190,9 @@ impl CacheWriter {
 
             let invalidation_count = fp_list.len() as u64;
             for fp in fp_list {
-                self.cache_query_invalidate(fp)
+                self.cache_query_cdc_invalidate(fp)
                     .await
-                    .attach_loc("invalidating query on delete")?;
+                    .attach_loc("cdc invalidating query on delete")?;
             }
             if invalidation_count > 0 {
                 metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
@@ -234,19 +236,20 @@ impl CacheWriter {
             .collect();
 
         for fp in fingerprints {
-            self.cache_query_invalidate(fp).await?;
+            self.cache_query_evict(fp).await?;
         }
         Ok(())
     }
 
-    /// Invalidate a specific cached query and purge its generation if safe.
+    /// Fully evict a cached query: remove from all data structures and purge rows.
+    /// Used by the eviction loop and schema-change (table) invalidation.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) async fn cache_query_invalidate(&mut self, fingerprint: u64) -> CacheResult<()> {
+    pub(super) async fn cache_query_evict(&mut self, fingerprint: u64) -> CacheResult<()> {
         let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
             return Ok(());
         };
 
-        debug!("invalidating query {fingerprint}");
+        debug!("evicting query {fingerprint}");
         self.active_relations_rebuild();
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
@@ -267,7 +270,66 @@ impl CacheWriter {
         }
 
         // Purge generations based on new threshold
-        // add in cache size check when supported here
+        let new_threshold = self.cache.generation_purge_threshold();
+        if new_threshold > prev_generation_threshold {
+            let mut current_size = self.cache_size_load().await?;
+
+            if self.cache.cache_size.is_some_and(|s| current_size > s) {
+                self.generation_purge(new_threshold).await?;
+                current_size = self.cache_size_load().await?;
+            }
+
+            self.cache.current_size = current_size as usize;
+        }
+
+        Ok(())
+    }
+
+    /// CDC-triggered invalidation of a cached query.
+    /// For FIFO: delegates to full eviction.
+    /// For CLOCK: marks the entry as Invalidated, keeping metadata for fast readmission.
+    /// Removes from generations BTreeSet and purges stale rows, but preserves
+    /// cached_queries entry and update_queries for reuse on readmission.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(super) async fn cache_query_cdc_invalidate(
+        &mut self,
+        fingerprint: u64,
+    ) -> CacheResult<()> {
+        if self.cache.cache_policy == CachePolicy::Fifo {
+            return self.cache_query_evict(fingerprint).await;
+        }
+
+        let Some(query) = self.cache.cached_queries.get1(&fingerprint) else {
+            return Ok(());
+        };
+
+        // Already invalidated — nothing to do
+        if query.invalidated {
+            return Ok(());
+        }
+
+        let generation = query.generation;
+        debug!("cdc invalidating query {fingerprint}");
+
+        let prev_generation_threshold = self.cache.generation_purge_threshold();
+
+        // Remove from active generations (no longer serving cached results)
+        self.cache.generations.remove(&generation);
+
+        // Mark as invalidated (keep entry for metadata reuse on readmission)
+        if let Some(mut query) = self.cache.cached_queries.get1_mut(&fingerprint) {
+            query.invalidated = true;
+        }
+
+        // Update state view to Invalidated
+        if let Ok(mut view) = self.state_view.write()
+            && let Some(entry) = view.cached_queries.get_mut(&fingerprint)
+        {
+            entry.state = CachedQueryState::Invalidated;
+            entry.referenced = false;
+        }
+
+        // Purge stale rows if generation threshold moved
         let new_threshold = self.cache.generation_purge_threshold();
         if new_threshold > prev_generation_threshold {
             let mut current_size = self.cache_size_load().await?;

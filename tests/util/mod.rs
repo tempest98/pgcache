@@ -149,6 +149,21 @@ impl TestContext {
         })
     }
 
+    /// Set up a test context with clock eviction policy.
+    pub async fn setup_clock(admission_threshold: u32) -> Result<Self, Error> {
+        let (dbs, origin) = start_databases().await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_clock(&dbs, admission_threshold).await?;
+        Ok(Self {
+            dbs,
+            pgcache,
+            cache_port,
+            metrics_port,
+            cache,
+            origin,
+        })
+    }
+
     /// Execute query through pgcache proxy
     pub async fn query<T>(
         &mut self,
@@ -288,15 +303,19 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
     ))
 }
 
-pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
-    // Find random available ports for listen and metrics
-    let listen_port = find_available_port()?;
+/// Spawn a pgcache process with the given extra CLI arguments.
+/// Returns the process, listen port, and metrics port.
+fn pgcache_spawn(
+    dbs: &TempDBs,
+    listen_port: u16,
+    metrics_port: u16,
+    extra_args: &[&str],
+) -> PgCacheProcess {
     let listen_socket = format!("127.0.0.1:{}", listen_port);
-    let metrics_port = find_available_port()?;
     let metrics_socket = format!("127.0.0.1:{}", metrics_port);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_pgcache"))
-        .arg("--config")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pgcache"));
+    cmd.arg("--config")
         .arg("tests/data/default_config.toml")
         .arg("--origin_host")
         .arg("127.0.0.1")
@@ -317,17 +336,23 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16,
         .arg("--listen_socket")
         .arg(&listen_socket)
         .arg("--metrics_socket")
-        .arg(&metrics_socket)
+        .arg(&metrics_socket);
+
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+
+    let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("run pgcache");
 
-    let mut pgcache = PgCacheProcess::new(child);
+    PgCacheProcess::new(child)
+}
 
-    //wait to listening message from proxy before proceeding
-    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
-
+/// Connect a plain TCP client to pgcache.
+async fn pgcache_client_connect(listen_port: u16) -> Result<Client, Error> {
     let (client, connection) = Config::new()
         .host("localhost")
         .port(listen_port)
@@ -343,60 +368,65 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16,
         }
     });
 
+    Ok(client)
+}
+
+pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let mut pgcache = pgcache_spawn(dbs, listen_port, metrics_port, &["--cache_policy", "fifo"]);
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))
 }
 
-/// Connect to pgcache with TLS enabled on the proxy
+/// Connect to pgcache with clock eviction policy.
+pub async fn connect_pgcache_clock(
+    dbs: &TempDBs,
+    admission_threshold: u32,
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let threshold_str = admission_threshold.to_string();
+    let mut pgcache = pgcache_spawn(
+        dbs,
+        listen_port,
+        metrics_port,
+        &[
+            "--cache_policy",
+            "clock",
+            "--admission_threshold",
+            &threshold_str,
+        ],
+    );
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
+/// Connect to pgcache with TLS enabled on the proxy.
 pub async fn connect_pgcache_tls(
     dbs: &TempDBs,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
-    // Initialize crypto provider (required for rustls)
     crypto_provider_init();
 
-    // Find random available ports for listen and metrics
     let listen_port = find_available_port()?;
-    let listen_socket = format!("127.0.0.1:{}", listen_port);
     let metrics_port = find_available_port()?;
-    let metrics_socket = format!("127.0.0.1:{}", metrics_port);
-
-    let child = Command::new(env!("CARGO_BIN_EXE_pgcache"))
-        .arg("--config")
-        .arg("tests/data/default_config.toml")
-        .arg("--origin_host")
-        .arg("127.0.0.1")
-        .arg("--origin_port")
-        .arg(dbs.origin.db_port().to_string())
-        .arg("--origin_user")
-        .arg(dbs.origin.db_user())
-        .arg("--origin_database")
-        .arg(dbs.origin.db_name())
-        .arg("--cache_host")
-        .arg("127.0.0.1")
-        .arg("--cache_port")
-        .arg(dbs.cache.db_port().to_string())
-        .arg("--cache_user")
-        .arg(dbs.cache.db_user())
-        .arg("--cache_database")
-        .arg(dbs.cache.db_name())
-        .arg("--listen_socket")
-        .arg(&listen_socket)
-        .arg("--metrics_socket")
-        .arg(&metrics_socket)
-        .arg("--tls_cert")
-        .arg("tests/data/certs/server.crt")
-        .arg("--tls_key")
-        .arg("tests/data/certs/server.key")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("run pgcache");
-
-    let mut pgcache = PgCacheProcess::new(child);
-
-    //wait to listening message from proxy before proceeding
+    let mut pgcache = pgcache_spawn(
+        dbs,
+        listen_port,
+        metrics_port,
+        &[
+            "--tls_cert",
+            "tests/data/certs/server.crt",
+            "--tls_key",
+            "tests/data/certs/server.key",
+            "--cache_policy",
+            "fifo",
+        ],
+    );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
 
-    // Connect using TLS, trusting our self-signed certificate
     let cert_path = Path::new("tests/data/certs/server.crt");
     let tls_config = tls_config_with_cert(cert_path)?;
     let tls = MakeRustlsConnect::new(tls_config);

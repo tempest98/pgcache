@@ -62,6 +62,45 @@ impl fmt::Display for ParseSslModeError {
 
 impl Error for ParseSslModeError {}
 
+/// Cache eviction policy
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CachePolicy {
+    /// FIFO eviction: oldest-registered query evicted first, no admission gating
+    Fifo,
+    /// CLOCK eviction: second-chance algorithm with frequency-based admission
+    #[default]
+    Clock,
+}
+
+/// Error returned when parsing an invalid cache policy string
+#[derive(Debug, Clone)]
+pub struct ParseCachePolicyError(String);
+
+impl fmt::Display for ParseCachePolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid cache policy: '{}', expected 'fifo' or 'clock'",
+            self.0
+        )
+    }
+}
+
+impl Error for ParseCachePolicyError {}
+
+impl FromStr for CachePolicy {
+    type Err = ParseCachePolicyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fifo" => Ok(CachePolicy::Fifo),
+            "clock" => Ok(CachePolicy::Clock),
+            _ => Err(ParseCachePolicyError(s.to_owned())),
+        }
+    }
+}
+
 impl FromStr for SslMode {
     type Err = ParseSslModeError;
 
@@ -153,6 +192,10 @@ struct SettingsToml {
     metrics: Option<MetricsSettings>,
     #[serde(default)]
     log_level: Option<String>,
+    #[serde(default)]
+    cache_policy: Option<CachePolicy>,
+    #[serde(default)]
+    admission_threshold: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +218,11 @@ pub struct Settings {
     /// Log level filter (supports tracing EnvFilter syntax)
     /// Examples: "debug", "info", "pgcache_lib::cache=debug,info"
     pub log_level: Option<String>,
+    /// Cache eviction policy: fifo or clock (default: clock)
+    pub cache_policy: CachePolicy,
+    /// Number of times a query must be seen before admission to cache (default: 2)
+    /// Only used with clock policy; fifo always admits immediately.
+    pub admission_threshold: u32,
 }
 
 impl Settings {
@@ -204,6 +252,8 @@ impl Settings {
         let mut replication_database: Option<String> = None;
         let mut replication_ssl_mode: Option<SslMode> = None;
         let mut replication_password: Option<String> = None;
+        let mut cache_policy: Option<CachePolicy> = None;
+        let mut admission_threshold: Option<u32> = None;
 
         let mut config_settings: Option<SettingsToml> = None;
         let mut parser = lexopt::Parser::from_env();
@@ -446,6 +496,26 @@ impl Settings {
                             .map_into_report::<ConfigError>()?,
                     )
                 }
+                Long("cache_policy") => {
+                    let policy_str = parser
+                        .value()
+                        .map_into_report::<ConfigError>()?
+                        .string()
+                        .map_into_report::<ConfigError>()?;
+                    cache_policy =
+                        Some(policy_str.parse().map_err(|e: ParseCachePolicyError| {
+                            Report::from(ConfigError::ArgumentError(e.to_string().into()))
+                        })?);
+                }
+                Long("admission_threshold") => {
+                    admission_threshold = Some(
+                        parser
+                            .value()
+                            .map_into_report::<ConfigError>()?
+                            .parse()
+                            .map_into_report::<ConfigError>()?,
+                    )
+                }
                 Long("help") => {
                     Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
                 }
@@ -505,6 +575,12 @@ impl Settings {
                 .map(|socket| MetricsSettings { socket })
                 .or(config.metrics);
             let log_level = log_level.or(config.log_level);
+            let cache_policy = cache_policy
+                .or(config.cache_policy)
+                .unwrap_or_default();
+            let admission_threshold = admission_threshold
+                .or(config.admission_threshold)
+                .unwrap_or(2);
 
             Settings {
                 origin: config.origin,
@@ -523,6 +599,8 @@ impl Settings {
                 tls_key,
                 metrics,
                 log_level,
+                cache_policy,
+                admission_threshold,
             }
         } else {
             let origin = PgSettings {
@@ -619,6 +697,8 @@ impl Settings {
                 tls_key,
                 metrics: metrics_socket.map(|socket| MetricsSettings { socket }),
                 log_level,
+                cache_policy: cache_policy.unwrap_or_default(),
+                admission_threshold: admission_threshold.unwrap_or(2),
             }
         };
 
@@ -640,6 +720,8 @@ impl Settings {
             --listen_socket IP_AND_PORT \n \
             --num_workers NUMBER \n \
             [--cache_size BYTES] \n \
+            [--cache_policy fifo|clock] (default: clock) \n \
+            [--admission_threshold N] (default: 2, clock policy only) \n \
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
             [--metrics_socket IP_AND_PORT] \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug)"

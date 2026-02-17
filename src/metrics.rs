@@ -68,6 +68,11 @@ pub mod names {
     // Cache performance metrics
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
+    pub const CACHE_READMISSIONS: &str = "pgcache.cache.readmissions";
+
+    // Cache state metrics (admission/eviction policy)
+    pub const CACHE_QUERIES_PENDING: &str = "pgcache.cache.queries_pending";
+    pub const CACHE_QUERIES_INVALIDATED: &str = "pgcache.cache.queries_invalidated";
 
     // Queue depth gauges
     pub const CACHE_WRITER_QUERY_QUEUE: &str = "pgcache.cache.writer_query_queue";

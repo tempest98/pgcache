@@ -13,7 +13,7 @@ use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::pg;
 use crate::query::resolved::{ResolvedQueryExpr, ResolvedSelectNode};
-use crate::settings::Settings;
+use crate::settings::{CachePolicy, Settings};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
@@ -174,20 +174,7 @@ impl CacheWriter {
             } => {
                 self.query_ready_mark(fingerprint, cached_bytes);
                 self.cache.current_size = self.cache_size_load().await?;
-
-                while self
-                    .cache
-                    .cache_size
-                    .is_some_and(|s| self.cache.current_size > s)
-                {
-                    if let Some(min_gen) = self.cache.generations.first()
-                        && let Some(query) = self.cache.cached_queries.get2(min_gen)
-                    {
-                        trace!("exceeded cache size, evicting query");
-                        metrics::counter!(names::CACHE_EVICTIONS).increment(1);
-                        self.cache_query_invalidate(query.fingerprint).await?;
-                    }
-                }
+                self.eviction_run().await?;
             }
             QueryCommand::Failed { fingerprint } => {
                 self.query_failed_cleanup(fingerprint);
@@ -281,6 +268,7 @@ impl CacheWriter {
                     generation,
                     resolved: Some(resolved.clone()),
                     max_limit,
+                    referenced: false,
                 },
             );
         }
@@ -293,12 +281,22 @@ impl CacheWriter {
             .set(self.cache.cached_queries.len() as f64);
 
         if let Ok(view) = self.state_view.read() {
-            let loading_count = view
-                .cached_queries
-                .values()
-                .filter(|&q| q.state == CachedQueryState::Loading)
-                .count();
+            let mut loading_count = 0;
+            let mut pending_count = 0;
+            let mut invalidated_count = 0;
+
+            for q in view.cached_queries.values() {
+                match q.state {
+                    CachedQueryState::Loading => loading_count += 1,
+                    CachedQueryState::Pending(_) => pending_count += 1,
+                    CachedQueryState::Invalidated => invalidated_count += 1,
+                    CachedQueryState::Ready => {}
+                }
+            }
+
             metrics::gauge!(names::CACHE_QUERIES_LOADING).set(loading_count as f64);
+            metrics::gauge!(names::CACHE_QUERIES_PENDING).set(pending_count as f64);
+            metrics::gauge!(names::CACHE_QUERIES_INVALIDATED).set(invalidated_count as f64);
         }
 
         metrics::gauge!(names::CACHE_SIZE_BYTES).set(self.cache.current_size as f64);
@@ -320,6 +318,157 @@ impl CacheWriter {
             .get(0);
 
         Ok(size as usize)
+    }
+
+    /// Run eviction loop. For CLOCK policy, uses second-chance algorithm with reference bit.
+    /// For FIFO policy, evicts the oldest-registered query.
+    async fn eviction_run(&mut self) -> CacheResult<()> {
+        /// Maximum number of generation bumps (second chances) per eviction round.
+        /// Bounds re-stamping work and prevents pathological case where all queries are referenced.
+        const MAX_BUMPS: usize = 5;
+        let mut bumps = 0;
+
+        while self
+            .cache
+            .cache_size
+            .is_some_and(|s| self.cache.current_size > s)
+        {
+            let Some(&min_gen) = self.cache.generations.first() else {
+                break;
+            };
+            let Some(query) = self.cache.cached_queries.get2(&min_gen) else {
+                break;
+            };
+            let fingerprint = query.fingerprint;
+
+            // For CLOCK policy, check reference bit before evicting
+            if self.cache.cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS {
+                let referenced = self
+                    .state_view
+                    .read()
+                    .ok()
+                    .and_then(|view| view.cached_queries.get(&fingerprint).map(|e| e.referenced))
+                    .unwrap_or(false);
+
+                if referenced {
+                    // Second chance: bump generation to move to back of eviction order
+                    trace!("clock bump {fingerprint}");
+                    metrics::counter!(names::CACHE_EVICTIONS, "result" => "bump").increment(1);
+                    self.cache_query_generation_bump(fingerprint).await?;
+                    bumps += 1;
+                    continue;
+                }
+            }
+
+            // Evict (full removal)
+            trace!("evicting query {fingerprint}");
+            metrics::counter!(names::CACHE_EVICTIONS).increment(1);
+            self.cache_query_evict(fingerprint).await?;
+            bumps = 0;
+        }
+
+        self.stale_entries_cleanup();
+        Ok(())
+    }
+
+    /// Bump a cached query's generation to give it a second chance in CLOCK eviction.
+    /// Re-executes the query against cache DB so the CustomScan tracker re-stamps
+    /// dshash entries from old_gen to new_gen.
+    async fn cache_query_generation_bump(&mut self, fingerprint: u64) -> CacheResult<()> {
+        let Some(query) = self.cache.cached_queries.get1(&fingerprint) else {
+            return Ok(());
+        };
+
+        let old_generation = query.generation;
+        let resolved = query.resolved.clone();
+
+        // 1. Assign new generation (insert before removing old — keeps old gen valid for re-stamp)
+        self.cache.generation_counter += 1;
+        let new_generation = self.cache.generation_counter;
+        self.cache.generations.insert(new_generation);
+
+        // 2. Set query generation on cache DB connection for row tracking
+        let set_gen_sql = format!("SET mem.query_generation = {new_generation}");
+        self.db_cache
+            .execute(&set_gen_sql, &[])
+            .await
+            .map_into_report::<CacheError>()?;
+
+        // 3. Re-execute query against cache DB (discard results).
+        //    The CustomScan tracker side-effect updates dshash from old_gen to new_gen.
+        let mut sql = String::with_capacity(512);
+        crate::query::ast::Deparse::deparse(&resolved, &mut sql);
+        let _ = self
+            .db_cache
+            .query(&sql, &[])
+            .await
+            .map_into_report::<CacheError>()?;
+
+        // 4. Reset query generation
+        self.db_cache
+            .execute("SET mem.query_generation = 0", &[])
+            .await
+            .map_into_report::<CacheError>()?;
+
+        // 5. Now safe to remove old generation (rows are re-stamped)
+        self.cache.generations.remove(&old_generation);
+
+        // 6. Update CachedQuery in BiHashMap (generation is key2, must remove/reinsert)
+        if let Some(mut cached) = self.cache.cached_queries.remove1(&fingerprint) {
+            cached.generation = new_generation;
+            self.cache.cached_queries.insert_overwrite(cached);
+        }
+
+        // 7. Clear reference bit and update generation in state_view
+        if let Ok(mut view) = self.state_view.write()
+            && let Some(entry) = view.cached_queries.get_mut(&fingerprint)
+        {
+            entry.referenced = false;
+            entry.generation = new_generation;
+        }
+
+        Ok(())
+    }
+
+    /// Clean up stale Pending and Invalidated entries from state_view.
+    /// Pending entries that haven't been promoted and Invalidated entries whose
+    /// generation is below the cleanup threshold are removed.
+    fn stale_entries_cleanup(&mut self) {
+        let cleanup_threshold = self.cache.generation_purge_threshold();
+
+        // Remove invalidated entries from cached_queries that are below threshold
+        let stale_fingerprints: Vec<u64> = self
+            .cache
+            .cached_queries
+            .iter()
+            .filter(|q| q.invalidated && q.generation < cleanup_threshold)
+            .map(|q| q.fingerprint)
+            .collect();
+
+        for fp in &stale_fingerprints {
+            if let Some(query) = self.cache.cached_queries.remove1(fp) {
+                // Remove update queries
+                for oid in &query.relation_oids {
+                    if let Some(mut queries) = self.cache.update_queries.get_mut(oid) {
+                        queries.queries.retain(|q| q.fingerprint != *fp);
+                    }
+                }
+            }
+        }
+
+        if !stale_fingerprints.is_empty() {
+            self.active_relations_rebuild();
+        }
+
+        // Remove stale Pending and Invalidated entries from state_view
+        if let Ok(mut view) = self.state_view.write() {
+            view.cached_queries.retain(|_fp, entry| {
+                !matches!(
+                    entry.state,
+                    CachedQueryState::Pending(_) | CachedQueryState::Invalidated
+                ) || entry.generation >= cleanup_threshold
+            });
+        }
     }
 
     /// Purge rows with generation <= threshold.
