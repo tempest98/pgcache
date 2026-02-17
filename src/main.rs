@@ -29,7 +29,7 @@ fn main() -> Result<(), Report> {
 
     let settings = Settings::from_args()?;
     let metrics_socket = settings.metrics.as_ref().map(|m| m.socket);
-    prometheus_install(metrics_socket).expect("install metrics recorder");
+    prometheus_install(metrics_socket)?;
 
     if let Some(socket) = metrics_socket {
         info!("Prometheus metrics available at http://{}/metrics", socket);

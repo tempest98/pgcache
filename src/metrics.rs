@@ -1,6 +1,36 @@
+use std::fmt;
 use std::net::SocketAddr;
+use std::sync::mpsc;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use rootcause::Report;
+
+/// Metrics subsystem errors.
+#[derive(Debug)]
+pub enum MetricsError {
+    /// The background metrics thread failed before sending a result.
+    ThreadStart,
+    /// Prometheus recorder build failed (includes tokio runtime creation).
+    Build(String),
+    /// A global metrics recorder was already installed.
+    RecorderInstall,
+}
+
+impl fmt::Display for MetricsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetricsError::ThreadStart => write!(f, "metrics thread failed to start"),
+            MetricsError::Build(msg) => write!(f, "{msg}"),
+            MetricsError::RecorderInstall => {
+                write!(f, "global metrics recorder already installed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetricsError {}
+
+pub type MetricsResult<T> = Result<T, Report<MetricsError>>;
 
 /// Metric names as constants for consistency
 pub mod names {
@@ -88,9 +118,7 @@ pub mod names {
 ///
 /// If `metrics_socket` is provided, starts an HTTP server on that address
 /// serving Prometheus metrics at `/metrics`.
-pub fn prometheus_install(metrics_socket: Option<SocketAddr>) -> Result<(), &'static str> {
-    use std::sync::mpsc;
-
+pub fn prometheus_install(metrics_socket: Option<SocketAddr>) -> MetricsResult<()> {
     // Configure Prometheus with quantiles for histograms
     let mut builder = PrometheusBuilder::new()
         .set_quantiles(&[0.5, 0.95, 0.99])
@@ -102,14 +130,21 @@ pub fn prometheus_install(metrics_socket: Option<SocketAddr>) -> Result<(), &'st
     }
 
     // build() requires a tokio runtime context, so we create the runtime
-    // in a background thread, build the recorder there, and send it back
+    // in a background thread, build the recorder there, and send it back.
+    // Errors are stringified because BuildError may not be Send.
     let (tx, rx) = mpsc::sync_channel(1);
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("create tokio runtime for metrics exporter");
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(Err(format!("tokio runtime creation failed: {e}")));
+                return;
+            }
+        };
 
         // Enter runtime context so build() can set up the HTTP listener
         let _guard = rt.enter();
@@ -117,7 +152,7 @@ pub fn prometheus_install(metrics_socket: Option<SocketAddr>) -> Result<(), &'st
         let (prometheus, exporter_future) = match builder.build() {
             Ok(result) => result,
             Err(e) => {
-                let _ = tx.send(Err(format!("failed to build prometheus: {e:?}")));
+                let _ = tx.send(Err(format!("prometheus build failed: {e}")));
                 return;
             }
         };
@@ -132,10 +167,11 @@ pub fn prometheus_install(metrics_socket: Option<SocketAddr>) -> Result<(), &'st
 
     let prometheus = rx
         .recv()
-        .map_err(|_| "metrics thread failed to start")?
-        .map_err(|_| "failed to build prometheus recorder")?;
+        .map_err(|_| Report::new(MetricsError::ThreadStart))?
+        .map_err(|msg| Report::new(MetricsError::Build(msg)))?;
 
-    metrics::set_global_recorder(prometheus).map_err(|_| "failed to install metrics recorder")?;
+    metrics::set_global_recorder(prometheus)
+        .map_err(|_| Report::new(MetricsError::RecorderInstall))?;
 
     Ok(())
 }
