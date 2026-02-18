@@ -15,7 +15,7 @@ use tokio::{
     net::{TcpStream, lookup_host},
     runtime::Builder,
     select,
-    sync::mpsc::{UnboundedReceiver, channel},
+    sync::{mpsc::UnboundedReceiver, oneshot},
     task::{LocalSet, spawn_local},
 };
 use tokio_stream::StreamExt;
@@ -764,12 +764,12 @@ impl ConnectionState {
                     }
                 }
             }
-            reply = cache_rx.recv() => {
+            reply = &mut *cache_rx => {
                 match reply {
-                    Some(reply) => {
+                    Ok(reply) => {
                         self.handle_cache_reply(reply);
                     }
-                    None => {
+                    Err(_) => {
                         debug!("cache channel closed");
                         return Err(ConnectionError::CacheDead.into());
                     }
@@ -929,7 +929,7 @@ async fn handle_connection(
                     }
                 };
 
-                let (reply_tx, reply_rx) = channel(10);
+                let (reply_tx, reply_rx) = oneshot::channel();
 
                 // Take timing from connection state and set dispatched_at
                 let timing = {

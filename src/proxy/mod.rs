@@ -15,7 +15,7 @@ use std::io;
 use error_set::error_set;
 use nix::errno::Errno;
 use rootcause::Report;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot;
 
 use crate::pg::cdc::PgCdcError;
 use crate::pg::protocol::ProtocolError;
@@ -70,7 +70,7 @@ impl From<io::Error> for ConnectionError {
 #[derive(Debug)]
 pub(crate) enum ProxyMode {
     Read,
-    CacheRead(Receiver<CacheReply>),
+    CacheRead(oneshot::Receiver<CacheReply>),
     CacheWrite(CacheMessage),
 }
 

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 
 use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
@@ -129,7 +129,7 @@ pub struct ProxyMessage {
     pub message: CacheMessage,
     /// Socket for sending response data directly to the client
     pub client_socket: ClientSocket,
-    pub reply_tx: Sender<CacheReply>,
+    pub reply_tx: oneshot::Sender<CacheReply>,
     /// Resolved search_path for this connection (with $user expanded to session_user)
     pub search_path: Vec<String>,
     /// Per-query timing data

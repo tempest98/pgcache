@@ -51,7 +51,7 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
         Err((e, data)) => {
             debug!("forwarding to origin due to parameter conversion error: {e}");
             // Forward to origin when parameter conversion fails
-            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(data)).await;
+            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(data));
         }
     }
 }
@@ -75,7 +75,7 @@ async fn handle_worker_request(
         }
     };
 
-    if msg.reply_tx.send(reply).await.is_err() {
+    if msg.reply_tx.send(reply).is_err() {
         error!("failed to send reply: no receiver");
     }
 

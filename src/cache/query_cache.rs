@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio_util::bytes::BytesMut;
 use tracing::{error, instrument, trace};
 
@@ -32,7 +32,7 @@ pub struct QueryRequest {
     pub cacheable_query: Box<CacheableQuery>,
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
-    pub reply_tx: Sender<CacheReply>,
+    pub reply_tx: oneshot::Sender<CacheReply>,
     /// Resolved search_path for schema resolution
     pub search_path: Vec<String>,
     /// Per-query timing data
@@ -49,7 +49,7 @@ pub struct WorkerRequest {
     pub generation: u64,
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
-    pub reply_tx: Sender<CacheReply>,
+    pub reply_tx: oneshot::Sender<CacheReply>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Incoming query's LIMIT clause, appended to SQL at serve time
@@ -150,7 +150,6 @@ impl QueryCache {
 
             msg.reply_tx
                 .send(CacheReply::Forward(msg.data))
-                .await
                 .map_err(|_| CacheError::Reply)?;
 
             self.query_tx
@@ -168,7 +167,6 @@ impl QueryCache {
 
         msg.reply_tx
             .send(CacheReply::Forward(msg.data))
-            .await
             .map_err(|_| CacheError::Reply)?;
 
         trace!("cache_entry check {fingerprint}");
