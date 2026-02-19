@@ -590,12 +590,11 @@ pub fn limit_is_sufficient(cached_max: Option<u64>, needed: Option<u64>) -> bool
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    clippy::wildcard_enum_match_arm
-)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::indexing_slicing)]
+    #![allow(clippy::wildcard_enum_match_arm)]
+
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 

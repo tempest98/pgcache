@@ -51,14 +51,15 @@ where_expr_conjuncts_join(Vec<ResolvedWhereExpr>) -> Option<ResolvedWhereExpr>  
 predicate_targets_subquery(&ResolvedWhereExpr, alias: &str) -> bool       // all cols target alias?
 predicate_has_subquery(&ResolvedWhereExpr) -> bool                        // contains Subquery variant?
 subquery_output_column_names(&ResolvedQueryExpr) -> Vec<String>           // name→position from leftmost SELECT
-branch_pushdown_is_safe(&ResolvedSelectNode) -> bool                      // no GROUP BY/HAVING/window fns
+branch_pushdown_is_safe(&ResolvedSelectNode) -> bool                      // no GROUP BY/HAVING/window fns (GROUP BY and HAVING are direct fields; window fns require walking SELECT columns for Function { over: Some(_), .. })
 predicate_push_into_query(&ResolvedQueryExpr, predicate, positions) -> Option<ResolvedQueryExpr>  // push into SELECT or recurse SetOp
 where_expr_columns_remap(&ResolvedWhereExpr, positions, branch_columns) -> Option<ResolvedWhereExpr>  // remap column refs
 ```
 
 ## Edge Cases
 
-- **Subquery has LIMIT**: skip pushdown (changes row set before filter)
+- **Subquery has LIMIT or OFFSET**: skip pushdown (changes row set before filter)
+- **All set op types are safe**: UNION, INTERSECT, and EXCEPT (including ALL variants) all support pushdown. The same predicate is pushed into both branches, so the identity `(A OP B) WHERE P = (A WHERE P) OP (B WHERE P)` holds. For EXCEPT, filtering the right branch may remove subtracting rows, but those same rows are also removed from the left branch, so nothing leaks through.
 - **Predicate contains OR**: pushed as a whole unit if all column refs target the alias
 - **All conjuncts pushed**: outer WHERE becomes `None`
 - **Non-column SELECT expr** (arithmetic, function) at target position: skip that conjunct

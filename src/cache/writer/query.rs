@@ -7,6 +7,7 @@ use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::query::ast::{QueryBody, TableNode};
 use crate::query::constraints::analyze_query_constraints;
+use crate::query::pushdown::predicate_pushdown_apply;
 use crate::query::resolved::{ResolvedTableNode, query_expr_resolve};
 use crate::query::transform::query_table_update_queries;
 
@@ -119,7 +120,8 @@ impl CacheWriter {
 
         let resolved = query_expr_resolve(&base_query, &self.cache.tables, search_path)
             .map_err(|e| e.context_transform(CacheError::from))
-            .attach_loc("resolving query expression")?;
+            .attach_loc("resolving query expression")
+            .map(predicate_pushdown_apply)?;
 
         // Build a temporary CacheableQuery with the base (limit-stripped) query
         // for update query generation
