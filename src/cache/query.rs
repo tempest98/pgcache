@@ -491,7 +491,7 @@ pub fn outer_join_optional_tables(
 /// Collect real table names from all column references in a resolved WHERE expression.
 fn resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, tables: &mut HashSet<String>) {
     for col in expr.nodes::<ResolvedColumnNode>() {
-        tables.insert(col.table.clone());
+        tables.insert(col.table.to_string());
     }
 }
 
@@ -500,7 +500,7 @@ fn resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, tables: &mut Has
 fn resolved_source_table_names_collect(source: &ResolvedTableSource, names: &mut HashSet<String>) {
     match source {
         ResolvedTableSource::Table(table) => {
-            names.insert(table.name.clone());
+            names.insert(table.name.to_string());
         }
         ResolvedTableSource::Join(join) => {
             resolved_source_table_names_collect(&join.left, names);
@@ -644,19 +644,19 @@ mod tests {
         for (i, col_name) in column_names.iter().enumerate() {
             let is_pk = i == 0;
             columns.insert_overwrite(ColumnMetadata {
-                name: (*col_name).to_owned(),
+                name: (*col_name).into(),
                 position: (i + 1) as i16,
                 type_oid: if is_pk { 23 } else { 25 },
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
-                type_name: if is_pk { "int4" } else { "text" }.to_owned(),
-                cache_type_name: if is_pk { "int4" } else { "text" }.to_owned(),
+                type_name: if is_pk { "int4" } else { "text" }.into(),
+                cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
             });
         }
         TableMetadata {
             relation_oid,
-            name: name.to_owned(),
-            schema: "public".to_owned(),
+            name: name.into(),
+            schema: "public".into(),
             primary_key_columns: vec![column_names[0].to_owned()],
             columns,
             indexes: Vec::new(),

@@ -376,38 +376,38 @@ mod tests {
         let mut columns = BiHashMap::new();
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "id".to_owned(),
+            name: "id".into(),
             position: 1,
             type_oid: 23, // INT4
             data_type: Type::INT4,
-            type_name: "integer".to_owned(),
-            cache_type_name: "int4".to_owned(),
+            type_name: "integer".into(),
+            cache_type_name: "int4".into(),
             is_primary_key: true,
         });
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "name".to_owned(),
+            name: "name".into(),
             position: 2,
             type_oid: 25, // TEXT
             data_type: Type::TEXT,
-            type_name: "text".to_owned(),
-            cache_type_name: "text".to_owned(),
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
             is_primary_key: false,
         });
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "active".to_owned(),
+            name: "active".into(),
             position: 3,
             type_oid: 16, // BOOL
             data_type: Type::BOOL,
-            type_name: "boolean".to_owned(),
-            cache_type_name: "bool".to_owned(),
+            type_name: "boolean".into(),
+            cache_type_name: "bool".into(),
             is_primary_key: false,
         });
 
         TableMetadata {
-            name: "test_table".to_owned(),
-            schema: "public".to_owned(),
+            name: "test_table".into(),
+            schema: "public".into(),
             relation_oid: 12345,
             primary_key_columns: vec!["id".to_owned()],
             columns,
@@ -1065,23 +1065,23 @@ mod tests {
         // Add a float column to metadata for testing
         let mut columns = BiHashMap::new();
         columns.insert_overwrite(ColumnMetadata {
-            name: "price".to_owned(),
+            name: "price".into(),
             position: 4,
             type_oid: 701, // FLOAT8
             data_type: Type::FLOAT8,
-            type_name: "double precision".to_owned(),
-            cache_type_name: "float8".to_owned(),
+            type_name: "double precision".into(),
+            cache_type_name: "float8".into(),
             is_primary_key: false,
         });
 
         let mut table_metadata = table_metadata;
         table_metadata.columns.insert_overwrite(ColumnMetadata {
-            name: "price".to_owned(),
+            name: "price".into(),
             position: 4,
             type_oid: 701,
             data_type: Type::FLOAT8,
-            type_name: "double precision".to_owned(),
-            cache_type_name: "float8".to_owned(),
+            type_name: "double precision".into(),
+            cache_type_name: "float8".into(),
             is_primary_key: false,
         });
 

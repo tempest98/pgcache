@@ -1,6 +1,6 @@
 [package]
 name = "pgcache"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 
 [[bin]]
@@ -73,6 +73,7 @@ rootcause = "0.12.0"
 lexopt = "0.3.1"
 async-stream = "0.3.6"
 iddqd = "0.3.17"
+ecow = "0.2.6"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 toml = "1.0.2"
@@ -91,9 +92,5 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 regex-lite = "0.1.9"
 
 [[bench]]
-name = "ast_conversion"
-harness = false
-
-[[bench]]
-name = "query_parsing"
+name = "query_pipeline"
 harness = false

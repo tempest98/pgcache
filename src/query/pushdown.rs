@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use ecow::EcoString;
+
 use crate::query::ast::BinaryOp;
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnExpr, ResolvedColumnNode, ResolvedMultiExpr,
@@ -151,7 +153,7 @@ fn predicate_has_subquery(expr: &ResolvedWhereExpr) -> bool {
 /// For set operations (UNION, etc.), output columns are defined by the
 /// leftmost branch. This mirrors `derived_table_columns_extract` logic
 /// but only returns names.
-fn subquery_output_column_names(query: &ResolvedQueryExpr) -> Vec<String> {
+fn subquery_output_column_names(query: &ResolvedQueryExpr) -> Vec<EcoString> {
     let select = match &query.body {
         ResolvedQueryBody::Select(select) => select,
         ResolvedQueryBody::SetOp(set_op) => return subquery_output_column_names(&set_op.left),
@@ -390,19 +392,19 @@ mod tests {
         let mut columns = BiHashMap::new();
         for (i, col_name) in column_names.iter().enumerate() {
             columns.insert_overwrite(ColumnMetadata {
-                name: col_name.to_string(),
+                name: (*col_name).into(),
                 position: (i + 1) as i16,
                 type_oid: 25,
                 data_type: Type::TEXT,
-                type_name: "text".to_owned(),
-                cache_type_name: "text".to_owned(),
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
                 is_primary_key: i == 0,
             });
         }
         TableMetadata {
             relation_oid,
-            name: name.to_owned(),
-            schema: "public".to_owned(),
+            name: name.into(),
+            schema: "public".into(),
             columns,
             primary_key_columns: vec![column_names[0].to_owned()],
             indexes: Vec::new(),

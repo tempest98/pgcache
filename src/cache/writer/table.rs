@@ -59,17 +59,17 @@ impl CacheWriter {
             let pg_position: i64 = row.get("position");
 
             let column = ColumnMetadata {
-                name: row.get("column_name"),
+                name: row.get::<_, String>("column_name").into(),
                 position: pg_position as i16,
                 type_oid,
                 data_type,
-                type_name,
-                cache_type_name,
+                type_name: type_name.into(),
+                cache_type_name: cache_type_name.into(),
                 is_primary_key: row.get("is_primary_key"),
             };
 
             if column.is_primary_key {
-                primary_key_columns.push(column.name.clone());
+                primary_key_columns.push(column.name.to_string());
             }
 
             columns.insert_overwrite(column);
@@ -90,8 +90,8 @@ impl CacheWriter {
         let indexes = self.query_table_indexes_get(relation_oid).await?;
 
         let table = TableMetadata {
-            name: table.to_owned(),
-            schema: schema.to_owned(),
+            name: table.into(),
+            schema: schema.into(),
             relation_oid,
             primary_key_columns,
             columns,

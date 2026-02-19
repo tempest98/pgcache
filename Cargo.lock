@@ -801,6 +801,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "ecow"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78e4f79b296fbaab6ce2e22d52cb4c7f010fe0ebe7a32e34fa25885fd797bd02"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1995,11 +2001,12 @@ dependencies = [
 
 [[package]]
 name = "pgcache"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-stream",
  "console-subscriber",
  "criterion",
+ "ecow",
  "error_set",
  "hotpath",
  "iddqd",

@@ -1,4 +1,6 @@
 use std::any::{Any, TypeId};
+
+use ecow::EcoString;
 use std::collections::hash_map::DefaultHasher;
 use std::convert::AsRef;
 use std::hash::{Hash, Hasher};
@@ -75,6 +77,12 @@ impl Deparse for &str {
         };
 
         buf
+    }
+}
+
+impl Deparse for EcoString {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.as_str().deparse(buf)
     }
 }
 

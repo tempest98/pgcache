@@ -1,5 +1,6 @@
 use std::any::Any;
 
+use ecow::EcoString;
 use error_set::error_set;
 use iddqd::BiHashMap;
 use rootcause::Report;
@@ -41,11 +42,11 @@ pub type ResolveResult<T> = Result<T, Report<ResolveError>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTableNode {
     /// Full schema name (resolved from 'public' default if needed)
-    pub schema: String,
+    pub schema: EcoString,
     /// Table name
-    pub name: String,
+    pub name: EcoString,
     /// Optional alias used in query
-    pub alias: Option<String>,
+    pub alias: Option<EcoString>,
     /// Relation OID from catalog
     pub relation_oid: u32,
 }
@@ -74,16 +75,20 @@ impl Deparse for ResolvedTableNode {
 ///
 /// Note: PartialEq and Hash are implemented manually to exclude `table_alias`
 /// since aliases are for deparsing only and don't affect column identity.
+///
+/// String fields use `EcoString`: short identifiers (schema, table, column names)
+/// are stored inline; the clone cost is a fixed 16-byte memcpy regardless of
+/// string length for inline values.
 #[derive(Debug, Clone, Eq)]
 pub struct ResolvedColumnNode {
     /// Schema name where the table is located
-    pub schema: String,
+    pub schema: EcoString,
     /// Table name (not alias) where column is defined
-    pub table: String,
+    pub table: EcoString,
     /// Table alias if one was used in the query (for deparsing only, not included in equality)
-    pub table_alias: Option<String>,
+    pub table_alias: Option<EcoString>,
     /// Column name
-    pub column: String,
+    pub column: EcoString,
     /// Column metadata from catalog (includes type info, position, primary key status, etc.)
     pub column_metadata: ColumnMetadata,
 }
@@ -193,7 +198,7 @@ pub enum ResolvedWhereExpr {
     Array(Vec<ResolvedWhereExpr>),
     /// Function call (for future support)
     Function {
-        name: String,
+        name: EcoString,
         args: Vec<ResolvedWhereExpr>,
     },
     /// Subquery in WHERE clause (EXISTS, IN, ANY, ALL, scalar)
@@ -547,10 +552,10 @@ pub enum ResolvedColumnExpr {
     /// Fully qualified column reference
     Column(ResolvedColumnNode),
     /// Unqualified column name (used in set operation ORDER BY)
-    Identifier(String),
+    Identifier(EcoString),
     /// Function call (including window functions)
     Function {
-        name: String,
+        name: EcoString,
         args: Vec<ResolvedColumnExpr>,
         agg_star: bool,
         agg_distinct: bool,
@@ -825,7 +830,7 @@ impl Deparse for ResolvedCaseExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSelectColumn {
     pub expr: ResolvedColumnExpr,
-    pub alias: Option<String>,
+    pub alias: Option<EcoString>,
 }
 
 impl ResolvedSelectColumn {
@@ -1572,8 +1577,8 @@ impl<'a> ResolutionScope<'a> {
 
         let synthetic_metadata = TableMetadata {
             relation_oid: 0,
-            name: alias.to_owned(),
-            schema: String::new(),
+            name: alias.into(),
+            schema: "".into(),
             primary_key_columns: Vec::new(),
             columns: column_map,
             indexes: Vec::new(),
@@ -1677,8 +1682,8 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                         position: (i + 1) as i16,
                         type_oid: 25, // TEXT OID
                         data_type: Type::TEXT,
-                        type_name: "text".to_owned(),
-                        cache_type_name: "text".to_owned(),
+                        type_name: EcoString::from("text"),
+                        cache_type_name: EcoString::from("text"),
                         is_primary_key: false,
                     },
                 };
@@ -1744,14 +1749,14 @@ fn column_resolve(
                 .get1(column_name.as_str())
                 .ok_or_else(|| {
                     Report::from(ResolveError::ColumnNotFound {
-                        table: table_metadata.name.clone(),
+                        table: table_metadata.name.to_string(),
                         column: column_name.clone(),
                     })
                 })?;
             return Ok(ResolvedColumnNode {
                 schema: table_metadata.schema.clone(),
                 table: table_metadata.name.clone(),
-                table_alias: alias.map(str::to_owned),
+                table_alias: alias.map(EcoString::from),
                 column: column_metadata.name.clone(),
                 column_metadata: column_metadata.clone(),
             });
@@ -1764,14 +1769,14 @@ fn column_resolve(
                 .get1(column_name.as_str())
                 .ok_or_else(|| {
                     Report::from(ResolveError::ColumnNotFound {
-                        table: outer_meta.name.clone(),
+                        table: outer_meta.name.to_string(),
                         column: column_name.clone(),
                     })
                 })?;
             let resolved = ResolvedColumnNode {
                 schema: outer_meta.schema.clone(),
                 table: outer_meta.name.clone(),
-                table_alias: outer_alias.map(str::to_owned),
+                table_alias: outer_alias.map(EcoString::from),
                 column: column_metadata.name.clone(),
                 column_metadata: column_metadata.clone(),
             };
@@ -1798,7 +1803,7 @@ fn column_resolve(
                 let resolved = ResolvedColumnNode {
                     schema: outer_meta.schema.clone(),
                     table: outer_meta.name.clone(),
-                    table_alias: outer_alias.map(str::to_owned),
+                    table_alias: outer_alias.map(EcoString::from),
                     column: col_meta.name.clone(),
                     column_metadata: col_meta.clone(),
                 };
@@ -1813,7 +1818,7 @@ fn column_resolve(
         [(table_metadata, alias, column_metadata)] => Ok(ResolvedColumnNode {
             schema: table_metadata.schema.clone(),
             table: table_metadata.name.clone(),
-            table_alias: alias.map(str::to_owned),
+            table_alias: alias.map(EcoString::from),
             column: column_metadata.name.clone(),
             column_metadata: (*column_metadata).clone(),
         }),
@@ -1873,7 +1878,7 @@ fn where_expr_resolve(
                 resolved_args.push(where_expr_resolve(arg, scope)?);
             }
             Ok(ResolvedWhereExpr::Function {
-                name: name.clone(),
+                name: name.as_str().into(),
                 args: resolved_args,
             })
         }
@@ -1926,7 +1931,7 @@ fn table_source_resolve<'a>(
             let resolved = ResolvedTableNode {
                 schema: table_metadata.schema.clone(),
                 name: table_metadata.name.clone(),
-                alias: table_node.alias.as_ref().map(|a| a.name.clone()),
+                alias: table_node.alias.as_ref().map(|a| a.name.as_str().into()),
                 relation_oid: table_metadata.relation_oid,
             };
 
@@ -2023,7 +2028,7 @@ fn column_expr_resolve(
                 None => None,
             };
             Ok(ResolvedColumnExpr::Function {
-                name: func.name.clone(),
+                name: func.name.as_str().into(),
                 args: resolved_args,
                 agg_star: func.agg_star,
                 agg_distinct: func.agg_distinct,
@@ -2121,7 +2126,7 @@ fn select_columns_resolve(
                                     expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
                                         schema: table_metadata.schema.clone(),
                                         table: table_metadata.name.clone(),
-                                        table_alias: alias.map(str::to_owned),
+                                        table_alias: alias.map(EcoString::from),
                                         column: column_metadata.name.clone(),
                                         column_metadata: column_metadata.clone(),
                                     }),
@@ -2134,7 +2139,7 @@ fn select_columns_resolve(
                     let resolved_expr = column_expr_resolve(&col.expr, scope)?;
                     resolved_cols.push(ResolvedSelectColumn {
                         expr: resolved_expr,
-                        alias: col.alias.clone(),
+                        alias: col.alias.as_deref().map(EcoString::from),
                     });
                 }
             }
@@ -2181,10 +2186,10 @@ fn order_by_as_identifiers(
 fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
     match expr {
         ColumnExpr::Star(_) => unreachable!("Star expanded in select_columns_resolve"),
-        ColumnExpr::Column(col) => ResolvedColumnExpr::Identifier(col.column.clone()),
+        ColumnExpr::Column(col) => ResolvedColumnExpr::Identifier(col.column.as_str().into()),
         ColumnExpr::Literal(lit) => ResolvedColumnExpr::Literal(lit.clone()),
         ColumnExpr::Function(func) => ResolvedColumnExpr::Function {
-            name: func.name.clone(),
+            name: func.name.as_str().into(),
             args: func.args.iter().map(column_expr_to_identifier).collect(),
             agg_star: func.agg_star,
             agg_distinct: func.agg_distinct,
@@ -2464,39 +2469,39 @@ mod tests {
     #[test]
     fn test_resolved_table_node_construction() {
         let table_node = ResolvedTableNode {
-            schema: "public".to_owned(),
-            name: "users".to_owned(),
-            alias: Some("u".to_owned()),
+            schema: "public".into(),
+            name: "users".into(),
+            alias: Some("u".into()),
             relation_oid: 12345,
         };
 
         assert_eq!(table_node.schema, "public");
         assert_eq!(table_node.name, "users");
-        assert_eq!(table_node.alias, Some("u".to_owned()));
+        assert_eq!(table_node.alias.as_deref(), Some("u"));
         assert_eq!(table_node.relation_oid, 12345);
     }
 
     #[test]
     fn test_resolved_column_node_construction() {
         let col_node = ResolvedColumnNode {
-            schema: "public".to_owned(),
-            table: "users".to_owned(),
-            table_alias: Some("u".to_owned()),
-            column: "id".to_owned(),
+            schema: "public".into(),
+            table: "users".into(),
+            table_alias: Some("u".into()),
+            column: "id".into(),
             column_metadata: ColumnMetadata {
-                name: "id".to_owned(),
+                name: "id".into(),
                 position: 1,
                 type_oid: 23,
                 data_type: Type::INT4,
-                type_name: "int4".to_owned(),
-                cache_type_name: "int4".to_owned(),
+                type_name: "int4".into(),
+                cache_type_name: "int4".into(),
                 is_primary_key: true,
             },
         };
 
         assert_eq!(col_node.schema, "public");
         assert_eq!(col_node.table, "users");
-        assert_eq!(col_node.table_alias, Some("u".to_owned()));
+        assert_eq!(col_node.table_alias.as_deref(), Some("u"));
         assert_eq!(col_node.column, "id");
         assert_eq!(col_node.column_metadata.type_name, "int4");
         assert_eq!(col_node.column_metadata.position, 1);
@@ -2520,30 +2525,30 @@ mod tests {
 
         // Add id column
         columns.insert_overwrite(ColumnMetadata {
-            name: "id".to_owned(),
+            name: "id".into(),
             position: 1,
             type_oid: 23,
             data_type: Type::INT4,
-            type_name: "int4".to_owned(),
-            cache_type_name: "int4".to_owned(),
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
             is_primary_key: true,
         });
 
         // Add name column
         columns.insert_overwrite(ColumnMetadata {
-            name: "name".to_owned(),
+            name: "name".into(),
             position: 2,
             type_oid: 25,
             data_type: Type::TEXT,
-            type_name: "text".to_owned(),
-            cache_type_name: "text".to_owned(),
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
             is_primary_key: false,
         });
 
         TableMetadata {
             relation_oid,
-            name: name.to_owned(),
-            schema: "public".to_owned(),
+            name: name.into(),
+            schema: "public".into(),
             primary_key_columns: vec!["id".to_owned()],
             columns,
             indexes: Vec::new(),
@@ -2559,19 +2564,19 @@ mod tests {
         let mut columns = BiHashMap::new();
         for (i, col_name) in column_names.iter().enumerate() {
             columns.insert_overwrite(ColumnMetadata {
-                name: (*col_name).to_owned(),
+                name: (*col_name).into(),
                 position: (i + 1) as i16,
                 type_oid: 25,
                 data_type: Type::TEXT,
-                type_name: "text".to_owned(),
-                cache_type_name: "text".to_owned(),
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
                 is_primary_key: i == 0,
             });
         }
         TableMetadata {
             relation_oid,
-            name: name.to_owned(),
-            schema: "public".to_owned(),
+            name: name.into(),
+            schema: "public".into(),
             primary_key_columns: vec![column_names[0].to_owned()],
             columns,
             indexes: Vec::new(),
@@ -2607,7 +2612,7 @@ mod tests {
         if let ResolvedTableSource::Table(table) = &resolved.from[0] {
             assert_eq!(table.schema, "public");
             assert_eq!(table.name, "users");
-            assert_eq!(table.alias, Some("u".to_owned()));
+            assert_eq!(table.alias.as_deref(), Some("u"));
             assert_eq!(table.relation_oid, 1001);
         } else {
             panic!("Expected table source");
@@ -2889,7 +2894,7 @@ mod tests {
             // Check left side has alias
             if let ResolvedTableSource::Table(left) = &join.left {
                 assert_eq!(left.name, "users");
-                assert_eq!(left.alias, Some("u".to_owned()));
+                assert_eq!(left.alias.as_deref(), Some("u"));
             } else {
                 panic!("Expected table on left side");
             }
@@ -2897,7 +2902,7 @@ mod tests {
             // Check right side has alias
             if let ResolvedTableSource::Table(right) = &join.right {
                 assert_eq!(right.name, "orders");
-                assert_eq!(right.alias, Some("o".to_owned()));
+                assert_eq!(right.alias.as_deref(), Some("o"));
             } else {
                 panic!("Expected table on right side");
             }
@@ -3100,12 +3105,12 @@ mod tests {
 
     fn id_column_metadata() -> ColumnMetadata {
         ColumnMetadata {
-            name: "id".to_owned(),
+            name: "id".into(),
             position: 1,
             type_oid: 23,
             data_type: Type::INT4,
-            type_name: "int4".to_owned(),
-            cache_type_name: "int4".to_owned(),
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
             is_primary_key: true,
         }
     }
@@ -3116,10 +3121,10 @@ mod tests {
 
         // Column with alias - should use alias
         ResolvedColumnNode {
-            schema: "public".to_owned(),
-            table: "users".to_owned(),
-            table_alias: Some("u".to_owned()),
-            column: "id".to_owned(),
+            schema: "public".into(),
+            table: "users".into(),
+            table_alias: Some("u".into()),
+            column: "id".into(),
             column_metadata: id_column_metadata(),
         }
         .deparse(&mut buf);
@@ -3132,10 +3137,10 @@ mod tests {
 
         // Column without alias - should use schema.table
         ResolvedColumnNode {
-            schema: "public".to_owned(),
-            table: "users".to_owned(),
+            schema: "public".into(),
+            table: "users".into(),
             table_alias: None,
-            column: "id".to_owned(),
+            column: "id".into(),
             column_metadata: id_column_metadata(),
         }
         .deparse(&mut buf);
@@ -3148,10 +3153,10 @@ mod tests {
 
         // Column without alias - should use schema.table
         ResolvedColumnNode {
-            schema: "Public".to_owned(),
-            table: "Users".to_owned(),
+            schema: "Public".into(),
+            table: "Users".into(),
             table_alias: None,
-            column: "firstName".to_owned(),
+            column: "firstName".into(),
             column_metadata: id_column_metadata(),
         }
         .deparse(&mut buf);
@@ -3163,9 +3168,9 @@ mod tests {
         let mut buf = String::new();
 
         ResolvedTableNode {
-            schema: "public".to_owned(),
-            name: "users".to_owned(),
-            alias: Some("u".to_owned()),
+            schema: "public".into(),
+            name: "users".into(),
+            alias: Some("u".into()),
             relation_oid: 1001,
         }
         .deparse(&mut buf);
@@ -3177,8 +3182,8 @@ mod tests {
         let mut buf = String::new();
 
         ResolvedTableNode {
-            schema: "public".to_owned(),
-            name: "users".to_owned(),
+            schema: "public".into(),
+            name: "users".into(),
             alias: None,
             relation_oid: 1001,
         }
@@ -3191,8 +3196,8 @@ mod tests {
         let mut buf = String::new();
 
         ResolvedTableNode {
-            schema: "Public".to_owned(),
-            name: "Users".to_owned(),
+            schema: "Public".into(),
+            name: "Users".into(),
             alias: None,
             relation_oid: 1001,
         }
@@ -3325,18 +3330,18 @@ mod tests {
     fn test_resolved_column_equality_ignores_alias() {
         // Two columns with same schema/table/column but different aliases should be equal
         let col1 = ResolvedColumnNode {
-            schema: "public".to_owned(),
-            table: "users".to_owned(),
-            table_alias: Some("u".to_owned()),
-            column: "id".to_owned(),
+            schema: "public".into(),
+            table: "users".into(),
+            table_alias: Some("u".into()),
+            column: "id".into(),
             column_metadata: id_column_metadata(),
         };
 
         let col2 = ResolvedColumnNode {
-            schema: "public".to_owned(),
-            table: "users".to_owned(),
-            table_alias: Some("u2".to_owned()), // Different alias
-            column: "id".to_owned(),
+            schema: "public".into(),
+            table: "users".into(),
+            table_alias: Some("u2".into()), // Different alias
+            column: "id".into(),
             column_metadata: id_column_metadata(),
         };
 
@@ -3559,7 +3564,7 @@ mod tests {
 
         assert_eq!(resolved.group_by.len(), 1);
         assert_eq!(resolved.group_by[0].table, "users");
-        assert_eq!(resolved.group_by[0].table_alias, Some("u".to_owned()));
+        assert_eq!(resolved.group_by[0].table_alias.as_deref(), Some("u"));
         assert_eq!(resolved.group_by[0].column, "name");
     }
 
@@ -3745,8 +3750,8 @@ mod tests {
 
         let left_select = ResolvedSelectNode {
             from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-                schema: "public".to_owned(),
-                name: "a".to_owned(),
+                schema: "public".into(),
+                name: "a".into(),
                 alias: None,
                 relation_oid: 1001,
             })],
@@ -3755,8 +3760,8 @@ mod tests {
 
         let right_select = ResolvedSelectNode {
             from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-                schema: "public".to_owned(),
-                name: "b".to_owned(),
+                schema: "public".into(),
+                name: "b".into(),
                 alias: None,
                 relation_oid: 1002,
             })],
@@ -3811,8 +3816,8 @@ mod tests {
         // Build: (SELECT FROM a UNION SELECT FROM b) UNION SELECT FROM c
         let a_select = ResolvedSelectNode {
             from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-                schema: "public".to_owned(),
-                name: "a".to_owned(),
+                schema: "public".into(),
+                name: "a".into(),
                 alias: None,
                 relation_oid: 1001,
             })],
@@ -3821,8 +3826,8 @@ mod tests {
 
         let b_select = ResolvedSelectNode {
             from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-                schema: "public".to_owned(),
-                name: "b".to_owned(),
+                schema: "public".into(),
+                name: "b".into(),
                 alias: None,
                 relation_oid: 1002,
             })],
@@ -3831,8 +3836,8 @@ mod tests {
 
         let c_select = ResolvedSelectNode {
             from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-                schema: "public".to_owned(),
-                name: "c".to_owned(),
+                schema: "public".into(),
+                name: "c".into(),
                 alias: None,
                 relation_oid: 1003,
             })],

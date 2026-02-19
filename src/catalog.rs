@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use ecow::EcoString;
 use iddqd::{BiHashItem, BiHashMap, bi_upcast};
 use tokio_postgres::types::{Kind, Type};
 use tokio_postgres::{Client, Error};
@@ -27,9 +28,9 @@ pub struct TableMetadata {
     /// PostgreSQL relation OID
     pub relation_oid: u32,
     /// Table name (unqualified)
-    pub name: String,
+    pub name: EcoString,
     /// Schema name (e.g., "public")
-    pub schema: String,
+    pub schema: EcoString,
     /// Names of columns that form the primary key
     pub primary_key_columns: Vec<String>,
     /// Column metadata indexed by name and position
@@ -65,16 +66,17 @@ impl TableMetadata {
                     table: if let Some(alias) = alias {
                         Some(alias.name.clone())
                     } else {
-                        Some(self.name.clone())
+                        Some(self.name.to_string())
                     },
                     column: if let Some(alias) = alias {
                         alias
                             .columns
                             .get(c.position as usize - 1)
-                            .unwrap_or(&c.name)
-                            .clone()
+                            .map(String::as_str)
+                            .unwrap_or(c.name.as_str())
+                            .to_owned()
                     } else {
-                        c.name.clone()
+                        c.name.to_string()
                     },
                 }),
                 alias: None,
@@ -96,7 +98,7 @@ impl TableMetadata {
                 expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
                     schema: self.schema.clone(),
                     table: self.name.clone(),
-                    table_alias: table_alias.map(str::to_owned),
+                    table_alias: table_alias.map(EcoString::from),
                     column: c.name.clone(),
                     column_metadata: c.clone(),
                 }),
@@ -127,10 +129,15 @@ impl BiHashItem for TableMetadata {
 ///
 /// Contains type information and position data for a single column
 /// within a table.
+///
+/// String fields use `EcoString` for reduced clone cost: short names (≤15 bytes)
+/// are stored inline (stack-only memcpy), longer names like
+/// `"timestamp with time zone"` get a single heap allocation shared via
+/// refcount across all clones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMetadata {
     /// Column name
-    pub name: String,
+    pub name: EcoString,
     /// 1-based position in table (matches PostgreSQL attnum)
     pub position: i16,
     /// PostgreSQL type OID (original from origin database, used in RowDescription)
@@ -138,9 +145,9 @@ pub struct ColumnMetadata {
     /// Parsed PostgreSQL type (may be Domain, Enum, etc.)
     pub data_type: Type,
     /// Human-readable type name from origin (e.g., "year", "mood")
-    pub type_name: String,
+    pub type_name: EcoString,
     /// Type name for cache table creation (e.g., "integer" for year domain, "text" for enums)
-    pub cache_type_name: String,
+    pub cache_type_name: EcoString,
     /// Whether this column is part of the primary key
     pub is_primary_key: bool,
 }

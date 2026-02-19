@@ -117,7 +117,7 @@ async fn population_task(
                 .find(|t| t.relation_oid == table_node.relation_oid)
                 .ok_or(CacheError::UnknownTable {
                     oid: Some(table_node.relation_oid),
-                    name: Some(table_node.name.clone()),
+                    name: Some(table_node.name.to_string()),
                 })?;
 
             let stream_start = Instant::now();

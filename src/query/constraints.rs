@@ -274,10 +274,10 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
         HashMap::new();
     for constraint in &column_constraints {
         table_constraints
-            .entry(constraint.column.table.clone())
+            .entry(constraint.column.table.to_string())
             .or_default()
             .push((
-                constraint.column.column.clone(),
+                constraint.column.column.to_string(),
                 constraint.op,
                 constraint.value.clone(),
             ));
@@ -319,29 +319,29 @@ mod tests {
         let mut columns = BiHashMap::new();
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "id".to_owned(),
+            name: "id".into(),
             position: 1,
             type_oid: 23,
             data_type: Type::INT4,
-            type_name: "int4".to_owned(),
-            cache_type_name: "int4".to_owned(),
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
             is_primary_key: true,
         });
 
         columns.insert_overwrite(ColumnMetadata {
-            name: "name".to_owned(),
+            name: "name".into(),
             position: 2,
             type_oid: 25,
             data_type: Type::TEXT,
-            type_name: "text".to_owned(),
-            cache_type_name: "text".to_owned(),
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
             is_primary_key: false,
         });
 
         TableMetadata {
             relation_oid,
-            name: name.to_owned(),
-            schema: "public".to_owned(),
+            name: name.into(),
+            schema: "public".into(),
             primary_key_columns: vec!["id".to_owned()],
             columns,
             indexes: Vec::new(),
@@ -430,18 +430,18 @@ mod tests {
 
         let mut c_columns = BiHashMap::new();
         c_columns.insert_overwrite(ColumnMetadata {
-            name: "id".to_owned(),
+            name: "id".into(),
             position: 1,
             type_oid: 23,
             data_type: Type::INT4,
-            type_name: "int4".to_owned(),
-            cache_type_name: "int4".to_owned(),
+            type_name: "int4".into(),
+            cache_type_name: "int4".into(),
             is_primary_key: true,
         });
         tables.insert_overwrite(TableMetadata {
             relation_oid: 1003,
-            name: "c".to_owned(),
-            schema: "public".to_owned(),
+            name: "c".into(),
+            schema: "public".into(),
             primary_key_columns: vec!["id".to_owned()],
             columns: c_columns,
             indexes: Vec::new(),

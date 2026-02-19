@@ -410,7 +410,7 @@ impl CacheWriter {
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> bool {
-        let Some(constraints) = constraints.table_constraints.get(&table_metadata.name) else {
+        let Some(constraints) = constraints.table_constraints.get(table_metadata.name.as_str()) else {
             return true;
         };
 
@@ -461,7 +461,7 @@ impl CacheWriter {
                 let has_table_constraints = update_query
                     .constraints
                     .table_constraints
-                    .contains_key(&table_metadata.name);
+                    .contains_key(table_metadata.name.as_str());
 
                 // If key_data is empty, PK didn't change. If all join columns are PK columns
                 // and there are no WHERE constraints for this table, the row's membership
@@ -477,7 +477,7 @@ impl CacheWriter {
                 let has_table_constraints = update_query
                     .constraints
                     .table_constraints
-                    .contains_key(&table_metadata.name);
+                    .contains_key(table_metadata.name.as_str());
 
                 // If key_data is empty, PK didn't change. If all join columns are PK columns
                 // and there are no WHERE constraints for this table, the row's membership

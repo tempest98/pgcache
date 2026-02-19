@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_replication::{
     LogicalReplicationStream,
@@ -435,11 +436,11 @@ impl CdcProcessor {
     /// Parse RelationBody into TableMetadata for cache registration.
     fn parse_relation_to_table_metadata(&self, relation_body: &RelationBody) -> TableMetadata {
         let relation_oid = relation_body.rel_id();
-        let table_name = relation_body.name().unwrap_or("unknown_table").to_owned();
-        let schema_name = relation_body
+        let table_name: EcoString = relation_body.name().unwrap_or("unknown_table").into();
+        let schema_name: EcoString = relation_body
             .namespace()
             .unwrap_or("unknown_schema")
-            .to_owned();
+            .into();
 
         // Build column metadata from relation body
         let mut columns = BiHashMap::new();
@@ -459,12 +460,12 @@ impl CdcProcessor {
                 cache_type_name_resolve(&data_type).unwrap_or_else(|_| "text".to_owned());
 
             let column_metadata = ColumnMetadata {
-                name: column.name().unwrap_or("unknown_column").to_owned(),
+                name: column.name().unwrap_or("unknown_column").into(),
                 position: (idx + 1) as i16, // PostgreSQL columns are 1-indexed
                 type_oid,
                 data_type,
-                type_name,
-                cache_type_name,
+                type_name: type_name.into(),
+                cache_type_name: cache_type_name.into(),
                 is_primary_key,
             };
 

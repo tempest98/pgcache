@@ -1,3 +1,4 @@
+use ecow::EcoString;
 use error_set::error_set;
 use ordered_float::NotNan;
 use postgres_protocol::types as pg_types;
@@ -533,8 +534,9 @@ pub fn resolved_select_node_table_replace_with_values(
                         found_alias = Some(
                             table
                                 .alias
-                                .clone()
-                                .unwrap_or_else(|| table_metadata.name.clone()),
+                                .as_deref()
+                                .unwrap_or(&table_metadata.name)
+                                .to_owned(),
                         );
                         break;
                     }
@@ -586,11 +588,11 @@ pub fn resolved_select_node_table_replace_with_values(
         let position = column_meta.position as usize - 1;
         if let Some(row_value) = row_data.get(position) {
             let value = row_value.as_deref().map_or(
-                LiteralValue::NullWithCast(column_meta.type_name.clone()),
-                |v| LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone()),
+                LiteralValue::NullWithCast(column_meta.type_name.to_string()),
+                |v| LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.to_string()),
             );
             values.push(value);
-            column_names.push(column_meta.name.clone());
+            column_names.push(column_meta.name.to_string());
         }
     }
 
@@ -665,7 +667,7 @@ fn resolved_where_column_alias_update(
     match expr {
         ResolvedWhereExpr::Column(col) => {
             if col.schema == schema && col.table == table {
-                col.table_alias = Some(alias.to_owned());
+                col.table_alias = Some(EcoString::from(alias));
             }
         }
         ResolvedWhereExpr::Unary(unary) => {
@@ -731,7 +733,7 @@ fn resolved_column_expr_alias_update(
     match expr {
         ResolvedColumnExpr::Column(col) => {
             if col.schema == schema && col.table == table {
-                col.table_alias = Some(alias.to_owned());
+                col.table_alias = Some(EcoString::from(alias));
             }
         }
         ResolvedColumnExpr::Function {
@@ -884,19 +886,19 @@ mod tests {
         for (i, col_name) in column_names.iter().enumerate() {
             let is_pk = i == 0;
             columns.insert_overwrite(ColumnMetadata {
-                name: (*col_name).to_owned(),
+                name: (*col_name).into(),
                 position: (i + 1) as i16,
                 type_oid: if is_pk { 23 } else { 25 },
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
-                type_name: if is_pk { "int4" } else { "text" }.to_owned(),
-                cache_type_name: if is_pk { "int4" } else { "text" }.to_owned(),
+                type_name: if is_pk { "int4" } else { "text" }.into(),
+                cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
             });
         }
         TableMetadata {
             relation_oid,
-            name: name.to_owned(),
-            schema: "public".to_owned(),
+            name: name.into(),
+            schema: "public".into(),
             primary_key_columns: vec![column_names[0].to_owned()],
             columns,
             indexes: Vec::new(),
@@ -1736,21 +1738,21 @@ mod tests {
         use postgres_types::Type;
 
         let col_meta = ColumnMetadata {
-            name: "status".to_owned(),
+            name: "status".into(),
             position: 1,
             type_oid: 25,
             data_type: Type::TEXT,
-            type_name: "text".to_owned(),
-            cache_type_name: "text".to_owned(),
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
             is_primary_key: false,
         };
 
         let node = ResolvedSelectNode {
             group_by: vec![ResolvedColumnNode {
-                schema: "public".to_owned(),
-                table: "orders".to_owned(),
+                schema: "public".into(),
+                table: "orders".into(),
                 table_alias: None,
-                column: "status".to_owned(),
+                column: "status".into(),
                 column_metadata: col_meta,
             }],
             ..Default::default()
@@ -1826,8 +1828,8 @@ mod tests {
 
         let node = ResolvedSelectNode {
             from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-                schema: "public".to_owned(),
-                name: "orders".to_owned(),
+                schema: "public".into(),
+                name: "orders".into(),
                 alias: None,
                 relation_oid: 12345,
             })],
