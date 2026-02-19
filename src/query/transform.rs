@@ -711,13 +711,6 @@ fn resolved_select_columns_alias_update(
     use crate::query::resolved::ResolvedSelectColumns;
 
     match columns {
-        ResolvedSelectColumns::All(cols) => {
-            for col in cols {
-                if col.schema == schema && col.table == table {
-                    col.table_alias = Some(alias.to_owned());
-                }
-            }
-        }
         ResolvedSelectColumns::Columns(cols) => {
             for col in cols {
                 resolved_column_expr_alias_update(&mut col.expr, schema, table, alias);
@@ -1124,7 +1117,11 @@ mod tests {
     fn test_query_select_replace() {
         // Test replacing specific columns with SELECT *
         let node = parse_select_node("SELECT id, name, email FROM users WHERE id = 1");
-        let result = select_node_columns_replace(&node, SelectColumns::All);
+        let star_columns = SelectColumns::Columns(vec![SelectColumn {
+            expr: ColumnExpr::Star(None),
+            alias: None,
+        }]);
+        let result = select_node_columns_replace(&node, star_columns);
 
         // Deparse to verify the transformation
         let mut buf = String::new();
@@ -1155,7 +1152,11 @@ mod tests {
         let node = parse_select_node(
             "SELECT a.id, b.data FROM table_a a WHERE a.status = 'active' AND b.enabled = true",
         );
-        let result = select_node_columns_replace(&node, SelectColumns::All);
+        let star_columns = SelectColumns::Columns(vec![SelectColumn {
+            expr: ColumnExpr::Star(None),
+            alias: None,
+        }]);
+        let result = select_node_columns_replace(&node, star_columns);
 
         // Deparse to verify the transformation
         let mut buf = String::new();

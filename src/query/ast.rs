@@ -1231,8 +1231,7 @@ impl Deparse for QueryExpr {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum SelectColumns {
     None,
-    All,                        // SELECT *
-    Columns(Vec<SelectColumn>), // SELECT col1, col2, ...
+    Columns(Vec<SelectColumn>), // SELECT col1, col2, ... (includes Star entries)
 }
 
 impl SelectColumns {
@@ -1240,7 +1239,7 @@ impl SelectColumns {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
 
         let children: Box<dyn Iterator<Item = &N> + '_> = match self {
-            SelectColumns::None | SelectColumns::All => Box::new(std::iter::empty()),
+            SelectColumns::None => Box::new(std::iter::empty()),
             SelectColumns::Columns(columns) => Box::new(columns.iter().flat_map(|col| col.nodes())),
         };
 
@@ -1265,7 +1264,6 @@ impl Deparse for SelectColumns {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
             SelectColumns::None => buf.push(' '),
-            SelectColumns::All => buf.push_str(" *"),
             SelectColumns::Columns(cols) => {
                 let mut sep = "";
                 for col in cols {
@@ -1356,6 +1354,7 @@ impl Deparse for ArithmeticExpr {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ColumnExpr {
     Column(ColumnNode),         // column_name, table.column_name
+    Star(Option<String>),       // * or table.*
     Function(FunctionCall),     // COUNT(*), SUM(col), etc.
     Literal(LiteralValue),      // Constant values
     Case(CaseExpr),             // CASE WHEN ... THEN ... END
@@ -1370,6 +1369,7 @@ impl ColumnExpr {
         }
         match self {
             ColumnExpr::Column(col) => Box::new((col as &dyn Any).downcast_ref::<N>().into_iter()),
+            ColumnExpr::Star(_) => Box::new(std::iter::empty()),
             ColumnExpr::Function(func) => {
                 Box::new((func as &dyn Any).downcast_ref::<N>().into_iter())
             }
@@ -1389,7 +1389,7 @@ impl ColumnExpr {
             ColumnExpr::Case(case) => case.has_subqueries(),
             ColumnExpr::Arithmetic(arith) => arith.has_subqueries(),
             ColumnExpr::Subquery(_) => true,
-            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => false,
+            ColumnExpr::Column(_) | ColumnExpr::Star(_) | ColumnExpr::Literal(_) => false,
         }
     }
 
@@ -1400,7 +1400,7 @@ impl ColumnExpr {
         branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
     ) {
         match self {
-            ColumnExpr::Column(_) | ColumnExpr::Literal(_) => {}
+            ColumnExpr::Column(_) | ColumnExpr::Star(_) | ColumnExpr::Literal(_) => {}
             ColumnExpr::Function(func) => {
                 for arg in &func.args {
                     arg.subquery_nodes_collect(branches);
@@ -1435,6 +1435,14 @@ impl Deparse for ColumnExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
             ColumnExpr::Column(col) => col.deparse(buf),
+            ColumnExpr::Star(qualifier) => {
+                if let Some(table) = qualifier {
+                    buf.push_str(table);
+                    buf.push('.');
+                }
+                buf.push('*');
+                buf
+            }
             ColumnExpr::Function(func) => func.deparse(buf),
             ColumnExpr::Literal(lit) => lit.deparse(buf),
             ColumnExpr::Case(case) => case.deparse(buf),
@@ -2414,7 +2422,6 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
     }
 
     let mut columns = Vec::new();
-    let mut has_star = false;
 
     for target in target_list {
         if let Some(NodeEnum::ResTarget(res_target)) = &target.node
@@ -2428,11 +2435,37 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
 
             match val_node.node.as_ref() {
                 Some(NodeEnum::ColumnRef(col_ref)) => {
-                    // Check if this is SELECT *
-                    if let [field] = col_ref.fields.as_slice()
+                    let fields = &col_ref.fields;
+
+                    // Bare star: SELECT *
+                    if let [field] = fields.as_slice()
                         && let Some(NodeEnum::AStar(_)) = &field.node
                     {
-                        has_star = true;
+                        columns.push(SelectColumn {
+                            expr: ColumnExpr::Star(None),
+                            alias,
+                        });
+                        continue;
+                    }
+
+                    // Qualified star: SELECT t1.*
+                    if fields.len() >= 2
+                        && matches!(
+                            fields.last().and_then(|f| f.node.as_ref()),
+                            Some(NodeEnum::AStar(_))
+                        )
+                    {
+                        let qualifier = fields
+                            .get(fields.len() - 2)
+                            .ok_or(AstError::InvalidTableRef)?;
+                        let table = match qualifier.node.as_ref() {
+                            Some(NodeEnum::String(s)) => s.sval.clone(),
+                            _ => return Err(AstError::InvalidTableRef),
+                        };
+                        columns.push(SelectColumn {
+                            expr: ColumnExpr::Star(Some(table)),
+                            alias,
+                        });
                         continue;
                     }
 
@@ -2526,15 +2559,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
         }
     }
 
-    if has_star && columns.is_empty() {
-        Ok(SelectColumns::All)
-    } else if !has_star && !columns.is_empty() {
-        Ok(SelectColumns::Columns(columns))
-    } else {
-        Err(AstError::UnsupportedSelectFeature {
-            feature: "Mixed * and column list".to_owned(),
-        })
-    }
+    Ok(SelectColumns::Columns(columns))
 }
 
 fn from_clause_convert(
@@ -5404,10 +5429,63 @@ mod tests {
 
         assert!(query_expr.is_single_table());
         assert!(!query_expr.has_where_clause());
-        assert!(matches!(
-            query_expr.as_select().unwrap().columns,
-            SelectColumns::All
-        ));
+
+        let SelectColumns::Columns(cols) = &query_expr.as_select().unwrap().columns else {
+            panic!("Expected Columns");
+        };
+        assert_eq!(cols.len(), 1);
+        assert!(matches!(&cols[0].expr, ColumnExpr::Star(None)));
+    }
+
+    #[test]
+    fn test_query_expr_select_star_with_column() {
+        let sql = "SELECT *, col FROM test";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let SelectColumns::Columns(cols) = &query_expr.as_select().unwrap().columns else {
+            panic!("Expected Columns");
+        };
+        assert_eq!(cols.len(), 2);
+        assert!(matches!(&cols[0].expr, ColumnExpr::Star(None)));
+        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "col"));
+    }
+
+    #[test]
+    fn test_query_expr_select_qualified_star() {
+        let sql = "SELECT t1.*, t2.col FROM test t1 JOIN test2 t2 ON t2.id = t1.id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+
+        let SelectColumns::Columns(cols) = &query_expr.as_select().unwrap().columns else {
+            panic!("Expected Columns");
+        };
+        assert_eq!(cols.len(), 2);
+        assert!(matches!(&cols[0].expr, ColumnExpr::Star(Some(t)) if t == "t1"));
+        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "col" && c.table.as_deref() == Some("t2")));
+    }
+
+    #[test]
+    fn test_query_expr_select_star_deparse() {
+        // Bare star
+        let sql = "SELECT * FROM products";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let mut buf = String::new();
+        query_expr.deparse(&mut buf);
+        assert!(buf.contains("SELECT *"), "should deparse as SELECT *: {buf}");
+
+        // Qualified star with column
+        let sql = "SELECT t1.*, t2.name FROM a t1 JOIN b t2 ON t2.id = t1.id";
+        let pg_ast = pg_query::parse(sql).unwrap();
+        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let mut buf = String::new();
+        query_expr.deparse(&mut buf);
+        assert!(
+            buf.contains("t1.*"),
+            "should deparse qualified star: {buf}"
+        );
+        assert!(buf.contains("t2.name"), "should deparse column: {buf}");
     }
 
     #[test]

@@ -388,7 +388,7 @@ fn is_cacheable_select_list(
     use crate::query::ast::SelectColumns;
 
     match &select.columns {
-        SelectColumns::All | SelectColumns::None => Ok(()),
+        SelectColumns::None => Ok(()),
         SelectColumns::Columns(cols) => {
             for col in cols {
                 is_cacheable_column_expr(&col.expr, ctx, fv)?;
@@ -407,7 +407,7 @@ fn is_cacheable_column_expr(
     use crate::query::ast::ColumnExpr;
 
     match expr {
-        ColumnExpr::Column(_) | ColumnExpr::Literal(_) => Ok(()),
+        ColumnExpr::Column(_) | ColumnExpr::Star(_) | ColumnExpr::Literal(_) => Ok(()),
         ColumnExpr::Function(func) => {
             // Recursively check function arguments
             for arg in &func.args {

@@ -854,9 +854,7 @@ impl Deparse for ResolvedSelectColumn {
 pub enum ResolvedSelectColumns {
     /// No columns (empty SELECT)
     None,
-    /// SELECT * (expanded to all columns from all tables)
-    All(Vec<ResolvedColumnNode>),
-    /// Specific columns
+    /// Specific columns (stars are expanded to explicit columns during resolution)
     Columns(Vec<ResolvedSelectColumn>),
 }
 
@@ -865,7 +863,6 @@ impl ResolvedSelectColumns {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let children: Box<dyn Iterator<Item = &'_ N>> = match self {
             ResolvedSelectColumns::None => Box::new(std::iter::empty()),
-            ResolvedSelectColumns::All(cols) => Box::new(cols.iter().flat_map(|col| col.nodes())),
             ResolvedSelectColumns::Columns(cols) => {
                 Box::new(cols.iter().flat_map(|col| col.nodes()))
             }
@@ -881,8 +878,7 @@ impl ResolvedSelectColumns {
                 .map(|c| c.expr.subquery_depth())
                 .max()
                 .unwrap_or(0),
-            // All and None contain no subqueries
-            ResolvedSelectColumns::None | ResolvedSelectColumns::All(_) => 0,
+            ResolvedSelectColumns::None => 0,
         }
     }
 
@@ -893,7 +889,6 @@ impl ResolvedSelectColumns {
                 col.expr.subquery_nodes_collect(branches);
             }
         }
-        // ResolvedSelectColumns::All only contains ResolvedColumnNode (no subqueries)
     }
 }
 
@@ -901,9 +896,6 @@ impl Deparse for ResolvedSelectColumns {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
             ResolvedSelectColumns::None => buf.push(' '),
-            ResolvedSelectColumns::All(_) => {
-                buf.push_str(" *");
-            }
             ResolvedSelectColumns::Columns(cols) => {
                 let mut sep = "";
                 for col in cols {
@@ -1634,9 +1626,6 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
 
     match &select.columns {
         ResolvedSelectColumns::None => Vec::new(),
-        ResolvedSelectColumns::All(cols) => {
-            cols.iter().map(|col| col.column_metadata.clone()).collect()
-        }
         ResolvedSelectColumns::Columns(cols) => cols
             .iter()
             .enumerate()
@@ -1960,6 +1949,7 @@ fn column_expr_resolve(
     scope: &ResolutionScope,
 ) -> ResolveResult<ResolvedColumnExpr> {
     match expr {
+        ColumnExpr::Star(_) => unreachable!("Star expanded in select_columns_resolve"),
         ColumnExpr::Column(col) => {
             let resolved = column_resolve(col, scope)?;
             Ok(ResolvedColumnExpr::Column(resolved))
@@ -2073,39 +2063,50 @@ fn window_spec_resolve(
 }
 
 /// Resolve SELECT columns
+///
+/// Star expressions (`*` or `t1.*`) are expanded inline to all columns from
+/// matching tables in scope.
 fn select_columns_resolve(
     columns: &SelectColumns,
     scope: &ResolutionScope,
 ) -> ResolveResult<ResolvedSelectColumns> {
     match columns {
         SelectColumns::None => Ok(ResolvedSelectColumns::None),
-        SelectColumns::All => {
-            // Expand SELECT * to all columns from all tables in scope
-            let mut all_columns = Vec::new();
-            for (table_metadata, alias) in &scope.tables {
-                for column_metadata in &table_metadata.columns {
-                    all_columns.push(ResolvedColumnNode {
-                        schema: table_metadata.schema.clone(),
-                        table: table_metadata.name.clone(),
-                        table_alias: alias.map(str::to_owned),
-                        column: column_metadata.name.clone(),
-                        column_metadata: column_metadata.clone(),
+        SelectColumns::Columns(cols) => {
+            let mut resolved_cols = Vec::new();
+            for col in cols {
+                if let ColumnExpr::Star(qualifier) = &col.expr {
+                    // Expand star to all columns from matching table(s)
+                    for (table_metadata, alias) in &scope.tables {
+                        let matches = match qualifier {
+                            None => true,
+                            Some(q) => {
+                                alias.is_some_and(|a| a == q) || table_metadata.name == *q
+                            }
+                        };
+                        if matches {
+                            for column_metadata in &table_metadata.columns {
+                                resolved_cols.push(ResolvedSelectColumn {
+                                    expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
+                                        schema: table_metadata.schema.clone(),
+                                        table: table_metadata.name.clone(),
+                                        table_alias: alias.map(str::to_owned),
+                                        column: column_metadata.name.clone(),
+                                        column_metadata: column_metadata.clone(),
+                                    }),
+                                    alias: None,
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    let resolved_expr = column_expr_resolve(&col.expr, scope)?;
+                    resolved_cols.push(ResolvedSelectColumn {
+                        expr: resolved_expr,
+                        alias: col.alias.clone(),
                     });
                 }
             }
-            Ok(ResolvedSelectColumns::All(all_columns))
-        }
-        SelectColumns::Columns(cols) => {
-            let resolved_cols = cols
-                .iter()
-                .map(|col| {
-                    let resolved_expr = column_expr_resolve(&col.expr, scope)?;
-                    Ok(ResolvedSelectColumn {
-                        expr: resolved_expr,
-                        alias: col.alias.clone(),
-                    })
-                })
-                .collect::<ResolveResult<Vec<_>>>()?;
             Ok(ResolvedSelectColumns::Columns(resolved_cols))
         }
     }
@@ -2149,6 +2150,7 @@ fn order_by_as_identifiers(
 /// Used for ORDER BY in set operations where columns reference output names, not table columns.
 fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
     match expr {
+        ColumnExpr::Star(_) => unreachable!("Star expanded in select_columns_resolve"),
         ColumnExpr::Column(col) => ResolvedColumnExpr::Identifier(col.column.clone()),
         ColumnExpr::Literal(lit) => ResolvedColumnExpr::Literal(lit.clone()),
         ColumnExpr::Function(func) => ResolvedColumnExpr::Function {
@@ -2593,15 +2595,20 @@ mod tests {
         let resolved = resolve_sql("SELECT * FROM users", &tables);
 
         // Check that SELECT * was expanded to all columns
-        if let ResolvedSelectColumns::All(cols) = &resolved.columns {
-            assert_eq!(cols.len(), 2);
-            assert_eq!(cols[0].column, "id");
-            assert_eq!(cols[0].table, "users");
-            assert_eq!(cols[1].column, "name");
-            assert_eq!(cols[1].table, "users");
-        } else {
-            panic!("Expected All columns");
-        }
+        let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+            panic!("Expected Columns");
+        };
+        assert_eq!(cols.len(), 2);
+        let ResolvedColumnExpr::Column(col) = &cols[0].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "id");
+        assert_eq!(col.table, "users");
+        let ResolvedColumnExpr::Column(col) = &cols[1].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "name");
+        assert_eq!(col.table, "users");
     }
 
     #[test]
@@ -2631,6 +2638,71 @@ mod tests {
         } else {
             panic!("Expected Columns");
         }
+    }
+
+    #[test]
+    fn test_select_star_with_column() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let resolved = resolve_sql("SELECT *, name FROM users", &tables);
+
+        // Star expands to all columns, then the explicit column follows
+        let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+            panic!("Expected Columns");
+        };
+        assert_eq!(cols.len(), 3); // id, name (from *), name (explicit)
+
+        let ResolvedColumnExpr::Column(col) = &cols[0].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "id");
+
+        let ResolvedColumnExpr::Column(col) = &cols[1].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "name");
+
+        let ResolvedColumnExpr::Column(col) = &cols[2].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "name");
+    }
+
+    #[test]
+    fn test_select_qualified_star_with_column() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", 1002));
+
+        let resolved = resolve_sql(
+            "SELECT u.*, o.name FROM users u JOIN orders o ON o.id = u.id",
+            &tables,
+        );
+
+        let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+            panic!("Expected Columns");
+        };
+        // u.* expands to users.id, users.name, then o.name
+        assert_eq!(cols.len(), 3);
+
+        let ResolvedColumnExpr::Column(col) = &cols[0].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "id");
+        assert_eq!(col.table, "users");
+
+        let ResolvedColumnExpr::Column(col) = &cols[1].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "name");
+        assert_eq!(col.table, "users");
+
+        let ResolvedColumnExpr::Column(col) = &cols[2].expr else {
+            panic!("Expected column expression");
+        };
+        assert_eq!(col.column, "name");
+        assert_eq!(col.table, "orders");
     }
 
     #[test]
@@ -3018,8 +3090,11 @@ mod tests {
         let mut buf = String::new();
         resolved.deparse(&mut buf);
 
-        // SELECT * is preserved, table and column references are fully qualified
-        assert_eq!(buf, "SELECT * FROM public.users WHERE public.users.id = 1");
+        // SELECT * is expanded to explicit columns, table and column references are fully qualified
+        assert_eq!(
+            buf,
+            "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1"
+        );
     }
 
     #[test]

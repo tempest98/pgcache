@@ -160,7 +160,6 @@ fn subquery_output_column_names(query: &ResolvedQueryExpr) -> Vec<String> {
 
     match &select.columns {
         ResolvedSelectColumns::None => Vec::new(),
-        ResolvedSelectColumns::All(cols) => cols.iter().map(|col| col.column.clone()).collect(),
         ResolvedSelectColumns::Columns(cols) => cols
             .iter()
             .filter_map(|col| {
@@ -244,8 +243,7 @@ fn predicate_push_into_select(
 
     let branch_columns = match &select.columns {
         ResolvedSelectColumns::Columns(cols) => cols,
-        // SELECT * and None don't have individual column expressions to remap through
-        ResolvedSelectColumns::All(_) | ResolvedSelectColumns::None => return None,
+        ResolvedSelectColumns::None => return None,
     };
 
     // Collect column names actually referenced by the predicate — only these
