@@ -31,9 +31,6 @@ error_set! {
 
         #[display("Invalid table reference")]
         InvalidTableRef,
-
-        #[display("Correlated subquery not supported: references outer table '{table}'")]
-        CorrelatedSubqueryNotSupported { table: String },
     }
 }
 
@@ -205,6 +202,9 @@ pub enum ResolvedWhereExpr {
         sublink_type: SubLinkType,
         /// Left-hand expression for IN/ANY/ALL (e.g., `id` in `id IN (SELECT ...)`)
         test_expr: Option<Box<ResolvedWhereExpr>>,
+        /// Columns from the outer query scope referenced inside this subquery.
+        /// Empty for non-correlated subqueries.
+        outer_refs: Vec<ResolvedColumnNode>,
     },
 }
 
@@ -465,6 +465,7 @@ impl Deparse for ResolvedWhereExpr {
                 query,
                 sublink_type,
                 test_expr,
+                ..
             } => {
                 match sublink_type {
                     SubLinkType::Exists => {
@@ -562,8 +563,8 @@ pub enum ResolvedColumnExpr {
     Case(ResolvedCaseExpr),
     /// Arithmetic expression: `left op right`
     Arithmetic(ResolvedArithmeticExpr),
-    /// Subquery (for future support)
-    Subquery(Box<ResolvedQueryExpr>),
+    /// Scalar subquery in SELECT list
+    Subquery(Box<ResolvedQueryExpr>, Vec<ResolvedColumnNode>),
 }
 
 /// Resolved window specification for OVER clause
@@ -653,7 +654,7 @@ impl ResolvedColumnExpr {
             }
             ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
             ResolvedColumnExpr::Arithmetic(arith) => Box::new(arith.nodes()),
-            ResolvedColumnExpr::Subquery(query) => Box::new(query.nodes()),
+            ResolvedColumnExpr::Subquery(query, _) => Box::new(query.nodes()),
         };
         current.chain(children)
     }
@@ -682,7 +683,7 @@ impl ResolvedColumnExpr {
                 .left
                 .subquery_depth()
                 .max(arith.right.subquery_depth()),
-            ResolvedColumnExpr::Subquery(query) => 1 + query.subquery_depth(),
+            ResolvedColumnExpr::Subquery(query, _) => 1 + query.subquery_depth(),
         }
     }
 
@@ -713,7 +714,7 @@ impl ResolvedColumnExpr {
                 arith.left.subquery_nodes_collect(branches);
                 arith.right.subquery_nodes_collect(branches);
             }
-            ResolvedColumnExpr::Subquery(query) => {
+            ResolvedColumnExpr::Subquery(query, _) => {
                 query.select_nodes_collect(branches);
             }
         }
@@ -788,7 +789,7 @@ impl Deparse for ResolvedColumnExpr {
             }
             ResolvedColumnExpr::Case(case) => case.deparse(buf),
             ResolvedColumnExpr::Arithmetic(arith) => arith.deparse(buf),
-            ResolvedColumnExpr::Subquery(query) => {
+            ResolvedColumnExpr::Subquery(query, _) => {
                 buf.push('(');
                 query.deparse(buf);
                 buf.push(')');
@@ -1461,6 +1462,13 @@ struct ResolutionScope<'a> {
     catalog_tables: &'a BiHashMap<TableMetadata>,
     /// Search path for schema resolution
     search_path: Vec<&'a str>,
+    /// Owned snapshot of ancestor scope tables for correlated reference fallback.
+    /// Populated when this scope was created for a WHERE/SELECT subquery body.
+    /// Empty at top level.
+    outer_tables: Vec<(TableMetadata, Option<String>)>,
+    /// Correlated column references found during resolution of this scope's expressions.
+    /// Populated by `column_resolve` when it falls back to `outer_tables`.
+    outer_refs: Vec<ResolvedColumnNode>,
 }
 
 impl<'a> ResolutionScope<'a> {
@@ -1470,7 +1478,58 @@ impl<'a> ResolutionScope<'a> {
             derived_tables: Vec::new(),
             catalog_tables,
             search_path: search_path.to_vec(),
+            outer_tables: Vec::new(),
+            outer_refs: Vec::new(),
         }
+    }
+
+    /// Create a scope for resolving an inner subquery body.
+    ///
+    /// `outer_tables` is an owned snapshot of the ancestor scopes' tables, used as
+    /// fallback when column resolution fails in this scope (correlated references).
+    fn new_with_outer(
+        catalog_tables: &'a BiHashMap<TableMetadata>,
+        search_path: &[&'a str],
+        outer_tables: Vec<(TableMetadata, Option<String>)>,
+    ) -> Self {
+        Self {
+            tables: Vec::new(),
+            derived_tables: Vec::new(),
+            catalog_tables,
+            search_path: search_path.to_vec(),
+            outer_tables,
+            outer_refs: Vec::new(),
+        }
+    }
+
+    /// Snapshot the current scope's tables (including derived and outer) for passing
+    /// to a child subquery scope. The child needs access to all ancestor tables.
+    fn scope_tables_snapshot(&self) -> Vec<(TableMetadata, Option<String>)> {
+        let mut snapshot: Vec<(TableMetadata, Option<String>)> = self
+            .tables
+            .iter()
+            .map(|(meta, alias)| ((*meta).clone(), alias.map(str::to_owned)))
+            .collect();
+        for (meta, alias) in &self.derived_tables {
+            snapshot.push((meta.clone(), Some(alias.clone())));
+        }
+        // Include ancestors so nested correlation can reach any level
+        snapshot.extend(self.outer_tables.iter().cloned());
+        snapshot
+    }
+
+    /// Find a table in the outer scope by name or alias.
+    fn outer_table_scope_find(&self, name: &str) -> Option<(&TableMetadata, Option<&str>)> {
+        self.outer_tables
+            .iter()
+            .find(|(meta, alias)| {
+                if let Some(alias_name) = alias {
+                    alias_name == name
+                } else {
+                    meta.name == name
+                }
+            })
+            .map(|(meta, alias)| (meta, alias.as_deref()))
     }
 
     /// Add a table to the scope
@@ -1497,24 +1556,6 @@ impl<'a> ResolutionScope<'a> {
             .iter()
             .find(|(_, alias)| alias == name)
             .map(|(meta, alias)| (meta, Some(alias.as_str())))
-    }
-
-    /// Find which outer-scope table contains a given column name, if any.
-    fn column_scope_find(&self, column: &str) -> Option<&TableMetadata> {
-        // Check catalog tables first
-        if let Some((meta, _)) = self
-            .tables
-            .iter()
-            .find(|(meta, _)| meta.columns.get1(column).is_some())
-        {
-            return Some(*meta);
-        }
-
-        // Check derived tables
-        self.derived_tables
-            .iter()
-            .find(|(meta, _)| meta.columns.get1(column).is_some())
-            .map(|(meta, _)| meta)
     }
 
     /// Add a derived table (FROM subquery) to the scope.
@@ -1564,45 +1605,21 @@ impl<'a> ResolutionScope<'a> {
         matches
     }
 
-    /// Resolve an inner query with a fresh scope, detecting correlated references.
+    /// Resolve an inner subquery, collecting any outer column references.
     ///
-    /// Detects two forms of correlated subqueries:
-    /// - Qualified references: `outer_table.column` produces `TableNotFound` in the fresh
-    ///   scope, intercepted here when the table exists in the outer scope.
-    /// - Unqualified references: a bare `column` that doesn't exist in any inner-scope
-    ///   table produces `ColumnNotFound`, intercepted here when the column exists in an
-    ///   outer-scope table.
-    fn subquery_resolve(&self, query: &QueryExpr) -> ResolveResult<ResolvedQueryExpr> {
-        query_expr_resolve(query, self.catalog_tables, &self.search_path).map_err(|report| {
-            match report.current_context() {
-                ResolveError::TableNotFound { name } if self.table_scope_find(name).is_some() => {
-                    ResolveError::CorrelatedSubqueryNotSupported {
-                        table: name.clone(),
-                    }
-                    .into()
-                }
-                ResolveError::ColumnNotFound { table, column } => {
-                    // Unqualified column (table == "<unknown>") not found in the inner
-                    // scope — check if it exists in the outer scope, which would make
-                    // this a correlated reference.
-                    if table == "<unknown>"
-                        && let Some(outer_table) = self.column_scope_find(column)
-                    {
-                        return ResolveError::CorrelatedSubqueryNotSupported {
-                            table: outer_table.name.clone(),
-                        }
-                        .into();
-                    }
-                    report
-                }
-                ResolveError::TableNotFound { .. }
-                | ResolveError::AmbiguousColumn { .. }
-                | ResolveError::SchemaNotFound { .. }
-                | ResolveError::SubqueryAliasNotFound { .. }
-                | ResolveError::InvalidTableRef
-                | ResolveError::CorrelatedSubqueryNotSupported { .. } => report,
-            }
-        })
+    /// Used for WHERE-clause and SELECT-list subqueries where correlated references
+    /// are allowed. Outer column references are resolved against `outer_tables` and
+    /// collected; they appear as normal `Column` nodes in the resolved inner query.
+    fn subquery_resolve(
+        &self,
+        query: &QueryExpr,
+    ) -> ResolveResult<(ResolvedQueryExpr, Vec<ResolvedColumnNode>)> {
+        query_expr_resolve_scoped(
+            query,
+            self.catalog_tables,
+            &self.search_path,
+            self.scope_tables_snapshot(),
+        )
     }
 }
 
@@ -1642,7 +1659,7 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                         | ResolvedColumnExpr::Literal(_)
                         | ResolvedColumnExpr::Case(_)
                         | ResolvedColumnExpr::Arithmetic(_)
-                        | ResolvedColumnExpr::Subquery(_) => return None,
+                        | ResolvedColumnExpr::Subquery(..) => return None,
                     }
                 };
 
@@ -1655,7 +1672,7 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                     | ResolvedColumnExpr::Literal(_)
                     | ResolvedColumnExpr::Case(_)
                     | ResolvedColumnExpr::Arithmetic(_)
-                    | ResolvedColumnExpr::Subquery(_) => ColumnMetadata {
+                    | ResolvedColumnExpr::Subquery(..) => ColumnMetadata {
                         name: name.clone(),
                         position: (i + 1) as i16,
                         type_oid: 25, // TEXT OID
@@ -1705,49 +1722,94 @@ fn table_metadata_find<'map, 'node: 'map>(
     None
 }
 
-/// Resolve a column reference to a resolved column node
-fn column_resolve<'a>(
+/// Resolve a column reference to a resolved column node.
+///
+/// When the column cannot be found in the inner scope and the scope has
+/// `outer_tables` set (i.e. we are inside a subquery body), the outer tables
+/// are tried as a fallback. On a successful outer-table match the resolved node
+/// is recorded in `scope.outer_refs` — marking this as a correlated reference —
+/// and returned as a normal column node so the inner query remains fully resolved.
+fn column_resolve(
     column_node: &ColumnNode,
-    scope: &ResolutionScope<'a>,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ResolvedColumnNode> {
     let column_name = &column_node.column;
 
-    // If column has table qualifier, resolve directly
+    // Table-qualified reference (e.g. `o.id`)
     if let Some(table_qualifier) = &column_node.table {
-        let (table_metadata, alias) = scope.table_scope_find(table_qualifier).ok_or_else(|| {
-            Report::from(ResolveError::TableNotFound {
-                name: table_qualifier.clone(),
-            })
-        })?;
+        // Try inner scope first
+        if let Some((table_metadata, alias)) = scope.table_scope_find(table_qualifier) {
+            let column_metadata = table_metadata
+                .columns
+                .get1(column_name.as_str())
+                .ok_or_else(|| {
+                    Report::from(ResolveError::ColumnNotFound {
+                        table: table_metadata.name.clone(),
+                        column: column_name.clone(),
+                    })
+                })?;
+            return Ok(ResolvedColumnNode {
+                schema: table_metadata.schema.clone(),
+                table: table_metadata.name.clone(),
+                table_alias: alias.map(str::to_owned),
+                column: column_metadata.name.clone(),
+                column_metadata: column_metadata.clone(),
+            });
+        }
 
-        let column_metadata = table_metadata
-            .columns
-            .get1(column_name.as_str())
-            .ok_or_else(|| {
-                Report::from(ResolveError::ColumnNotFound {
-                    table: table_metadata.name.clone(),
-                    column: column_name.clone(),
-                })
-            })?;
+        // Fall back to outer scope (correlated reference)
+        if let Some((outer_meta, outer_alias)) = scope.outer_table_scope_find(table_qualifier) {
+            let column_metadata = outer_meta
+                .columns
+                .get1(column_name.as_str())
+                .ok_or_else(|| {
+                    Report::from(ResolveError::ColumnNotFound {
+                        table: outer_meta.name.clone(),
+                        column: column_name.clone(),
+                    })
+                })?;
+            let resolved = ResolvedColumnNode {
+                schema: outer_meta.schema.clone(),
+                table: outer_meta.name.clone(),
+                table_alias: outer_alias.map(str::to_owned),
+                column: column_metadata.name.clone(),
+                column_metadata: column_metadata.clone(),
+            };
+            scope.outer_refs.push(resolved.clone());
+            return Ok(resolved);
+        }
 
-        return Ok(ResolvedColumnNode {
-            schema: table_metadata.schema.clone(),
-            table: table_metadata.name.clone(),
-            table_alias: alias.map(str::to_owned),
-            column: column_metadata.name.clone(),
-            column_metadata: column_metadata.clone(),
-        });
+        return Err(Report::from(ResolveError::TableNotFound {
+            name: table_qualifier.clone(),
+        }));
     }
 
-    // Unqualified column - search all tables in scope (including derived tables)
+    // Unqualified column — search inner scope first
     let matches = scope.column_matches_find(column_name.as_str());
-
     match matches.as_slice() {
-        [] => Err(ResolveError::ColumnNotFound {
-            table: "<unknown>".to_owned(),
-            column: column_name.clone(),
+        [] => {
+            // Fall back to outer scope (correlated reference)
+            let outer_match = scope.outer_tables.iter().find_map(|(meta, alias)| {
+                meta.columns
+                    .get1(column_name.as_str())
+                    .map(|col_meta| (meta, alias.as_deref(), col_meta))
+            });
+            if let Some((outer_meta, outer_alias, col_meta)) = outer_match {
+                let resolved = ResolvedColumnNode {
+                    schema: outer_meta.schema.clone(),
+                    table: outer_meta.name.clone(),
+                    table_alias: outer_alias.map(str::to_owned),
+                    column: col_meta.name.clone(),
+                    column_metadata: col_meta.clone(),
+                };
+                scope.outer_refs.push(resolved.clone());
+                return Ok(resolved);
+            }
+            Err(Report::from(ResolveError::ColumnNotFound {
+                table: "<unknown>".to_owned(),
+                column: column_name.clone(),
+            }))
         }
-        .into()),
         [(table_metadata, alias, column_metadata)] => Ok(ResolvedColumnNode {
             schema: table_metadata.schema.clone(),
             table: table_metadata.name.clone(),
@@ -1755,17 +1817,16 @@ fn column_resolve<'a>(
             column: column_metadata.name.clone(),
             column_metadata: (*column_metadata).clone(),
         }),
-        _ => Err(ResolveError::AmbiguousColumn {
+        _ => Err(Report::from(ResolveError::AmbiguousColumn {
             column: column_name.clone(),
-        }
-        .into()),
+        })),
     }
 }
 
 /// Resolve a WHERE expression
 fn where_expr_resolve(
     expr: &WhereExpr,
-    scope: &ResolutionScope,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ResolvedWhereExpr> {
     match expr {
         WhereExpr::Value(lit) => Ok(ResolvedWhereExpr::Value(lit.clone())),
@@ -1790,28 +1851,27 @@ fn where_expr_resolve(
             }))
         }
         WhereExpr::Multi(multi) => {
-            let resolved_exprs = multi
-                .exprs
-                .iter()
-                .map(|e| where_expr_resolve(e, scope))
-                .collect::<ResolveResult<Vec<_>>>()?;
+            let mut resolved_exprs = Vec::with_capacity(multi.exprs.len());
+            for e in &multi.exprs {
+                resolved_exprs.push(where_expr_resolve(e, scope)?);
+            }
             Ok(ResolvedWhereExpr::Multi(ResolvedMultiExpr {
                 op: multi.op,
                 exprs: resolved_exprs,
             }))
         }
         WhereExpr::Array(elems) => {
-            let resolved_elems = elems
-                .iter()
-                .map(|e| where_expr_resolve(e, scope))
-                .collect::<ResolveResult<Vec<_>>>()?;
+            let mut resolved_elems = Vec::with_capacity(elems.len());
+            for e in elems {
+                resolved_elems.push(where_expr_resolve(e, scope)?);
+            }
             Ok(ResolvedWhereExpr::Array(resolved_elems))
         }
         WhereExpr::Function { name, args } => {
-            let resolved_args = args
-                .iter()
-                .map(|arg| where_expr_resolve(arg, scope))
-                .collect::<ResolveResult<Vec<_>>>()?;
+            let mut resolved_args = Vec::with_capacity(args.len());
+            for arg in args {
+                resolved_args.push(where_expr_resolve(arg, scope)?);
+            }
             Ok(ResolvedWhereExpr::Function {
                 name: name.clone(),
                 args: resolved_args,
@@ -1823,20 +1883,19 @@ fn where_expr_resolve(
             test_expr,
         } => {
             // Resolve the test expression (left-hand side for IN/ANY/ALL) in the outer scope
-            let resolved_test = test_expr
-                .as_ref()
-                .map(|e| where_expr_resolve(e, scope))
-                .transpose()?
-                .map(Box::new);
+            let resolved_test = match test_expr {
+                Some(e) => Some(Box::new(where_expr_resolve(e, scope)?)),
+                None => None,
+            };
 
-            // Resolve the inner query with a fresh scope (non-correlated)
-            // Detects correlated references and returns a clear error
-            let resolved_query = scope.subquery_resolve(query)?;
+            // Resolve the inner query, collecting any correlated outer references
+            let (resolved_query, outer_refs) = scope.subquery_resolve(query)?;
 
             Ok(ResolvedWhereExpr::Subquery {
                 query: Box::new(resolved_query),
                 sublink_type: *sublink_type,
                 test_expr: resolved_test,
+                outer_refs,
             })
         }
     }
@@ -1882,11 +1941,10 @@ fn table_source_resolve<'a>(
                 table_source_resolve(&join_node.right, tables, scope, search_path)?;
 
             // Resolve join condition using the updated scope
-            let resolved_condition = join_node
-                .condition
-                .as_ref()
-                .map(|cond| where_expr_resolve(cond, scope))
-                .transpose()?;
+            let resolved_condition = match &join_node.condition {
+                Some(cond) => Some(where_expr_resolve(cond, scope)?),
+                None => None,
+            };
 
             Ok(ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
                 join_type: join_node.join_type,
@@ -1903,10 +1961,10 @@ fn table_source_resolve<'a>(
                 })
             })?;
 
-            // Resolve the inner query with a fresh scope (non-correlated)
-            // LATERAL subqueries would need access to outer scope, but we don't support those yet
-            // Detects correlated references and returns a clear error
-            let resolved_query = scope.subquery_resolve(&subquery.query)?;
+            // FROM-clause subqueries use a fresh scope — LATERAL (which would require access
+            // to the outer scope) is not supported and produces TableNotFound if attempted.
+            let resolved_query =
+                query_expr_resolve(&subquery.query, tables, search_path)?;
 
             // Add derived table to outer scope so outer columns can reference it
             scope.derived_table_scope_add(&resolved_query, &alias.name);
@@ -1923,8 +1981,9 @@ fn table_source_resolve<'a>(
                 .map(|a| a.name.as_str())
                 .unwrap_or(&cte_ref.cte_name);
 
-            // Resolve CTE body with fresh scope (non-correlated)
-            let resolved_query = scope.subquery_resolve(&cte_ref.query)?;
+            // CTE bodies use a fresh scope (non-correlated)
+            let resolved_query =
+                query_expr_resolve(&cte_ref.query, tables, search_path)?;
 
             let alias = TableAlias {
                 name: alias_name.to_owned(),
@@ -1944,7 +2003,7 @@ fn table_source_resolve<'a>(
 /// Resolve a column expression in SELECT list
 fn column_expr_resolve(
     expr: &ColumnExpr,
-    scope: &ResolutionScope,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ResolvedColumnExpr> {
     match expr {
         ColumnExpr::Star(_) => unreachable!("Star expanded in select_columns_resolve"),
@@ -1954,23 +2013,15 @@ fn column_expr_resolve(
         }
         ColumnExpr::Literal(lit) => Ok(ResolvedColumnExpr::Literal(lit.clone())),
         ColumnExpr::Function(func) => {
-            // Recursively resolve function arguments
-            let resolved_args = func
-                .args
-                .iter()
-                .map(|arg| column_expr_resolve(arg, scope))
-                .collect::<ResolveResult<Vec<_>>>()?;
-
-            // Resolve aggregate ORDER BY clauses
+            let mut resolved_args = Vec::with_capacity(func.args.len());
+            for arg in &func.args {
+                resolved_args.push(column_expr_resolve(arg, scope)?);
+            }
             let resolved_agg_order = order_by_resolve(&func.agg_order, scope)?;
-
-            // Resolve window specification if present
-            let resolved_over = func
-                .over
-                .as_ref()
-                .map(|w| window_spec_resolve(w, scope))
-                .transpose()?;
-
+            let resolved_over = match &func.over {
+                Some(w) => Some(window_spec_resolve(w, scope)?),
+                None => None,
+            };
             Ok(ResolvedColumnExpr::Function {
                 name: func.name.clone(),
                 args: resolved_args,
@@ -1981,30 +2032,20 @@ fn column_expr_resolve(
             })
         }
         ColumnExpr::Case(case) => {
-            let arg = case
-                .arg
-                .as_ref()
-                .map(|a| column_expr_resolve(a, scope))
-                .transpose()?
-                .map(Box::new);
-
-            let whens = case
-                .whens
-                .iter()
-                .map(|w| {
-                    let condition = where_expr_resolve(&w.condition, scope)?;
-                    let result = column_expr_resolve(&w.result, scope)?;
-                    Ok(ResolvedCaseWhen { condition, result })
-                })
-                .collect::<ResolveResult<Vec<_>>>()?;
-
-            let default = case
-                .default
-                .as_ref()
-                .map(|d| column_expr_resolve(d, scope))
-                .transpose()?
-                .map(Box::new);
-
+            let arg = match &case.arg {
+                Some(a) => Some(Box::new(column_expr_resolve(a, scope)?)),
+                None => None,
+            };
+            let mut whens = Vec::with_capacity(case.whens.len());
+            for w in &case.whens {
+                let condition = where_expr_resolve(&w.condition, scope)?;
+                let result = column_expr_resolve(&w.result, scope)?;
+                whens.push(ResolvedCaseWhen { condition, result });
+            }
+            let default = match &case.default {
+                Some(d) => Some(Box::new(column_expr_resolve(d, scope)?)),
+                None => None,
+            };
             Ok(ResolvedColumnExpr::Case(ResolvedCaseExpr {
                 arg,
                 whens,
@@ -2021,10 +2062,12 @@ fn column_expr_resolve(
             }))
         }
         ColumnExpr::Subquery(query) => {
-            // Resolve the inner query with a fresh scope (non-correlated scalar subquery)
-            // Detects correlated references and returns a clear error
-            let resolved_query = scope.subquery_resolve(query)?;
-            Ok(ResolvedColumnExpr::Subquery(Box::new(resolved_query)))
+            // Resolve the scalar subquery, collecting any correlated outer references
+            let (resolved_query, outer_refs) = scope.subquery_resolve(query)?;
+            Ok(ResolvedColumnExpr::Subquery(
+                Box::new(resolved_query),
+                outer_refs,
+            ))
         }
     }
 }
@@ -2032,28 +2075,20 @@ fn column_expr_resolve(
 /// Resolve a window specification
 fn window_spec_resolve(
     window_spec: &WindowSpec,
-    scope: &ResolutionScope,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ResolvedWindowSpec> {
-    // Resolve PARTITION BY columns
-    let partition_by = window_spec
-        .partition_by
-        .iter()
-        .map(|col| column_expr_resolve(col, scope))
-        .collect::<ResolveResult<Vec<_>>>()?;
-
-    // Resolve ORDER BY clauses
-    let order_by = window_spec
-        .order_by
-        .iter()
-        .map(|clause| {
-            let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
-            Ok(ResolvedOrderByClause {
-                expr: resolved_expr,
-                direction: clause.direction.clone(),
-            })
-        })
-        .collect::<ResolveResult<Vec<_>>>()?;
-
+    let mut partition_by = Vec::with_capacity(window_spec.partition_by.len());
+    for col in &window_spec.partition_by {
+        partition_by.push(column_expr_resolve(col, scope)?);
+    }
+    let mut order_by = Vec::with_capacity(window_spec.order_by.len());
+    for clause in &window_spec.order_by {
+        let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
+        order_by.push(ResolvedOrderByClause {
+            expr: resolved_expr,
+            direction: clause.direction.clone(),
+        });
+    }
     Ok(ResolvedWindowSpec {
         partition_by,
         order_by,
@@ -2066,7 +2101,7 @@ fn window_spec_resolve(
 /// matching tables in scope.
 fn select_columns_resolve(
     columns: &SelectColumns,
-    scope: &ResolutionScope,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ResolvedSelectColumns> {
     match columns {
         SelectColumns::None => Ok(ResolvedSelectColumns::None),
@@ -2111,18 +2146,17 @@ fn select_columns_resolve(
 /// Resolve ORDER BY clauses
 fn order_by_resolve(
     order_by: &[crate::query::ast::OrderByClause],
-    scope: &ResolutionScope,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<Vec<ResolvedOrderByClause>> {
-    order_by
-        .iter()
-        .map(|clause| {
-            let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
-            Ok(ResolvedOrderByClause {
-                expr: resolved_expr,
-                direction: clause.direction.clone(),
-            })
-        })
-        .collect()
+    let mut resolved = Vec::with_capacity(order_by.len());
+    for clause in order_by {
+        let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
+        resolved.push(ResolvedOrderByClause {
+            expr: resolved_expr,
+            direction: clause.direction.clone(),
+        });
+    }
+    Ok(resolved)
 }
 
 /// Convert ORDER BY clauses to use unqualified Identifier expressions.
@@ -2172,20 +2206,24 @@ fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
 /// Resolve GROUP BY clauses
 fn group_by_resolve(
     group_by: &[ColumnNode],
-    scope: &ResolutionScope,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<Vec<ResolvedColumnNode>> {
-    group_by
-        .iter()
-        .map(|col| column_resolve(col, scope))
-        .collect()
+    let mut resolved = Vec::with_capacity(group_by.len());
+    for col in group_by {
+        resolved.push(column_resolve(col, scope)?);
+    }
+    Ok(resolved)
 }
 
 /// Resolve HAVING clause
 fn having_resolve(
     having: Option<&WhereExpr>,
-    scope: &ResolutionScope,
+    scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<Option<ResolvedWhereExpr>> {
-    having.map(|h| where_expr_resolve(h, scope)).transpose()
+    match having {
+        Some(h) => Ok(Some(where_expr_resolve(h, scope)?)),
+        None => Ok(None),
+    }
 }
 
 /// Resolve LIMIT clause
@@ -2219,7 +2257,7 @@ pub fn query_expr_resolve(
             for table_source in &select.from {
                 let _ = table_source_resolve(table_source, tables, &mut scope, search_path);
             }
-            order_by_resolve(&query.order_by, &scope)?
+            order_by_resolve(&query.order_by, &mut scope)?
         }
         QueryBody::SetOp(_) | QueryBody::Values(_) => order_by_as_identifiers(&query.order_by),
     };
@@ -2268,29 +2306,41 @@ pub fn select_node_resolve(
     search_path: &[&str],
 ) -> ResolveResult<ResolvedSelectNode> {
     let mut scope = ResolutionScope::new(tables, search_path);
+    select_node_resolve_scoped(select, tables, &mut scope, search_path)
+}
 
+/// Resolve a SelectNode using a pre-built scope.
+///
+/// Called by the public `select_node_resolve` (with a fresh scope) and by
+/// `query_expr_resolve_scoped` (with a scope that has `outer_tables` set for
+/// correlated subquery resolution).
+fn select_node_resolve_scoped<'a>(
+    select: &'a SelectNode,
+    tables: &'a BiHashMap<TableMetadata>,
+    scope: &mut ResolutionScope<'a>,
+    search_path: &[&'a str],
+) -> ResolveResult<ResolvedSelectNode> {
     // First pass: resolve all table references and build scope
     let mut resolved_from = Vec::new();
     for table_source in &select.from {
-        let resolved = table_source_resolve(table_source, tables, &mut scope, search_path)?;
+        let resolved = table_source_resolve(table_source, tables, scope, search_path)?;
         resolved_from.push(resolved);
     }
 
     // Resolve SELECT columns
-    let resolved_columns = select_columns_resolve(&select.columns, &scope)?;
+    let resolved_columns = select_columns_resolve(&select.columns, scope)?;
 
     // Resolve WHERE clause
-    let resolved_where = select
-        .where_clause
-        .as_ref()
-        .map(|w| where_expr_resolve(w, &scope))
-        .transpose()?;
+    let resolved_where = match &select.where_clause {
+        Some(w) => Some(where_expr_resolve(w, scope)?),
+        None => None,
+    };
 
     // Resolve GROUP BY clause
-    let resolved_group_by = group_by_resolve(&select.group_by, &scope)?;
+    let resolved_group_by = group_by_resolve(&select.group_by, scope)?;
 
     // Resolve HAVING clause
-    let resolved_having = having_resolve(select.having.as_ref(), &scope)?;
+    let resolved_having = having_resolve(select.having.as_ref(), scope)?;
 
     Ok(ResolvedSelectNode {
         distinct: select.distinct,
@@ -2300,6 +2350,80 @@ pub fn select_node_resolve(
         group_by: resolved_group_by,
         having: resolved_having,
     })
+}
+
+/// Resolve a QueryExpr using a pre-built outer_tables context, collecting outer refs.
+///
+/// Used by `ResolutionScope::subquery_resolve` to resolve correlated subquery bodies.
+/// Returns the resolved query and the outer column references found within it.
+fn query_expr_resolve_scoped(
+    query: &QueryExpr,
+    catalog_tables: &BiHashMap<TableMetadata>,
+    search_path: &[&str],
+    outer_tables: Vec<(TableMetadata, Option<String>)>,
+) -> ResolveResult<(ResolvedQueryExpr, Vec<ResolvedColumnNode>)> {
+    let mut scope = ResolutionScope::new_with_outer(catalog_tables, search_path, outer_tables);
+
+    let body = match &query.body {
+        QueryBody::Select(select) => {
+            let resolved =
+                select_node_resolve_scoped(select, catalog_tables, &mut scope, search_path)?;
+            ResolvedQueryBody::Select(Box::new(resolved))
+        }
+        QueryBody::Values(values) => ResolvedQueryBody::Values(values.clone()),
+        QueryBody::SetOp(set_op) => {
+            // Each branch is independent — resolve with the same outer_tables but
+            // separate scopes so their FROM tables don't bleed across branches.
+            let outer = scope.outer_tables.clone();
+            let (left_resolved, left_outer_refs) = query_expr_resolve_scoped(
+                &set_op.left,
+                catalog_tables,
+                search_path,
+                outer.clone(),
+            )?;
+            let (right_resolved, right_outer_refs) = query_expr_resolve_scoped(
+                &set_op.right,
+                catalog_tables,
+                search_path,
+                outer,
+            )?;
+            scope.outer_refs.extend(left_outer_refs);
+            scope.outer_refs.extend(right_outer_refs);
+            ResolvedQueryBody::SetOp(ResolvedSetOpNode {
+                op: set_op.op,
+                all: set_op.all,
+                left: Box::new(left_resolved),
+                right: Box::new(right_resolved),
+            })
+        }
+    };
+
+    // ORDER BY: build a fresh scope with the same outer_tables so correlated refs
+    // in ORDER BY (rare but possible) are handled correctly.
+    let order_by = match &query.body {
+        QueryBody::Select(select) => {
+            let mut order_scope = ResolutionScope::new_with_outer(
+                catalog_tables,
+                search_path,
+                scope.outer_tables.clone(),
+            );
+            for table_source in &select.from {
+                let _ = table_source_resolve(
+                    table_source,
+                    catalog_tables,
+                    &mut order_scope,
+                    search_path,
+                );
+            }
+            order_by_resolve(&query.order_by, &mut order_scope)?
+        }
+        QueryBody::SetOp(_) | QueryBody::Values(_) => order_by_as_identifiers(&query.order_by),
+    };
+
+    let limit = limit_resolve(query.limit.as_ref());
+    let outer_refs = scope.outer_refs;
+
+    Ok((ResolvedQueryExpr { body, order_by, limit }, outer_refs))
 }
 
 #[cfg(test)]
@@ -3782,6 +3906,7 @@ mod tests {
                 sublink_type,
                 test_expr,
                 query,
+                ..
             } => {
                 assert_eq!(
                     *sublink_type,
@@ -4124,11 +4249,11 @@ mod tests {
     }
 
     // ==========================================================================
-    // Correlated Subquery Detection Tests
+    // Correlated Subquery Tests
     // ==========================================================================
 
     #[test]
-    fn test_correlated_exists_subquery_detected() {
+    fn test_correlated_exists_subquery_resolves() {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("orders", 1001));
         tables.insert_overwrite(test_table_metadata("items", 1002));
@@ -4138,18 +4263,17 @@ mod tests {
         );
         let result = select_node_resolve(&node, &tables, &["public"]);
 
-        assert!(
-            matches!(
-                result.as_ref().map_err(|e| e.current_context()),
-                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
-            ),
-            "Correlated EXISTS subquery should return CorrelatedSubqueryNotSupported, got: {:?}",
-            result
-        );
+        let resolved = result.expect("correlated EXISTS should resolve successfully");
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        assert_eq!(outer_refs.len(), 1, "should have one outer ref");
+        assert_eq!(outer_refs[0].table, "orders");
+        assert_eq!(outer_refs[0].column, "id");
     }
 
     #[test]
-    fn test_correlated_in_subquery_detected() {
+    fn test_correlated_in_subquery_resolves() {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
@@ -4159,18 +4283,18 @@ mod tests {
         );
         let result = select_node_resolve(&node, &tables, &["public"]);
 
-        assert!(
-            matches!(
-                result.as_ref().map_err(|e| e.current_context()),
-                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
-            ),
-            "Correlated IN subquery should return CorrelatedSubqueryNotSupported, got: {:?}",
-            result
-        );
+        let resolved = result.expect("correlated IN should resolve successfully");
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        assert_eq!(outer_refs.len(), 1, "should have one outer ref");
+        assert_eq!(outer_refs[0].table, "users");
+        assert_eq!(outer_refs[0].column, "name");
     }
 
     #[test]
-    fn test_correlated_scalar_subquery_detected() {
+    fn test_correlated_scalar_subquery_resolves() {
+        // Scalar correlated subquery in SELECT list
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
@@ -4180,42 +4304,47 @@ mod tests {
         );
         let result = select_node_resolve(&node, &tables, &["public"]);
 
-        assert!(
-            matches!(
-                result.as_ref().map_err(|e| e.current_context()),
-                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
-            ),
-            "Correlated scalar subquery should return CorrelatedSubqueryNotSupported, got: {:?}",
-            result
-        );
+        let resolved = result.expect("correlated scalar subquery should resolve successfully");
+        let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+            panic!("expected Columns");
+        };
+        let outer_refs = cols
+            .iter()
+            .find_map(|col| match &col.expr {
+                ResolvedColumnExpr::Subquery(_, outer_refs) => Some(outer_refs),
+                _ => None,
+            })
+            .expect("subquery column");
+        assert_eq!(outer_refs.len(), 1, "should have one outer ref");
+        assert_eq!(outer_refs[0].table, "users");
+        assert_eq!(outer_refs[0].column, "id");
     }
 
     #[test]
-    fn test_correlated_subquery_with_alias_detected() {
+    fn test_correlated_subquery_with_alias_resolves() {
+        // Table alias in outer scope should be resolved to the aliased table
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         tables.insert_overwrite(test_table_metadata("orders", 1002));
 
-        // Using table alias - the alias 'u' should be detected in the outer scope
         let node = parse_select_node(
             "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE orders.id = u.id)",
         );
         let result = select_node_resolve(&node, &tables, &["public"]);
 
-        assert!(
-            matches!(
-                result.as_ref().map_err(|e| e.current_context()),
-                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
-            ),
-            "Correlated subquery using alias should return CorrelatedSubqueryNotSupported, got: {:?}",
-            result
-        );
+        let resolved = result.expect("correlated subquery with alias should resolve successfully");
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        assert_eq!(outer_refs.len(), 1, "should have one outer ref");
+        assert_eq!(outer_refs[0].table, "users");
+        assert_eq!(outer_refs[0].column, "id");
     }
 
     #[test]
     fn test_correlated_unqualified_column_in_where() {
         // `email` only exists on `users`, not `orders` — bare `email` in the subquery
-        // is an implicit correlated reference
+        // is an implicit correlated reference resolved via outer scope fallback
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "users",
@@ -4233,19 +4362,18 @@ mod tests {
         );
         let result = select_node_resolve(&node, &tables, &["public"]);
 
-        assert!(
-            matches!(
-                result.as_ref().map_err(|e| e.current_context()),
-                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
-            ),
-            "Unqualified column from outer scope should be detected as correlated, got: {:?}",
-            result
-        );
+        let resolved = result.expect("unqualified outer column should resolve successfully");
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        assert_eq!(outer_refs.len(), 1, "should have one outer ref");
+        assert_eq!(outer_refs[0].table, "users");
+        assert_eq!(outer_refs[0].column, "email");
     }
 
     #[test]
     fn test_correlated_unqualified_column_in_select_list() {
-        // `email` only exists on `users` — bare `email` in subquery SELECT list
+        // `id` exists in both `users` and `orders` — resolves to inner scope (non-correlated)
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "users",
@@ -4263,18 +4391,17 @@ mod tests {
         );
         let result = select_node_resolve(&node, &tables, &["public"]);
 
-        // `id` exists in both tables so it resolves to `orders.id` (inner scope) — non-correlated.
-        // This should succeed.
-        assert!(
-            result.is_ok(),
-            "Column present in both scopes should resolve to inner scope, got: {:?}",
-            result
-        );
+        let resolved = result.expect("column present in both scopes should resolve to inner scope");
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        // `id` resolves to `orders.id` in the inner scope — not a correlated reference
+        assert!(outer_refs.is_empty(), "inner-scope column should not appear in outer_refs");
     }
 
     #[test]
     fn test_correlated_unqualified_column_scalar_subquery() {
-        // `status` only exists on `users`, bare reference in scalar subquery
+        // `status` only exists on `users`, bare reference in SELECT-list scalar subquery
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "users",
@@ -4292,14 +4419,116 @@ mod tests {
         );
         let result = select_node_resolve(&node, &tables, &["public"]);
 
+        let resolved = result.expect("unqualified outer column in scalar subquery should resolve");
+        let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+            panic!("expected Columns");
+        };
+        let outer_refs = cols
+            .iter()
+            .find_map(|col| match &col.expr {
+                ResolvedColumnExpr::Subquery(_, outer_refs) => Some(outer_refs),
+                _ => None,
+            })
+            .expect("subquery column");
+        assert_eq!(outer_refs.len(), 1, "should have one outer ref");
+        assert_eq!(outer_refs[0].table, "users");
+        assert_eq!(outer_refs[0].column, "status");
+    }
+
+    #[test]
+    fn test_non_correlated_subquery_has_empty_outer_refs() {
+        // Non-correlated subquery should have outer_refs: []
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+
+        let node =
+            parse_select_node("SELECT * FROM users WHERE id IN (SELECT id FROM active_users)");
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        let resolved = result.expect("non-correlated subquery should resolve successfully");
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        assert!(outer_refs.is_empty(), "non-correlated subquery must have empty outer_refs");
+    }
+
+    #[test]
+    fn test_correlated_mixed_inner_and_outer_columns() {
+        // Same predicate references both an inner-scope column and an outer-scope column.
+        // The inner column resolves normally; the outer column goes into outer_refs.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "departments",
+            1001,
+            &["id", "region"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "employees",
+            1002,
+            &["id", "dept_id", "region"],
+        ));
+
+        // `employees.dept_id = departments.id` — dept_id is inner, departments.id is outer
+        let node = parse_select_node(
+            "SELECT d.id FROM departments d \
+             WHERE EXISTS (SELECT 1 FROM employees WHERE dept_id = d.id)",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        let resolved = result.expect("mixed inner/outer predicate should resolve");
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        assert_eq!(outer_refs.len(), 1, "only the outer-scope column should be in outer_refs");
+        assert_eq!(outer_refs[0].table, "departments");
+        assert_eq!(outer_refs[0].column, "id");
+    }
+
+    #[test]
+    fn test_doubly_nested_correlated_subquery() {
+        // Grandchild subquery references the grandparent scope
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "departments",
+            1001,
+            &["id", "name"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "employees",
+            1002,
+            &["id", "dept_id"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "projects",
+            1003,
+            &["id", "employee_id"],
+        ));
+
+        // departments d → employees e (correlated on d.id) → projects (correlated on e.id)
+        let node = parse_select_node(
+            "SELECT d.id FROM departments d \
+             WHERE EXISTS (\
+               SELECT 1 FROM employees e WHERE e.dept_id = d.id AND EXISTS (\
+                 SELECT 1 FROM projects WHERE employee_id = e.id\
+               )\
+             )",
+        );
+        let result = select_node_resolve(&node, &tables, &["public"]);
+
+        // Resolution must succeed; the outer EXISTS subquery is correlated on d.id
         assert!(
-            matches!(
-                result.as_ref().map_err(|e| e.current_context()),
-                Err(ResolveError::CorrelatedSubqueryNotSupported { .. })
-            ),
-            "Unqualified column from outer scope in scalar subquery should be detected as correlated, got: {:?}",
+            result.is_ok(),
+            "doubly-nested correlated subquery should resolve, got: {:?}",
             result
         );
+        let resolved = result.unwrap();
+        let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
+            panic!("expected Subquery WHERE");
+        };
+        assert!(!outer_refs.is_empty(), "outer EXISTS should be correlated on departments.id");
+        assert_eq!(outer_refs[0].table, "departments");
+        assert_eq!(outer_refs[0].column, "id");
     }
 
     #[test]
@@ -4332,21 +4561,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_non_correlated_subquery_succeeds() {
-        // Non-correlated subquery should still resolve fine
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("active_users", 1002));
-
-        let node =
-            parse_select_node("SELECT * FROM users WHERE id IN (SELECT id FROM active_users)");
-        let result = select_node_resolve(&node, &tables, &["public"]);
-
-        assert!(
-            result.is_ok(),
-            "Non-correlated subquery should resolve successfully, got: {:?}",
-            result
-        );
-    }
 }

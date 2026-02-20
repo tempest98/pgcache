@@ -173,7 +173,7 @@ fn subquery_output_column_names(query: &ResolvedQueryExpr) -> Vec<String> {
                         | ResolvedColumnExpr::Literal(_)
                         | ResolvedColumnExpr::Case(_)
                         | ResolvedColumnExpr::Arithmetic(_)
-                        | ResolvedColumnExpr::Subquery(_) => None,
+                        | ResolvedColumnExpr::Subquery(..) => None,
                     }
                 }
             })
@@ -266,7 +266,7 @@ fn predicate_push_into_select(
                 | ResolvedColumnExpr::Literal(_)
                 | ResolvedColumnExpr::Case(_)
                 | ResolvedColumnExpr::Arithmetic(_)
-                | ResolvedColumnExpr::Subquery(_) => None,
+                | ResolvedColumnExpr::Subquery(..) => None,
             }
         })
         .collect::<Option<_>>()?;
