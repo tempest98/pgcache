@@ -5,7 +5,8 @@ use tokio_util::bytes::{BufMut, BytesMut};
 use tracing::instrument;
 
 use crate::pg::protocol::backend::{
-    COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG,
+    BIND_COMPLETE_TAG, COMMAND_COMPLETE_TAG, DATA_ROW_TAG, PARSE_COMPLETE_TAG, READY_FOR_QUERY_TAG,
+    ROW_DESCRIPTION_TAG,
 };
 
 #[instrument(skip_all)]
@@ -62,4 +63,16 @@ pub fn ready_for_query_encode(buf: &mut BytesMut) {
     buf.put_u8(READY_FOR_QUERY_TAG);
     buf.put_i32(5);
     buf.put_u8(b'I');
+}
+
+/// Encodes a ParseComplete message (tag '1', 5 bytes total, no payload).
+pub fn parse_complete_encode(buf: &mut BytesMut) {
+    buf.put_u8(PARSE_COMPLETE_TAG);
+    buf.put_i32(4);
+}
+
+/// Encodes a BindComplete message (tag '2', 5 bytes total, no payload).
+pub fn bind_complete_encode(buf: &mut BytesMut) {
+    buf.put_u8(BIND_COMPLETE_TAG);
+    buf.put_i32(4);
 }

@@ -575,9 +575,7 @@ impl Settings {
                 .map(|socket| MetricsSettings { socket })
                 .or(config.metrics);
             let log_level = log_level.or(config.log_level);
-            let cache_policy = cache_policy
-                .or(config.cache_policy)
-                .unwrap_or_default();
+            let cache_policy = cache_policy.or(config.cache_policy).unwrap_or_default();
             let admission_threshold = admission_threshold
                 .or(config.admission_threshold)
                 .unwrap_or(2);

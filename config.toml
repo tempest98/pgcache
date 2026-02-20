@@ -4,7 +4,7 @@ num_workers = 2
 #log_level = "debug"
 
 [origin]
-host = "127.0.0.1"
+host = "localhost"
 port = 5432
 user = "postgres"
 #database = "origin"

@@ -1,0 +1,8 @@
+# Non-cacheable statement: INSERT buffered until Sync, then forwarded
+# Tests that non-SELECT statements are correctly forwarded to origin
+'P'	"S1"	"INSERT INTO proto_test (id, name) VALUES (99, 'pgproto')"	0
+'B'	""	"S1"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

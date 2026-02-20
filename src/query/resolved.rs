@@ -217,9 +217,7 @@ impl ResolvedWhereExpr {
             ResolvedWhereExpr::Unary(unary) => Box::new(unary.nodes()),
             ResolvedWhereExpr::Binary(binary) => Box::new(binary.nodes()),
             ResolvedWhereExpr::Multi(multi) => Box::new(multi.nodes()),
-            ResolvedWhereExpr::Array(elems) => {
-                Box::new(elems.iter().flat_map(|elem| elem.nodes()))
-            }
+            ResolvedWhereExpr::Array(elems) => Box::new(elems.iter().flat_map(|elem| elem.nodes())),
             ResolvedWhereExpr::Function { args, .. } => {
                 Box::new(args.iter().flat_map(|arg| arg.nodes()))
             }
@@ -284,7 +282,7 @@ impl ResolvedWhereExpr {
             },
             ResolvedWhereExpr::Multi(_) => 1, // Multi ops (IN, BETWEEN, etc.) are single predicates
             ResolvedWhereExpr::Unary(u) => u.expr.predicate_count(),
-            ResolvedWhereExpr::Array(_) => 0,            // Array literals are not predicates
+            ResolvedWhereExpr::Array(_) => 0, // Array literals are not predicates
             ResolvedWhereExpr::Function { .. } => 1, // Treat function calls as single predicate
             ResolvedWhereExpr::Subquery { .. } => 1, // Treat subqueries as single predicate
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
@@ -2080,9 +2078,7 @@ fn select_columns_resolve(
                     for (table_metadata, alias) in &scope.tables {
                         let matches = match qualifier {
                             None => true,
-                            Some(q) => {
-                                alias.is_some_and(|a| a == q) || table_metadata.name == *q
-                            }
+                            Some(q) => alias.is_some_and(|a| a == q) || table_metadata.name == *q,
                         };
                         if matches {
                             for column_metadata in &table_metadata.columns {

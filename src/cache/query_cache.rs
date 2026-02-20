@@ -14,7 +14,7 @@ use crate::timing::QueryTiming;
 
 use super::{
     CacheError, CacheResult,
-    messages::{CacheReply, QueryCommand},
+    messages::{CacheReply, PipelineContext, PipelineDescribe, QueryCommand},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     types::{CacheStateView, CachedQueryState, CachedQueryView},
 };
@@ -37,6 +37,8 @@ pub struct QueryRequest {
     pub search_path: Vec<String>,
     /// Per-query timing data
     pub timing: QueryTiming,
+    /// Pipeline context from the proxy (None for simple queries and cold-path extended)
+    pub pipeline: Option<PipelineContext>,
 }
 
 /// Request sent to cache worker for executing cached queries.
@@ -54,6 +56,21 @@ pub struct WorkerRequest {
     pub timing: QueryTiming,
     /// Incoming query's LIMIT clause, appended to SQL at serve time
     pub limit: Option<LimitClause>,
+    /// Whether a Sync was included in the buffered pipeline.
+    /// When true, the worker appends ReadyForQuery to the response.
+    pub has_sync: bool,
+    /// Whether Parse was buffered in the pipeline.
+    /// False for Bind-only pipelines (named statement re-execution without Parse).
+    pub has_parse: bool,
+    /// Whether Bind was buffered in the pipeline.
+    /// False when Bind was flushed separately (e.g., JDBC Parse/Bind/Describe/Flush then Execute/Sync).
+    pub has_bind: bool,
+    /// Whether the pipeline includes a Describe message and which type.
+    pub pipeline_describe: PipelineDescribe,
+    /// Stored ParameterDescription bytes for Describe('S') responses in the pipeline.
+    pub parameter_description: Option<BytesMut>,
+    /// Buffered bytes for origin fallback on worker error.
+    pub forward_bytes: Option<BytesMut>,
 }
 
 /// Query cache coordinator - routes queries and delegates writes to the writer thread.
@@ -130,6 +147,26 @@ impl QueryCache {
                     t
                 };
 
+                // Extract pipeline fields for the worker
+                let (
+                    has_sync,
+                    has_parse,
+                    has_bind,
+                    pipeline_describe,
+                    parameter_description,
+                    forward_bytes,
+                ) = match msg.pipeline {
+                    Some(pipeline) => (
+                        true,
+                        pipeline.has_parse,
+                        pipeline.has_bind,
+                        pipeline.describe,
+                        pipeline.parameter_description,
+                        Some(pipeline.buffered_bytes),
+                    ),
+                    None => (false, false, false, PipelineDescribe::None, None, None),
+                };
+
                 let worker_request = WorkerRequest {
                     query_type: msg.query_type,
                     data: msg.data,
@@ -140,6 +177,12 @@ impl QueryCache {
                     reply_tx: msg.reply_tx,
                     timing,
                     limit: msg.cacheable_query.query.limit.clone(),
+                    has_sync,
+                    has_parse,
+                    has_bind,
+                    pipeline_describe,
+                    parameter_description,
+                    forward_bytes,
                 };
                 return self.worker_tx.send(worker_request).map_err(|e| {
                     error!("worker send {e} {fingerprint}");
@@ -164,7 +207,10 @@ impl QueryCache {
                 }
 
                 msg.reply_tx
-                    .send(CacheReply::Forward(msg.data))
+                    .send(CacheReply::Forward(forward_buf_assemble(
+                        msg.pipeline,
+                        msg.data,
+                    )))
                     .map_err(|_| CacheError::Reply)?;
 
                 self.query_tx
@@ -184,7 +230,10 @@ impl QueryCache {
             }) => {
                 trace!("cache loading {fingerprint}");
                 msg.reply_tx
-                    .send(CacheReply::Forward(msg.data))
+                    .send(CacheReply::Forward(forward_buf_assemble(
+                        msg.pipeline,
+                        msg.data,
+                    )))
                     .map_err(|_| CacheError::Reply)?;
                 return Ok(());
             }
@@ -198,7 +247,10 @@ impl QueryCache {
                 trace!("pending {fingerprint} count={new_count}");
 
                 msg.reply_tx
-                    .send(CacheReply::Forward(msg.data))
+                    .send(CacheReply::Forward(forward_buf_assemble(
+                        msg.pipeline,
+                        msg.data,
+                    )))
                     .map_err(|_| CacheError::Reply)?;
 
                 if new_count >= self.admission_threshold {
@@ -237,7 +289,10 @@ impl QueryCache {
                 trace!("invalidated readmit {fingerprint}");
 
                 msg.reply_tx
-                    .send(CacheReply::Forward(msg.data))
+                    .send(CacheReply::Forward(forward_buf_assemble(
+                        msg.pipeline,
+                        msg.data,
+                    )))
                     .map_err(|_| CacheError::Reply)?;
 
                 // Transition to Loading and send Register for fast readmission
@@ -267,7 +322,10 @@ impl QueryCache {
         trace!("cache miss {fingerprint}");
 
         msg.reply_tx
-            .send(CacheReply::Forward(msg.data))
+            .send(CacheReply::Forward(forward_buf_assemble(
+                msg.pipeline,
+                msg.data,
+            )))
             .map_err(|_| CacheError::Reply)?;
 
         // Determine initial state based on policy
@@ -322,5 +380,16 @@ impl QueryCache {
         }
 
         Ok(())
+    }
+}
+
+/// Assemble a forward buffer from pipeline context or raw data.
+///
+/// Pipeline path: buffered_bytes already includes Parse+Bind+Execute+Sync.
+/// Simple query path: data is the raw query bytes.
+fn forward_buf_assemble(pipeline: Option<PipelineContext>, data: BytesMut) -> BytesMut {
+    match pipeline {
+        Some(pipeline) => pipeline.buffered_bytes,
+        None => data,
     }
 }

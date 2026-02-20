@@ -1,0 +1,11 @@
+# Multiple Executes before Sync: two Parse/Bind/Execute pairs then one Sync
+# Tests that multiple_executes flag forces forward to origin (not cached)
+'P'	"S1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'B'	""	"S1"	0	0	0
+'E'	""	0
+'P'	"S2"	"SELECT id, name FROM proto_test WHERE id = 1"	0
+'B'	""	"S2"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

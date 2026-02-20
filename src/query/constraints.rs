@@ -135,8 +135,11 @@ fn between_constraints_extract(
     constraints: &mut HashSet<ColumnConstraint>,
 ) {
     // exprs layout: [subject, low, high]
-    let [ResolvedWhereExpr::Column(col), ResolvedWhereExpr::Value(low), ResolvedWhereExpr::Value(high)] =
-        exprs
+    let [
+        ResolvedWhereExpr::Column(col),
+        ResolvedWhereExpr::Value(low),
+        ResolvedWhereExpr::Value(high),
+    ] = exprs
     else {
         return;
     };
@@ -170,9 +173,7 @@ fn literal_value_order(a: &LiteralValue, b: &LiteralValue) -> Option<std::cmp::O
         (LiteralValue::Integer(a), LiteralValue::Integer(b)) => Some(a.cmp(b)),
         (LiteralValue::Float(a), LiteralValue::Float(b)) => Some(a.cmp(b)),
         (LiteralValue::String(a), LiteralValue::String(b)) => Some(a.cmp(b)),
-        (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => {
-            Some(a.cmp(b))
-        }
+        (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => Some(a.cmp(b)),
         _ => None,
     }
 }
@@ -355,10 +356,10 @@ mod tests {
         op: BinaryOp,
         value: LiteralValue,
     ) -> bool {
-        constraints
-            .table_constraints
-            .get(table)
-            .is_some_and(|cs| cs.iter().any(|(c, o, v)| c == column && *o == op && *v == value))
+        constraints.table_constraints.get(table).is_some_and(|cs| {
+            cs.iter()
+                .any(|(c, o, v)| c == column && *o == op && *v == value)
+        })
     }
 
     // ========== Existing equality tests (updated for new tuple format) ==========
@@ -454,9 +455,27 @@ mod tests {
         // Should propagate through: a.id = 1 -> b.id = 1 -> c.id = 1
         assert_eq!(constraints.column_constraints.len(), 3);
 
-        assert!(has_constraint(&constraints, "a", "id", BinaryOp::Equal, LiteralValue::Integer(1)));
-        assert!(has_constraint(&constraints, "b", "id", BinaryOp::Equal, LiteralValue::Integer(1)));
-        assert!(has_constraint(&constraints, "c", "id", BinaryOp::Equal, LiteralValue::Integer(1)));
+        assert!(has_constraint(
+            &constraints,
+            "a",
+            "id",
+            BinaryOp::Equal,
+            LiteralValue::Integer(1)
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "b",
+            "id",
+            BinaryOp::Equal,
+            LiteralValue::Integer(1)
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "c",
+            "id",
+            BinaryOp::Equal,
+            LiteralValue::Integer(1)
+        ));
     }
 
     #[test]
@@ -502,8 +521,20 @@ mod tests {
         let constraints = analyze_query_constraints(&resolved);
 
         assert_eq!(constraints.column_constraints.len(), 2);
-        assert!(has_constraint(&constraints, "a", "id", BinaryOp::Equal, LiteralValue::Integer(1)));
-        assert!(has_constraint(&constraints, "b", "id", BinaryOp::Equal, LiteralValue::Integer(1)));
+        assert!(has_constraint(
+            &constraints,
+            "a",
+            "id",
+            BinaryOp::Equal,
+            LiteralValue::Integer(1)
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "b",
+            "id",
+            BinaryOp::Equal,
+            LiteralValue::Integer(1)
+        ));
     }
 
     #[test]
@@ -866,10 +897,34 @@ mod tests {
 
         // Both tables should get the two BETWEEN constraints
         assert_eq!(constraints.column_constraints.len(), 4);
-        assert!(has_constraint(&constraints, "a", "id", BinaryOp::GreaterThanOrEqual, LiteralValue::Integer(1)));
-        assert!(has_constraint(&constraints, "a", "id", BinaryOp::LessThanOrEqual, LiteralValue::Integer(10)));
-        assert!(has_constraint(&constraints, "b", "id", BinaryOp::GreaterThanOrEqual, LiteralValue::Integer(1)));
-        assert!(has_constraint(&constraints, "b", "id", BinaryOp::LessThanOrEqual, LiteralValue::Integer(10)));
+        assert!(has_constraint(
+            &constraints,
+            "a",
+            "id",
+            BinaryOp::GreaterThanOrEqual,
+            LiteralValue::Integer(1)
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "a",
+            "id",
+            BinaryOp::LessThanOrEqual,
+            LiteralValue::Integer(10)
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "b",
+            "id",
+            BinaryOp::GreaterThanOrEqual,
+            LiteralValue::Integer(1)
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "b",
+            "id",
+            BinaryOp::LessThanOrEqual,
+            LiteralValue::Integer(10)
+        ));
     }
 
     #[test]

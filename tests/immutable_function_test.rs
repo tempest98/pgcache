@@ -4,8 +4,8 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta, wait_cache_load,
-    wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta,
+    wait_cache_load, wait_for_cdc,
 };
 
 mod util;
@@ -29,8 +29,7 @@ async fn test_immutable_function_in_where_cacheable() -> Result<(), Error> {
     )
     .await?;
 
-    let query_str =
-        "select id, name from test_imm_where where lower(name) = 'alice' order by id";
+    let query_str = "select id, name from test_imm_where where lower(name) = 'alice' order by id";
 
     // First query — cache miss
     let m = ctx.metrics().await?;
@@ -169,7 +168,11 @@ async fn test_immutable_function_cdc_insert() -> Result<(), Error> {
     let res = ctx.simple_query(query_str).await?;
 
     assert_eq!(res.len(), 3);
-    assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice"), ("data", "first")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[("id", "1"), ("name", "Alice"), ("data", "first")],
+    )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
@@ -192,7 +195,11 @@ async fn test_immutable_function_cdc_insert() -> Result<(), Error> {
 
     // RowDescription + 2 data rows + CommandComplete = 4
     assert_eq!(res.len(), 4);
-    assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice"), ("data", "first")])?;
+    assert_row_at(
+        &res,
+        1,
+        &[("id", "1"), ("name", "Alice"), ("data", "first")],
+    )?;
     assert_row_at(
         &res,
         2,

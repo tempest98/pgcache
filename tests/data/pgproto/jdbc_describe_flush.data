@@ -1,0 +1,12 @@
+# JDBC pattern: Parse/Bind/Describe then Flush, followed by Execute/Sync
+# Tests that Flush forwards Parse/Bind/Describe to origin immediately,
+# and the subsequent Execute/Sync buffer has no redundant Bind
+'P'	"S1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'B'	""	"S1"	0	0	0
+'D'	'S'	"S1"
+'H'
+'y'
+'E'	""	0
+'S'
+'Y'
+'X'

@@ -43,6 +43,7 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
                 reply_tx: proxy_msg.reply_tx,
                 search_path: proxy_msg.search_path,
                 timing: proxy_msg.timing,
+                pipeline: proxy_msg.pipeline,
             };
             if let Err(e) = qcache.query_dispatch(request).await {
                 error!("query dispatch failed: {e}");
@@ -50,8 +51,13 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
         }
         Err((e, data)) => {
             debug!("forwarding to origin due to parameter conversion error: {e}");
-            // Forward to origin when parameter conversion fails
-            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(data));
+            // Pipeline includes Execute+Sync; simple queries use raw data.
+            let forward_buf = if let Some(pipeline) = proxy_msg.pipeline {
+                pipeline.buffered_bytes
+            } else {
+                data
+            };
+            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(forward_buf));
         }
     }
 }
@@ -68,10 +74,15 @@ async fn handle_worker_request(
     msg.timing.worker_start_at = Some(Instant::now());
 
     let reply = match handle_cached_query(conn, return_tx, &mut msg).await {
-        Ok(_) => CacheReply::Complete(msg.data, Some(msg.timing)),
+        Ok(_) => CacheReply::Complete(Some(msg.timing)),
         Err(e) => {
             error!("handle_cached_query failed: {e}");
-            CacheReply::Error(msg.data)
+            // Forward bytes include the full pipeline (Execute+Sync etc.); fall back to raw data
+            let error_buf = msg
+                .forward_bytes
+                .take()
+                .unwrap_or_else(|| msg.data.split_off(0));
+            CacheReply::Error(error_buf)
         }
     };
 

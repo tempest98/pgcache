@@ -23,6 +23,17 @@ pub struct PreparedStatement {
     pub sql: String,
     pub parameter_oids: Vec<u32>,
     pub sql_type: StatementType,
+    /// Raw ParameterDescription bytes from origin, used for Describe('S') in pipeline.
+    pub parameter_description: Option<BytesMut>,
+    /// True when origin has acknowledged this statement (ParseComplete received).
+    /// Gates pipeline activation — the proxy only buffers Parse/Bind/Execute
+    /// when origin_prepared is true.
+    pub origin_prepared: bool,
+    /// Raw Parse message bytes, stored for proactive origin forwarding.
+    /// On cache hit for a named statement, origin never sees Parse — these
+    /// bytes let the proxy send Parse+Sync to origin so subsequent Bind-only
+    /// or transaction paths work correctly.
+    pub parse_bytes: Option<BytesMut>,
 }
 
 /// Portal (bound prepared statement) stored in connection state

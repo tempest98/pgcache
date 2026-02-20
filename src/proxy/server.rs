@@ -286,7 +286,10 @@ async fn function_volatility_load(
         .iter()
         .filter(|(_, v)| matches!(v, FunctionVolatility::Immutable))
         .count();
-    info!("loaded {} function volatilities ({immutable_count} immutable)", map.len());
+    info!(
+        "loaded {} function volatilities ({immutable_count} immutable)",
+        map.len()
+    );
 
     if tracing::enabled!(tracing::Level::TRACE) {
         let mut names: Vec<&str> = map

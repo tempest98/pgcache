@@ -45,9 +45,13 @@ pub mod names {
     pub const QUERIES_CACHE_ERROR: &str = "pgcache.queries.cache_error";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
-    pub const QUERY_LATENCY_SECONDS: &str = "pgcache.query.latency_seconds";
+    /// End-to-end latency for cache hits: client message received → response written to client.
+    pub const CACHE_QUERY_LATENCY_SECONDS: &str = "pgcache.query.cache_latency_seconds";
+    /// End-to-end latency for origin queries: client message received → ReadyForQuery forwarded to client.
+    pub const ORIGIN_QUERY_LATENCY_SECONDS: &str = "pgcache.query.origin_latency_seconds";
+    /// Pure origin execution time: forward decision made → ReadyForQuery received (excludes proxy overhead).
+    pub const ORIGIN_EXECUTION_SECONDS: &str = "pgcache.origin.execution_seconds";
     pub const CACHE_LOOKUP_LATENCY_SECONDS: &str = "pgcache.cache.lookup_latency_seconds";
-    pub const ORIGIN_LATENCY_SECONDS: &str = "pgcache.origin.latency_seconds";
     pub const QUERY_REGISTRATION_LATENCY_SECONDS: &str =
         "pgcache.query.registration_latency_seconds";
 

@@ -122,15 +122,17 @@ impl CacheConnection {
     /// - Q: SET query
     /// - P: Parse (unnamed statement, SQL, no params)
     /// - B: Bind (unnamed portal/stmt, binary result format)
+    /// - D: Describe (unnamed portal) — only when `include_describe` is true
     /// - E: Execute (unnamed portal, no row limit)
     /// - S: Sync
     pub async fn pipelined_binary_query_send(
         &mut self,
         set_sql: &str,
         select_sql: &str,
+        include_describe: bool,
     ) -> CacheResult<()> {
         let set_msg = simple_query_message_build(set_sql);
-        let ext_msg = extended_query_binary_build(select_sql);
+        let ext_msg = extended_query_binary_build(select_sql, include_describe);
 
         // Pipeline both in a single write
         let mut combined = BytesMut::with_capacity(set_msg.len() + ext_msg.len());
@@ -168,10 +170,12 @@ fn startup_message_build(user: &str, database: &str) -> BytesMut {
     buf
 }
 
-/// Build Parse + Bind + Execute + Sync messages for binary result format.
+/// Build Parse + Bind + [Describe('P')] + Execute + Sync messages for binary result format.
 ///
 /// Uses unnamed statement and portal, no parameters, binary result format.
-fn extended_query_binary_build(sql: &str) -> BytesMut {
+/// When `include_describe` is true, inserts a Describe('P') message between Bind and Execute
+/// so the cache DB returns a RowDescription that can be forwarded to the client.
+fn extended_query_binary_build(sql: &str, include_describe: bool) -> BytesMut {
     let sql_bytes = sql.as_bytes();
 
     // Parse: 'P' | int32 len | \0 (unnamed) | sql\0 | int16 0 (no param types)
@@ -181,13 +185,28 @@ fn extended_query_binary_build(sql: &str) -> BytesMut {
     //       | int16 0 (params) | int16 1 (result format count) | int16 1 (binary)
     let bind_len = 4 + 1 + 1 + 2 + 2 + 2 + 2; // 14
 
+    // Describe: 'D' | int32 len | 'P' | \0 (unnamed portal)
+    let describe_len = 4 + 1 + 1; // 6
+
     // Execute: 'E' | int32 len | \0 (portal) | int32 0 (no limit)
     let execute_len = 4 + 1 + 4; // 9
 
     // Sync: 'S' | int32 4
     let sync_len = 4;
 
-    let total = 1 + parse_len + 1 + bind_len + 1 + execute_len + 1 + sync_len;
+    let total = 1
+        + parse_len
+        + 1
+        + bind_len
+        + if include_describe {
+            1 + describe_len
+        } else {
+            0
+        }
+        + 1
+        + execute_len
+        + 1
+        + sync_len;
     let mut buf = BytesMut::with_capacity(total);
 
     // Parse
@@ -207,6 +226,14 @@ fn extended_query_binary_build(sql: &str) -> BytesMut {
     buf.put_i16(0); // no parameters
     buf.put_i16(1); // one result format code
     buf.put_i16(1); // binary format
+
+    // Describe (optional)
+    if include_describe {
+        buf.put_u8(b'D');
+        buf.put_i32(describe_len as i32);
+        buf.put_u8(b'P'); // describe portal
+        buf.put_u8(0); // unnamed portal
+    }
 
     // Execute
     buf.put_u8(b'E');

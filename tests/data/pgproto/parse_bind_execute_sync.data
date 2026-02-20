@@ -1,0 +1,8 @@
+# Standard extended protocol: Parse/Bind/Execute/Sync
+# Tests basic cacheable query flow through the extended protocol buffer
+'P'	"S1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'B'	""	"S1"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

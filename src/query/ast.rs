@@ -5462,7 +5462,9 @@ mod tests {
         };
         assert_eq!(cols.len(), 2);
         assert!(matches!(&cols[0].expr, ColumnExpr::Star(Some(t)) if t == "t1"));
-        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "col" && c.table.as_deref() == Some("t2")));
+        assert!(
+            matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "col" && c.table.as_deref() == Some("t2"))
+        );
     }
 
     #[test]
@@ -5473,7 +5475,10 @@ mod tests {
         let query_expr = query_expr_convert(&pg_ast).unwrap();
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
-        assert!(buf.contains("SELECT *"), "should deparse as SELECT *: {buf}");
+        assert!(
+            buf.contains("SELECT *"),
+            "should deparse as SELECT *: {buf}"
+        );
 
         // Qualified star with column
         let sql = "SELECT t1.*, t2.name FROM a t1 JOIN b t2 ON t2.id = t1.id";
@@ -5481,10 +5486,7 @@ mod tests {
         let query_expr = query_expr_convert(&pg_ast).unwrap();
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
-        assert!(
-            buf.contains("t1.*"),
-            "should deparse qualified star: {buf}"
-        );
+        assert!(buf.contains("t1.*"), "should deparse qualified star: {buf}");
         assert!(buf.contains("t2.name"), "should deparse column: {buf}");
     }
 

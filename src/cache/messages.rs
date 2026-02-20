@@ -8,6 +8,36 @@ use crate::catalog::TableMetadata;
 use crate::proxy::ClientSocket;
 use crate::timing::QueryTiming;
 
+/// Whether the pipeline includes a Describe and which type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineDescribe {
+    /// No Describe in the pipeline
+    None,
+    /// Describe('S') — worker should include ParameterDescription + RowDescription
+    Statement,
+    /// Describe('P') — worker should include RowDescription only
+    Portal,
+}
+
+/// Pipeline context for atomic extended query dispatch.
+/// Contains the raw Parse/Bind/Describe bytes buffered by the proxy,
+/// used for origin fallback on cache miss.
+pub struct PipelineContext {
+    /// All buffered messages (Parse + Bind + optional Describe) concatenated.
+    /// Forwarded to origin on cache miss (Forward reply).
+    pub buffered_bytes: BytesMut,
+    /// Whether the pipeline includes a Describe message.
+    pub describe: PipelineDescribe,
+    /// Stored ParameterDescription bytes for Describe('S') responses.
+    pub parameter_description: Option<BytesMut>,
+    /// Whether Parse was buffered in this pipeline.
+    /// False for Bind-only pipelines (named statement re-execution without Parse).
+    pub has_parse: bool,
+    /// Whether Bind was buffered in this pipeline.
+    /// False when Bind was flushed separately (e.g., JDBC Parse/Bind/Describe/Flush then Execute/Sync).
+    pub has_bind: bool,
+}
+
 /// Converted query data ready for processing
 pub struct QueryData {
     pub data: BytesMut,
@@ -125,13 +155,12 @@ pub enum DataStreamState {
 /// Reply messages sent from cache back to proxy
 #[derive(Debug)]
 pub enum CacheReply {
-    /// Data chunk to write to client (cache worker sends multiple of these)
-    Data(BytesMut),
-    /// Query completed successfully (final message after all Data chunks)
-    Complete(BytesMut, Option<QueryTiming>),
-    /// Query should be forwarded to origin (cache miss or not cacheable)
+    /// Query completed successfully. Worker wrote the full response to the client.
+    Complete(Option<QueryTiming>),
+    /// Query should be forwarded to origin (cache miss or not cacheable).
+    /// Contains buffered bytes for origin (or just execute_data if no pipeline).
     Forward(BytesMut),
-    /// Query execution failed
+    /// Query execution failed. Contains buffered bytes for origin fallback.
     Error(BytesMut),
 }
 
@@ -145,6 +174,9 @@ pub struct ProxyMessage {
     pub search_path: Vec<String>,
     /// Per-query timing data
     pub timing: QueryTiming,
+    /// Pipeline context for atomic extended query dispatch.
+    /// None for simple queries and cold-path extended queries (no pipeline active).
+    pub pipeline: Option<PipelineContext>,
 }
 
 /// Commands for query registration lifecycle, sent to the writer thread

@@ -291,10 +291,7 @@ impl CacheWriter {
     /// Removes from generations BTreeSet and purges stale rows, but preserves
     /// cached_queries entry and update_queries for reuse on readmission.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) async fn cache_query_cdc_invalidate(
-        &mut self,
-        fingerprint: u64,
-    ) -> CacheResult<()> {
+    pub(super) async fn cache_query_cdc_invalidate(&mut self, fingerprint: u64) -> CacheResult<()> {
         if self.cache.cache_policy == CachePolicy::Fifo {
             return self.cache_query_evict(fingerprint).await;
         }
@@ -422,9 +419,7 @@ impl CacheWriter {
                 let position = column_meta.position as usize - 1;
                 if let Some(row_value) = row_data.get(position) {
                     let matches = match row_value {
-                        Some(row_str) => {
-                            where_value_compare_string(constraint_value, row_str, *op)
-                        }
+                        Some(row_str) => where_value_compare_string(constraint_value, row_str, *op),
                         // NULL: comparison operators never match NULL values
                         // (only IS NULL / IS NOT NULL can test for NULL, and those
                         // are UnaryOps not extracted as constraints)

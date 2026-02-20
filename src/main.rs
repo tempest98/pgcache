@@ -10,10 +10,10 @@ use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use rootcause::Report;
 
-use tokio::io;
-use tracing::info;
 #[cfg(not(feature = "console"))]
 use pgcache_lib::tracing_utils::SimpeFormatter;
+use tokio::io;
+use tracing::info;
 #[cfg(not(feature = "console"))]
 use tracing_subscriber::EnvFilter;
 
