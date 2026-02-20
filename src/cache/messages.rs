@@ -3,7 +3,7 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 
-use super::{CacheError, query::CacheableQuery, query_cache::QueryType};
+use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
 use crate::proxy::ClientSocket;
 use crate::timing::QueryTiming;
@@ -26,18 +26,29 @@ pub struct QueryParameters {
 
 impl QueryParameters {
     pub fn get(&self, index: usize) -> Option<QueryParameter> {
-        if let Some(value) = self.values.get(index)
-            && let Some(&format) = self.formats.get(index)
-            && let Some(&oid) = self.oids.get(index)
-        {
-            Some(QueryParameter {
-                value: value.clone(),
-                format,
-                oid,
-            })
-        } else {
-            None
-        }
+        let value = self.values.get(index)?;
+
+        // Per the extended query protocol, format codes and OIDs may have fewer
+        // entries than there are parameters:
+        //   0 entries  → apply the default (text format / unspecified OID) to all
+        //   1 entry    → apply that single value to all parameters
+        //   N entries  → one entry per parameter
+        let format = match self.formats.as_slice() {
+            [] => 0,
+            [single] => *single,
+            codes => *codes.get(index)?,
+        };
+        let oid = match self.oids.as_slice() {
+            [] => 0,
+            [single] => *single,
+            oids => *oids.get(index)?,
+        };
+
+        Some(QueryParameter {
+            value: value.clone(),
+            format,
+            oid,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -75,7 +86,7 @@ impl CacheMessage {
     /// For parameterized queries, this performs parameter replacement in the AST.
     ///
     /// On error, returns the original data buffer so it can be forwarded to the origin.
-    pub fn into_query_data(self) -> Result<QueryData, (CacheError, BytesMut)> {
+    pub fn into_query_data(self) -> Result<QueryData, (Report<CacheError>, BytesMut)> {
         match self {
             CacheMessage::Query(data, cacheable_query) => Ok(QueryData {
                 data,
@@ -91,7 +102,7 @@ impl CacheMessage {
             ) => {
                 // Replace parameters in AST
                 if let Err(e) = cacheable_query.parameters_replace(&parameters) {
-                    return Err((e.into_current_context().into(), data));
+                    return Err((e.context_transform(CacheError::from), data));
                 }
                 Ok(QueryData {
                     data,
