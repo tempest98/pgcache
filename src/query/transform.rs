@@ -8,16 +8,17 @@ use rootcause::Report;
 use crate::{
     cache::{
         QueryParameter, QueryParameters, UpdateQuerySource,
-        query::{CacheableQuery, outer_join_optional_tables},
+        query::outer_join_optional_tables,
     },
     catalog::TableMetadata,
     query::ast::{
-        ColumnExpr, LiteralValue, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode,
-        TableAlias, TableNode, TableSource, ValuesClause, WhereExpr,
+        LiteralValue, QueryBody, QueryExpr, SelectColumns, SelectNode, TableAlias, TableSource,
+        ValuesClause, WhereExpr,
     },
     query::resolved::{
-        ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns, ResolvedSelectNode,
-        ResolvedTableSource, ResolvedTableSubqueryNode,
+        ResolvedColumnExpr, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumn,
+        ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableNode, ResolvedTableSource,
+        ResolvedTableSubqueryNode,
     },
 };
 
@@ -505,6 +506,25 @@ pub fn resolved_select_node_replace(
     }
 }
 
+/// Replace SELECT columns in a ResolvedSelectNode for update queries.
+///
+/// Unlike `resolved_select_node_replace` (used for population), this preserves
+/// GROUP BY and HAVING clauses because update queries need the full predicate
+/// structure to correctly match CDC events.
+pub fn resolved_select_node_update_replace(
+    node: &ResolvedSelectNode,
+    columns: ResolvedSelectColumns,
+) -> ResolvedSelectNode {
+    ResolvedSelectNode {
+        distinct: node.distinct,
+        columns,
+        from: node.from.clone(),
+        where_clause: node.where_clause.clone(),
+        group_by: node.group_by.clone(),
+        having: node.having.clone(),
+    }
+}
+
 /// Replace a table source with a VALUES clause in a ResolvedSelectNode.
 ///
 /// Similar to `resolved_table_replace_with_values` but operates on the new ResolvedSelectNode type.
@@ -781,7 +801,8 @@ fn resolved_column_expr_alias_update(
 }
 
 /// Generate queries used to check if a DML statement applies to a given table.
-/// Returns one update query per (table, branch) pair.
+/// Returns one update query per (table, branch) pair, operating entirely in the
+/// resolved AST domain.
 ///
 /// For simple SELECT queries, each table gets one update query derived from that SELECT.
 /// For set operations (UNION/INTERSECT/EXCEPT), each table gets an update query derived
@@ -789,52 +810,32 @@ fn resolved_column_expr_alias_update(
 ///
 /// This approach ensures that CDC handling only checks if a changed row matches the
 /// specific branch conditions, not the entire set operation structure.
-///
-/// The `resolved` parameter provides the resolved AST, used for terminality analysis
-/// of outer join tables (resolved columns carry real table names, eliminating alias
-/// ambiguity).
-pub fn query_table_update_queries<'a>(
-    cacheable_query: &'a CacheableQuery,
+pub fn query_table_update_queries(
     resolved: &ResolvedQueryExpr,
-) -> Vec<(&'a TableNode, QueryExpr, UpdateQuerySource)> {
+) -> Vec<(&ResolvedTableNode, ResolvedQueryExpr, UpdateQuerySource)> {
     let mut result = Vec::new();
 
-    let column = SelectColumn {
-        expr: ColumnExpr::Literal(LiteralValue::Boolean(true)),
+    let select_true = ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
+        expr: ResolvedColumnExpr::Literal(LiteralValue::Boolean(true)),
         alias: None,
-    };
-    let select_list = SelectColumns::Columns(vec![column]);
+    }]);
 
-    let resolved_branches = resolved.select_nodes();
-
-    // For each SELECT branch in the query, with its source context
-    for (i, (branch, source)) in cacheable_query
-        .query
-        .select_nodes_with_source()
-        .into_iter()
-        .enumerate()
-    {
-        // Categorize optional-side tables using resolved AST
-        let (terminal, non_terminal) = resolved_branches
-            .get(i)
-            .map(|resolved_branch| outer_join_optional_tables(resolved_branch))
-            .unwrap_or_default();
+    for (branch, source) in resolved.select_nodes_with_source() {
+        let (terminal, non_terminal) = outer_join_optional_tables(branch);
 
         // For each direct table in this branch (not inside subqueries).
         // Tables inside subqueries are handled by their own inner branch.
         for table in branch.direct_table_nodes() {
             // Create update query from just this branch (not full query)
-            let update_select = select_node_columns_replace(branch, select_list.clone());
-            let update_query = QueryExpr {
-                ctes: vec![],
-                body: QueryBody::Select(update_select),
+            let update_select =
+                resolved_select_node_update_replace(branch, select_true.clone());
+            let update_query = ResolvedQueryExpr {
+                body: ResolvedQueryBody::Select(Box::new(update_select)),
                 order_by: vec![],
                 limit: None,
             };
 
             // Outer join optional-side tables need specialized CDC handling.
-            // The sets contain real table names (from resolved AST),
-            // so we match against the table's real name, not its alias.
             let effective_source = if source == UpdateQuerySource::Direct {
                 if non_terminal.contains(table.name.as_str()) {
                     UpdateQuerySource::OuterJoinOptional
@@ -866,8 +867,9 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::cache::SubqueryKind;
+    use crate::cache::query::CacheableQuery;
     use crate::catalog::{ColumnMetadata, TableMetadata};
-    use crate::query::ast::{Deparse, query_expr_convert};
+    use crate::query::ast::{ColumnExpr, Deparse, SelectColumn, query_expr_convert};
     use crate::query::resolved::query_expr_resolve;
 
     use super::*;
@@ -973,13 +975,13 @@ mod tests {
     }
 
     /// Parse SQL, resolve, and call query_table_update_queries.
-    fn update_queries(sql: &str) -> Vec<(String, QueryExpr, UpdateQuerySource)> {
+    fn update_queries(sql: &str) -> Vec<(String, ResolvedQueryExpr, UpdateQuerySource)> {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
         let resolved = query_expr_resolve(&cacheable.query, &tables, &["public"]).expect("resolve");
-        query_table_update_queries(&cacheable, &resolved)
+        query_table_update_queries(&resolved)
             .into_iter()
-            .map(|(t, q, s)| (t.name.clone(), q, s))
+            .map(|(t, q, s)| (t.name.to_string(), q, s))
             .collect()
     }
 
@@ -1206,7 +1208,10 @@ mod tests {
         let mut buf = String::new();
         let new_sql = result[0].1.deparse(&mut buf);
 
-        assert_eq!(new_sql, "SELECT true FROM users WHERE id = 1");
+        assert_eq!(
+            new_sql,
+            "SELECT true FROM public.users WHERE public.users.id = 1"
+        );
     }
 
     #[test]
@@ -1219,19 +1224,15 @@ mod tests {
 
         assert_eq!(result.len(), 2);
 
+        let expected = "SELECT true FROM public.users JOIN public.location ON public.location.user_id = public.users.user_id WHERE public.users.user_id = 1";
+
         let mut update1 = String::new();
         result[0].1.deparse(&mut update1);
-        assert_eq!(
-            update1,
-            "SELECT true FROM users JOIN location ON location.user_id = users.user_id WHERE users.user_id = 1"
-        );
+        assert_eq!(update1, expected);
 
         let mut update2 = String::new();
         result[1].1.deparse(&mut update2);
-        assert_eq!(
-            update2,
-            "SELECT true FROM users JOIN location ON location.user_id = users.user_id WHERE users.user_id = 1"
-        );
+        assert_eq!(update2, expected);
     }
 
     #[test]

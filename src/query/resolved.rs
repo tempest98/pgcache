@@ -6,6 +6,7 @@ use iddqd::BiHashMap;
 use rootcause::Report;
 use tokio_postgres::types::Type;
 
+use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::{
     ArithmeticOp, BinaryOp, ColumnExpr, ColumnNode, Deparse, JoinType, LimitClause, LiteralValue,
@@ -291,6 +292,81 @@ impl ResolvedWhereExpr {
             ResolvedWhereExpr::Function { .. } => 1, // Treat function calls as single predicate
             ResolvedWhereExpr::Subquery { .. } => 1, // Treat subqueries as single predicate
             ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
+        }
+    }
+
+    /// Recursively collect subquery branches with source tracking.
+    /// `negated` tracks NOT-wrapping to flip Inclusion/Exclusion for
+    /// EXISTS/ANY subqueries. ALL is already Exclusion (NOT IN).
+    fn subquery_nodes_collect_with_source<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a ResolvedSelectNode, UpdateQuerySource)>,
+        negated: bool,
+    ) {
+        match self {
+            ResolvedWhereExpr::Binary(binary) => {
+                binary
+                    .lexpr
+                    .subquery_nodes_collect_with_source(branches, negated);
+                binary
+                    .rexpr
+                    .subquery_nodes_collect_with_source(branches, negated);
+            }
+            ResolvedWhereExpr::Unary(unary) => {
+                let child_negated = if unary.op == UnaryOp::Not {
+                    !negated
+                } else {
+                    negated
+                };
+                unary
+                    .expr
+                    .subquery_nodes_collect_with_source(branches, child_negated);
+            }
+            ResolvedWhereExpr::Multi(multi) => {
+                for expr in &multi.exprs {
+                    expr.subquery_nodes_collect_with_source(branches, negated);
+                }
+            }
+            ResolvedWhereExpr::Array(elems) => {
+                for elem in elems {
+                    elem.subquery_nodes_collect_with_source(branches, negated);
+                }
+            }
+            ResolvedWhereExpr::Function { args, .. } => {
+                for arg in args {
+                    arg.subquery_nodes_collect_with_source(branches, negated);
+                }
+            }
+            ResolvedWhereExpr::Subquery {
+                query,
+                sublink_type,
+                test_expr,
+                ..
+            } => {
+                let kind = match sublink_type {
+                    SubLinkType::Expr => SubqueryKind::Scalar,
+                    SubLinkType::Any | SubLinkType::Exists => {
+                        if negated {
+                            SubqueryKind::Exclusion
+                        } else {
+                            SubqueryKind::Inclusion
+                        }
+                    }
+                    SubLinkType::All => {
+                        if negated {
+                            SubqueryKind::Inclusion
+                        } else {
+                            SubqueryKind::Exclusion
+                        }
+                    }
+                };
+                let source = UpdateQuerySource::Subquery(kind);
+                query.select_nodes_collect_with_source(branches, source, negated);
+                if let Some(test) = test_expr {
+                    test.subquery_nodes_collect_with_source(branches, negated);
+                }
+            }
+            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => {}
         }
     }
 
@@ -692,6 +768,46 @@ impl ResolvedColumnExpr {
         }
     }
 
+    /// Collect subquery branches from column expressions with source tracking.
+    /// All subqueries within column expressions are Scalar.
+    fn subquery_nodes_collect_with_source<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a ResolvedSelectNode, UpdateQuerySource)>,
+    ) {
+        match self {
+            ResolvedColumnExpr::Column(_)
+            | ResolvedColumnExpr::Identifier(_)
+            | ResolvedColumnExpr::Literal(_) => {}
+            ResolvedColumnExpr::Function { args, .. } => {
+                for arg in args {
+                    arg.subquery_nodes_collect_with_source(branches);
+                }
+            }
+            ResolvedColumnExpr::Case(case) => {
+                if let Some(arg) = &case.arg {
+                    arg.subquery_nodes_collect_with_source(branches);
+                }
+                for when in &case.whens {
+                    // condition is WhereExpr — use negated=false (Scalar context)
+                    when.condition
+                        .subquery_nodes_collect_with_source(branches, false);
+                    when.result.subquery_nodes_collect_with_source(branches);
+                }
+                if let Some(default) = &case.default {
+                    default.subquery_nodes_collect_with_source(branches);
+                }
+            }
+            ResolvedColumnExpr::Arithmetic(arith) => {
+                arith.left.subquery_nodes_collect_with_source(branches);
+                arith.right.subquery_nodes_collect_with_source(branches);
+            }
+            ResolvedColumnExpr::Subquery(query, _) => {
+                let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);
+                query.select_nodes_collect_with_source(branches, source, false);
+            }
+        }
+    }
+
     /// Recursively collect SELECT branches from subqueries in this column expression.
     fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
@@ -886,6 +1002,19 @@ impl ResolvedSelectColumns {
         }
     }
 
+    /// Collect subquery branches from SELECT list with source tracking.
+    /// All subqueries in a SELECT list are Scalar (must return single value).
+    fn subquery_nodes_collect_with_source<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a ResolvedSelectNode, UpdateQuerySource)>,
+    ) {
+        if let ResolvedSelectColumns::Columns(columns) = self {
+            for col in columns {
+                col.expr.subquery_nodes_collect_with_source(branches);
+            }
+        }
+    }
+
     /// Recursively collect SELECT branches from subqueries in the SELECT list.
     fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         if let ResolvedSelectColumns::Columns(columns) = self {
@@ -958,6 +1087,39 @@ impl ResolvedTableSource {
                     .subquery_depth()
                     .max(join.right.subquery_depth())
                     .max(condition_depth)
+            }
+        }
+    }
+
+    /// Collect subquery branches from table sources with source tracking.
+    /// FROM subqueries inherit the negation context as Inclusion/Exclusion.
+    fn subquery_nodes_collect_with_source<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a ResolvedSelectNode, UpdateQuerySource)>,
+        negated: bool,
+    ) {
+        match self {
+            ResolvedTableSource::Table(_) => {}
+            ResolvedTableSource::Subquery(sub) => {
+                let kind = if negated {
+                    SubqueryKind::Exclusion
+                } else {
+                    SubqueryKind::Inclusion
+                };
+                sub.query.select_nodes_collect_with_source(
+                    branches,
+                    UpdateQuerySource::Subquery(kind),
+                    negated,
+                );
+            }
+            ResolvedTableSource::Join(join) => {
+                join.left
+                    .subquery_nodes_collect_with_source(branches, negated);
+                join.right
+                    .subquery_nodes_collect_with_source(branches, negated);
+                if let Some(condition) = &join.condition {
+                    condition.subquery_nodes_collect_with_source(branches, negated);
+                }
             }
         }
     }
@@ -1378,6 +1540,60 @@ impl ResolvedQueryExpr {
             ResolvedQueryBody::Values(_) => 0,
             ResolvedQueryBody::SetOp(set_op) => {
                 set_op.left.complexity() + set_op.right.complexity() + 1
+            }
+        }
+    }
+
+    /// Extract all SELECT branches with source tracking (Direct, Subquery, etc.).
+    ///
+    /// Mirrors `QueryExpr::select_nodes_with_source()` but for the resolved AST.
+    /// Top-level branches are Direct; subquery/CTE branches carry their
+    /// Inclusion/Exclusion/Scalar classification.
+    pub fn select_nodes_with_source(
+        &self,
+    ) -> Vec<(&ResolvedSelectNode, UpdateQuerySource)> {
+        let mut branches = Vec::new();
+        self.select_nodes_collect_with_source(
+            &mut branches,
+            UpdateQuerySource::Direct,
+            false,
+        );
+        branches
+    }
+
+    /// Collects branches with source tracking.
+    /// `outer_source` is the source assigned to this query's body branches.
+    /// `negated` tracks NOT-wrapping to flip Inclusion/Exclusion.
+    fn select_nodes_collect_with_source<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a ResolvedSelectNode, UpdateQuerySource)>,
+        outer_source: UpdateQuerySource,
+        negated: bool,
+    ) {
+        match &self.body {
+            ResolvedQueryBody::Select(select) => {
+                branches.push((select, outer_source));
+                for source in &select.from {
+                    source.subquery_nodes_collect_with_source(branches, negated);
+                }
+                if let Some(where_clause) = &select.where_clause {
+                    where_clause.subquery_nodes_collect_with_source(branches, negated);
+                }
+                if let Some(having) = &select.having {
+                    having.subquery_nodes_collect_with_source(branches, negated);
+                }
+                select
+                    .columns
+                    .subquery_nodes_collect_with_source(branches);
+            }
+            ResolvedQueryBody::Values(_) => {}
+            ResolvedQueryBody::SetOp(set_op) => {
+                set_op
+                    .left
+                    .select_nodes_collect_with_source(branches, outer_source, negated);
+                set_op
+                    .right
+                    .select_nodes_collect_with_source(branches, outer_source, negated);
             }
         }
     }

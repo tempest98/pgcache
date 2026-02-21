@@ -123,42 +123,12 @@ impl CacheWriter {
             .attach_loc("resolving query expression")
             .map(predicate_pushdown_apply)?;
 
-        // Build a temporary CacheableQuery with the base (limit-stripped) query
-        // for update query generation
-        let base_cacheable = CacheableQuery {
-            query: base_query.clone(),
-        };
-
-        for (table_node, update_query_expr, source) in
-            query_table_update_queries(&base_cacheable, &resolved)
-        {
-            let schema = self
-                .table_schema_resolve(
-                    table_node.name.as_str(),
-                    table_node.schema.as_deref(),
-                    search_path,
-                )
-                .await?;
-            let relation_oid = self
-                .cache
-                .tables
-                .get2(&(schema.as_str(), table_node.name.as_str()))
-                .ok_or(CacheError::UnknownTable {
-                    oid: None,
-                    name: Some(table_node.name.clone()),
-                })?
-                .relation_oid;
-
-            let update_resolved =
-                query_expr_resolve(&update_query_expr, &self.cache.tables, search_path)
-                    .map_err(|e| e.context_transform(CacheError::from))
-                    .attach_loc("resolving update query expression")?;
-
+        for (table_node, update_resolved, source) in query_table_update_queries(&resolved) {
+            let relation_oid = table_node.relation_oid;
             let constraints = update_resolved
                 .as_select()
                 .map(analyze_query_constraints)
                 .unwrap_or_default();
-
             let complexity = update_resolved.complexity();
             let update_query = UpdateQuery {
                 fingerprint,
