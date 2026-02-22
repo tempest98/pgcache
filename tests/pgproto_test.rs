@@ -27,7 +27,7 @@ fn assert_pgproto_select(output: &str, expected_rows: usize) {
 ///
 /// These tests exercise wire-level protocol sequences that tokio-postgres cannot
 /// produce, such as Flush-before-Sync (JDBC pattern), multi-Execute pipelines,
-/// and named statement reuse without re-Parse.
+/// named statement reuse without re-Parse, and named portals.
 #[tokio::test]
 async fn test_pgproto_extended_protocol() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
@@ -80,7 +80,22 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
         delta.queries_total,
     );
 
-    // --- Scenario 3: JDBC Describe/Flush pattern ---
+    // --- Scenario 3: Named portal ---
+    // Bind to a named portal "P1", then Execute referencing that portal.
+    // Verifies the proxy correctly tracks named portals and resolves them
+    // during Execute for cacheability routing.
+    let m = ctx.metrics().await?;
+    let output = pgproto_run(ctx.cache_port, "tests/data/pgproto/named_portal.data");
+    assert_pgproto_select(&output, 3);
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&m, &after);
+    assert!(
+        delta.queries_total >= 1,
+        "expected at least 1 query from named portal, got {}",
+        delta.queries_total,
+    );
+
+    // --- Scenario 4: JDBC Describe/Flush pattern ---
     // Flush sends Parse/Bind/Describe to origin immediately.
     // Execute/Sync follows separately.
     let m = ctx.metrics().await?;
@@ -98,7 +113,7 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
         delta.queries_total,
     );
 
-    // --- Scenario 4: Multiple Executes before Sync (must forward) ---
+    // --- Scenario 5: Multiple Executes before Sync (must forward) ---
     // Two Parse/Bind/Execute pairs before a single Sync.
     // multiple_executes flag forces forward to origin (uncacheable).
     let m = ctx.metrics().await?;
@@ -112,7 +127,7 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
         delta.queries_uncacheable,
     );
 
-    // --- Scenario 5: Non-cacheable INSERT forwarded at Sync ---
+    // --- Scenario 6: Non-cacheable INSERT forwarded at Sync ---
     let m = ctx.metrics().await?;
     let output = pgproto_run(ctx.cache_port, "tests/data/pgproto/non_cacheable_sync.data");
     assert!(

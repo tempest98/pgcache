@@ -1,0 +1,8 @@
+# Named portal: Bind to a named portal, Execute by portal name
+# Tests that the proxy correctly tracks and routes named portals
+'P'	"S1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'B'	"P1"	"S1"	0	0	0
+'E'	"P1"	0
+'S'
+'Y'
+'X'
