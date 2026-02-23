@@ -7,9 +7,9 @@ use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::query::ast::{QueryBody, TableNode};
 use crate::query::constraints::analyze_query_constraints;
-use crate::query::pushdown::predicate_pushdown_apply;
 use crate::query::resolved::{ResolvedTableNode, query_expr_resolve};
-use crate::query::transform::query_table_update_queries;
+use crate::query::transform::predicate_pushdown_apply;
+use crate::query::update::query_table_update_queries;
 
 use super::super::{
     CacheError, CacheResult, ReportExt,
