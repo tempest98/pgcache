@@ -332,7 +332,7 @@ fn is_cacheable_expr(
         },
         WhereExpr::Array(elems) => elems.iter().try_for_each(|e| is_cacheable_expr(e, ctx, fv)),
         WhereExpr::Unary(unary_expr) => is_cacheable_expr(&unary_expr.expr, ctx, fv),
-        WhereExpr::Function { name, args } => {
+        WhereExpr::Function { name, args, .. } => {
             let is_immutable = matches!(
                 fv.get(name.to_lowercase().as_str()),
                 Some(FunctionVolatility::Immutable)

@@ -88,7 +88,7 @@ fn select_node_pushdown_apply(mut select: ResolvedSelectNode) -> ResolvedSelectN
 ///
 /// `a AND b AND c` becomes `[a, b, c]`. Non-AND expressions return a
 /// single-element vec.
-fn where_expr_conjuncts_split(expr: ResolvedWhereExpr) -> Vec<ResolvedWhereExpr> {
+pub(crate) fn where_expr_conjuncts_split(expr: ResolvedWhereExpr) -> Vec<ResolvedWhereExpr> {
     match expr {
         ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::And => {
             let mut result = where_expr_conjuncts_split(*binary.lexpr);
@@ -107,7 +107,7 @@ fn where_expr_conjuncts_split(expr: ResolvedWhereExpr) -> Vec<ResolvedWhereExpr>
 }
 
 /// Rebuild an AND tree from conjuncts. Returns None if the vec is empty.
-fn where_expr_conjuncts_join(conjuncts: Vec<ResolvedWhereExpr>) -> Option<ResolvedWhereExpr> {
+pub(crate) fn where_expr_conjuncts_join(conjuncts: Vec<ResolvedWhereExpr>) -> Option<ResolvedWhereExpr> {
     let mut iter = conjuncts.into_iter();
     let first = iter.next()?;
     Some(iter.fold(first, |acc, next| {
@@ -356,7 +356,11 @@ fn where_expr_columns_remap(
                 .collect();
             Some(ResolvedWhereExpr::Array(remapped?))
         }
-        ResolvedWhereExpr::Function { name, args } => {
+        ResolvedWhereExpr::Function {
+            name,
+            args,
+            agg_star,
+        } => {
             let remapped: Option<Vec<_>> = args
                 .iter()
                 .map(|a| where_expr_columns_remap(a, name_to_column))
@@ -364,6 +368,7 @@ fn where_expr_columns_remap(
             Some(ResolvedWhereExpr::Function {
                 name: name.clone(),
                 args: remapped?,
+                agg_star: *agg_star,
             })
         }
         // Should not reach here — predicate_has_subquery filters these out

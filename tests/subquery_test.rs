@@ -1113,19 +1113,13 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
 }
 
 // =============================================================================
-// Correlated Subquery Tests (not yet supported for caching)
+// Correlated Subquery Tests
 // =============================================================================
 
-// Correlated subqueries reference columns from the outer query, which makes
-// them impossible to resolve independently. These patterns are correctly
-// detected and rejected at resolution time (CorrelatedSubqueryNotSupported).
-// The proxy passes them through to origin and returns correct results,
-// but they cannot be cached.
+// Correlated EXISTS/NOT EXISTS subqueries are now supported via decorrelation
+// (flattened into JOINs for update query generation). See correlated_subquery_test.rs.
 //
-// Enable these tests when correlated subquery support is added:
-//
-// - WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.ref = t1.ref)
-// - WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.ref = t1.ref)
+// Not yet supported (require more complex decorrelation):
 // - SELECT col, (SELECT COUNT(*) FROM t2 WHERE t2.ref = t1.ref) FROM t1
 // - SELECT ... WHERE col > (SELECT AVG(col) FROM t2 WHERE t2.ref = t1.ref)
 // - LATERAL (SELECT ... WHERE subquery.ref = table.ref)

@@ -7,6 +7,7 @@ use crate::catalog::TableMetadata;
 use crate::metrics::names;
 use crate::query::ast::{QueryBody, TableNode};
 use crate::query::constraints::analyze_query_constraints;
+use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::resolved::{ResolvedTableNode, query_expr_resolve};
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
@@ -123,7 +124,18 @@ impl CacheWriter {
             .attach_loc("resolving query expression")
             .map(predicate_pushdown_apply)?;
 
-        for (table_node, update_resolved, source) in query_table_update_queries(&resolved) {
+        // Decorrelate correlated subqueries for update query generation.
+        // Works entirely on resolved AST — no re-resolution needed.
+        let decorrelated = query_expr_decorrelate(&resolved)
+            .map_err(|e| e.context_transform(CacheError::from))
+            .attach_loc("decorrelating correlated subqueries")?;
+        let update_source = if decorrelated.transformed {
+            &decorrelated.resolved
+        } else {
+            &resolved
+        };
+
+        for (table_node, update_resolved, source) in query_table_update_queries(update_source) {
             let relation_oid = table_node.relation_oid;
             let constraints = update_resolved
                 .as_select()
@@ -165,9 +177,20 @@ impl CacheWriter {
         self.active_relations_rebuild();
         trace!("cached query loading");
 
-        // Extract SELECT branches for population
-        // Each branch is processed independently, which handles set operations correctly
-        let branches: Vec<_> = resolved.select_nodes().into_iter().cloned().collect();
+        // Extract SELECT branches for population.
+        // When decorrelation was applied, use the decorrelated form so that inner
+        // correlated tables are merged into JOINs. This avoids extracting standalone
+        // correlated branches that reference outer-scope columns and can't run independently.
+        let population_source = if decorrelated.transformed {
+            &decorrelated.resolved
+        } else {
+            &resolved
+        };
+        let branches: Vec<_> = population_source
+            .select_nodes()
+            .into_iter()
+            .cloned()
+            .collect();
 
         // Collect all unique table OIDs across all branches for metadata lookup
         let branch_relation_oids: Vec<u32> = branches
@@ -234,8 +257,17 @@ impl CacheWriter {
             max_limit,
         );
 
-        // Extract SELECT branches for population
-        let branches: Vec<_> = resolved.select_nodes().into_iter().cloned().collect();
+        // Use decorrelated form for population branches to avoid standalone
+        // correlated branches that can't run independently.
+        let population_resolved = query_expr_decorrelate(&resolved)
+            .map(|d| if d.transformed { d.resolved } else { resolved.clone() })
+            .unwrap_or_else(|_| resolved.clone());
+
+        let branches: Vec<_> = population_resolved
+            .select_nodes()
+            .into_iter()
+            .cloned()
+            .collect();
 
         let branch_relation_oids: Vec<u32> = branches
             .iter()
@@ -382,8 +414,16 @@ impl CacheWriter {
             new_max_limit,
         );
 
-        // Extract SELECT branches for population
-        let branches: Vec<_> = resolved.select_nodes().into_iter().cloned().collect();
+        // Use decorrelated form for population branches (same rationale as query_register)
+        let population_resolved = query_expr_decorrelate(&resolved)
+            .map(|d| if d.transformed { d.resolved } else { resolved.clone() })
+            .unwrap_or_else(|_| resolved.clone());
+
+        let branches: Vec<_> = population_resolved
+            .select_nodes()
+            .into_iter()
+            .cloned()
+            .collect();
 
         let branch_relation_oids: Vec<u32> = branches
             .iter()

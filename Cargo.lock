@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "pgcache"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "async-stream",
  "console-subscriber",
