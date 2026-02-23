@@ -529,6 +529,7 @@ pub enum WhereExpr {
     Function {
         name: String,
         args: Vec<WhereExpr>,
+        agg_star: bool,
     },
 
     // Subqueries in WHERE clauses (EXISTS, IN, ANY, ALL, scalar)
@@ -693,14 +694,22 @@ impl Deparse for WhereExpr {
                 }
                 buf.push(']');
             }
-            WhereExpr::Function { name, args } => {
+            WhereExpr::Function {
+                name,
+                args,
+                agg_star,
+            } => {
                 buf.push_str(name);
                 buf.push('(');
-                let mut sep = "";
-                for arg in args {
-                    buf.push_str(sep);
-                    arg.deparse(buf);
-                    sep = ", ";
+                if *agg_star {
+                    buf.push('*');
+                } else {
+                    let mut sep = "";
+                    for arg in args {
+                        buf.push_str(sep);
+                        arg.deparse(buf);
+                        sep = ", ";
+                    }
                 }
                 buf.push(')');
             }

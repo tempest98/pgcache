@@ -747,6 +747,7 @@ mod tests {
         let expr = WhereExpr::Function {
             name: "upper".to_owned(),
             args: vec![],
+            agg_star: false,
         };
 
         assert!(!where_expr_evaluate(&expr, &row_data, &table_metadata));

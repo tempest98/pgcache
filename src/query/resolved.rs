@@ -201,6 +201,7 @@ pub enum ResolvedWhereExpr {
     Function {
         name: EcoString,
         args: Vec<ResolvedWhereExpr>,
+        agg_star: bool,
     },
     /// Subquery in WHERE clause (EXISTS, IN, ANY, ALL, scalar)
     Subquery {
@@ -530,14 +531,22 @@ impl Deparse for ResolvedWhereExpr {
                 buf.push(']');
                 buf
             }
-            ResolvedWhereExpr::Function { name, args } => {
+            ResolvedWhereExpr::Function {
+                name,
+                args,
+                agg_star,
+            } => {
                 buf.push_str(name);
                 buf.push('(');
-                let mut sep = "";
-                for arg in args {
-                    buf.push_str(sep);
-                    arg.deparse(buf);
-                    sep = ", ";
+                if *agg_star {
+                    buf.push('*');
+                } else {
+                    let mut sep = "";
+                    for arg in args {
+                        buf.push_str(sep);
+                        arg.deparse(buf);
+                        sep = ", ";
+                    }
                 }
                 buf.push(')');
                 buf
@@ -2089,7 +2098,11 @@ fn where_expr_resolve(
             }
             Ok(ResolvedWhereExpr::Array(resolved_elems))
         }
-        WhereExpr::Function { name, args } => {
+        WhereExpr::Function {
+            name,
+            args,
+            agg_star,
+        } => {
             let mut resolved_args = Vec::with_capacity(args.len());
             for arg in args {
                 resolved_args.push(where_expr_resolve(arg, scope)?);
@@ -2097,6 +2110,7 @@ fn where_expr_resolve(
             Ok(ResolvedWhereExpr::Function {
                 name: name.as_str().into(),
                 args: resolved_args,
+                agg_star: *agg_star,
             })
         }
         WhereExpr::Subquery {

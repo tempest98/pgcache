@@ -162,7 +162,11 @@ fn func_call_to_where_expr(func_call: &FuncCall) -> Result<WhereExpr, WhereParse
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    Ok(WhereExpr::Function { name, args })
+    Ok(WhereExpr::Function {
+        name,
+        args,
+        agg_star: func_call.agg_star,
+    })
 }
 
 /// Extract column reference from pg_query ColumnRef
