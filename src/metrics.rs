@@ -131,7 +131,7 @@ pub fn prometheus_install(metrics_socket: Option<SocketAddr>) -> MetricsResult<(
     // Configure Prometheus with quantiles for histograms
     let mut builder = PrometheusBuilder::new()
         .set_quantiles(&[0.5, 0.95, 0.99])
-        .expect("configure prometheus quantiles");
+        .map_err(|e| MetricsError::Build(e.to_string()))?;
 
     // Optionally bind HTTP listener
     if let Some(socket) = metrics_socket {

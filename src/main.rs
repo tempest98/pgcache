@@ -21,7 +21,7 @@ fn main() -> Result<(), Report> {
     // Install rustls crypto provider for TLS support
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("install crypto provider");
+        .map_err(|_| io::Error::other("crypto provider already installed"))?;
 
     #[cfg(feature = "hotpath")]
     let _guard = hotpath::FunctionsGuardBuilder::new("pgcache")

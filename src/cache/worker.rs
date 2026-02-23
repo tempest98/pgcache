@@ -111,7 +111,7 @@ async fn handle_cached_query_text(
     msg: &mut WorkerRequest,
 ) -> CacheResult<()> {
     let mut guard = ConnectionGuard::new(conn, return_tx);
-    let mut conn = guard.conn.take().expect("connection available");
+    let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
     // Generate SQL query from resolved AST (with schema-qualified table names)
     #[cfg(feature = "hotpath")]
@@ -318,7 +318,7 @@ async fn handle_cached_query_binary(
     msg: &mut WorkerRequest,
 ) -> CacheResult<()> {
     let mut guard = ConnectionGuard::new(conn, return_tx);
-    let mut conn = guard.conn.take().expect("connection available");
+    let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
     // Generate SQL query from resolved AST
     let mut sql = String::new();
