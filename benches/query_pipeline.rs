@@ -374,11 +374,7 @@ limit
 // Test catalog
 // ---------------------------------------------------------------------------
 
-fn table_metadata_build(
-    name: &str,
-    oid: u32,
-    column_defs: &[(&str, Type, bool)],
-) -> TableMetadata {
+fn table_metadata_build(name: &str, oid: u32, column_defs: &[(&str, Type, bool)]) -> TableMetadata {
     let mut columns = BiHashMap::new();
     let mut pk_cols = Vec::new();
     for (i, &(col_name, ref data_type, is_pk)) in column_defs.iter().enumerate() {
@@ -450,11 +446,7 @@ fn test_catalog_build() -> BiHashMap<TableMetadata> {
 /// `type_name` is stored verbatim as both `type_name` and `cache_type_name`,
 /// which means long names like `"timestamp with time zone"` (24 bytes) will
 /// exercise ecow's heap path post-migration.
-fn typed_table_build(
-    name: &str,
-    oid: u32,
-    cols: &[(&str, Type, &str, bool)],
-) -> TableMetadata {
+fn typed_table_build(name: &str, oid: u32, cols: &[(&str, Type, &str, bool)]) -> TableMetadata {
     let mut columns = BiHashMap::new();
     let mut pk_cols = Vec::new();
     for (i, (col_name, data_type, type_name, is_pk)) in cols.iter().enumerate() {
@@ -483,12 +475,12 @@ fn typed_table_build(
 
 // type_name strings used in large_catalog_build.
 // Strings > 15 bytes will land on ecow's refcounted heap post-migration.
-const TN_UUID: &str = "uuid";                       // 4 bytes
-const TN_TEXT: &str = "text";                       // 4 bytes
-const TN_DATE: &str = "date";                       // 4 bytes
-const TN_NUMERIC: &str = "numeric";                 // 7 bytes
-const TN_INTEGER: &str = "integer";                 // 7 bytes
-const TN_TSTZ: &str = "timestamp with time zone";   // 24 bytes — exceeds ecow inline
+const TN_UUID: &str = "uuid"; // 4 bytes
+const TN_TEXT: &str = "text"; // 4 bytes
+const TN_DATE: &str = "date"; // 4 bytes
+const TN_NUMERIC: &str = "numeric"; // 7 bytes
+const TN_INTEGER: &str = "integer"; // 7 bytes
+const TN_TSTZ: &str = "timestamp with time zone"; // 24 bytes — exceeds ecow inline
 
 /// Build a catalog matching the 7 tables referenced in LARGE_SQL.
 ///
@@ -734,9 +726,7 @@ fn bench_large_query(c: &mut Criterion) {
     let ast = query_expr_convert(&pg).unwrap();
 
     group.bench_function("resolve", |b| {
-        b.iter(|| {
-            black_box(query_expr_resolve(black_box(&ast), &tables, search_path).unwrap())
-        })
+        b.iter(|| black_box(query_expr_resolve(black_box(&ast), &tables, search_path).unwrap()))
     });
 
     let resolved = query_expr_resolve(&ast, &tables, search_path).unwrap();

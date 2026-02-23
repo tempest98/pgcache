@@ -1764,15 +1764,16 @@ fn column_resolve(
 
         // Fall back to outer scope (correlated reference)
         if let Some((outer_meta, outer_alias)) = scope.outer_table_scope_find(table_qualifier) {
-            let column_metadata = outer_meta
-                .columns
-                .get1(column_name.as_str())
-                .ok_or_else(|| {
-                    Report::from(ResolveError::ColumnNotFound {
-                        table: outer_meta.name.to_string(),
-                        column: column_name.clone(),
-                    })
-                })?;
+            let column_metadata =
+                outer_meta
+                    .columns
+                    .get1(column_name.as_str())
+                    .ok_or_else(|| {
+                        Report::from(ResolveError::ColumnNotFound {
+                            table: outer_meta.name.to_string(),
+                            column: column_name.clone(),
+                        })
+                    })?;
             let resolved = ResolvedColumnNode {
                 schema: outer_meta.schema.clone(),
                 table: outer_meta.name.clone(),
@@ -1968,8 +1969,7 @@ fn table_source_resolve<'a>(
 
             // FROM-clause subqueries use a fresh scope — LATERAL (which would require access
             // to the outer scope) is not supported and produces TableNotFound if attempted.
-            let resolved_query =
-                query_expr_resolve(&subquery.query, tables, search_path)?;
+            let resolved_query = query_expr_resolve(&subquery.query, tables, search_path)?;
 
             // Add derived table to outer scope so outer columns can reference it
             scope.derived_table_scope_add(&resolved_query, &alias.name);
@@ -1987,8 +1987,7 @@ fn table_source_resolve<'a>(
                 .unwrap_or(&cte_ref.cte_name);
 
             // CTE bodies use a fresh scope (non-correlated)
-            let resolved_query =
-                query_expr_resolve(&cte_ref.query, tables, search_path)?;
+            let resolved_query = query_expr_resolve(&cte_ref.query, tables, search_path)?;
 
             let alias = TableAlias {
                 name: alias_name.to_owned(),
@@ -2386,12 +2385,8 @@ fn query_expr_resolve_scoped(
                 search_path,
                 outer.clone(),
             )?;
-            let (right_resolved, right_outer_refs) = query_expr_resolve_scoped(
-                &set_op.right,
-                catalog_tables,
-                search_path,
-                outer,
-            )?;
+            let (right_resolved, right_outer_refs) =
+                query_expr_resolve_scoped(&set_op.right, catalog_tables, search_path, outer)?;
             scope.outer_refs.extend(left_outer_refs);
             scope.outer_refs.extend(right_outer_refs);
             ResolvedQueryBody::SetOp(ResolvedSetOpNode {
@@ -2428,7 +2423,14 @@ fn query_expr_resolve_scoped(
     let limit = limit_resolve(query.limit.as_ref());
     let outer_refs = scope.outer_refs;
 
-    Ok((ResolvedQueryExpr { body, order_by, limit }, outer_refs))
+    Ok((
+        ResolvedQueryExpr {
+            body,
+            order_by,
+            limit,
+        },
+        outer_refs,
+    ))
 }
 
 #[cfg(test)]
@@ -4401,7 +4403,10 @@ mod tests {
             panic!("expected Subquery WHERE");
         };
         // `id` resolves to `orders.id` in the inner scope — not a correlated reference
-        assert!(outer_refs.is_empty(), "inner-scope column should not appear in outer_refs");
+        assert!(
+            outer_refs.is_empty(),
+            "inner-scope column should not appear in outer_refs"
+        );
     }
 
     #[test]
@@ -4455,7 +4460,10 @@ mod tests {
         let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
             panic!("expected Subquery WHERE");
         };
-        assert!(outer_refs.is_empty(), "non-correlated subquery must have empty outer_refs");
+        assert!(
+            outer_refs.is_empty(),
+            "non-correlated subquery must have empty outer_refs"
+        );
     }
 
     #[test]
@@ -4485,7 +4493,11 @@ mod tests {
         let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
             panic!("expected Subquery WHERE");
         };
-        assert_eq!(outer_refs.len(), 1, "only the outer-scope column should be in outer_refs");
+        assert_eq!(
+            outer_refs.len(),
+            1,
+            "only the outer-scope column should be in outer_refs"
+        );
         assert_eq!(outer_refs[0].table, "departments");
         assert_eq!(outer_refs[0].column, "id");
     }
@@ -4531,7 +4543,10 @@ mod tests {
         let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
             panic!("expected Subquery WHERE");
         };
-        assert!(!outer_refs.is_empty(), "outer EXISTS should be correlated on departments.id");
+        assert!(
+            !outer_refs.is_empty(),
+            "outer EXISTS should be correlated on departments.id"
+        );
         assert_eq!(outer_refs[0].table, "departments");
         assert_eq!(outer_refs[0].column, "id");
     }
@@ -4565,5 +4580,4 @@ mod tests {
             result
         );
     }
-
 }

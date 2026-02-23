@@ -410,7 +410,10 @@ impl CacheWriter {
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> bool {
-        let Some(constraints) = constraints.table_constraints.get(table_metadata.name.as_str()) else {
+        let Some(constraints) = constraints
+            .table_constraints
+            .get(table_metadata.name.as_str())
+        else {
             return true;
         };
 

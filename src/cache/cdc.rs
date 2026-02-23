@@ -437,10 +437,7 @@ impl CdcProcessor {
     fn parse_relation_to_table_metadata(&self, relation_body: &RelationBody) -> TableMetadata {
         let relation_oid = relation_body.rel_id();
         let table_name: EcoString = relation_body.name().unwrap_or("unknown_table").into();
-        let schema_name: EcoString = relation_body
-            .namespace()
-            .unwrap_or("unknown_schema")
-            .into();
+        let schema_name: EcoString = relation_body.namespace().unwrap_or("unknown_schema").into();
 
         // Build column metadata from relation body
         let mut columns = BiHashMap::new();

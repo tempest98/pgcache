@@ -175,7 +175,6 @@ pub(super) struct ConnectionState {
     /// sends Parse to origin).
     pending_parse_statement: Option<String>,
 
-
     /// Buffered extended protocol messages accumulated until Sync/Flush.
     /// Decision-making deferred to Sync time.
     extended_buffer: Option<ExtendedBuffer>,
@@ -619,7 +618,10 @@ impl ConnectionState {
 
                 if let Some(parse_bytes) = proactive_parse_bytes {
                     let stmt_name = self.pending_parse_statement.take().unwrap_or_default();
-                    trace!("proactive Parse sent to origin for statement '{}'", stmt_name);
+                    trace!(
+                        "proactive Parse sent to origin for statement '{}'",
+                        stmt_name
+                    );
                     self.origin_write_buf.push_back(parse_bytes);
                     let mut sync_buf = BytesMut::with_capacity(5);
                     sync_buf.put_u8(b'S');
