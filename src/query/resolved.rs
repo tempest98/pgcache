@@ -416,8 +416,13 @@ impl Deparse for ResolvedWhereExpr {
             ResolvedWhereExpr::Column(col) => col.deparse(buf),
             ResolvedWhereExpr::Unary(unary) => {
                 match unary.op {
-                    UnaryOp::IsNull | UnaryOp::IsNotNull => {
-                        // Postfix operators: expr IS NULL
+                    UnaryOp::IsNull
+                    | UnaryOp::IsNotNull
+                    | UnaryOp::IsTrue
+                    | UnaryOp::IsNotTrue
+                    | UnaryOp::IsFalse
+                    | UnaryOp::IsNotFalse => {
+                        // Postfix operators: expr IS NULL, expr IS TRUE, etc.
                         unary.expr.deparse(buf);
                         buf.push(' ');
                         unary.op.deparse(buf);

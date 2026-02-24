@@ -1,11 +1,12 @@
 use error_set::error_set;
 use ordered_float::NotNan;
+use tracing::trace;
 
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{
-    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, ColumnRef, FuncCall, NullTest, NullTestType,
-    ParamRef, SelectStmt, SubLink,
+    AConst, AExpr, AExprKind, BoolExpr, BoolExprType, BoolTestType, BooleanTest, ColumnRef,
+    FuncCall, NullTest, NullTestType, ParamRef, SelectStmt, SubLink,
 };
 
 use super::ast::{
@@ -69,9 +70,10 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
         }
         Some(NodeEnum::SubLink(sub_link)) => sublink_convert(sub_link),
         Some(NodeEnum::NullTest(null_test)) => null_test_convert(null_test),
+        Some(NodeEnum::BooleanTest(bool_test)) => boolean_test_convert(bool_test),
         Some(NodeEnum::FuncCall(func_call)) => func_call_to_where_expr(func_call),
         unsupported => {
-            dbg!(unsupported);
+            trace!(?unsupported, "unsupported WHERE clause node type");
             Err(WhereParseError::UnsupportedPattern)
         }
     }
@@ -128,6 +130,34 @@ fn null_test_convert(null_test: &NullTest) -> Result<WhereExpr, WhereParseError>
         NullTestType::Undefined => {
             return Err(WhereParseError::UnsupportedAExpr {
                 expr: "Undefined NullTest type".to_owned(),
+            });
+        }
+    };
+
+    Ok(WhereExpr::Unary(UnaryExpr {
+        op,
+        expr: Box::new(node_convert_to_expr(arg)?),
+    }))
+}
+
+/// Convert pg_query BooleanTest to WhereExpr (IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE)
+fn boolean_test_convert(bool_test: &BooleanTest) -> Result<WhereExpr, WhereParseError> {
+    let arg = bool_test
+        .arg
+        .as_ref()
+        .ok_or(WhereParseError::MissingExpression)?;
+
+    let op = match bool_test.booltesttype() {
+        BoolTestType::IsTrue => UnaryOp::IsTrue,
+        BoolTestType::IsNotTrue => UnaryOp::IsNotTrue,
+        BoolTestType::IsFalse => UnaryOp::IsFalse,
+        BoolTestType::IsNotFalse => UnaryOp::IsNotFalse,
+        // IS UNKNOWN / IS NOT UNKNOWN are semantically identical to IS NULL / IS NOT NULL
+        BoolTestType::IsUnknown => UnaryOp::IsNull,
+        BoolTestType::IsNotUnknown => UnaryOp::IsNotNull,
+        BoolTestType::Undefined => {
+            return Err(WhereParseError::UnsupportedAExpr {
+                expr: "Undefined BooleanTest type".to_owned(),
             });
         }
     };
@@ -1228,6 +1258,132 @@ mod tests {
             panic!("expected Column");
         };
         assert_eq!(col.column, "name");
+    }
+
+    #[test]
+    fn where_clause_is_true() {
+        let result = where_clause_parse("SELECT id FROM test WHERE active IS TRUE");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        assert_eq!(unary.op, UnaryOp::IsTrue);
+
+        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "active");
+    }
+
+    #[test]
+    fn where_clause_is_false() {
+        let result = where_clause_parse("SELECT id FROM test WHERE active IS FALSE");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        assert_eq!(unary.op, UnaryOp::IsFalse);
+
+        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "active");
+    }
+
+    #[test]
+    fn where_clause_is_not_true() {
+        let result = where_clause_parse("SELECT id FROM test WHERE active IS NOT TRUE");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        assert_eq!(unary.op, UnaryOp::IsNotTrue);
+
+        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "active");
+    }
+
+    #[test]
+    fn where_clause_is_not_false() {
+        let result = where_clause_parse("SELECT id FROM test WHERE active IS NOT FALSE");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        assert_eq!(unary.op, UnaryOp::IsNotFalse);
+
+        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+            panic!("expected Column");
+        };
+        assert_eq!(col.column, "active");
+    }
+
+    #[test]
+    fn where_clause_is_true_combined_with_and() {
+        let result =
+            where_clause_parse("SELECT * FROM t WHERE id = 1 AND active IS TRUE");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Binary(binary) = where_clause else {
+            panic!("expected BinaryExpr");
+        };
+
+        assert_eq!(binary.op, BinaryOp::And);
+
+        let WhereExpr::Unary(unary) = binary.rexpr.as_ref() else {
+            panic!("expected UnaryExpr on right side");
+        };
+        assert_eq!(unary.op, UnaryOp::IsTrue);
+    }
+
+    #[test]
+    fn where_clause_is_unknown_maps_to_is_null() {
+        let result = where_clause_parse("SELECT id FROM test WHERE active IS UNKNOWN");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        // IS UNKNOWN is semantically identical to IS NULL
+        assert_eq!(unary.op, UnaryOp::IsNull);
+    }
+
+    #[test]
+    fn where_clause_is_not_unknown_maps_to_is_not_null() {
+        let result = where_clause_parse("SELECT id FROM test WHERE active IS NOT UNKNOWN");
+
+        assert!(result.is_ok());
+        let where_clause = result.unwrap().unwrap();
+
+        let WhereExpr::Unary(unary) = where_clause else {
+            panic!("expected UnaryExpr");
+        };
+
+        // IS NOT UNKNOWN is semantically identical to IS NOT NULL
+        assert_eq!(unary.op, UnaryOp::IsNotNull);
     }
 
     #[test]

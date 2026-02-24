@@ -2,7 +2,7 @@
 
 use crate::catalog::TableMetadata;
 
-use super::ast::{BinaryExpr, BinaryOp, LiteralValue, WhereExpr};
+use super::ast::{BinaryExpr, BinaryOp, ColumnNode, LiteralValue, UnaryOp, WhereExpr};
 
 /// Recursively evaluate a WHERE expression against row data.
 /// Returns true if the row matches the expression, false otherwise.
@@ -36,8 +36,11 @@ pub fn where_expr_evaluate(
                 false
             }
         },
+        WhereExpr::Unary(unary_expr) => {
+            unary_expr_evaluate(&unary_expr.op, &unary_expr.expr, row_data, table_metadata)
+        }
         _ => {
-            // Unsupported expression type (Unary, Multi, etc.)
+            // Unsupported expression type (Multi, etc.)
             false
         }
     }
@@ -80,6 +83,45 @@ fn expr_comparison_evaluate(
             false
         }
     }
+}
+
+/// Evaluate a unary expression (IS NULL, IS TRUE, NOT, etc.) against row data.
+fn unary_expr_evaluate(
+    op: &UnaryOp,
+    expr: &WhereExpr,
+    row_data: &[Option<String>],
+    table_metadata: &TableMetadata,
+) -> bool {
+    let value = if let WhereExpr::Column(col) = expr {
+        column_value_get(col, row_data, table_metadata)
+    } else {
+        None
+    };
+
+    match op {
+        UnaryOp::Not => !where_expr_evaluate(expr, row_data, table_metadata),
+        UnaryOp::IsNull => value.is_none(),
+        UnaryOp::IsNotNull => value.is_some(),
+        UnaryOp::IsTrue => matches!(value, Some("t" | "true")),
+        UnaryOp::IsNotTrue => !matches!(value, Some("t" | "true")),
+        UnaryOp::IsFalse => matches!(value, Some("f" | "false")),
+        UnaryOp::IsNotFalse => !matches!(value, Some("f" | "false")),
+    }
+}
+
+/// Look up a column's value in row data, returning None for NULL or missing columns.
+fn column_value_get<'a>(
+    col: &ColumnNode,
+    row_data: &'a [Option<String>],
+    table_metadata: &TableMetadata,
+) -> Option<&'a str> {
+    table_metadata
+        .columns
+        .get1(col.column.as_str())
+        .and_then(|col_meta| {
+            let pos = col_meta.position as usize - 1;
+            row_data.get(pos)?.as_deref()
+        })
 }
 
 /// Compare a string value from row data with a LiteralValue using the specified operator.
@@ -185,7 +227,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::ColumnMetadata;
-    use crate::query::ast::ColumnNode;
+    use crate::query::ast::{ColumnNode, UnaryExpr};
     use iddqd::BiHashMap;
     use ordered_float::NotNan;
     use tokio_postgres::types::Type;
@@ -751,6 +793,216 @@ mod tests {
         };
 
         assert!(!where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    // Tests for IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE
+    #[test]
+    fn where_expr_evaluate_is_true_with_true_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("t".to_owned()),
+        ];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsTrue,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_true_with_false_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("f".to_owned()),
+        ];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsTrue,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        assert!(!where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_true_with_null_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsTrue,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        // IS TRUE returns false for NULL
+        assert!(!where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_false_with_false_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("f".to_owned()),
+        ];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsFalse,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_false_with_true_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("t".to_owned()),
+        ];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsFalse,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        assert!(!where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_not_true_with_false_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("f".to_owned()),
+        ];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsNotTrue,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        // IS NOT TRUE returns true for FALSE
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_not_true_with_null_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsNotTrue,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        // IS NOT TRUE returns true for NULL
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_not_false_with_true_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("t".to_owned()),
+        ];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsNotFalse,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        // IS NOT FALSE returns true for TRUE
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_not_false_with_null_value() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsNotFalse,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        // IS NOT FALSE returns true for NULL
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_null_via_unary() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsNull,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
+    }
+
+    #[test]
+    fn where_expr_evaluate_is_not_null_via_unary() {
+        let table_metadata = create_test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("t".to_owned()),
+        ];
+
+        let expr = WhereExpr::Unary(UnaryExpr {
+            op: UnaryOp::IsNotNull,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        });
+
+        assert!(where_expr_evaluate(&expr, &row_data, &table_metadata));
     }
 
     // Tests for NotEqual operator

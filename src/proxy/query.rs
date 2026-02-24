@@ -4,7 +4,7 @@ use std::{
 };
 
 use tokio_util::bytes::BytesMut;
-use tracing::trace;
+use tracing::{trace, debug};
 
 use crate::{
     cache::query::CacheableQuery,
@@ -61,17 +61,21 @@ pub(super) async fn handle_query(
             match query_expr_convert(&ast) {
                 Ok(query) => {
                     // Successfully parsed as SELECT
-                    if let Ok(cacheable_query) = CacheableQuery::try_new(&query, func_volatility) {
-                        fp_cache.insert(fingerprint, Ok(Box::new(cacheable_query.clone())));
-                        Ok(Action::CacheCheck(Box::new(cacheable_query)))
-                    } else {
-                        let reason = ForwardReason::UncacheableSelect;
-                        fp_cache.insert(fingerprint, Err(reason));
-                        Ok(Action::Forward(reason))
+                    match CacheableQuery::try_new(&query, func_volatility) {
+                        Ok(cacheable_query) => {
+                            fp_cache.insert(fingerprint, Ok(Box::new(cacheable_query.clone())));
+                            Ok(Action::CacheCheck(Box::new(cacheable_query)))
+                        }
+                        Err(cacheability_error) => {
+                            debug!(%cacheability_error, "uncacheable SELECT");
+                            let reason = ForwardReason::UncacheableSelect;
+                            fp_cache.insert(fingerprint, Err(reason));
+                            Ok(Action::Forward(reason))
+                        }
                     }
                 }
                 Err(ast_error) => {
-                    let reason = match ast_error {
+                    let reason = match &ast_error {
                         AstError::UnsupportedStatement { .. } => {
                             // Not a SELECT statement (INSERT, UPDATE, DELETE, DDL, etc.)
                             ForwardReason::UnsupportedStatement
@@ -80,10 +84,16 @@ pub(super) async fn handle_query(
                         | AstError::UnsupportedFeature { .. }
                         | AstError::UnsupportedJoinType
                         | AstError::UnsupportedSubLinkType { .. }
-                        | AstError::WhereParseError(_) => ForwardReason::UncacheableSelect,
+                        | AstError::WhereParseError(_) => {
+                            debug!(%ast_error, "forwarding query: AST conversion failed");
+                            ForwardReason::UncacheableSelect
+                        }
                         AstError::MultipleStatements
                         | AstError::MissingStatement
-                        | AstError::InvalidTableRef => ForwardReason::Invalid,
+                        | AstError::InvalidTableRef => {
+                            debug!(%ast_error, "forwarding query: invalid");
+                            ForwardReason::Invalid
+                        }
                     };
 
                     fp_cache.insert(fingerprint, Err(reason));

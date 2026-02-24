@@ -222,6 +222,14 @@ pub enum UnaryOp {
     IsNull,
     #[strum(to_string = "IS NOT NULL")]
     IsNotNull,
+    #[strum(to_string = "IS TRUE")]
+    IsTrue,
+    #[strum(to_string = "IS NOT TRUE")]
+    IsNotTrue,
+    #[strum(to_string = "IS FALSE")]
+    IsFalse,
+    #[strum(to_string = "IS NOT FALSE")]
+    IsNotFalse,
 }
 
 impl Deparse for UnaryOp {
@@ -364,8 +372,13 @@ impl UnaryExpr {
 impl Deparse for UnaryExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self.op {
-            UnaryOp::IsNull | UnaryOp::IsNotNull => {
-                // Postfix operators: expr IS NULL
+            UnaryOp::IsNull
+            | UnaryOp::IsNotNull
+            | UnaryOp::IsTrue
+            | UnaryOp::IsNotTrue
+            | UnaryOp::IsFalse
+            | UnaryOp::IsNotFalse => {
+                // Postfix operators: expr IS NULL, expr IS TRUE, etc.
                 self.expr.deparse(buf);
                 buf.push(' ');
                 self.op.deparse(buf);
@@ -3723,6 +3736,22 @@ mod tests {
 
         UnaryOp::IsNotNull.deparse(&mut buf);
         assert_eq!(buf, "IS NOT NULL");
+        buf.clear();
+
+        UnaryOp::IsTrue.deparse(&mut buf);
+        assert_eq!(buf, "IS TRUE");
+        buf.clear();
+
+        UnaryOp::IsNotTrue.deparse(&mut buf);
+        assert_eq!(buf, "IS NOT TRUE");
+        buf.clear();
+
+        UnaryOp::IsFalse.deparse(&mut buf);
+        assert_eq!(buf, "IS FALSE");
+        buf.clear();
+
+        UnaryOp::IsNotFalse.deparse(&mut buf);
+        assert_eq!(buf, "IS NOT FALSE");
     }
 
     #[test]
@@ -3849,6 +3878,32 @@ mod tests {
 
         expr.deparse(&mut buf);
         assert_eq!(buf, "name IS NOT NULL");
+        buf.clear();
+
+        // active IS TRUE (postfix operator)
+        let expr = UnaryExpr {
+            op: UnaryOp::IsTrue,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        };
+
+        expr.deparse(&mut buf);
+        assert_eq!(buf, "active IS TRUE");
+        buf.clear();
+
+        // active IS NOT FALSE (postfix operator)
+        let expr = UnaryExpr {
+            op: UnaryOp::IsNotFalse,
+            expr: Box::new(WhereExpr::Column(ColumnNode {
+                table: None,
+                column: "active".to_owned(),
+            })),
+        };
+
+        expr.deparse(&mut buf);
+        assert_eq!(buf, "active IS NOT FALSE");
     }
 
     #[test]
