@@ -1,6 +1,7 @@
 use ecow::EcoString;
 use rootcause::Report;
 
+use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
 use crate::query::ast::{LiteralValue, TableAlias, ValuesClause};
 use crate::query::resolved::{
@@ -111,6 +112,7 @@ pub fn resolved_select_node_table_replace_with_values(
             name: alias,
             columns: column_names,
         },
+        subquery_kind: SubqueryKind::Inclusion,
     });
 
     Ok(resolved_new)

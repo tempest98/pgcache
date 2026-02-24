@@ -9,7 +9,7 @@ use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, Config, NoTls};
 use tracing::{debug, error, trace};
 
-use crate::catalog::TableMetadata;
+use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::metrics::names;
 use crate::pg;
 use crate::query::resolved::{ResolvedQueryExpr, ResolvedSelectNode};
@@ -56,6 +56,8 @@ pub struct CacheWriter {
     pub(super) cache_pool: Vec<Rc<Client>>,
     /// Shared set of relation OIDs with active cached queries (read by CDC processor).
     active_relations: ActiveRelations,
+    /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
+    pub(super) aggregate_functions: HashSet<String>,
 }
 
 impl CacheWriter {
@@ -86,6 +88,11 @@ impl CacheWriter {
             .attach_loc("connecting to origin database")?;
 
         let db_origin = Rc::new(origin_client);
+
+        let aggregate_functions = aggregate_functions_load(&db_origin)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("loading aggregate functions")?;
 
         // Spawn persistent population workers (each with its own cache connection)
         let mut populate_txs = Vec::with_capacity(POPULATE_POOL_SIZE);
@@ -147,6 +154,7 @@ impl CacheWriter {
             populate_next: 0,
             cache_pool,
             active_relations,
+            aggregate_functions,
         })
     }
 

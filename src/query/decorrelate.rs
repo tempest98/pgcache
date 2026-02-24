@@ -1,12 +1,17 @@
 use std::collections::HashSet;
 
+use ecow::EcoString;
 use error_set::error_set;
 use rootcause::Report;
+use tokio_postgres::types::Type;
 
-use crate::query::ast::{BinaryOp, JoinType, SubLinkType, UnaryOp};
+use crate::cache::SubqueryKind;
+use crate::catalog::ColumnMetadata;
+use crate::query::ast::{BinaryOp, JoinType, SubLinkType, TableAlias, UnaryOp};
 use crate::query::resolved::{
-    ResolvedBinaryExpr, ResolvedColumnExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedQueryBody,
-    ResolvedQueryExpr, ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableSource,
+    ResolvedBinaryExpr, ResolvedColumnExpr, ResolvedColumnNode, ResolvedJoinNode,
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumn, ResolvedSelectColumns,
+    ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableSource, ResolvedTableSubqueryNode,
     ResolvedUnaryExpr, ResolvedWhereExpr,
 };
 use crate::query::transform::{where_expr_conjuncts_join, where_expr_conjuncts_split};
@@ -34,11 +39,68 @@ struct CorrelationPredicate {
     inner_column: ResolvedColumnNode,
 }
 
-/// Build a lookup set of `(schema, table, column)` tuples from outer_refs.
+/// Mutable state threaded through decorrelation to generate unique aliases.
+struct DecorrelateState<'a> {
+    /// Counter for derived table aliases: _dc1, _dc2, ...
+    derived_table_counter: u32,
+    /// Counter for scalar column aliases: _ds1, _ds2, ...
+    scalar_column_counter: u32,
+    /// Aggregate function names from pg_proc (lowercase).
+    aggregate_functions: &'a HashSet<String>,
+}
+
+impl<'a> DecorrelateState<'a> {
+    fn new(aggregate_functions: &'a HashSet<String>) -> Self {
+        Self {
+            derived_table_counter: 0,
+            scalar_column_counter: 0,
+            aggregate_functions,
+        }
+    }
+
+    fn next_derived_alias(&mut self) -> String {
+        self.derived_table_counter += 1;
+        format!("_dc{}", self.derived_table_counter)
+    }
+
+    fn next_scalar_alias(&mut self) -> EcoString {
+        self.scalar_column_counter += 1;
+        EcoString::from(format!("_ds{}", self.scalar_column_counter))
+    }
+}
+
+/// Result of decorrelating a single scalar subquery.
+struct ScalarDecorrelateResult {
+    /// The derived table to LEFT JOIN onto the outer query.
+    derived_table: ResolvedTableSource,
+    /// The JOIN ON condition (correlation predicates mapped to derived table columns).
+    join_condition: ResolvedWhereExpr,
+    /// A column reference pointing to the scalar result column inside the derived table.
+    scalar_column_ref: ResolvedColumnNode,
+}
+
+/// Effective table identifier for matching: uses alias when present, otherwise table name.
+///
+/// Self-joins alias the same table differently (e.g., `departments d` / `departments d2`),
+/// so the alias is needed to distinguish outer refs from inner columns.
+fn effective_table(col: &ResolvedColumnNode) -> &str {
+    col.table_alias
+        .as_ref()
+        .map(EcoString::as_str)
+        .unwrap_or(col.table.as_str())
+}
+
+/// Build a lookup set of `(schema, effective_table, column)` tuples from outer_refs.
 fn outer_ref_keys(outer_refs: &[ResolvedColumnNode]) -> HashSet<(&str, &str, &str)> {
     outer_refs
         .iter()
-        .map(|col| (col.schema.as_str(), col.table.as_str(), col.column.as_str()))
+        .map(|col| {
+            (
+                col.schema.as_str(),
+                effective_table(col),
+                col.column.as_str(),
+            )
+        })
         .collect()
 }
 
@@ -47,7 +109,11 @@ fn column_matches_outer_ref(
     col: &ResolvedColumnNode,
     outer_keys: &HashSet<(&str, &str, &str)>,
 ) -> bool {
-    outer_keys.contains(&(col.schema.as_str(), col.table.as_str(), col.column.as_str()))
+    outer_keys.contains(&(
+        col.schema.as_str(),
+        effective_table(col),
+        col.column.as_str(),
+    ))
 }
 
 /// Partition an inner subquery's WHERE clause into correlation predicates and residual predicates.
@@ -420,9 +486,341 @@ fn correlated_not_exists_inner_prepare(
     Ok((cleaned_query, inner_select.clone()))
 }
 
+/// Check whether a `ResolvedColumnExpr` contains any aggregate function call.
+///
+/// Walks the expression tree looking for `Function { name, .. }` nodes whose name
+/// appears in the aggregate function set.
+fn column_expr_has_aggregate(expr: &ResolvedColumnExpr, agg_fns: &HashSet<String>) -> bool {
+    match expr {
+        ResolvedColumnExpr::Function { name, args, .. } => {
+            agg_fns.contains(name.as_str())
+                || args.iter().any(|a| column_expr_has_aggregate(a, agg_fns))
+        }
+        ResolvedColumnExpr::Case(case) => {
+            case.arg
+                .as_ref()
+                .is_some_and(|a| column_expr_has_aggregate(a, agg_fns))
+                || case
+                    .whens
+                    .iter()
+                    .any(|w| column_expr_has_aggregate(&w.result, agg_fns))
+                || case
+                    .default
+                    .as_ref()
+                    .is_some_and(|d| column_expr_has_aggregate(d, agg_fns))
+        }
+        ResolvedColumnExpr::Arithmetic(arith) => {
+            column_expr_has_aggregate(&arith.left, agg_fns)
+                || column_expr_has_aggregate(&arith.right, agg_fns)
+        }
+        ResolvedColumnExpr::Column(_)
+        | ResolvedColumnExpr::Identifier(_)
+        | ResolvedColumnExpr::Literal(_)
+        | ResolvedColumnExpr::Subquery(_, _) => false,
+    }
+}
+
+/// Validate and clean an inner query for scalar subquery decorrelation.
+///
+/// Requirements:
+/// - Must be a simple SELECT (not SetOp/Values)
+/// - Must have exactly one output column
+/// - Must have a WHERE clause (needed for correlation extraction)
+/// - Non-aggregate inner query WITH LIMIT is rejected (can't safely strip LIMIT)
+///
+/// Returns the cleaned query (LIMIT/ORDER BY stripped) and the inner select node.
+fn scalar_inner_prepare(
+    inner_query: &ResolvedQueryExpr,
+    agg_fns: &HashSet<String>,
+) -> DecorrelateResult<(ResolvedQueryExpr, ResolvedSelectNode)> {
+    let inner_select = inner_query_select(inner_query).ok_or_else(|| {
+        Report::from(DecorrelateError::NonDecorrelatable {
+            reason: "scalar subquery is not a simple SELECT".to_owned(),
+        })
+    })?;
+
+    // Must have exactly one output column
+    let columns = match &inner_select.columns {
+        ResolvedSelectColumns::Columns(cols) => cols,
+        ResolvedSelectColumns::None => &Vec::new(),
+    };
+    let scalar_expr = match columns.as_slice() {
+        [col] => &col.expr,
+        _ => {
+            return Err(DecorrelateError::NonDecorrelatable {
+                reason: "scalar subquery must have exactly one output column".to_owned(),
+            }
+            .into());
+        }
+    };
+
+    // Must have WHERE (needed for correlation predicates)
+    if inner_select.where_clause.is_none() {
+        return Err(DecorrelateError::NonDecorrelatable {
+            reason: "scalar subquery has no WHERE clause".to_owned(),
+        }
+        .into());
+    }
+
+    let has_aggregate = column_expr_has_aggregate(scalar_expr, agg_fns);
+
+    // Reject non-aggregate with LIMIT (can't safely strip LIMIT without aggregate dedup)
+    if !has_aggregate && inner_query.limit.is_some() {
+        return Err(DecorrelateError::NonDecorrelatable {
+            reason: "non-aggregate scalar subquery with LIMIT".to_owned(),
+        }
+        .into());
+    }
+
+    // Strip LIMIT and ORDER BY
+    let cleaned_select = inner_select.clone();
+    let cleaned_query = ResolvedQueryExpr {
+        body: ResolvedQueryBody::Select(Box::new(cleaned_select.clone())),
+        order_by: Vec::new(),
+        limit: None,
+    };
+
+    Ok((cleaned_query, cleaned_select))
+}
+
+/// Build a synthetic `ResolvedColumnNode` for a derived table column.
+fn synthetic_column_node(
+    derived_alias: &str,
+    column_name: EcoString,
+    column_metadata: ColumnMetadata,
+) -> ResolvedColumnNode {
+    ResolvedColumnNode {
+        schema: EcoString::from(""),
+        table: EcoString::from(derived_alias),
+        table_alias: Some(EcoString::from(derived_alias)),
+        column: column_name,
+        column_metadata,
+    }
+}
+
+/// Synthetic column metadata for derived table columns (TEXT type, non-primary-key).
+fn synthetic_text_metadata(name: &str, position: i16) -> ColumnMetadata {
+    ColumnMetadata {
+        name: EcoString::from(name),
+        position,
+        type_oid: 25,
+        data_type: Type::TEXT,
+        type_name: EcoString::from("text"),
+        cache_type_name: EcoString::from("text"),
+        is_primary_key: false,
+    }
+}
+
+/// Core scalar subquery decorrelation: converts a correlated scalar subquery into a
+/// LEFT JOIN with a derived table.
+///
+/// Input: inner query, outer_refs, mutable state for alias generation.
+/// Output: `ScalarDecorrelateResult` containing the derived table, join condition,
+/// and a column reference to the scalar result.
+fn subquery_scalar_decorrelate(
+    inner_query: &ResolvedQueryExpr,
+    outer_refs: &[ResolvedColumnNode],
+    state: &mut DecorrelateState<'_>,
+) -> DecorrelateResult<ScalarDecorrelateResult> {
+    let (_cleaned_query, cleaned_select) =
+        scalar_inner_prepare(inner_query, state.aggregate_functions)?;
+
+    let inner_where = cleaned_select
+        .where_clause
+        .as_ref()
+        .expect("scalar_inner_prepare validated WHERE clause exists");
+
+    let (predicates, residual) = where_clause_correlation_partition(inner_where, outer_refs)
+        .ok_or_else(|| {
+            Report::from(DecorrelateError::NonDecorrelatable {
+                reason: "unsupported correlation pattern in scalar subquery".to_owned(),
+            })
+        })?;
+
+    // Extract the scalar expression from the single output column
+    // Safety: scalar_inner_prepare validated exactly one column
+    let columns = match &cleaned_select.columns {
+        ResolvedSelectColumns::Columns(cols) => cols,
+        ResolvedSelectColumns::None => &Vec::new(),
+    };
+    let scalar_expr = match columns.as_slice() {
+        [col] => &col.expr,
+        _ => {
+            return Err(DecorrelateError::NonDecorrelatable {
+                reason: "scalar subquery must have exactly one output column".to_owned(),
+            }
+            .into());
+        }
+    };
+
+    let has_aggregate = column_expr_has_aggregate(scalar_expr, state.aggregate_functions);
+
+    // Generate aliases
+    let derived_alias = state.next_derived_alias();
+    let scalar_alias = state.next_scalar_alias();
+
+    // Build derived table SELECT columns: correlation key columns + scalar expr
+    let mut derived_columns: Vec<ResolvedSelectColumn> = predicates
+        .iter()
+        .map(|p| ResolvedSelectColumn {
+            expr: ResolvedColumnExpr::Column(p.inner_column.clone()),
+            alias: None,
+        })
+        .collect();
+
+    derived_columns.push(ResolvedSelectColumn {
+        expr: scalar_expr.clone(),
+        alias: Some(scalar_alias.clone()),
+    });
+
+    // GROUP BY on correlation key columns if the scalar expression has an aggregate
+    let group_by = if has_aggregate {
+        predicates.iter().map(|p| p.inner_column.clone()).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Build inner select for the derived table
+    let derived_select = ResolvedSelectNode {
+        distinct: false,
+        columns: ResolvedSelectColumns::Columns(derived_columns),
+        from: cleaned_select.from.clone(),
+        where_clause: residual,
+        group_by,
+        having: None,
+    };
+
+    let derived_query = ResolvedQueryExpr {
+        body: ResolvedQueryBody::Select(Box::new(derived_select)),
+        order_by: Vec::new(),
+        limit: None,
+    };
+
+    let derived_table = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
+        query: Box::new(derived_query),
+        alias: TableAlias {
+            name: derived_alias.clone(),
+            columns: Vec::new(),
+        },
+        subquery_kind: SubqueryKind::Scalar,
+    });
+
+    // Build JOIN ON: _dcN.inner_col = outer_col for each correlation predicate
+    let join_conditions: Vec<ResolvedWhereExpr> = predicates
+        .iter()
+        .map(|p| {
+            let derived_col = synthetic_column_node(
+                &derived_alias,
+                p.inner_column.column.clone(),
+                p.inner_column.column_metadata.clone(),
+            );
+            ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+                op: BinaryOp::Equal,
+                lexpr: Box::new(ResolvedWhereExpr::Column(derived_col)),
+                rexpr: Box::new(ResolvedWhereExpr::Column(p.outer_column.clone())),
+            })
+        })
+        .collect();
+
+    let join_condition =
+        where_expr_conjuncts_join(join_conditions).expect("correlation predicates non-empty");
+
+    // Build scalar column ref: _dcN._dsN
+    let scalar_column_ref = synthetic_column_node(
+        &derived_alias,
+        scalar_alias.clone(),
+        synthetic_text_metadata(scalar_alias.as_str(), 1),
+    );
+
+    Ok(ScalarDecorrelateResult {
+        derived_table,
+        join_condition,
+        scalar_column_ref,
+    })
+}
+
+/// LEFT JOIN a derived table onto the current select's FROM sources.
+fn left_join_derived(
+    from: &[ResolvedTableSource],
+    derived_table: ResolvedTableSource,
+    join_condition: ResolvedWhereExpr,
+) -> Vec<ResolvedTableSource> {
+    let left = from_sources_to_table_source(from);
+    vec![ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
+        join_type: JoinType::Left,
+        left,
+        right: derived_table,
+        condition: Some(join_condition),
+    }))]
+}
+
+/// Recursively walk a WHERE expression, decorrelating scalar subqueries
+/// (`Subquery { sublink_type: Expr, outer_refs non-empty }`) by replacing them
+/// with column references to LEFT JOINed derived tables.
+///
+/// Returns `(new_expr, was_transformed)`. Adds LEFT JOINs to `select.from`.
+fn conjunct_scalar_decorrelate(
+    expr: &ResolvedWhereExpr,
+    select: &mut ResolvedSelectNode,
+    state: &mut DecorrelateState<'_>,
+) -> DecorrelateResult<(ResolvedWhereExpr, bool)> {
+    match expr {
+        ResolvedWhereExpr::Subquery {
+            sublink_type: SubLinkType::Expr,
+            outer_refs,
+            query,
+            ..
+        } if !outer_refs.is_empty() => {
+            let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
+            select.from =
+                left_join_derived(&select.from, result.derived_table, result.join_condition);
+            Ok((ResolvedWhereExpr::Column(result.scalar_column_ref), true))
+        }
+        ResolvedWhereExpr::Binary(binary) => {
+            let (new_left, left_transformed) =
+                conjunct_scalar_decorrelate(&binary.lexpr, select, state)?;
+            let (new_right, right_transformed) =
+                conjunct_scalar_decorrelate(&binary.rexpr, select, state)?;
+            if left_transformed || right_transformed {
+                Ok((
+                    ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+                        op: binary.op,
+                        lexpr: Box::new(new_left),
+                        rexpr: Box::new(new_right),
+                    }),
+                    true,
+                ))
+            } else {
+                Ok((expr.clone(), false))
+            }
+        }
+        ResolvedWhereExpr::Unary(unary) => {
+            let (new_inner, was_transformed) =
+                conjunct_scalar_decorrelate(&unary.expr, select, state)?;
+            if was_transformed {
+                Ok((
+                    ResolvedWhereExpr::Unary(ResolvedUnaryExpr {
+                        op: unary.op,
+                        expr: Box::new(new_inner),
+                    }),
+                    true,
+                ))
+            } else {
+                Ok((expr.clone(), false))
+            }
+        }
+        ResolvedWhereExpr::Value(_)
+        | ResolvedWhereExpr::Column(_)
+        | ResolvedWhereExpr::Multi(_)
+        | ResolvedWhereExpr::Array(_)
+        | ResolvedWhereExpr::Function { .. }
+        | ResolvedWhereExpr::Subquery { .. } => Ok((expr.clone(), false)),
+    }
+}
+
 /// Main entry point: decorrelate correlated subqueries in a single SELECT node.
 ///
-/// Walks WHERE conjuncts looking for correlated EXISTS/NOT EXISTS subqueries,
+/// Walks SELECT columns and WHERE conjuncts looking for correlated subqueries,
 /// and flattens them into JOINs. Non-correlated subqueries and non-subquery
 /// predicates are left unchanged.
 ///
@@ -430,27 +828,60 @@ fn correlated_not_exists_inner_prepare(
 /// this is safe because it produces conservative (over-) invalidation.
 /// For NOT EXISTS, LIMIT is stripped (boolean check, irrelevant), but GROUP BY/HAVING
 /// are rejected because the anti-join would under-invalidate.
+/// For scalar subqueries, a LEFT JOIN + derived table is used (SELECT list and WHERE).
 ///
 /// Returns `Err(NonDecorrelatable)` if a correlated subquery is found in an
-/// unsupported position (SELECT list, HAVING, OR-connected, non-EXISTS type),
-/// or if a NOT EXISTS inner subquery has GROUP BY/HAVING.
+/// unsupported position (HAVING, OR-connected, IN/ALL type), or if a NOT EXISTS
+/// inner subquery has GROUP BY/HAVING.
 fn select_node_decorrelate(
     select: &ResolvedSelectNode,
+    state: &mut DecorrelateState<'_>,
 ) -> DecorrelateResult<(ResolvedSelectNode, bool)> {
-    // Reject correlated subqueries in SELECT columns
-    if let ResolvedSelectColumns::Columns(cols) = &select.columns {
+    let mut current_select = select.clone();
+    let mut transformed = false;
+
+    // Decorrelate correlated scalar subqueries in SELECT columns
+    if let ResolvedSelectColumns::Columns(cols) = &current_select.columns {
+        let mut new_cols = Vec::with_capacity(cols.len());
         for col in cols {
-            if column_expr_has_correlation(&col.expr) {
-                return Err(DecorrelateError::NonDecorrelatable {
-                    reason: "correlated subquery in SELECT list".to_owned(),
+            match &col.expr {
+                ResolvedColumnExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
+                    let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
+                    current_select.from = left_join_derived(
+                        &current_select.from,
+                        result.derived_table,
+                        result.join_condition,
+                    );
+                    new_cols.push(ResolvedSelectColumn {
+                        expr: ResolvedColumnExpr::Column(result.scalar_column_ref),
+                        alias: col.alias.clone(),
+                    });
+                    transformed = true;
                 }
-                .into());
+                other @ (ResolvedColumnExpr::Column(_)
+                | ResolvedColumnExpr::Identifier(_)
+                | ResolvedColumnExpr::Function { .. }
+                | ResolvedColumnExpr::Literal(_)
+                | ResolvedColumnExpr::Case(_)
+                | ResolvedColumnExpr::Arithmetic(_)
+                | ResolvedColumnExpr::Subquery(..)) => {
+                    // Reject nested correlation in non-Subquery exprs (e.g., CASE with
+                    // correlated subquery) — we don't walk into arbitrary column exprs.
+                    if column_expr_has_correlation(other) {
+                        return Err(DecorrelateError::NonDecorrelatable {
+                            reason: "correlated subquery nested in SELECT expression".to_owned(),
+                        }
+                        .into());
+                    }
+                    new_cols.push(col.clone());
+                }
             }
         }
+        current_select.columns = ResolvedSelectColumns::Columns(new_cols);
     }
 
     // Reject correlated subqueries in HAVING
-    if let Some(having) = &select.having
+    if let Some(having) = &current_select.having
         && where_expr_has_correlation(having)
     {
         return Err(DecorrelateError::NonDecorrelatable {
@@ -459,14 +890,11 @@ fn select_node_decorrelate(
         .into());
     }
 
-    let Some(where_clause) = &select.where_clause else {
-        return Ok((select.clone(), false));
+    let Some(where_clause) = &current_select.where_clause else {
+        return Ok((current_select, transformed));
     };
 
     let conjuncts = where_expr_conjuncts_split(where_clause.clone());
-
-    let mut current_select = select.clone();
-    let mut transformed = false;
 
     // Rebuild the WHERE clause without the correlated subquery conjuncts,
     // processing one at a time since each decorrelation modifies the FROM.
@@ -616,10 +1044,14 @@ fn select_node_decorrelate(
                 remaining_conjuncts.push(conjunct);
             }
 
-            // Any other correlated subquery type (IN, scalar, ALL) — reject
-            ResolvedWhereExpr::Subquery { outer_refs, .. } if !outer_refs.is_empty() => {
+            // Correlated IN/ALL subquery — reject (scalar Expr falls through to catch-all)
+            ResolvedWhereExpr::Subquery {
+                sublink_type: SubLinkType::Any | SubLinkType::All,
+                outer_refs,
+                ..
+            } if !outer_refs.is_empty() => {
                 return Err(DecorrelateError::NonDecorrelatable {
-                    reason: "correlated non-EXISTS subquery (IN/ALL/scalar)".to_owned(),
+                    reason: "correlated IN/ALL subquery".to_owned(),
                 }
                 .into());
             }
@@ -638,7 +1070,8 @@ fn select_node_decorrelate(
                 remaining_conjuncts.push(conjunct);
             }
 
-            // Non-correlated or non-subquery — keep as-is
+            // Catch-all: non-correlated or non-subquery predicates, and scalar
+            // correlated subqueries embedded in expressions (e.g., col > (SELECT ...))
             ResolvedWhereExpr::Value(_)
             | ResolvedWhereExpr::Column(_)
             | ResolvedWhereExpr::Unary(_)
@@ -647,7 +1080,14 @@ fn select_node_decorrelate(
             | ResolvedWhereExpr::Array(_)
             | ResolvedWhereExpr::Function { .. }
             | ResolvedWhereExpr::Subquery { .. } => {
-                remaining_conjuncts.push(conjunct);
+                if where_expr_has_correlation(&conjunct) {
+                    let (new_conjunct, was_transformed) =
+                        conjunct_scalar_decorrelate(&conjunct, &mut current_select, state)?;
+                    remaining_conjuncts.push(new_conjunct);
+                    transformed |= was_transformed;
+                } else {
+                    remaining_conjuncts.push(conjunct);
+                }
             }
         }
     }
@@ -658,19 +1098,29 @@ fn select_node_decorrelate(
     Ok((current_select, transformed))
 }
 
-use crate::query::resolved::ResolvedSelectColumns;
-
 /// Top-level entry: decorrelate correlated subqueries in a resolved query expression.
 ///
 /// Handles SELECT bodies directly, and recursively processes SetOp branches.
 /// Returns `DecorrelateOutcome` with the (possibly transformed) query and a
 /// flag indicating whether any transformation occurred.
+///
+/// `aggregate_functions` is the set of aggregate function names from pg_proc,
+/// used to decide whether derived tables need GROUP BY during scalar decorrelation.
 pub fn query_expr_decorrelate(
     resolved: &ResolvedQueryExpr,
+    aggregate_functions: &HashSet<String>,
+) -> DecorrelateResult<DecorrelateOutcome> {
+    let mut state = DecorrelateState::new(aggregate_functions);
+    query_expr_decorrelate_inner(resolved, &mut state)
+}
+
+fn query_expr_decorrelate_inner(
+    resolved: &ResolvedQueryExpr,
+    state: &mut DecorrelateState<'_>,
 ) -> DecorrelateResult<DecorrelateOutcome> {
     match &resolved.body {
         ResolvedQueryBody::Select(select) => {
-            let (new_select, transformed) = select_node_decorrelate(select)?;
+            let (new_select, transformed) = select_node_decorrelate(select, state)?;
             Ok(DecorrelateOutcome {
                 resolved: ResolvedQueryExpr {
                     body: ResolvedQueryBody::Select(Box::new(new_select)),
@@ -681,8 +1131,8 @@ pub fn query_expr_decorrelate(
             })
         }
         ResolvedQueryBody::SetOp(set_op) => {
-            let left_outcome = query_expr_decorrelate(&set_op.left)?;
-            let right_outcome = query_expr_decorrelate(&set_op.right)?;
+            let left_outcome = query_expr_decorrelate_inner(&set_op.left, state)?;
+            let right_outcome = query_expr_decorrelate_inner(&set_op.right, state)?;
             let transformed = left_outcome.transformed || right_outcome.transformed;
             Ok(DecorrelateOutcome {
                 resolved: ResolvedQueryExpr {
@@ -778,6 +1228,23 @@ mod tests {
         tables
     }
 
+    fn test_aggregate_functions() -> HashSet<String> {
+        [
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "array_agg",
+            "string_agg",
+            "bool_and",
+            "bool_or",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
     /// Parse SQL → resolve → decorrelate → return outcome.
     fn resolve_and_decorrelate(
         sql: &str,
@@ -786,7 +1253,7 @@ mod tests {
         let parsed = pg_query::parse(sql).expect("parse SQL");
         let ast = query_expr_convert(&parsed).expect("convert to AST");
         let resolved = query_expr_resolve(&ast, tables, &["public"]).expect("resolve query");
-        query_expr_decorrelate(&resolved)
+        query_expr_decorrelate(&resolved, &test_aggregate_functions())
     }
 
     fn deparse(query: &ResolvedQueryExpr) -> String {
@@ -874,10 +1341,7 @@ mod tests {
         assert!(!sql.contains("EXISTS"), "should not have EXISTS: {sql}");
         assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
         // Both correlation predicates in ON clause (using aliases)
-        assert!(
-            sql.contains("o.emp_id = e.id"),
-            "first correlation: {sql}"
-        );
+        assert!(sql.contains("o.emp_id = e.id"), "first correlation: {sql}");
         assert!(
             sql.contains("o.status = e.status"),
             "second correlation: {sql}"
@@ -977,10 +1441,7 @@ mod tests {
 
         assert!(!sql.contains("EXISTS"), "should not have EXISTS: {sql}");
         // Both subquery tables should be joined in
-        assert!(
-            sql.contains("public.orders"),
-            "first subquery table: {sql}"
-        );
+        assert!(sql.contains("public.orders"), "first subquery table: {sql}");
         assert!(
             sql.contains("public.projects"),
             "second subquery table: {sql}"
@@ -1042,14 +1503,8 @@ mod tests {
         assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
         // Residual should be in ON clause, not outer WHERE
         // The ON clause should contain both correlation and residual
-        assert!(
-            sql.contains("e.dept_id = d.id"),
-            "correlation in ON: {sql}"
-        );
-        assert!(
-            sql.contains("e.status = 'active'"),
-            "residual in ON: {sql}"
-        );
+        assert!(sql.contains("e.dept_id = d.id"), "correlation in ON: {sql}");
+        assert!(sql.contains("e.status = 'active'"), "residual in ON: {sql}");
         assert!(sql.contains("IS NULL"), "IS NULL check present: {sql}");
     }
 
@@ -1083,7 +1538,10 @@ mod tests {
             &tables,
         );
 
-        assert!(result.is_err(), "non-equality correlation should be rejected");
+        assert!(
+            result.is_err(),
+            "non-equality correlation should be rejected"
+        );
     }
 
     #[test]
@@ -1099,18 +1557,29 @@ mod tests {
     }
 
     #[test]
-    fn test_correlated_scalar_subquery_rejected() {
+    fn test_correlated_scalar_subquery_decorrelated() {
         let tables = test_tables();
-        let result = resolve_and_decorrelate(
+        let outcome = resolve_and_decorrelate(
             "SELECT e.id, \
                  (SELECT count(*) FROM orders o WHERE o.emp_id = e.id) AS order_count \
              FROM employees e",
             &tables,
-        );
+        )
+        .unwrap();
 
         assert!(
-            result.is_err(),
-            "correlated subquery in SELECT list should be rejected"
+            outcome.transformed,
+            "correlated scalar subquery in SELECT should be decorrelated"
+        );
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(
+            sql.contains("_dc1"),
+            "should have derived table alias _dc1: {sql}"
+        );
+        assert!(
+            sql.contains("_ds1"),
+            "should have scalar column alias _ds1: {sql}"
         );
     }
 
@@ -1178,10 +1647,7 @@ mod tests {
         let sql = deparse(&outcome.resolved);
         assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
         assert!(!sql.contains("EXISTS"), "should not have EXISTS: {sql}");
-        assert!(
-            !sql.contains("HAVING"),
-            "HAVING should be stripped: {sql}"
-        );
+        assert!(!sql.contains("HAVING"), "HAVING should be stripped: {sql}");
     }
 
     #[test]
@@ -1242,10 +1708,7 @@ mod tests {
             &tables,
         );
 
-        assert!(
-            result.is_err(),
-            "NOT EXISTS with HAVING should be rejected"
-        );
+        assert!(result.is_err(), "NOT EXISTS with HAVING should be rejected");
     }
 
     #[test]
@@ -1322,9 +1785,264 @@ mod tests {
             "outer predicate preserved: {sql}"
         );
         // Correlation should be in JOIN
+        assert!(sql.contains("JOIN"), "correlation should be JOIN: {sql}");
+    }
+
+    // ==================== Scalar SELECT List Decorrelation ====================
+
+    #[test]
+    fn test_scalar_select_count_single_correlation() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT count(*) FROM orders o WHERE o.emp_id = e.id) AS order_count \
+             FROM employees e",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("_dc1"), "derived table alias: {sql}");
+        assert!(sql.contains("_ds1"), "scalar column alias: {sql}");
+        assert!(sql.contains("GROUP BY"), "aggregate needs GROUP BY: {sql}");
+    }
+
+    #[test]
+    fn test_scalar_select_avg_with_residual() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT avg(o.total) FROM orders o WHERE o.emp_id = e.id AND o.status = 'done') AS avg_total \
+             FROM employees e",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("GROUP BY"), "aggregate needs GROUP BY: {sql}");
+        // Residual predicate should be in the derived table's WHERE, not outer WHERE
         assert!(
-            sql.contains("JOIN"),
-            "correlation should be JOIN: {sql}"
+            sql.contains("o.status = 'done'"),
+            "residual in derived table: {sql}"
         );
+    }
+
+    #[test]
+    fn test_scalar_select_multiple_correlations() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT count(*) FROM orders o WHERE o.emp_id = e.id AND o.status = e.status) AS cnt \
+             FROM employees e",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("GROUP BY"), "aggregate needs GROUP BY: {sql}");
+    }
+
+    #[test]
+    fn test_scalar_select_multiple_subqueries() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT count(*) FROM orders o WHERE o.emp_id = e.id) AS order_count, \
+                 (SELECT count(*) FROM projects p WHERE p.dept_id = e.dept_id) AS project_count \
+             FROM employees e",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("_dc1"), "first derived table: {sql}");
+        assert!(sql.contains("_dc2"), "second derived table: {sql}");
+        assert!(sql.contains("_ds1"), "first scalar column: {sql}");
+        assert!(sql.contains("_ds2"), "second scalar column: {sql}");
+    }
+
+    #[test]
+    fn test_scalar_select_non_aggregate_no_group_by() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT d.name FROM departments d WHERE d.id = e.dept_id) AS dept_name \
+             FROM employees e",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(
+            !sql.contains("GROUP BY"),
+            "non-aggregate should not have GROUP BY: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_scalar_select_non_aggregate_with_limit_rejected() {
+        let tables = test_tables();
+        let result = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT d.name FROM departments d WHERE d.id = e.dept_id LIMIT 1) AS dept_name \
+             FROM employees e",
+            &tables,
+        );
+
+        assert!(
+            result.is_err(),
+            "non-aggregate scalar with LIMIT should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_scalar_select_mixed_with_exists() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT count(*) FROM orders o WHERE o.emp_id = e.id) AS order_count \
+             FROM employees e \
+             WHERE EXISTS (SELECT 1 FROM projects p WHERE p.dept_id = e.dept_id)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        // Scalar subquery decorrelated as LEFT JOIN
+        assert!(sql.contains("_dc1"), "scalar derived table: {sql}");
+        // EXISTS decorrelated as INNER JOIN + DISTINCT
+        assert!(sql.contains("DISTINCT"), "EXISTS → DISTINCT: {sql}");
+        assert!(
+            !sql.contains("EXISTS"),
+            "EXISTS should be decorrelated: {sql}"
+        );
+    }
+
+    // ==================== Scalar WHERE Clause Decorrelation ====================
+
+    #[test]
+    fn test_scalar_where_comparison() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT d.id, d.name FROM departments d \
+             WHERE d.budget > (SELECT avg(d2.budget) FROM departments d2 WHERE d2.location = d.location)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("_dc1"), "derived table alias: {sql}");
+        assert!(sql.contains("_ds1"), "scalar column alias: {sql}");
+    }
+
+    #[test]
+    fn test_scalar_where_equality() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.id = (SELECT max(o.emp_id) FROM orders o WHERE o.status = e.status)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("_dc1"), "derived table alias: {sql}");
+    }
+
+    #[test]
+    fn test_scalar_where_multiple_subqueries() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.id > (SELECT min(o.emp_id) FROM orders o WHERE o.status = e.status) \
+             AND e.id < (SELECT max(o.emp_id) FROM orders o WHERE o.status = e.status)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("_dc1"), "first derived table: {sql}");
+        assert!(sql.contains("_dc2"), "second derived table: {sql}");
+    }
+
+    #[test]
+    fn test_scalar_where_non_aggregate() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.name = (SELECT d.name FROM departments d WHERE d.id = e.dept_id)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(
+            !sql.contains("GROUP BY"),
+            "non-aggregate should not have GROUP BY: {sql}"
+        );
+        assert!(sql.contains("_dc1"), "derived table alias: {sql}");
+    }
+
+    // ==================== Self-Join / Alias Handling ====================
+
+    #[test]
+    fn test_scalar_select_self_join() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT count(*) FROM employees e2 WHERE e2.manager_id = e.id) AS report_count \
+             FROM employees e",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("_dc1"), "derived table alias: {sql}");
+        assert!(sql.contains("GROUP BY"), "aggregate needs GROUP BY: {sql}");
+    }
+
+    // ==================== SetOp with Scalar Subqueries ====================
+
+    #[test]
+    fn test_scalar_setop_unique_aliases() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, \
+                 (SELECT count(*) FROM orders o WHERE o.emp_id = e.id) AS cnt \
+             FROM employees e \
+             UNION ALL \
+             SELECT d.id, \
+                 (SELECT count(*) FROM projects p WHERE p.dept_id = d.id) AS cnt \
+             FROM departments d",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        // Both branches should have derived tables with unique aliases
+        assert!(sql.contains("_dc1"), "first branch derived table: {sql}");
+        assert!(sql.contains("_dc2"), "second branch derived table: {sql}");
+        assert!(sql.contains("_ds1"), "first branch scalar column: {sql}");
+        assert!(sql.contains("_ds2"), "second branch scalar column: {sql}");
     }
 }

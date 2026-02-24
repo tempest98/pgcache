@@ -4,7 +4,7 @@
 //! These structures are used by both the cache subsystem (for tracking tables)
 //! and the query resolution subsystem (for name resolution and type information).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 use iddqd::{BiHashItem, BiHashMap, bi_upcast};
@@ -248,6 +248,29 @@ pub async fn function_volatility_map_load(
     }
 
     Ok(map)
+}
+
+/// Load aggregate function names from pg_proc.
+///
+/// Queries the origin database for all aggregate functions and builds a set
+/// of lowercase function names. Used during decorrelation to determine whether
+/// a scalar subquery's output expression contains an aggregate (which controls
+/// whether a GROUP BY is needed in the derived table).
+pub async fn aggregate_functions_load(client: &Client) -> Result<HashSet<String>, Error> {
+    let rows = client
+        .query(
+            "SELECT DISTINCT lower(p.proname) FROM pg_proc p WHERE p.prokind = 'a'",
+            &[],
+        )
+        .await?;
+
+    let mut set = HashSet::with_capacity(rows.len());
+    for row in &rows {
+        let name: &str = row.get(0);
+        set.insert(name.to_owned());
+    }
+
+    Ok(set)
 }
 
 /// Resolves a PostgreSQL Type to its cache-compatible storage type name.

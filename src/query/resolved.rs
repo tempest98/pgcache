@@ -1115,10 +1115,11 @@ impl ResolvedTableSource {
         match self {
             ResolvedTableSource::Table(_) => {}
             ResolvedTableSource::Subquery(sub) => {
-                let kind = if negated {
-                    SubqueryKind::Exclusion
-                } else {
-                    SubqueryKind::Inclusion
+                let kind = match (sub.subquery_kind, negated) {
+                    (SubqueryKind::Scalar, _) => SubqueryKind::Scalar,
+                    (SubqueryKind::Inclusion, true) => SubqueryKind::Exclusion,
+                    (SubqueryKind::Exclusion, true) => SubqueryKind::Inclusion,
+                    (kind, false) => kind,
                 };
                 sub.query.select_nodes_collect_with_source(
                     branches,
@@ -1171,6 +1172,10 @@ impl Deparse for ResolvedTableSource {
 pub struct ResolvedTableSubqueryNode {
     pub query: Box<ResolvedQueryExpr>,
     pub alias: TableAlias,
+    /// What role this subquery plays for CDC invalidation purposes.
+    /// Scalar subqueries always invalidate; Inclusion/Exclusion are flipped
+    /// by negation context during traversal.
+    pub subquery_kind: SubqueryKind,
 }
 
 impl ResolvedTableSubqueryNode {
@@ -2212,6 +2217,7 @@ fn table_source_resolve<'a>(
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
                 alias: alias.clone(),
+                subquery_kind: SubqueryKind::Inclusion,
             }))
         }
         TableSource::CteRef(cte_ref) => {
@@ -2234,6 +2240,7 @@ fn table_source_resolve<'a>(
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
                 alias,
+                subquery_kind: SubqueryKind::Inclusion,
             }))
         }
     }

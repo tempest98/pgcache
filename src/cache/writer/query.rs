@@ -126,7 +126,7 @@ impl CacheWriter {
 
         // Decorrelate correlated subqueries for update query generation.
         // Works entirely on resolved AST — no re-resolution needed.
-        let decorrelated = query_expr_decorrelate(&resolved)
+        let decorrelated = query_expr_decorrelate(&resolved, &self.aggregate_functions)
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("decorrelating correlated subqueries")?;
         let update_source = if decorrelated.transformed {
@@ -259,7 +259,7 @@ impl CacheWriter {
 
         // Use decorrelated form for population branches to avoid standalone
         // correlated branches that can't run independently.
-        let population_resolved = query_expr_decorrelate(&resolved)
+        let population_resolved = query_expr_decorrelate(&resolved, &self.aggregate_functions)
             .map(|d| if d.transformed { d.resolved } else { resolved.clone() })
             .unwrap_or_else(|_| resolved.clone());
 
@@ -415,7 +415,7 @@ impl CacheWriter {
         );
 
         // Use decorrelated form for population branches (same rationale as query_register)
-        let population_resolved = query_expr_decorrelate(&resolved)
+        let population_resolved = query_expr_decorrelate(&resolved, &self.aggregate_functions)
             .map(|d| if d.transformed { d.resolved } else { resolved.clone() })
             .unwrap_or_else(|_| resolved.clone());
 

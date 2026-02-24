@@ -900,6 +900,18 @@ mod tests {
     }
 
     #[test]
+    fn test_correlated_scalar_subquery_in_select_cacheable() {
+        let sql = "SELECT e.name, \
+                   (SELECT count(*) FROM orders o WHERE o.emp_id = e.id) AS order_count \
+                   FROM employees e ORDER BY e.name";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "Correlated scalar subquery in SELECT should be cacheable: {result:?}"
+        );
+    }
+
+    #[test]
     fn test_subquery_nested_cacheable() {
         let sql = "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))";
         let result = check_cacheable(sql);
