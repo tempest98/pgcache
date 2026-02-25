@@ -449,15 +449,15 @@ impl CacheWriter {
         operation: CdcOperation,
     ) -> bool {
         match update_query.source {
-            UpdateQuerySource::Direct => {
+            UpdateQuerySource::FromClause => {
                 // DELETE on a limited query's table: cached result may have fewer
                 // rows than the LIMIT window. Invalidate to trigger re-population.
                 if update_query.has_limit && operation == CdcOperation::Delete {
                     return true;
                 }
 
-                // DELETE on Direct source: the row is already removed from the cache
-                // table. For INNER JOIN (the only join type that gets Direct source),
+                // DELETE on FromClause source: the row is already removed from the cache
+                // table. For INNER JOIN (the only join type that gets FromClause source),
                 // removing a row can only shrink the result set, never expand it.
                 // Serve-time re-evaluation handles correctness.
                 if operation == CdcOperation::Delete {

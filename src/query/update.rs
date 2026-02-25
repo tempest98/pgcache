@@ -41,7 +41,7 @@ pub fn query_table_update_queries(
             };
 
             // Outer join optional-side tables need specialized CDC handling.
-            let effective_source = if source == UpdateQuerySource::Direct {
+            let effective_source = if source == UpdateQuerySource::FromClause {
                 if non_terminal.contains(table.name.as_str()) {
                     UpdateQuerySource::OuterJoinOptional
                 } else if terminal.contains(table.name.as_str()) {
@@ -383,7 +383,7 @@ mod tests {
         let result = update_queries("SELECT id FROM users WHERE id = 1");
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].2, UpdateQuerySource::Direct);
+        assert_eq!(result[0].2, UpdateQuerySource::FromClause);
     }
 
     #[test]
@@ -393,12 +393,12 @@ mod tests {
         );
 
         assert_eq!(result.len(), 2);
-        // Both tables in a JOIN are Direct
+        // Both tables in a JOIN are FromClause
         assert!(
             result
                 .iter()
-                .all(|(_, _, src)| *src == UpdateQuerySource::Direct),
-            "All JOIN tables should be Direct"
+                .all(|(_, _, src)| *src == UpdateQuerySource::FromClause),
+            "All JOIN tables should be FromClause"
         );
     }
 
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(result.len(), 2);
 
         let users = result.iter().find(|(t, _, _)| t == "users").unwrap();
-        assert_eq!(users.2, UpdateQuerySource::Direct);
+        assert_eq!(users.2, UpdateQuerySource::FromClause);
 
         let active = result.iter().find(|(t, _, _)| t == "active_users").unwrap();
         assert_eq!(
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
-        assert_eq!(products.2, UpdateQuerySource::Direct);
+        assert_eq!(products.2, UpdateQuerySource::FromClause);
 
         let stores = result.iter().find(|(t, _, _)| t == "stores").unwrap();
         assert_eq!(
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
-        assert_eq!(products.2, UpdateQuerySource::Direct);
+        assert_eq!(products.2, UpdateQuerySource::FromClause);
 
         let stores = result.iter().find(|(t, _, _)| t == "stores").unwrap();
         assert_eq!(
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         let products = result.iter().find(|(t, _, _)| t == "products").unwrap();
-        assert_eq!(products.2, UpdateQuerySource::Direct);
+        assert_eq!(products.2, UpdateQuerySource::FromClause);
 
         let blacklist = result.iter().find(|(t, _, _)| t == "blacklist").unwrap();
         assert_eq!(
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(result.len(), 2);
 
         let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::Direct, "preserved side is Direct");
+        assert_eq!(a.2, UpdateQuerySource::FromClause, "preserved side is FromClause");
 
         let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
         assert_eq!(
@@ -634,8 +634,8 @@ mod tests {
         let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
         assert_eq!(
             a.2,
-            UpdateQuerySource::Direct,
-            "preserved side should be Direct"
+            UpdateQuerySource::FromClause,
+            "preserved side should be FromClause"
         );
 
         let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::Direct);
+        assert_eq!(a.2, UpdateQuerySource::FromClause);
 
         // b is non-terminal: its columns appear in the outer LEFT JOIN's condition
         let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
@@ -683,10 +683,10 @@ mod tests {
         assert_eq!(result.len(), 3);
 
         let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::Direct, "a is INNER JOIN");
+        assert_eq!(a.2, UpdateQuerySource::FromClause, "a is INNER JOIN");
 
         let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
-        assert_eq!(b.2, UpdateQuerySource::Direct, "b is INNER JOIN");
+        assert_eq!(b.2, UpdateQuerySource::FromClause, "b is INNER JOIN");
 
         let c = result.iter().find(|(t, _, _)| t == "c").unwrap();
         assert_eq!(
@@ -713,9 +713,9 @@ mod tests {
         );
 
         let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::Direct);
+        assert_eq!(a.2, UpdateQuerySource::FromClause);
 
         let c = result.iter().find(|(t, _, _)| t == "c").unwrap();
-        assert_eq!(c.2, UpdateQuerySource::Direct, "c is not on optional side");
+        assert_eq!(c.2, UpdateQuerySource::FromClause, "c is not on optional side");
     }
 }

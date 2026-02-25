@@ -1150,15 +1150,15 @@ impl QueryExpr {
             .collect()
     }
 
-    /// Extract all SELECT branches with their source context (Direct vs Subquery).
+    /// Extract all SELECT branches with their source context (FromClause vs Subquery).
     ///
-    /// Tracks whether each branch came from the top-level body (Direct) or
+    /// Tracks whether each branch came from the top-level body (FromClause) or
     /// from a subquery context (Subquery with kind). CTE definitions are not
     /// collected directly — their branches are collected when referenced via
     /// CteRef, inheriting the reference site's source context.
     pub fn select_nodes_with_source(&self) -> Vec<(&SelectNode, UpdateQuerySource)> {
         let mut branches = Vec::new();
-        self.select_nodes_collect(&mut branches, UpdateQuerySource::Direct, false);
+        self.select_nodes_collect(&mut branches, UpdateQuerySource::FromClause, false);
         branches
     }
 
@@ -6380,7 +6380,7 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
     }
 
     #[test]
@@ -6389,11 +6389,11 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
-        // Both branches of a UNION are Direct
+        // Both branches of a UNION are FromClause
         assert!(
             branches
                 .iter()
-                .all(|(_, src)| *src == UpdateQuerySource::Direct)
+                .all(|(_, src)| *src == UpdateQuerySource::FromClause)
         );
     }
 
@@ -6403,9 +6403,9 @@ mod tests {
             parse_query("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
         let branches = query.select_nodes_with_source();
 
-        // Outer SELECT (Direct) + IN subquery (Inclusion)
+        // Outer SELECT (FromClause) + IN subquery (Inclusion)
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         assert_eq!(
             branches[1].1,
             UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
@@ -6419,7 +6419,7 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         // NOT IN is parsed as SubLinkType::All (already Exclusion)
         // or as NOT wrapping Any (negated → Exclusion)
         assert_eq!(
@@ -6437,7 +6437,7 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         assert_eq!(
             branches[1].1,
             UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
@@ -6452,7 +6452,7 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         assert_eq!(
             branches[1].1,
             UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
@@ -6466,7 +6466,7 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         assert_eq!(
             branches[1].1,
             UpdateQuerySource::Subquery(SubqueryKind::Scalar),
@@ -6482,7 +6482,7 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         assert_eq!(
             branches[1].1,
             UpdateQuerySource::Subquery(SubqueryKind::Scalar),
@@ -6496,7 +6496,7 @@ mod tests {
         let branches = query.select_nodes_with_source();
 
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         assert_eq!(
             branches[1].1,
             UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
@@ -6511,10 +6511,10 @@ mod tests {
         );
         let branches = query.select_nodes_with_source();
 
-        // Outer SELECT (Direct) + CteRef body (Subquery(Inclusion))
+        // Outer SELECT (FromClause) + CteRef body (Subquery(Inclusion))
         // CTE definitions are NOT collected — only CteRef references are
         assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].1, UpdateQuerySource::Direct);
+        assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
         assert_eq!(
             branches[1].1,
             UpdateQuerySource::Subquery(SubqueryKind::Inclusion),

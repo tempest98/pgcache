@@ -91,8 +91,8 @@ pub enum SubqueryKind {
 /// Whether an update query was derived from a direct table or a subquery table
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UpdateQuerySource {
-    /// Table appears directly in FROM clause (including JOINs)
-    Direct,
+    /// Table appears in the FROM clause (inner join or single table)
+    FromClause,
     /// Table appears inside a subquery, CTE, or derived table
     Subquery(SubqueryKind),
     /// Table is on the terminal optional side of an outer join.

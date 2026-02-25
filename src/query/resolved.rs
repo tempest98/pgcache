@@ -1563,14 +1563,14 @@ impl ResolvedQueryExpr {
         }
     }
 
-    /// Extract all SELECT branches with source tracking (Direct, Subquery, etc.).
+    /// Extract all SELECT branches with source tracking (FromClause, Subquery, etc.).
     ///
     /// Mirrors `QueryExpr::select_nodes_with_source()` but for the resolved AST.
-    /// Top-level branches are Direct; subquery/CTE branches carry their
+    /// Top-level branches are FromClause; subquery/CTE branches carry their
     /// Inclusion/Exclusion/Scalar classification.
     pub fn select_nodes_with_source(&self) -> Vec<(&ResolvedSelectNode, UpdateQuerySource)> {
         let mut branches = Vec::new();
-        self.select_nodes_collect_with_source(&mut branches, UpdateQuerySource::Direct, false);
+        self.select_nodes_collect_with_source(&mut branches, UpdateQuerySource::FromClause, false);
         branches
     }
 
