@@ -39,6 +39,21 @@ struct CorrelationPredicate {
     inner_column: ResolvedColumnNode,
 }
 
+/// Non-empty collection of correlation predicates.
+/// Constructed by `where_clause_correlation_partition` which returns `None`
+/// when no predicates are found, so existence of this type guarantees at
+/// least one predicate.
+struct CorrelationPredicates {
+    first: CorrelationPredicate,
+    rest: Vec<CorrelationPredicate>,
+}
+
+impl CorrelationPredicates {
+    fn iter(&self) -> impl Iterator<Item = &CorrelationPredicate> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
 /// Mutable state threaded through decorrelation to generate unique aliases.
 struct DecorrelateState<'a> {
     /// Counter for derived table aliases: _dc1, _dc2, ...
@@ -124,7 +139,7 @@ fn column_matches_outer_ref(
 fn where_clause_correlation_partition(
     where_clause: &ResolvedWhereExpr,
     outer_refs: &[ResolvedColumnNode],
-) -> Option<(Vec<CorrelationPredicate>, Option<ResolvedWhereExpr>)> {
+) -> Option<(CorrelationPredicates, Option<ResolvedWhereExpr>)> {
     let outer_keys = outer_ref_keys(outer_refs);
     let conjuncts = where_expr_conjuncts_split(where_clause.clone());
 
@@ -183,12 +198,12 @@ fn where_clause_correlation_partition(
         }
     }
 
-    if correlation_predicates.is_empty() {
-        return None;
-    }
+    let mut iter = correlation_predicates.into_iter();
+    let first = iter.next()?;
+    let rest = iter.collect();
 
     let residual_where = where_expr_conjuncts_join(residual);
-    Some((correlation_predicates, residual_where))
+    Some((CorrelationPredicates { first, rest }, residual_where))
 }
 
 /// Check whether a WHERE expression references any column matching the outer_ref keys.
@@ -219,20 +234,29 @@ fn conjunct_references_outer_ref(
 }
 
 /// Build a JOIN ON condition from correlation predicates.
-fn correlation_predicates_to_condition(predicates: &[CorrelationPredicate]) -> ResolvedWhereExpr {
-    let conditions: Vec<ResolvedWhereExpr> = predicates
-        .iter()
-        .map(|p| {
-            ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
-                op: BinaryOp::Equal,
-                lexpr: Box::new(ResolvedWhereExpr::Column(p.inner_column.clone())),
-                rexpr: Box::new(ResolvedWhereExpr::Column(p.outer_column.clone())),
-            })
-        })
-        .collect();
+fn correlation_predicates_to_condition(predicates: &CorrelationPredicates) -> ResolvedWhereExpr {
+    let first = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+        op: BinaryOp::Equal,
+        lexpr: Box::new(ResolvedWhereExpr::Column(
+            predicates.first.inner_column.clone(),
+        )),
+        rexpr: Box::new(ResolvedWhereExpr::Column(
+            predicates.first.outer_column.clone(),
+        )),
+    });
 
-    // Always non-empty since we checked for empty above
-    where_expr_conjuncts_join(conditions).expect("correlation predicates non-empty")
+    predicates.rest.iter().fold(first, |acc, p| {
+        let condition = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: BinaryOp::Equal,
+            lexpr: Box::new(ResolvedWhereExpr::Column(p.inner_column.clone())),
+            rexpr: Box::new(ResolvedWhereExpr::Column(p.outer_column.clone())),
+        });
+        ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: BinaryOp::And,
+            lexpr: Box::new(acc),
+            rexpr: Box::new(condition),
+        })
+    })
 }
 
 /// Extract the inner SELECT node and its FROM sources from a subquery's ResolvedQueryExpr.
@@ -252,7 +276,7 @@ fn inner_query_select(query: &ResolvedQueryExpr) -> Option<&ResolvedSelectNode> 
 fn subquery_exists_decorrelate(
     select: &ResolvedSelectNode,
     inner_query: &ResolvedQueryExpr,
-    predicates: &[CorrelationPredicate],
+    predicates: &CorrelationPredicates,
     residual: Option<ResolvedWhereExpr>,
 ) -> Option<ResolvedSelectNode> {
     let inner_select = inner_query_select(inner_query)?;
@@ -260,10 +284,10 @@ fn subquery_exists_decorrelate(
     let join_condition = correlation_predicates_to_condition(predicates);
 
     // Build the right side of the JOIN from the inner query's FROM sources
-    let right = from_sources_to_table_source(&inner_select.from);
+    let right = from_sources_to_table_source(&inner_select.from)?;
 
     // Build the left side from the outer query's FROM sources
-    let left = from_sources_to_table_source(&select.from);
+    let left = from_sources_to_table_source(&select.from)?;
 
     let join = ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
         join_type: JoinType::Inner,
@@ -294,7 +318,7 @@ fn subquery_exists_decorrelate(
 fn subquery_not_exists_decorrelate(
     select: &ResolvedSelectNode,
     inner_query: &ResolvedQueryExpr,
-    predicates: &[CorrelationPredicate],
+    predicates: &CorrelationPredicates,
     residual: Option<ResolvedWhereExpr>,
 ) -> Option<ResolvedSelectNode> {
     let inner_select = inner_query_select(inner_query)?;
@@ -310,8 +334,8 @@ fn subquery_not_exists_decorrelate(
         None => correlation_condition,
     };
 
-    let right = from_sources_to_table_source(&inner_select.from);
-    let left = from_sources_to_table_source(&select.from);
+    let right = from_sources_to_table_source(&inner_select.from)?;
+    let left = from_sources_to_table_source(&select.from)?;
 
     let join = ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
         join_type: JoinType::Left,
@@ -321,10 +345,7 @@ fn subquery_not_exists_decorrelate(
     }));
 
     // Add IS NULL check on the first inner correlation column.
-    // predicates is guaranteed non-empty by where_clause_correlation_partition.
-    let first_predicate = predicates
-        .first()
-        .expect("correlation predicates non-empty");
+    let first_predicate = &predicates.first;
     let is_null_check = ResolvedWhereExpr::Unary(ResolvedUnaryExpr {
         op: UnaryOp::IsNull,
         expr: Box::new(ResolvedWhereExpr::Column(
@@ -356,13 +377,9 @@ fn subquery_not_exists_decorrelate(
 ///
 /// If there's exactly one source, returns it directly. Multiple sources are
 /// combined into a chain of cross joins (no condition).
-///
-/// # Panics
-/// Panics if `sources` is empty — callers must ensure the inner query has FROM.
-fn from_sources_to_table_source(sources: &[ResolvedTableSource]) -> ResolvedTableSource {
-    let mut iter = sources.iter().cloned();
-    let first = iter.next().expect("inner subquery has FROM sources");
-    iter.fold(first, |acc, next| {
+/// Returns `None` if `sources` is empty.
+fn from_sources_to_table_source(sources: &[ResolvedTableSource]) -> Option<ResolvedTableSource> {
+    sources.iter().cloned().reduce(|acc, next| {
         ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
             join_type: JoinType::Inner,
             left: acc,
@@ -528,11 +545,12 @@ fn column_expr_has_aggregate(expr: &ResolvedColumnExpr, agg_fns: &HashSet<String
 /// - Must have a WHERE clause (needed for correlation extraction)
 /// - Non-aggregate inner query WITH LIMIT is rejected (can't safely strip LIMIT)
 ///
-/// Returns the cleaned query (LIMIT/ORDER BY stripped) and the inner select node.
+/// Returns the cleaned select node (LIMIT/ORDER BY stripped) and the validated
+/// WHERE clause (guaranteed to exist).
 fn scalar_inner_prepare(
     inner_query: &ResolvedQueryExpr,
     agg_fns: &HashSet<String>,
-) -> DecorrelateResult<(ResolvedQueryExpr, ResolvedSelectNode)> {
+) -> DecorrelateResult<(ResolvedSelectNode, ResolvedWhereExpr)> {
     let inner_select = inner_query_select(inner_query).ok_or_else(|| {
         Report::from(DecorrelateError::NonDecorrelatable {
             reason: "scalar subquery is not a simple SELECT".to_owned(),
@@ -555,12 +573,11 @@ fn scalar_inner_prepare(
     };
 
     // Must have WHERE (needed for correlation predicates)
-    if inner_select.where_clause.is_none() {
-        return Err(DecorrelateError::NonDecorrelatable {
+    let inner_where = inner_select.where_clause.clone().ok_or_else(|| {
+        Report::from(DecorrelateError::NonDecorrelatable {
             reason: "scalar subquery has no WHERE clause".to_owned(),
-        }
-        .into());
-    }
+        })
+    })?;
 
     let has_aggregate = column_expr_has_aggregate(scalar_expr, agg_fns);
 
@@ -574,13 +591,8 @@ fn scalar_inner_prepare(
 
     // Strip LIMIT and ORDER BY
     let cleaned_select = inner_select.clone();
-    let cleaned_query = ResolvedQueryExpr {
-        body: ResolvedQueryBody::Select(Box::new(cleaned_select.clone())),
-        order_by: Vec::new(),
-        limit: None,
-    };
 
-    Ok((cleaned_query, cleaned_select))
+    Ok((cleaned_select, inner_where))
 }
 
 /// Build a synthetic `ResolvedColumnNode` for a derived table column.
@@ -622,15 +634,10 @@ fn subquery_scalar_decorrelate(
     outer_refs: &[ResolvedColumnNode],
     state: &mut DecorrelateState<'_>,
 ) -> DecorrelateResult<ScalarDecorrelateResult> {
-    let (_cleaned_query, cleaned_select) =
+    let (cleaned_select, inner_where) =
         scalar_inner_prepare(inner_query, state.aggregate_functions)?;
 
-    let inner_where = cleaned_select
-        .where_clause
-        .as_ref()
-        .expect("scalar_inner_prepare validated WHERE clause exists");
-
-    let (predicates, residual) = where_clause_correlation_partition(inner_where, outer_refs)
+    let (predicates, residual) = where_clause_correlation_partition(&inner_where, outer_refs)
         .ok_or_else(|| {
             Report::from(DecorrelateError::NonDecorrelatable {
                 reason: "unsupported correlation pattern in scalar subquery".to_owned(),
@@ -706,24 +713,31 @@ fn subquery_scalar_decorrelate(
     });
 
     // Build JOIN ON: _dcN.inner_col = outer_col for each correlation predicate
-    let join_conditions: Vec<ResolvedWhereExpr> = predicates
-        .iter()
-        .map(|p| {
-            let derived_col = synthetic_column_node(
-                &derived_alias,
-                p.inner_column.column.clone(),
-                p.inner_column.column_metadata.clone(),
-            );
-            ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
-                op: BinaryOp::Equal,
-                lexpr: Box::new(ResolvedWhereExpr::Column(derived_col)),
-                rexpr: Box::new(ResolvedWhereExpr::Column(p.outer_column.clone())),
-            })
+    let predicate_to_join_eq = |p: &CorrelationPredicate| {
+        let derived_col = synthetic_column_node(
+            &derived_alias,
+            p.inner_column.column.clone(),
+            p.inner_column.column_metadata.clone(),
+        );
+        ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: BinaryOp::Equal,
+            lexpr: Box::new(ResolvedWhereExpr::Column(derived_col)),
+            rexpr: Box::new(ResolvedWhereExpr::Column(p.outer_column.clone())),
         })
-        .collect();
+    };
 
     let join_condition =
-        where_expr_conjuncts_join(join_conditions).expect("correlation predicates non-empty");
+        predicates
+            .rest
+            .iter()
+            .map(predicate_to_join_eq)
+            .fold(predicate_to_join_eq(&predicates.first), |acc, next| {
+                ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+                    op: BinaryOp::And,
+                    lexpr: Box::new(acc),
+                    rexpr: Box::new(next),
+                })
+            });
 
     // Build scalar column ref: _dcN._dsN
     let scalar_column_ref = synthetic_column_node(
@@ -744,14 +758,16 @@ fn left_join_derived(
     from: &[ResolvedTableSource],
     derived_table: ResolvedTableSource,
     join_condition: ResolvedWhereExpr,
-) -> Vec<ResolvedTableSource> {
-    let left = from_sources_to_table_source(from);
-    vec![ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
-        join_type: JoinType::Left,
-        left,
-        right: derived_table,
-        condition: Some(join_condition),
-    }))]
+) -> Option<Vec<ResolvedTableSource>> {
+    let left = from_sources_to_table_source(from)?;
+    Some(vec![ResolvedTableSource::Join(Box::new(
+        ResolvedJoinNode {
+            join_type: JoinType::Left,
+            left,
+            right: derived_table,
+            condition: Some(join_condition),
+        },
+    ))])
 }
 
 /// Recursively walk a WHERE expression, decorrelating scalar subqueries
@@ -772,9 +788,13 @@ fn conjunct_scalar_decorrelate(
             ..
         } if !outer_refs.is_empty() => {
             let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
-            select.from =
-                left_join_derived(&select.from, result.derived_table, result.join_condition);
-            Ok((ResolvedWhereExpr::Column(result.scalar_column_ref), true))
+            match left_join_derived(&select.from, result.derived_table, result.join_condition) {
+                Some(new_from) => {
+                    select.from = new_from;
+                    Ok((ResolvedWhereExpr::Column(result.scalar_column_ref), true))
+                }
+                None => Ok((expr.clone(), false)),
+            }
         }
         ResolvedWhereExpr::Binary(binary) => {
             let (new_left, left_transformed) =
@@ -837,16 +857,23 @@ fn select_columns_decorrelate(
         match &col.expr {
             ResolvedColumnExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
                 let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
-                select.from = left_join_derived(
+                match left_join_derived(
                     &select.from,
                     result.derived_table,
                     result.join_condition,
-                );
-                new_cols.push(ResolvedSelectColumn {
-                    expr: ResolvedColumnExpr::Column(result.scalar_column_ref),
-                    alias: col.alias.clone(),
-                });
-                transformed = true;
+                ) {
+                    Some(new_from) => {
+                        select.from = new_from;
+                        new_cols.push(ResolvedSelectColumn {
+                            expr: ResolvedColumnExpr::Column(result.scalar_column_ref),
+                            alias: col.alias.clone(),
+                        });
+                        transformed = true;
+                    }
+                    None => {
+                        new_cols.push(col.clone());
+                    }
+                }
             }
             other @ (ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
