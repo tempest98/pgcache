@@ -1437,4 +1437,46 @@ mod tests {
             "LIMIT+OFFSET should not affect fingerprint"
         );
     }
+
+    #[test]
+    fn test_locking_clause_uncacheable() {
+        // All locking clause variants should be rejected at the AST level
+        let cases = [
+            "SELECT * FROM orders WHERE id = 1 FOR UPDATE",
+            "SELECT * FROM orders WHERE id = 1 FOR SHARE",
+            "SELECT * FROM orders WHERE id = 1 FOR NO KEY UPDATE",
+            "SELECT * FROM orders WHERE id = 1 FOR KEY SHARE",
+            "SELECT * FROM orders WHERE id = 1 FOR UPDATE NOWAIT",
+            "SELECT * FROM orders WHERE id = 1 FOR UPDATE SKIP LOCKED",
+        ];
+
+        for sql in cases {
+            let ast = pg_query::parse(sql).unwrap();
+            let result = query_expr_convert(&ast);
+            assert!(result.is_err(), "should reject locking clause: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_locking_clause_in_subquery_uncacheable() {
+        let cases = [
+            // FROM subquery
+            "SELECT * FROM (SELECT * FROM orders FOR UPDATE) sub WHERE sub.id = 1",
+            // WHERE EXISTS subquery
+            "SELECT * FROM orders o WHERE EXISTS (SELECT 1 FROM items i WHERE i.order_id = o.id FOR UPDATE)",
+            // WHERE IN subquery
+            "SELECT * FROM orders WHERE id IN (SELECT id FROM orders FOR SHARE)",
+            // Scalar subquery in SELECT list
+            "SELECT (SELECT count(*) FROM items FOR UPDATE) FROM orders WHERE id = 1",
+        ];
+
+        for sql in cases {
+            let ast = pg_query::parse(sql).unwrap();
+            let result = query_expr_convert(&ast);
+            assert!(
+                result.is_err(),
+                "should reject locking clause in subquery: {sql}"
+            );
+        }
+    }
 }

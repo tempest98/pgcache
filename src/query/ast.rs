@@ -2322,6 +2322,14 @@ fn select_stmt_to_query_expr_with_ctx(
     select_stmt: &SelectStmt,
     outer_ctx: &ParseContext,
 ) -> Result<QueryExpr, AstError> {
+    // Locking clauses (FOR UPDATE, FOR SHARE, etc.) acquire row locks and must
+    // not be cached — reject early before doing any further parsing work.
+    if !select_stmt.locking_clause.is_empty() {
+        return Err(AstError::UnsupportedSelectFeature {
+            feature: "locking clause (FOR UPDATE/FOR SHARE)".to_owned(),
+        });
+    }
+
     // Parse WITH clause if present, merging with any outer CTE context
     let ctes = if let Some(with_clause) = &select_stmt.with_clause {
         with_clause_extract(with_clause)?
