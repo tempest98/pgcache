@@ -1,11 +1,13 @@
+use std::fmt::Write;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use postgres_protocol::escape;
 use rootcause::prelude::ResultExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_postgres::{Client, SimpleQueryMessage};
+use tokio_postgres::{Client, SimpleColumn, SimpleQueryMessage, SimpleQueryRow};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
 
@@ -150,6 +152,100 @@ async fn population_task(
     Ok(total_bytes)
 }
 
+/// Pre-computed parts of the batched INSERT...ON CONFLICT statement.
+struct InsertStatement {
+    prefix: String,
+    suffix: String,
+    /// Column positions of primary key fields, for detecting NULL-padded phantom rows.
+    pkey_positions: Vec<usize>,
+    num_columns: usize,
+}
+
+/// Build the INSERT statement template from the row description and table metadata.
+///
+/// Pre-computes column lists, conflict clause, and primary key positions so that
+/// the streaming loop only needs to format value tuples.
+fn insert_statement_build(
+    table: &TableMetadata,
+    row_description: &Arc<[SimpleColumn]>,
+) -> InsertStatement {
+    let columns: Vec<String> = row_description
+        .iter()
+        .map(|c| format!("\"{}\"", c.name()))
+        .collect();
+
+    let pkey_columns: Vec<String> = table
+        .primary_key_columns
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect();
+
+    let update_columns: Vec<String> = columns
+        .iter()
+        .filter(|c| !pkey_columns.contains(c))
+        .map(|c| format!("{c} = EXCLUDED.{c}"))
+        .collect();
+
+    let pkey_positions: Vec<usize> = table
+        .primary_key_columns
+        .iter()
+        .filter_map(|pk| row_description.iter().position(|c| c.name() == pk.as_str()))
+        .collect();
+
+    let columns_joined = columns.join(",");
+    let pkey_joined = pkey_columns.join(",");
+    let update_joined = update_columns.join(", ");
+
+    InsertStatement {
+        prefix: format!(
+            "INSERT INTO \"{}\".\"{}\"({columns_joined}) VALUES ",
+            table.schema, table.name
+        ),
+        suffix: format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}"),
+        pkey_positions,
+        num_columns: row_description.len(),
+    }
+}
+
+/// Convert a streamed row into a SQL value tuple string.
+///
+/// Returns `None` for phantom rows (NULL primary keys from outer joins).
+/// Returns the tuple string and the number of bytes in the row's values.
+fn row_to_tuple(
+    row: &SimpleQueryRow,
+    insert: &InsertStatement,
+    values_buf: &mut Vec<String>,
+    tuple_buf: &mut String,
+) -> Option<(String, usize)> {
+    // Skip NULL-padded phantom rows from outer joins
+    if insert
+        .pkey_positions
+        .iter()
+        .any(|&pos| row.get(pos).is_none())
+    {
+        return None;
+    }
+
+    let mut row_bytes = 0;
+    values_buf.clear();
+    for idx in 0..insert.num_columns {
+        let value = row.get(idx);
+        row_bytes += value.map_or(0, |v| v.len());
+        values_buf.push(
+            value
+                .map(escape::escape_literal)
+                .unwrap_or_else(|| "NULL".to_owned()),
+        );
+    }
+
+    tuple_buf.clear();
+    tuple_buf.push('(');
+    tuple_buf.push_str(&values_buf.join(","));
+    tuple_buf.push(')');
+
+    Some((tuple_buf.clone(), row_bytes))
+}
+
 /// Fetch data from origin and stream it into the cache database in batches.
 ///
 /// Streams rows from origin via SimpleQueryStream, batching INSERT...ON CONFLICT
@@ -169,9 +265,7 @@ async fn population_stream(
     let mut buf = String::with_capacity(1024);
     new_ast.deparse(&mut buf);
 
-    // Append LIMIT to population query when max_limit is set
     if let Some(limit) = max_limit {
-        use std::fmt::Write;
         write!(buf, " LIMIT {limit}").ok();
     }
 
@@ -193,89 +287,31 @@ async fn population_stream(
         None => return Ok(0),
     };
 
-    // Pre-compute column and conflict clause strings
-    let columns: Vec<String> = row_description
-        .iter()
-        .map(|c| format!("\"{}\"", c.name()))
-        .collect();
-
-    let pkey_columns: Vec<String> = table
-        .primary_key_columns
-        .iter()
-        .map(|c| format!("\"{c}\""))
-        .collect();
-
-    let update_columns: Vec<String> = columns
-        .iter()
-        .filter(|c| !pkey_columns.contains(c))
-        .map(|c| format!("{c} = EXCLUDED.{c}"))
-        .collect();
-
-    // Pre-compute primary key column positions for NULL-row detection.
-    // LEFT/RIGHT JOINs produce NULL-padded rows for the optional side when there's
-    // no match. These phantom rows have NULL primary keys and must be skipped.
-    let pkey_positions: Vec<usize> = table
-        .primary_key_columns
-        .iter()
-        .filter_map(|pk| row_description.iter().position(|c| c.name() == pk.as_str()))
-        .collect();
-
-    let columns_joined = columns.join(",");
-    let pkey_joined = pkey_columns.join(",");
-    let update_joined = update_columns.join(", ");
-
-    let schema = &table.schema;
-    let table_name = &table.name;
+    let insert = insert_statement_build(table, &row_description);
 
     let mut cached_bytes: usize = 0;
     let mut value_tuples: Vec<String> = Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
-
-    // Pre-compute the fixed prefix and suffix for the multi-row INSERT statement.
-    // Each batch produces a single: INSERT INTO ... VALUES (...), (...), ... ON CONFLICT ... DO UPDATE SET ...
-    let insert_prefix =
-        format!("INSERT INTO \"{schema}\".\"{table_name}\"({columns_joined}) VALUES ");
-    let insert_suffix = format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}");
-
-    let num_columns = row_description.len();
-    let mut values: Vec<String> = Vec::with_capacity(num_columns);
+    let mut values_buf: Vec<String> = Vec::with_capacity(insert.num_columns);
     let mut tuple_buf = String::new();
 
-    // Consume stream, batching rows into a single multi-row INSERT
     loop {
         match stream.next().await {
             Some(Ok(SimpleQueryMessage::Row(row))) => {
-                // Skip NULL-padded phantom rows from outer joins.
-                // A NULL primary key means this table had no matching row.
-                if pkey_positions.iter().any(|&pos| row.get(pos).is_none()) {
-                    continue;
-                }
+                if let Some((tuple, bytes)) =
+                    row_to_tuple(&row, &insert, &mut values_buf, &mut tuple_buf)
+                {
+                    cached_bytes += bytes;
+                    value_tuples.push(tuple);
 
-                values.clear();
-                for idx in 0..num_columns {
-                    let value = row.get(idx);
-                    cached_bytes += value.map_or(0, |v| v.len());
-                    values.push(
-                        value
-                            .map(escape::escape_literal)
-                            .unwrap_or_else(|| "NULL".to_owned()),
-                    );
-                }
-
-                tuple_buf.clear();
-                tuple_buf.push('(');
-                tuple_buf.push_str(&values.join(","));
-                tuple_buf.push(')');
-
-                value_tuples.push(tuple_buf.clone());
-
-                if value_tuples.len() >= POPULATION_INSERT_BATCH_SIZE {
-                    population_batch_flush(
-                        db_cache,
-                        &insert_prefix,
-                        &insert_suffix,
-                        &mut value_tuples,
-                    )
-                    .await?;
+                    if value_tuples.len() >= POPULATION_INSERT_BATCH_SIZE {
+                        population_batch_flush(
+                            db_cache,
+                            &insert.prefix,
+                            &insert.suffix,
+                            &mut value_tuples,
+                        )
+                        .await?;
+                    }
                 }
             }
             Some(Ok(SimpleQueryMessage::CommandComplete(_))) => break,
@@ -285,9 +321,9 @@ async fn population_stream(
         }
     }
 
-    // Flush remaining rows
     if !value_tuples.is_empty() {
-        population_batch_flush(db_cache, &insert_prefix, &insert_suffix, &mut value_tuples).await?;
+        population_batch_flush(db_cache, &insert.prefix, &insert.suffix, &mut value_tuples)
+            .await?;
     }
 
     Ok(cached_bytes)
