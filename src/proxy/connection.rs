@@ -432,6 +432,7 @@ impl ConnectionState {
             extended: ExtendedPending::new(),
         }
     }
+
 }
 
 impl ConnectionState {
@@ -1265,6 +1266,23 @@ async fn origin_connect(
     Err(ConnectionError::NoConnection.into())
 }
 
+/// Forward a query to origin when cache dispatch isn't possible.
+///
+/// Sends either the buffered pipeline bytes or the raw message data to origin.
+/// Free function (not a method) to allow disjoint field borrows when `proxy_mode`
+/// has been partially moved by pattern matching.
+fn origin_forward(
+    extended: &mut ExtendedPending,
+    origin_write_buf: &mut VecDeque<BytesMut>,
+    msg: CacheMessage,
+) {
+    if let Some(pipeline) = extended.pipeline_take() {
+        origin_write_buf.push_back(pipeline.buffered_bytes);
+    } else {
+        origin_write_buf.push_back(msg.into_data());
+    }
+}
+
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_connection(
@@ -1344,12 +1362,7 @@ async fn handle_connection(
                 else {
                     debug!("search_path unknown, forwarding to origin");
                     metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
-                    // Pipeline includes Execute+Sync; simple queries use msg data
-                    if let Some(pipeline) = state.extended.pipeline_take() {
-                        state.origin_write_buf.push_back(pipeline.buffered_bytes);
-                    } else {
-                        state.origin_write_buf.push_back(msg.into_data());
-                    }
+                    origin_forward(&mut state.extended, &mut state.origin_write_buf, msg);
                     state.proxy_mode = ProxyMode::Read;
                     continue;
                 };
@@ -1361,11 +1374,7 @@ async fn handle_connection(
                     Ok(s) => s,
                     Err(e) => {
                         error!("Failed to create client socket: {}", e);
-                        if let Some(pipeline) = state.extended.pipeline_take() {
-                            state.origin_write_buf.push_back(pipeline.buffered_bytes);
-                        } else {
-                            state.origin_write_buf.push_back(msg.into_data());
-                        }
+                        origin_forward(&mut state.extended, &mut state.origin_write_buf, msg);
                         state.proxy_mode = ProxyMode::Read;
                         continue;
                     }
