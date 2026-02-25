@@ -116,8 +116,9 @@ async fn test_correlated_exists_basic() -> Result<(), Error> {
 
     wait_cache_load().await;
 
-    // --- CDC DELETE on inner table (orders) → invalidates ---
-    // Remove Charlie's order — he should disappear
+    // --- CDC DELETE on inner table (orders) → in-place removal, cache hit ---
+    // Direct source: row removed from cache table, serve-time EXISTS
+    // re-evaluates. INNER JOIN DELETE can only shrink the result.
     ctx.origin_query("DELETE FROM orders WHERE id = 101", &[])
         .await?;
 
@@ -127,7 +128,7 @@ async fn test_correlated_exists_basic() -> Result<(), Error> {
     assert_eq!(res.len(), 4); // Alice, Bob
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;
-    let _m = assert_cache_miss(&mut ctx, m).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }

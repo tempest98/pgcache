@@ -456,6 +456,14 @@ impl CacheWriter {
                     return true;
                 }
 
+                // DELETE on Direct source: the row is already removed from the cache
+                // table. For INNER JOIN (the only join type that gets Direct source),
+                // removing a row can only shrink the result set, never expand it.
+                // Serve-time re-evaluation handles correctness.
+                if operation == CdcOperation::Delete {
+                    return false;
+                }
+
                 // Single-table queries don't need invalidation for uncached rows
                 if update_query.resolved.is_single_table() {
                     return false;
