@@ -157,6 +157,22 @@ impl PgSettingsPartial {
     }
 }
 
+/// Resolve replication settings from the three-tier cascade:
+/// 1. Origin defaults (base)
+/// 2. TOML `[replication]` partial (if present)
+/// 3. CLI `--replication_*` overrides (if present)
+pub fn replication_settings_resolve(
+    origin: &PgSettings,
+    toml_replication: Option<PgSettingsPartial>,
+    cli_overrides: PgSettingsPartial,
+) -> PgSettings {
+    let base = match toml_replication {
+        Some(partial) => partial.merge_with(origin),
+        None => origin.clone(),
+    };
+    cli_overrides.merge_with(&base)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CdcSettings {
     pub publication_name: String,
@@ -225,486 +241,280 @@ pub struct Settings {
     pub admission_threshold: u32,
 }
 
-impl Settings {
-    pub fn from_args() -> ConfigResult<Settings> {
-        let mut origin_host: Option<String> = None;
-        let mut origin_port: Option<u16> = None;
-        let mut origin_user: Option<String> = None;
-        let mut origin_database: Option<String> = None;
-        let mut origin_ssl_mode: Option<SslMode> = None;
-        let mut origin_password: Option<String> = None;
-        let mut cache_host: Option<String> = None;
-        let mut cache_port: Option<u16> = None;
-        let mut cache_user: Option<String> = None;
-        let mut cache_database: Option<String> = None;
-        let mut cdc_publication_name: Option<String> = None;
-        let mut cdc_slot_name: Option<String> = None;
-        let mut listen_socket: Option<SocketAddr> = None;
-        let mut num_workers: Option<usize> = None;
-        let mut cache_size: Option<usize> = None;
-        let mut tls_cert: Option<PathBuf> = None;
-        let mut tls_key: Option<PathBuf> = None;
-        let mut metrics_socket: Option<SocketAddr> = None;
-        let mut log_level: Option<String> = None;
-        let mut replication_host: Option<String> = None;
-        let mut replication_port: Option<u16> = None;
-        let mut replication_user: Option<String> = None;
-        let mut replication_database: Option<String> = None;
-        let mut replication_ssl_mode: Option<SslMode> = None;
-        let mut replication_password: Option<String> = None;
-        let mut cache_policy: Option<CachePolicy> = None;
-        let mut admission_threshold: Option<u32> = None;
+/// Parse the next CLI argument as a string.
+fn arg_string(parser: &mut lexopt::Parser) -> ConfigResult<String> {
+    parser
+        .value()
+        .map_into_report::<ConfigError>()?
+        .string()
+        .map_into_report::<ConfigError>()
+}
 
-        let mut config_settings: Option<SettingsToml> = None;
-        let mut parser = lexopt::Parser::from_env();
-        while let Some(arg) = parser.next().map_into_report::<ConfigError>()? {
-            match arg {
-                Short('c') | Long("config") => {
-                    let path = parser
-                        .value()
-                        .map_into_report::<ConfigError>()?
-                        .string()
-                        .map_into_report::<ConfigError>()?;
-                    let file = read_to_string(path).map_into_report::<ConfigError>()?;
-                    config_settings = Some(toml::from_str(&file).map_into_report::<ConfigError>()?);
-                }
-                Long("origin_host") => {
-                    origin_host = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("origin_port") => {
-                    origin_port = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("origin_user") => {
-                    origin_user = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("origin_database") => {
-                    origin_database = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("origin_ssl_mode") => {
-                    let mode_str = parser
-                        .value()
-                        .map_into_report::<ConfigError>()?
-                        .string()
-                        .map_into_report::<ConfigError>()?;
-                    origin_ssl_mode = Some(mode_str.parse().map_err(|e: ParseSslModeError| {
-                        Report::from(ConfigError::ArgumentError(e.to_string().into()))
-                    })?);
-                }
-                Long("origin_password") => {
-                    origin_password = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("replication_host") => {
-                    replication_host = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("replication_port") => {
-                    replication_port = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("replication_user") => {
-                    replication_user = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("replication_database") => {
-                    replication_database = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("replication_ssl_mode") => {
-                    let mode_str = parser
-                        .value()
-                        .map_into_report::<ConfigError>()?
-                        .string()
-                        .map_into_report::<ConfigError>()?;
-                    replication_ssl_mode =
-                        Some(mode_str.parse().map_err(|e: ParseSslModeError| {
-                            Report::from(ConfigError::ArgumentError(e.to_string().into()))
-                        })?);
-                }
-                Long("replication_password") => {
-                    replication_password = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cache_host") => {
-                    cache_host = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cache_port") => {
-                    cache_port = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cache_user") => {
-                    cache_user = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cache_database") => {
-                    cache_database = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cdc_publication_name") => {
-                    cdc_publication_name = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cdc_slot_name") => {
-                    cdc_slot_name = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("listen_socket") => {
-                    listen_socket = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("num_workers") => {
-                    num_workers = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cache_size") => {
-                    cache_size = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("tls_cert") => {
-                    tls_cert = Some(PathBuf::from(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    ))
-                }
-                Long("tls_key") => {
-                    tls_key = Some(PathBuf::from(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    ))
-                }
-                Long("metrics_socket") => {
-                    metrics_socket = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("log_level") => {
-                    log_level = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .string()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("cache_policy") => {
-                    let policy_str = parser
-                        .value()
-                        .map_into_report::<ConfigError>()?
-                        .string()
-                        .map_into_report::<ConfigError>()?;
-                    cache_policy =
-                        Some(policy_str.parse().map_err(|e: ParseCachePolicyError| {
-                            Report::from(ConfigError::ArgumentError(e.to_string().into()))
-                        })?);
-                }
-                Long("admission_threshold") => {
-                    admission_threshold = Some(
-                        parser
-                            .value()
-                            .map_into_report::<ConfigError>()?
-                            .parse()
-                            .map_into_report::<ConfigError>()?,
-                    )
-                }
-                Long("help") => {
-                    Self::print_usage_and_exit(parser.bin_name().unwrap_or_default());
-                }
-                Short(_) | Long(_) | Value(_) => {
-                    return Err(ConfigError::ArgumentError(Box::new(arg.unexpected())).into());
-                }
+/// Parse the next CLI argument via `FromStr`.
+fn arg_parse<T: FromStr>(parser: &mut lexopt::Parser) -> ConfigResult<T>
+where
+    T::Err: Error + Send + Sync + 'static,
+{
+    parser
+        .value()
+        .map_into_report::<ConfigError>()?
+        .parse()
+        .map_into_report::<ConfigError>()
+}
+
+/// Parse the next CLI argument as a custom enum type, mapping parse errors to `ArgumentError`.
+fn arg_enum<T: FromStr>(parser: &mut lexopt::Parser) -> ConfigResult<T>
+where
+    T::Err: fmt::Display,
+{
+    let s = arg_string(parser)?;
+    s.parse().map_err(|e: T::Err| {
+        Report::from(ConfigError::ArgumentError(e.to_string().into()))
+    })
+}
+
+/// Require an `Option<T>` to be `Some`, or return `ArgumentMissing`.
+fn require<T>(value: Option<T>, name: &'static str) -> ConfigResult<T> {
+    value.ok_or_else(|| Report::from(ConfigError::ArgumentMissing { name }))
+}
+
+/// Raw CLI argument values before merging with config file.
+#[derive(Default)]
+struct CliArgs {
+    origin_host: Option<String>,
+    origin_port: Option<u16>,
+    origin_user: Option<String>,
+    origin_database: Option<String>,
+    origin_ssl_mode: Option<SslMode>,
+    origin_password: Option<String>,
+    replication_host: Option<String>,
+    replication_port: Option<u16>,
+    replication_user: Option<String>,
+    replication_database: Option<String>,
+    replication_ssl_mode: Option<SslMode>,
+    replication_password: Option<String>,
+    cache_host: Option<String>,
+    cache_port: Option<u16>,
+    cache_user: Option<String>,
+    cache_database: Option<String>,
+    cdc_publication_name: Option<String>,
+    cdc_slot_name: Option<String>,
+    listen_socket: Option<SocketAddr>,
+    num_workers: Option<usize>,
+    cache_size: Option<usize>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    metrics_socket: Option<SocketAddr>,
+    log_level: Option<String>,
+    cache_policy: Option<CachePolicy>,
+    admission_threshold: Option<u32>,
+}
+
+fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
+    let mut args = CliArgs::default();
+    let mut config = None;
+    let mut parser = lexopt::Parser::from_env();
+
+    while let Some(arg) = parser.next().map_into_report::<ConfigError>()? {
+        match arg {
+            Short('c') | Long("config") => {
+                let path = arg_string(&mut parser)?;
+                let file = read_to_string(path).map_into_report::<ConfigError>()?;
+                config = Some(toml::from_str(&file).map_into_report::<ConfigError>()?);
+            }
+            Long("origin_host") => args.origin_host = Some(arg_string(&mut parser)?),
+            Long("origin_port") => args.origin_port = Some(arg_parse(&mut parser)?),
+            Long("origin_user") => args.origin_user = Some(arg_string(&mut parser)?),
+            Long("origin_database") => args.origin_database = Some(arg_string(&mut parser)?),
+            Long("origin_ssl_mode") => args.origin_ssl_mode = Some(arg_enum(&mut parser)?),
+            Long("origin_password") => args.origin_password = Some(arg_string(&mut parser)?),
+            Long("replication_host") => args.replication_host = Some(arg_string(&mut parser)?),
+            Long("replication_port") => args.replication_port = Some(arg_parse(&mut parser)?),
+            Long("replication_user") => args.replication_user = Some(arg_string(&mut parser)?),
+            Long("replication_database") => {
+                args.replication_database = Some(arg_string(&mut parser)?)
+            }
+            Long("replication_ssl_mode") => {
+                args.replication_ssl_mode = Some(arg_enum(&mut parser)?)
+            }
+            Long("replication_password") => {
+                args.replication_password = Some(arg_string(&mut parser)?)
+            }
+            Long("cache_host") => args.cache_host = Some(arg_string(&mut parser)?),
+            Long("cache_port") => args.cache_port = Some(arg_parse(&mut parser)?),
+            Long("cache_user") => args.cache_user = Some(arg_string(&mut parser)?),
+            Long("cache_database") => args.cache_database = Some(arg_string(&mut parser)?),
+            Long("cdc_publication_name") => {
+                args.cdc_publication_name = Some(arg_string(&mut parser)?)
+            }
+            Long("cdc_slot_name") => args.cdc_slot_name = Some(arg_string(&mut parser)?),
+            Long("listen_socket") => args.listen_socket = Some(arg_parse(&mut parser)?),
+            Long("num_workers") => args.num_workers = Some(arg_parse(&mut parser)?),
+            Long("cache_size") => args.cache_size = Some(arg_parse(&mut parser)?),
+            Long("tls_cert") => args.tls_cert = Some(PathBuf::from(arg_string(&mut parser)?)),
+            Long("tls_key") => args.tls_key = Some(PathBuf::from(arg_string(&mut parser)?)),
+            Long("metrics_socket") => args.metrics_socket = Some(arg_parse(&mut parser)?),
+            Long("log_level") => args.log_level = Some(arg_string(&mut parser)?),
+            Long("cache_policy") => args.cache_policy = Some(arg_enum(&mut parser)?),
+            Long("admission_threshold") => {
+                args.admission_threshold = Some(arg_parse(&mut parser)?)
+            }
+            Long("help") => {
+                Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
+            }
+            Short(_) | Long(_) | Value(_) => {
+                return Err(ConfigError::ArgumentError(Box::new(arg.unexpected())).into());
             }
         }
+    }
 
-        let mut settings = if let Some(mut config) = config_settings {
-            //command line arguments can override values loaded from a config file
-            config.origin.host = origin_host.unwrap_or(config.origin.host);
-            config.origin.port = origin_port.unwrap_or(config.origin.port);
-            config.origin.user = origin_user.unwrap_or(config.origin.user);
-            config.origin.database = origin_database.unwrap_or(config.origin.database);
-            config.origin.ssl_mode = origin_ssl_mode.unwrap_or(config.origin.ssl_mode);
-            config.origin.password = origin_password.or(config.origin.password);
+    Ok((args, config))
+}
 
-            // Compute replication: TOML partial -> merge with origin -> CLI overrides
-            let mut replication = match config.replication {
-                Some(partial) => partial.merge_with(&config.origin),
-                None => config.origin.clone(),
-            };
-            // Apply CLI overrides on top
-            if let Some(host) = replication_host {
-                replication.host = host;
-            }
-            if let Some(port) = replication_port {
-                replication.port = port;
-            }
-            if let Some(user) = replication_user {
-                replication.user = user;
-            }
-            if let Some(database) = replication_database {
-                replication.database = database;
-            }
-            if let Some(ssl_mode) = replication_ssl_mode {
-                replication.ssl_mode = ssl_mode;
-            }
-            if replication_password.is_some() {
-                replication.password = replication_password;
-            }
+fn settings_build(args: CliArgs, config: Option<SettingsToml>) -> ConfigResult<Settings> {
+    let mut settings = if let Some(mut config) = config {
+        settings_build_with_config(args, &mut config)?
+    } else {
+        settings_build_cli_only(args)?
+    };
 
-            config.cache.host = cache_host.unwrap_or(config.cache.host);
-            config.cache.port = cache_port.unwrap_or(config.cache.port);
-            config.cache.user = cache_user.unwrap_or(config.cache.user);
-            config.cache.database = cache_database.unwrap_or(config.cache.database);
+    // Lowercase CDC names to avoid quoting in postgres
+    settings.cdc.publication_name = settings.cdc.publication_name.to_ascii_lowercase();
+    settings.cdc.slot_name = settings.cdc.slot_name.to_ascii_lowercase();
 
-            let cdc_publication_name = cdc_publication_name.unwrap_or(config.cdc.publication_name);
-            let cdc_slot_name = cdc_slot_name.unwrap_or(config.cdc.slot_name);
-            let listen_socket = listen_socket.unwrap_or(config.listen.socket);
-            let num_workers = num_workers.unwrap_or(config.num_workers);
-            let cache_size = cache_size.or(config.cache_size);
-            let tls_cert = tls_cert.or(config.tls_cert);
-            let tls_key = tls_key.or(config.tls_key);
-            let metrics = metrics_socket
-                .map(|socket| MetricsSettings { socket })
-                .or(config.metrics);
-            let log_level = log_level.or(config.log_level);
-            let cache_policy = cache_policy.or(config.cache_policy).unwrap_or_default();
-            let admission_threshold = admission_threshold
-                .or(config.admission_threshold)
-                .unwrap_or(2);
+    Ok(settings)
+}
 
-            Settings {
-                origin: config.origin,
-                replication,
-                cache: config.cache,
-                cdc: CdcSettings {
-                    publication_name: cdc_publication_name,
-                    slot_name: cdc_slot_name,
-                },
-                listen: ListenSettings {
-                    socket: listen_socket,
-                },
-                num_workers,
-                cache_size,
-                tls_cert,
-                tls_key,
-                metrics,
-                log_level,
-                cache_policy,
-                admission_threshold,
-            }
-        } else {
-            let origin = PgSettings {
-                host: origin_host.ok_or_else(|| {
-                    Report::from(ConfigError::ArgumentMissing {
-                        name: "origin_host",
-                    })
-                })?,
-                port: origin_port.ok_or_else(|| {
-                    Report::from(ConfigError::ArgumentMissing {
-                        name: "origin_port",
-                    })
-                })?,
-                user: origin_user.ok_or_else(|| {
-                    Report::from(ConfigError::ArgumentMissing {
-                        name: "origin_user",
-                    })
-                })?,
-                password: origin_password,
-                database: origin_database.ok_or_else(|| {
-                    Report::from(ConfigError::ArgumentMissing {
-                        name: "origin_database",
-                    })
-                })?,
-                ssl_mode: origin_ssl_mode.unwrap_or_default(),
-            };
-            // CLI-only mode: replication defaults to origin, with CLI overrides
-            let mut replication = origin.clone();
-            if let Some(host) = replication_host {
-                replication.host = host;
-            }
-            if let Some(port) = replication_port {
-                replication.port = port;
-            }
-            if let Some(user) = replication_user {
-                replication.user = user;
-            }
-            if let Some(database) = replication_database {
-                replication.database = database;
-            }
-            if let Some(ssl_mode) = replication_ssl_mode {
-                replication.ssl_mode = ssl_mode;
-            }
-            if replication_password.is_some() {
-                replication.password = replication_password;
-            }
-            Settings {
-                origin,
-                replication,
-                cache: PgSettings {
-                    host: cache_host.ok_or_else(|| {
-                        Report::from(ConfigError::ArgumentMissing { name: "cache_host" })
-                    })?,
-                    port: cache_port.ok_or_else(|| {
-                        Report::from(ConfigError::ArgumentMissing { name: "cache_port" })
-                    })?,
-                    user: cache_user.ok_or_else(|| {
-                        Report::from(ConfigError::ArgumentMissing { name: "cache_user" })
-                    })?,
-                    password: None, // Cache is localhost, uses trust auth
-                    database: cache_database.ok_or_else(|| {
-                        Report::from(ConfigError::ArgumentMissing {
-                            name: "cache_database",
-                        })
-                    })?,
-                    ssl_mode: SslMode::Disable, // Cache is always localhost, no TLS needed
-                },
-                cdc: CdcSettings {
-                    publication_name: cdc_publication_name.ok_or_else(|| {
-                        Report::from(ConfigError::ArgumentMissing {
-                            name: "cdc_publication_name",
-                        })
-                    })?,
-                    slot_name: cdc_slot_name.ok_or_else(|| {
-                        Report::from(ConfigError::ArgumentMissing {
-                            name: "cdc_slot_name",
-                        })
-                    })?,
-                },
-                listen: ListenSettings {
-                    socket: listen_socket.ok_or_else(|| {
-                        Report::from(ConfigError::ArgumentMissing {
-                            name: "listen_socket",
-                        })
-                    })?,
-                },
-                num_workers: num_workers.ok_or_else(|| {
-                    Report::from(ConfigError::ArgumentMissing {
-                        name: "num_workers",
-                    })
-                })?,
-                cache_size,
-                tls_cert,
-                tls_key,
-                metrics: metrics_socket.map(|socket| MetricsSettings { socket }),
-                log_level,
-                cache_policy: cache_policy.unwrap_or_default(),
-                admission_threshold: admission_threshold.unwrap_or(2),
-            }
-        };
+/// Build settings by merging CLI args over a TOML config file.
+fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> ConfigResult<Settings> {
+    let origin_overrides = PgSettingsPartial {
+        host: args.origin_host,
+        port: args.origin_port,
+        user: args.origin_user,
+        password: args.origin_password,
+        database: args.origin_database,
+        ssl_mode: args.origin_ssl_mode,
+    };
+    let origin = origin_overrides.merge_with(&config.origin);
 
-        //make cdc settings lowercase to avoid having to quote them in postgres
-        settings.cdc.publication_name = settings.cdc.publication_name.to_ascii_lowercase();
-        settings.cdc.slot_name = settings.cdc.slot_name.to_ascii_lowercase();
+    let replication = replication_settings_resolve(
+        &origin,
+        config.replication.take(),
+        PgSettingsPartial {
+            host: args.replication_host,
+            port: args.replication_port,
+            user: args.replication_user,
+            password: args.replication_password,
+            database: args.replication_database,
+            ssl_mode: args.replication_ssl_mode,
+        },
+    );
 
-        Ok(settings)
+    let cache_overrides = PgSettingsPartial {
+        host: args.cache_host,
+        port: args.cache_port,
+        user: args.cache_user,
+        password: None,
+        database: args.cache_database,
+        ssl_mode: None,
+    };
+    let cache = cache_overrides.merge_with(&config.cache);
+
+    Ok(Settings {
+        origin,
+        replication,
+        cache,
+        cdc: CdcSettings {
+            publication_name: args
+                .cdc_publication_name
+                .unwrap_or_else(|| config.cdc.publication_name.clone()),
+            slot_name: args
+                .cdc_slot_name
+                .unwrap_or_else(|| config.cdc.slot_name.clone()),
+        },
+        listen: ListenSettings {
+            socket: args.listen_socket.unwrap_or(config.listen.socket),
+        },
+        num_workers: args.num_workers.unwrap_or(config.num_workers),
+        cache_size: args.cache_size.or(config.cache_size),
+        tls_cert: args.tls_cert.or_else(|| config.tls_cert.clone()),
+        tls_key: args.tls_key.or_else(|| config.tls_key.clone()),
+        metrics: args
+            .metrics_socket
+            .map(|socket| MetricsSettings { socket })
+            .or_else(|| config.metrics.clone()),
+        log_level: args.log_level.or_else(|| config.log_level.clone()),
+        cache_policy: args
+            .cache_policy
+            .or(config.cache_policy)
+            .unwrap_or_default(),
+        admission_threshold: args
+            .admission_threshold
+            .or(config.admission_threshold)
+            .unwrap_or(2),
+    })
+}
+
+/// Build settings from CLI args alone (no config file). Required fields must be present.
+fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
+    let origin = PgSettings {
+        host: require(args.origin_host, "origin_host")?,
+        port: require(args.origin_port, "origin_port")?,
+        user: require(args.origin_user, "origin_user")?,
+        password: args.origin_password,
+        database: require(args.origin_database, "origin_database")?,
+        ssl_mode: args.origin_ssl_mode.unwrap_or_default(),
+    };
+
+    // CLI-only mode: replication defaults to origin, with CLI overrides
+    let replication = replication_settings_resolve(
+        &origin,
+        None,
+        PgSettingsPartial {
+            host: args.replication_host,
+            port: args.replication_port,
+            user: args.replication_user,
+            password: args.replication_password,
+            database: args.replication_database,
+            ssl_mode: args.replication_ssl_mode,
+        },
+    );
+
+    Ok(Settings {
+        origin,
+        replication,
+        cache: PgSettings {
+            host: require(args.cache_host, "cache_host")?,
+            port: require(args.cache_port, "cache_port")?,
+            user: require(args.cache_user, "cache_user")?,
+            password: None, // Cache is localhost, uses trust auth
+            database: require(args.cache_database, "cache_database")?,
+            ssl_mode: SslMode::Disable, // Cache is always localhost, no TLS needed
+        },
+        cdc: CdcSettings {
+            publication_name: require(args.cdc_publication_name, "cdc_publication_name")?,
+            slot_name: require(args.cdc_slot_name, "cdc_slot_name")?,
+        },
+        listen: ListenSettings {
+            socket: require(args.listen_socket, "listen_socket")?,
+        },
+        num_workers: require(args.num_workers, "num_workers")?,
+        cache_size: args.cache_size,
+        tls_cert: args.tls_cert,
+        tls_key: args.tls_key,
+        metrics: args
+            .metrics_socket
+            .map(|socket| MetricsSettings { socket }),
+        log_level: args.log_level,
+        cache_policy: args.cache_policy.unwrap_or_default(),
+        admission_threshold: args.admission_threshold.unwrap_or(2),
+    })
+}
+
+impl Settings {
+    pub fn from_args() -> ConfigResult<Settings> {
+        let (args, config) = cli_args_parse()?;
+        settings_build(args, config)
     }
 
     fn print_usage_and_exit(name: &str) -> ! {
@@ -1044,5 +854,442 @@ socket = "127.0.0.1:5434"
         assert_eq!(replication.password, None);
         assert_eq!(replication.database, "mydb");
         assert_eq!(replication.ssl_mode, SslMode::Disable);
+    }
+
+    // ==================== replication_settings_resolve Tests ====================
+
+    #[test]
+    fn replication_resolve_no_toml_no_cli_defaults_to_origin() {
+        let origin = base_settings();
+
+        let result = replication_settings_resolve(&origin, None, PgSettingsPartial::default());
+
+        assert_eq!(result.host, origin.host);
+        assert_eq!(result.port, origin.port);
+        assert_eq!(result.user, origin.user);
+        assert_eq!(result.password, origin.password);
+        assert_eq!(result.database, origin.database);
+        assert_eq!(result.ssl_mode, origin.ssl_mode);
+    }
+
+    #[test]
+    fn replication_resolve_toml_partial_merges_with_origin() {
+        let origin = base_settings();
+        let toml_partial = PgSettingsPartial {
+            host: Some("replica.example.com".to_owned()),
+            port: Some(5433),
+            ..Default::default()
+        };
+
+        let result =
+            replication_settings_resolve(&origin, Some(toml_partial), PgSettingsPartial::default());
+
+        assert_eq!(result.host, "replica.example.com");
+        assert_eq!(result.port, 5433);
+        assert_eq!(result.user, "base_user");
+        assert_eq!(result.password, Some("base_password".to_owned()));
+        assert_eq!(result.database, "base_db");
+        assert_eq!(result.ssl_mode, SslMode::Disable);
+    }
+
+    #[test]
+    fn replication_resolve_cli_overrides_origin_when_no_toml() {
+        let origin = base_settings();
+        let cli = PgSettingsPartial {
+            host: Some("cli-host.example.com".to_owned()),
+            ..Default::default()
+        };
+
+        let result = replication_settings_resolve(&origin, None, cli);
+
+        assert_eq!(result.host, "cli-host.example.com");
+        assert_eq!(result.port, origin.port);
+        assert_eq!(result.user, origin.user);
+        assert_eq!(result.password, origin.password);
+        assert_eq!(result.database, origin.database);
+    }
+
+    #[test]
+    fn replication_resolve_cli_overrides_toml_partial() {
+        let origin = base_settings();
+        let toml_partial = PgSettingsPartial {
+            host: Some("toml-replica.example.com".to_owned()),
+            port: Some(5433),
+            ..Default::default()
+        };
+        let cli = PgSettingsPartial {
+            host: Some("cli-replica.example.com".to_owned()),
+            ..Default::default()
+        };
+
+        let result = replication_settings_resolve(&origin, Some(toml_partial), cli);
+
+        // CLI host wins over TOML host
+        assert_eq!(result.host, "cli-replica.example.com");
+        // TOML port wins over origin port (CLI didn't specify)
+        assert_eq!(result.port, 5433);
+        // Remaining fields from origin
+        assert_eq!(result.user, "base_user");
+        assert_eq!(result.password, Some("base_password".to_owned()));
+        assert_eq!(result.database, "base_db");
+    }
+
+    #[test]
+    fn replication_resolve_cli_overrides_all_fields() {
+        let origin = base_settings();
+        let toml_partial = PgSettingsPartial {
+            host: Some("toml-replica.example.com".to_owned()),
+            user: Some("toml_user".to_owned()),
+            ..Default::default()
+        };
+        let cli = PgSettingsPartial {
+            host: Some("cli-host.example.com".to_owned()),
+            port: Some(6432),
+            user: Some("cli_user".to_owned()),
+            password: Some("cli_password".to_owned()),
+            database: Some("cli_db".to_owned()),
+            ssl_mode: Some(SslMode::Require),
+        };
+
+        let result = replication_settings_resolve(&origin, Some(toml_partial), cli);
+
+        assert_eq!(result.host, "cli-host.example.com");
+        assert_eq!(result.port, 6432);
+        assert_eq!(result.user, "cli_user");
+        assert_eq!(result.password, Some("cli_password".to_owned()));
+        assert_eq!(result.database, "cli_db");
+        assert_eq!(result.ssl_mode, SslMode::Require);
+    }
+
+    #[test]
+    fn replication_resolve_cli_password_overrides_toml_password() {
+        let origin = base_settings();
+        let toml_partial = PgSettingsPartial {
+            password: Some("toml_password".to_owned()),
+            ..Default::default()
+        };
+        let cli = PgSettingsPartial {
+            password: Some("cli_password".to_owned()),
+            ..Default::default()
+        };
+
+        let result = replication_settings_resolve(&origin, Some(toml_partial), cli);
+
+        assert_eq!(result.password, Some("cli_password".to_owned()));
+    }
+
+    #[test]
+    fn replication_resolve_cli_password_not_set_preserves_toml_password() {
+        let origin = base_settings();
+        let toml_partial = PgSettingsPartial {
+            password: Some("toml_password".to_owned()),
+            ..Default::default()
+        };
+
+        let result =
+            replication_settings_resolve(&origin, Some(toml_partial), PgSettingsPartial::default());
+
+        assert_eq!(result.password, Some("toml_password".to_owned()));
+    }
+
+    #[test]
+    fn replication_resolve_full_toml_with_no_cli_uses_toml() {
+        let origin = base_settings();
+        let toml_partial = PgSettingsPartial {
+            host: Some("replica.example.com".to_owned()),
+            port: Some(5433),
+            user: Some("repl_user".to_owned()),
+            password: Some("repl_pass".to_owned()),
+            database: Some("repl_db".to_owned()),
+            ssl_mode: Some(SslMode::Require),
+        };
+
+        let result =
+            replication_settings_resolve(&origin, Some(toml_partial), PgSettingsPartial::default());
+
+        assert_eq!(result.host, "replica.example.com");
+        assert_eq!(result.port, 5433);
+        assert_eq!(result.user, "repl_user");
+        assert_eq!(result.password, Some("repl_pass".to_owned()));
+        assert_eq!(result.database, "repl_db");
+        assert_eq!(result.ssl_mode, SslMode::Require);
+    }
+
+    #[test]
+    fn replication_resolve_cli_port_only_with_toml_host() {
+        let origin = base_settings();
+        let toml_partial = PgSettingsPartial {
+            host: Some("toml-host.example.com".to_owned()),
+            ..Default::default()
+        };
+        let cli = PgSettingsPartial {
+            port: Some(6432),
+            ..Default::default()
+        };
+
+        let result = replication_settings_resolve(&origin, Some(toml_partial), cli);
+
+        // TOML host preserved
+        assert_eq!(result.host, "toml-host.example.com");
+        // CLI port applied
+        assert_eq!(result.port, 6432);
+        // Origin fills the rest
+        assert_eq!(result.user, "base_user");
+        assert_eq!(result.database, "base_db");
+    }
+
+    // ==================== settings_build Tests ====================
+
+    fn base_toml_config() -> SettingsToml {
+        SettingsToml {
+            origin: PgSettings {
+                host: "origin.example.com".to_owned(),
+                port: 5432,
+                user: "origin_user".to_owned(),
+                password: Some("origin_pass".to_owned()),
+                database: "origin_db".to_owned(),
+                ssl_mode: SslMode::Disable,
+            },
+            replication: None,
+            cache: PgSettings {
+                host: "localhost".to_owned(),
+                port: 5433,
+                user: "cache_user".to_owned(),
+                password: None,
+                database: "cache_db".to_owned(),
+                ssl_mode: SslMode::Disable,
+            },
+            cdc: CdcSettings {
+                publication_name: "pub".to_owned(),
+                slot_name: "slot".to_owned(),
+            },
+            listen: ListenSettings {
+                socket: "127.0.0.1:6432".parse().expect("valid socket addr"),
+            },
+            num_workers: 4,
+            cache_size: None,
+            tls_cert: None,
+            tls_key: None,
+            metrics: None,
+            log_level: None,
+            cache_policy: None,
+            admission_threshold: None,
+        }
+    }
+
+    #[test]
+    fn settings_build_no_replication_defaults_to_origin() {
+        let config = base_toml_config();
+        let args = CliArgs::default();
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        assert_eq!(settings.replication.host, "origin.example.com");
+        assert_eq!(settings.replication.port, 5432);
+        assert_eq!(settings.replication.user, "origin_user");
+        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(settings.replication.database, "origin_db");
+    }
+
+    #[test]
+    fn settings_build_toml_replication_partial_merges_with_origin() {
+        let mut config = base_toml_config();
+        config.replication = Some(PgSettingsPartial {
+            host: Some("replica.example.com".to_owned()),
+            ..Default::default()
+        });
+        let args = CliArgs::default();
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        assert_eq!(settings.replication.host, "replica.example.com");
+        assert_eq!(settings.replication.port, 5432);
+        assert_eq!(settings.replication.user, "origin_user");
+        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+    }
+
+    #[test]
+    fn settings_build_cli_replication_overrides_no_toml_section() {
+        let config = base_toml_config();
+        let args = CliArgs {
+            replication_host: Some("cli-replica.example.com".to_owned()),
+            replication_port: Some(6432),
+            ..Default::default()
+        };
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        assert_eq!(settings.replication.host, "cli-replica.example.com");
+        assert_eq!(settings.replication.port, 6432);
+        // Remaining fields cascade from origin
+        assert_eq!(settings.replication.user, "origin_user");
+        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(settings.replication.database, "origin_db");
+    }
+
+    #[test]
+    fn settings_build_cli_replication_overrides_toml_replication() {
+        let mut config = base_toml_config();
+        config.replication = Some(PgSettingsPartial {
+            host: Some("toml-replica.example.com".to_owned()),
+            port: Some(5433),
+            ..Default::default()
+        });
+        let args = CliArgs {
+            replication_host: Some("cli-replica.example.com".to_owned()),
+            ..Default::default()
+        };
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        // CLI host wins over TOML host
+        assert_eq!(settings.replication.host, "cli-replica.example.com");
+        // TOML port preserved (CLI didn't specify)
+        assert_eq!(settings.replication.port, 5433);
+        // Origin fills unspecified fields
+        assert_eq!(settings.replication.user, "origin_user");
+    }
+
+    #[test]
+    fn settings_build_cli_origin_override_cascades_to_replication() {
+        let config = base_toml_config();
+        let args = CliArgs {
+            origin_host: Some("cli-origin.example.com".to_owned()),
+            ..Default::default()
+        };
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        // Origin was overridden by CLI
+        assert_eq!(settings.origin.host, "cli-origin.example.com");
+        // Replication inherits the CLI-overridden origin (no TOML replication section)
+        assert_eq!(settings.replication.host, "cli-origin.example.com");
+    }
+
+    #[test]
+    fn settings_build_cdc_names_lowercased() {
+        let mut config = base_toml_config();
+        config.cdc.publication_name = "MY_PUB".to_owned();
+        config.cdc.slot_name = "MY_SLOT".to_owned();
+        let args = CliArgs::default();
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        assert_eq!(settings.cdc.publication_name, "my_pub");
+        assert_eq!(settings.cdc.slot_name, "my_slot");
+    }
+
+    // ==================== settings_build CLI-only Tests ====================
+
+    /// All required CLI fields populated, no config file.
+    fn base_cli_args() -> CliArgs {
+        CliArgs {
+            origin_host: Some("origin.example.com".to_owned()),
+            origin_port: Some(5432),
+            origin_user: Some("origin_user".to_owned()),
+            origin_password: Some("origin_pass".to_owned()),
+            origin_database: Some("origin_db".to_owned()),
+            cache_host: Some("localhost".to_owned()),
+            cache_port: Some(5433),
+            cache_user: Some("cache_user".to_owned()),
+            cache_database: Some("cache_db".to_owned()),
+            cdc_publication_name: Some("pub".to_owned()),
+            cdc_slot_name: Some("slot".to_owned()),
+            listen_socket: Some("127.0.0.1:6432".parse().expect("valid socket addr")),
+            num_workers: Some(4),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn settings_build_cli_only_replication_defaults_to_origin() {
+        let args = base_cli_args();
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        assert_eq!(settings.replication.host, "origin.example.com");
+        assert_eq!(settings.replication.port, 5432);
+        assert_eq!(settings.replication.user, "origin_user");
+        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(settings.replication.database, "origin_db");
+        assert_eq!(settings.replication.ssl_mode, SslMode::Disable);
+    }
+
+    #[test]
+    fn settings_build_cli_only_replication_host_override() {
+        let args = CliArgs {
+            replication_host: Some("replica.example.com".to_owned()),
+            ..base_cli_args()
+        };
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        assert_eq!(settings.replication.host, "replica.example.com");
+        // Remaining fields inherited from origin
+        assert_eq!(settings.replication.port, 5432);
+        assert_eq!(settings.replication.user, "origin_user");
+        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(settings.replication.database, "origin_db");
+    }
+
+    #[test]
+    fn settings_build_cli_only_replication_all_fields_override() {
+        let args = CliArgs {
+            replication_host: Some("replica.example.com".to_owned()),
+            replication_port: Some(6432),
+            replication_user: Some("repl_user".to_owned()),
+            replication_password: Some("repl_pass".to_owned()),
+            replication_database: Some("repl_db".to_owned()),
+            replication_ssl_mode: Some(SslMode::Require),
+            ..base_cli_args()
+        };
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        assert_eq!(settings.replication.host, "replica.example.com");
+        assert_eq!(settings.replication.port, 6432);
+        assert_eq!(settings.replication.user, "repl_user");
+        assert_eq!(settings.replication.password, Some("repl_pass".to_owned()));
+        assert_eq!(settings.replication.database, "repl_db");
+        assert_eq!(settings.replication.ssl_mode, SslMode::Require);
+        // Origin unchanged
+        assert_eq!(settings.origin.host, "origin.example.com");
+        assert_eq!(settings.origin.ssl_mode, SslMode::Disable);
+    }
+
+    #[test]
+    fn settings_build_cli_only_missing_origin_host_errors() {
+        let mut args = base_cli_args();
+        args.origin_host = None;
+
+        let err = settings_build(args, None).expect_err("missing origin_host");
+        assert!(err.to_string().contains("origin_host"));
+    }
+
+    #[test]
+    fn settings_build_cli_only_defaults() {
+        let args = base_cli_args();
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        assert_eq!(settings.origin.ssl_mode, SslMode::Disable);
+        assert_eq!(settings.cache_policy, CachePolicy::Clock);
+        assert_eq!(settings.admission_threshold, 2);
+        assert_eq!(settings.cache.ssl_mode, SslMode::Disable);
+        assert_eq!(settings.cache.password, None);
+    }
+
+    #[test]
+    fn settings_build_cli_only_cdc_names_lowercased() {
+        let args = CliArgs {
+            cdc_publication_name: Some("MY_PUB".to_owned()),
+            cdc_slot_name: Some("MY_SLOT".to_owned()),
+            ..base_cli_args()
+        };
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        assert_eq!(settings.cdc.publication_name, "my_pub");
+        assert_eq!(settings.cdc.slot_name, "my_slot");
     }
 }
