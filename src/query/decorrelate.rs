@@ -818,6 +818,159 @@ fn conjunct_scalar_decorrelate(
     }
 }
 
+/// Decorrelate correlated scalar subqueries in SELECT columns.
+///
+/// Replaces each correlated scalar subquery with a column reference to a LEFT JOINed
+/// derived table. Rejects nested correlation in non-subquery column expressions.
+fn select_columns_decorrelate(
+    select: &mut ResolvedSelectNode,
+    state: &mut DecorrelateState<'_>,
+) -> DecorrelateResult<bool> {
+    let ResolvedSelectColumns::Columns(cols) = &select.columns else {
+        return Ok(false);
+    };
+
+    let mut new_cols = Vec::with_capacity(cols.len());
+    let mut transformed = false;
+
+    for col in cols {
+        match &col.expr {
+            ResolvedColumnExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
+                let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
+                select.from = left_join_derived(
+                    &select.from,
+                    result.derived_table,
+                    result.join_condition,
+                );
+                new_cols.push(ResolvedSelectColumn {
+                    expr: ResolvedColumnExpr::Column(result.scalar_column_ref),
+                    alias: col.alias.clone(),
+                });
+                transformed = true;
+            }
+            other @ (ResolvedColumnExpr::Column(_)
+            | ResolvedColumnExpr::Identifier(_)
+            | ResolvedColumnExpr::Function { .. }
+            | ResolvedColumnExpr::Literal(_)
+            | ResolvedColumnExpr::Case(_)
+            | ResolvedColumnExpr::Arithmetic(_)
+            | ResolvedColumnExpr::Subquery(..)) => {
+                // Reject nested correlation in non-Subquery exprs (e.g., CASE with
+                // correlated subquery) — we don't walk into arbitrary column exprs.
+                if column_expr_has_correlation(other) {
+                    return Err(DecorrelateError::NonDecorrelatable {
+                        reason: "correlated subquery nested in SELECT expression".to_owned(),
+                    }
+                    .into());
+                }
+                new_cols.push(col.clone());
+            }
+        }
+    }
+
+    select.columns = ResolvedSelectColumns::Columns(new_cols);
+    Ok(transformed)
+}
+
+/// Attempt to decorrelate a correlated EXISTS subquery conjunct.
+///
+/// Returns `Ok(Some(new_select))` on success, `Ok(None)` if the conjunct can't be
+/// decorrelated (caller should keep as residual), or `Err` for unsupported patterns.
+fn conjunct_exists_try_decorrelate(
+    current_select: &ResolvedSelectNode,
+    query: &ResolvedQueryExpr,
+    outer_refs: &[ResolvedColumnNode],
+) -> DecorrelateResult<Option<ResolvedSelectNode>> {
+    let Some(inner_select) = inner_query_select(query) else {
+        return Ok(None);
+    };
+
+    // Strip GROUP BY/HAVING/LIMIT — safe for EXISTS (conservative invalidation)
+    let (cleaned_query, cleaned_select) = correlated_exists_inner_prepare(query, inner_select);
+
+    let Some(inner_where) = &cleaned_select.where_clause else {
+        return Ok(None);
+    };
+
+    let (predicates, residual) = where_clause_correlation_partition(inner_where, outer_refs)
+        .ok_or_else(|| {
+            Report::from(DecorrelateError::NonDecorrelatable {
+                reason: "unsupported correlation pattern in EXISTS".to_owned(),
+            })
+        })?;
+
+    Ok(subquery_exists_decorrelate(
+        current_select,
+        &cleaned_query,
+        &predicates,
+        residual,
+    ))
+}
+
+/// Attempt to decorrelate a correlated NOT EXISTS subquery conjunct.
+///
+/// Returns `Ok(Some(new_select))` on success, `Ok(None)` if the conjunct can't be
+/// decorrelated, or `Err` for unsupported patterns (including GROUP BY/HAVING).
+fn conjunct_not_exists_try_decorrelate(
+    current_select: &ResolvedSelectNode,
+    query: &ResolvedQueryExpr,
+    outer_refs: &[ResolvedColumnNode],
+) -> DecorrelateResult<Option<ResolvedSelectNode>> {
+    let Some(inner_select) = inner_query_select(query) else {
+        return Ok(None);
+    };
+
+    // Strip LIMIT (safe); reject GROUP BY/HAVING (unsafe for anti-join)
+    let (cleaned_query, cleaned_select) =
+        correlated_not_exists_inner_prepare(query, inner_select)?;
+
+    let Some(inner_where) = &cleaned_select.where_clause else {
+        return Ok(None);
+    };
+
+    let (predicates, residual) = where_clause_correlation_partition(inner_where, outer_refs)
+        .ok_or_else(|| {
+            Report::from(DecorrelateError::NonDecorrelatable {
+                reason: "unsupported correlation pattern in NOT EXISTS".to_owned(),
+            })
+        })?;
+
+    Ok(subquery_not_exists_decorrelate(
+        current_select,
+        &cleaned_query,
+        &predicates,
+        residual,
+    ))
+}
+
+/// Apply a join-based decorrelation result to the iteration state.
+///
+/// On `Some`: replaces current_select with the new node, re-splits its WHERE into
+/// remaining_conjuncts so subsequent iterations build on top. Returns true.
+/// On `None`: pushes the original conjunct as residual. Returns false.
+fn join_result_apply(
+    result: Option<ResolvedSelectNode>,
+    conjunct: ResolvedWhereExpr,
+    current_select: &mut ResolvedSelectNode,
+    remaining_conjuncts: &mut Vec<ResolvedWhereExpr>,
+) -> bool {
+    match result {
+        Some(new_select) => {
+            *current_select = new_select;
+            remaining_conjuncts.clear();
+            if let Some(w) = &current_select.where_clause {
+                *remaining_conjuncts = where_expr_conjuncts_split(w.clone());
+            }
+            current_select.where_clause = None;
+            true
+        }
+        None => {
+            remaining_conjuncts.push(conjunct);
+            false
+        }
+    }
+}
+
 /// Main entry point: decorrelate correlated subqueries in a single SELECT node.
 ///
 /// Walks SELECT columns and WHERE conjuncts looking for correlated subqueries,
@@ -840,45 +993,8 @@ fn select_node_decorrelate(
     let mut current_select = select.clone();
     let mut transformed = false;
 
-    // Decorrelate correlated scalar subqueries in SELECT columns
-    if let ResolvedSelectColumns::Columns(cols) = &current_select.columns {
-        let mut new_cols = Vec::with_capacity(cols.len());
-        for col in cols {
-            match &col.expr {
-                ResolvedColumnExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
-                    let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
-                    current_select.from = left_join_derived(
-                        &current_select.from,
-                        result.derived_table,
-                        result.join_condition,
-                    );
-                    new_cols.push(ResolvedSelectColumn {
-                        expr: ResolvedColumnExpr::Column(result.scalar_column_ref),
-                        alias: col.alias.clone(),
-                    });
-                    transformed = true;
-                }
-                other @ (ResolvedColumnExpr::Column(_)
-                | ResolvedColumnExpr::Identifier(_)
-                | ResolvedColumnExpr::Function { .. }
-                | ResolvedColumnExpr::Literal(_)
-                | ResolvedColumnExpr::Case(_)
-                | ResolvedColumnExpr::Arithmetic(_)
-                | ResolvedColumnExpr::Subquery(..)) => {
-                    // Reject nested correlation in non-Subquery exprs (e.g., CASE with
-                    // correlated subquery) — we don't walk into arbitrary column exprs.
-                    if column_expr_has_correlation(other) {
-                        return Err(DecorrelateError::NonDecorrelatable {
-                            reason: "correlated subquery nested in SELECT expression".to_owned(),
-                        }
-                        .into());
-                    }
-                    new_cols.push(col.clone());
-                }
-            }
-        }
-        current_select.columns = ResolvedSelectColumns::Columns(new_cols);
-    }
+    // Phase 1: Decorrelate scalar subqueries in SELECT columns
+    transformed |= select_columns_decorrelate(&mut current_select, state)?;
 
     // Reject correlated subqueries in HAVING
     if let Some(having) = &current_select.having
@@ -890,14 +1006,12 @@ fn select_node_decorrelate(
         .into());
     }
 
+    // Phase 2: Decorrelate subqueries in WHERE conjuncts
     let Some(where_clause) = &current_select.where_clause else {
         return Ok((current_select, transformed));
     };
 
     let conjuncts = where_expr_conjuncts_split(where_clause.clone());
-
-    // Rebuild the WHERE clause without the correlated subquery conjuncts,
-    // processing one at a time since each decorrelation modifies the FROM.
     let mut remaining_conjuncts = Vec::new();
 
     for conjunct in conjuncts {
@@ -909,58 +1023,16 @@ fn select_node_decorrelate(
                 query,
                 ..
             } if !outer_refs.is_empty() => {
-                let inner_select = match inner_query_select(query) {
-                    Some(s) => s,
-                    None => {
-                        remaining_conjuncts.push(conjunct);
-                        continue;
-                    }
-                };
-
-                // Strip GROUP BY/HAVING/LIMIT — safe for EXISTS (conservative invalidation)
-                let (cleaned_query, cleaned_select) =
-                    correlated_exists_inner_prepare(query, inner_select);
-
-                let Some(inner_where) = &cleaned_select.where_clause else {
-                    remaining_conjuncts.push(conjunct);
-                    continue;
-                };
-
-                match where_clause_correlation_partition(inner_where, outer_refs) {
-                    Some((predicates, residual)) => {
-                        // Set up a temporary select with the current state
-                        current_select.where_clause =
-                            where_expr_conjuncts_join(remaining_conjuncts.clone());
-
-                        match subquery_exists_decorrelate(
-                            &current_select,
-                            &cleaned_query,
-                            &predicates,
-                            residual,
-                        ) {
-                            Some(new_select) => {
-                                current_select = new_select;
-                                remaining_conjuncts.clear();
-                                // Collect the new WHERE conjuncts so further iterations can
-                                // build on top
-                                if let Some(w) = &current_select.where_clause {
-                                    remaining_conjuncts = where_expr_conjuncts_split(w.clone());
-                                }
-                                current_select.where_clause = None;
-                                transformed = true;
-                            }
-                            None => {
-                                remaining_conjuncts.push(conjunct);
-                            }
-                        }
-                    }
-                    None => {
-                        return Err(DecorrelateError::NonDecorrelatable {
-                            reason: "unsupported correlation pattern in EXISTS".to_owned(),
-                        }
-                        .into());
-                    }
-                }
+                current_select.where_clause =
+                    where_expr_conjuncts_join(remaining_conjuncts.clone());
+                let result =
+                    conjunct_exists_try_decorrelate(&current_select, query, outer_refs)?;
+                transformed |= join_result_apply(
+                    result,
+                    conjunct,
+                    &mut current_select,
+                    &mut remaining_conjuncts,
+                );
             }
 
             // NOT EXISTS (SELECT ... WHERE correlated)
@@ -982,55 +1054,16 @@ fn select_node_decorrelate(
                     unreachable!()
                 };
 
-                let inner_select = match inner_query_select(query) {
-                    Some(s) => s,
-                    None => {
-                        remaining_conjuncts.push(conjunct);
-                        continue;
-                    }
-                };
-
-                // Strip LIMIT (safe); reject GROUP BY/HAVING (unsafe for anti-join)
-                let (cleaned_query, cleaned_select) =
-                    correlated_not_exists_inner_prepare(query, inner_select)?;
-
-                let Some(inner_where) = &cleaned_select.where_clause else {
-                    remaining_conjuncts.push(conjunct);
-                    continue;
-                };
-
-                match where_clause_correlation_partition(inner_where, outer_refs) {
-                    Some((predicates, residual)) => {
-                        current_select.where_clause =
-                            where_expr_conjuncts_join(remaining_conjuncts.clone());
-
-                        match subquery_not_exists_decorrelate(
-                            &current_select,
-                            &cleaned_query,
-                            &predicates,
-                            residual,
-                        ) {
-                            Some(new_select) => {
-                                current_select = new_select;
-                                remaining_conjuncts.clear();
-                                if let Some(w) = &current_select.where_clause {
-                                    remaining_conjuncts = where_expr_conjuncts_split(w.clone());
-                                }
-                                current_select.where_clause = None;
-                                transformed = true;
-                            }
-                            None => {
-                                remaining_conjuncts.push(conjunct);
-                            }
-                        }
-                    }
-                    None => {
-                        return Err(DecorrelateError::NonDecorrelatable {
-                            reason: "unsupported correlation pattern in NOT EXISTS".to_owned(),
-                        }
-                        .into());
-                    }
-                }
+                current_select.where_clause =
+                    where_expr_conjuncts_join(remaining_conjuncts.clone());
+                let result =
+                    conjunct_not_exists_try_decorrelate(&current_select, query, outer_refs)?;
+                transformed |= join_result_apply(
+                    result,
+                    conjunct,
+                    &mut current_select,
+                    &mut remaining_conjuncts,
+                );
             }
 
             // Correlated subquery inside OR — reject
@@ -1092,9 +1125,7 @@ fn select_node_decorrelate(
         }
     }
 
-    // Rebuild WHERE from remaining conjuncts
     current_select.where_clause = where_expr_conjuncts_join(remaining_conjuncts);
-
     Ok((current_select, transformed))
 }
 
