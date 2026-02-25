@@ -336,11 +336,7 @@ mod tests {
         })
     }
 
-    fn resolved_column(
-        table: &str,
-        column: &str,
-        col_meta: ColumnMetadata,
-    ) -> ResolvedColumnNode {
+    fn resolved_column(table: &str, column: &str, col_meta: ColumnMetadata) -> ResolvedColumnNode {
         ResolvedColumnNode {
             schema: "public".into(),
             table: table.into(),
@@ -369,7 +365,11 @@ mod tests {
     #[test]
     fn test_simple_table_replaced_with_values() {
         let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
-        let node = select_node(vec![resolved_table("users", 100, None)], ResolvedSelectColumns::None, None);
+        let node = select_node(
+            vec![resolved_table("users", 100, None)],
+            ResolvedSelectColumns::None,
+            None,
+        );
         let row = vec![Some("42".to_owned()), Some("alice".to_owned())];
 
         let result =
@@ -404,7 +404,11 @@ mod tests {
     #[test]
     fn test_null_values_produce_null_with_cast() {
         let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
-        let node = select_node(vec![resolved_table("users", 100, None)], ResolvedSelectColumns::None, None);
+        let node = select_node(
+            vec![resolved_table("users", 100, None)],
+            ResolvedSelectColumns::None,
+            None,
+        );
         let row = vec![Some("1".to_owned()), None];
 
         let result =
@@ -463,7 +467,11 @@ mod tests {
     fn test_non_matching_oid_returns_missing_table() {
         let meta = table_metadata("users", 100, &[("id", "int4")]);
         // FROM has a table with OID 999, but metadata says OID 100
-        let node = select_node(vec![resolved_table("users", 999, None)], ResolvedSelectColumns::None, None);
+        let node = select_node(
+            vec![resolved_table("users", 999, None)],
+            ResolvedSelectColumns::None,
+            None,
+        );
         let row = vec![Some("1".to_owned())];
 
         let err = resolved_select_node_table_replace_with_values(&node, &meta, &row)
@@ -519,11 +527,7 @@ mod tests {
         }]);
 
         let meta = table_metadata("users", 100, &[("id", "int4")]);
-        let node = select_node(
-            vec![resolved_table("users", 100, None)],
-            columns,
-            None,
-        );
+        let node = select_node(vec![resolved_table("users", 100, None)], columns, None);
         let row = vec![Some("42".to_owned())];
 
         let result =
@@ -580,7 +584,10 @@ mod tests {
         let subquery = match &join_node.right {
             ResolvedTableSource::Subquery(sq) => sq,
             ResolvedTableSource::Table(_) | ResolvedTableSource::Join(_) => {
-                panic!("expected right side to be Subquery, got: {:?}", join_node.right)
+                panic!(
+                    "expected right side to be Subquery, got: {:?}",
+                    join_node.right
+                )
             }
         };
         assert_eq!(subquery.alias.name, "orders");

@@ -260,7 +260,13 @@ impl CacheWriter {
         // Use decorrelated form for population branches to avoid standalone
         // correlated branches that can't run independently.
         let population_resolved = query_expr_decorrelate(&resolved, &self.aggregate_functions)
-            .map(|d| if d.transformed { d.resolved } else { resolved.clone() })
+            .map(|d| {
+                if d.transformed {
+                    d.resolved
+                } else {
+                    resolved.clone()
+                }
+            })
             .unwrap_or_else(|_| resolved.clone());
 
         let branches: Vec<_> = population_resolved
@@ -416,7 +422,13 @@ impl CacheWriter {
 
         // Use decorrelated form for population branches (same rationale as query_register)
         let population_resolved = query_expr_decorrelate(&resolved, &self.aggregate_functions)
-            .map(|d| if d.transformed { d.resolved } else { resolved.clone() })
+            .map(|d| {
+                if d.transformed {
+                    d.resolved
+                } else {
+                    resolved.clone()
+                }
+            })
             .unwrap_or_else(|_| resolved.clone());
 
         let branches: Vec<_> = population_resolved

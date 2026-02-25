@@ -9,8 +9,8 @@ use tokio_postgres::types::Type;
 
 use pgcache_lib::catalog::{ColumnMetadata, TableMetadata};
 use pgcache_lib::query::ast::{query_expr_convert, query_expr_fingerprint};
-use pgcache_lib::query::transform::predicate_pushdown_apply;
 use pgcache_lib::query::resolved::query_expr_resolve;
+use pgcache_lib::query::transform::predicate_pushdown_apply;
 
 // ---------------------------------------------------------------------------
 // Large query (real-world UNION subquery with window function, aggregates,

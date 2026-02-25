@@ -4,7 +4,9 @@ use error_set::error_set;
 use rootcause::Report;
 use tokio_postgres::Error;
 
-use crate::query::{decorrelate::DecorrelateError, resolved::ResolveError, transform::AstTransformError};
+use crate::query::{
+    decorrelate::DecorrelateError, resolved::ResolveError, transform::AstTransformError,
+};
 
 /// Result type with location-tracking error reports.
 /// Use this for functions where you want automatic file:line capture on errors.

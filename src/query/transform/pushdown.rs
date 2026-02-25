@@ -107,7 +107,9 @@ pub(crate) fn where_expr_conjuncts_split(expr: ResolvedWhereExpr) -> Vec<Resolve
 }
 
 /// Rebuild an AND tree from conjuncts. Returns None if the vec is empty.
-pub(crate) fn where_expr_conjuncts_join(conjuncts: Vec<ResolvedWhereExpr>) -> Option<ResolvedWhereExpr> {
+pub(crate) fn where_expr_conjuncts_join(
+    conjuncts: Vec<ResolvedWhereExpr>,
+) -> Option<ResolvedWhereExpr> {
     let mut iter = conjuncts.into_iter();
     let first = iter.next()?;
     Some(iter.fold(first, |acc, next| {

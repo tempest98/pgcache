@@ -4,7 +4,7 @@ use std::{
 };
 
 use tokio_util::bytes::BytesMut;
-use tracing::{trace, debug};
+use tracing::{debug, trace};
 
 use crate::{
     cache::query::CacheableQuery,

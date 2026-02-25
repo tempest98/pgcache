@@ -1338,8 +1338,7 @@ mod tests {
 
     #[test]
     fn where_clause_is_true_combined_with_and() {
-        let result =
-            where_clause_parse("SELECT * FROM t WHERE id = 1 AND active IS TRUE");
+        let result = where_clause_parse("SELECT * FROM t WHERE id = 1 AND active IS TRUE");
 
         assert!(result.is_ok());
         let where_clause = result.unwrap().unwrap();

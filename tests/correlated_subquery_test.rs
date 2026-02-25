@@ -842,11 +842,8 @@ async fn test_correlated_scalar_select_lookup() -> Result<(), Error> {
     let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC UPDATE on inner table (departments) → invalidates ---
-    ctx.origin_query(
-        "UPDATE departments SET name = 'Eng' WHERE id = 1",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("UPDATE departments SET name = 'Eng' WHERE id = 1", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -916,11 +913,8 @@ async fn test_correlated_scalar_where_aggregate() -> Result<(), Error> {
 
     // --- CDC UPDATE: increase Marketing budget to shift NYC average ---
     // New NYC avg = (100 + 120) / 2 = 110, Engineering (100) now BELOW average
-    ctx.origin_query(
-        "UPDATE departments SET budget = 120 WHERE id = 2",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("UPDATE departments SET budget = 120 WHERE id = 2", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -1055,11 +1049,8 @@ async fn test_correlated_scalar_and_exists_combined() -> Result<(), Error> {
     .await?;
 
     // Dept 10 has a project, dept 20 does not
-    ctx.query(
-        "INSERT INTO projects (id, dept_id) VALUES (200, 10)",
-        &[],
-    )
-    .await?;
+    ctx.query("INSERT INTO projects (id, dept_id) VALUES (200, 10)", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -1087,11 +1078,8 @@ async fn test_correlated_scalar_and_exists_combined() -> Result<(), Error> {
     let m = assert_cache_hit(&mut ctx, m).await?;
 
     // --- CDC INSERT project for dept 20 → Bob should appear ---
-    ctx.origin_query(
-        "INSERT INTO projects (id, dept_id) VALUES (201, 20)",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("INSERT INTO projects (id, dept_id) VALUES (201, 20)", &[])
+        .await?;
 
     wait_for_cdc().await;
 

@@ -1568,15 +1568,9 @@ impl ResolvedQueryExpr {
     /// Mirrors `QueryExpr::select_nodes_with_source()` but for the resolved AST.
     /// Top-level branches are Direct; subquery/CTE branches carry their
     /// Inclusion/Exclusion/Scalar classification.
-    pub fn select_nodes_with_source(
-        &self,
-    ) -> Vec<(&ResolvedSelectNode, UpdateQuerySource)> {
+    pub fn select_nodes_with_source(&self) -> Vec<(&ResolvedSelectNode, UpdateQuerySource)> {
         let mut branches = Vec::new();
-        self.select_nodes_collect_with_source(
-            &mut branches,
-            UpdateQuerySource::Direct,
-            false,
-        );
+        self.select_nodes_collect_with_source(&mut branches, UpdateQuerySource::Direct, false);
         branches
     }
 
@@ -1601,9 +1595,7 @@ impl ResolvedQueryExpr {
                 if let Some(having) = &select.having {
                     having.subquery_nodes_collect_with_source(branches, negated);
                 }
-                select
-                    .columns
-                    .subquery_nodes_collect_with_source(branches);
+                select.columns.subquery_nodes_collect_with_source(branches);
             }
             ResolvedQueryBody::Values(_) => {}
             ResolvedQueryBody::SetOp(set_op) => {

@@ -31,7 +31,6 @@ use crate::{
         messages::{PipelineContext, PipelineDescribe},
         query::CacheableQuery,
     },
-    query::ast::query_expr_fingerprint,
     metrics::names,
     pg::protocol::{
         backend::{
@@ -48,6 +47,7 @@ use crate::{
             simple_query_message_build, startup_message_parameter,
         },
     },
+    query::ast::query_expr_fingerprint,
     settings::{Settings, SslMode},
     timing::{QueryId, QueryTiming, timing_record},
     tls::{self},
@@ -208,9 +208,10 @@ impl QueryTelemetry {
     /// Take the cache timing for dispatch to the cache pipeline.
     /// Sets dispatched_at before returning.
     fn cache_timing_dispatch(&mut self) -> QueryTiming {
-        let mut t = self.cache_timing.take().unwrap_or_else(|| {
-            QueryTiming::new(QueryId::new(0), Instant::now())
-        });
+        let mut t = self
+            .cache_timing
+            .take()
+            .unwrap_or_else(|| QueryTiming::new(QueryId::new(0), Instant::now()));
         t.dispatched_at = Some(Instant::now());
         t
     }
@@ -546,7 +547,8 @@ impl ConnectionState {
                 PgBackendMessageType::DataRows => {
                     if let Some(value) = data_row_first_column(&msg.data) {
                         debug!("received search_path from SHOW query: {}", value);
-                        self.search_path_state = SearchPathState::Resolved(SearchPath::parse(value));
+                        self.search_path_state =
+                            SearchPathState::Resolved(SearchPath::parse(value));
                     }
                 }
                 PgBackendMessageType::ReadyForQuery => {
@@ -602,10 +604,8 @@ impl ConnectionState {
                 }
             }
             PgBackendMessageType::ParameterDescription => {
-                self.extended.parameter_description_received(
-                    &msg.data,
-                    &mut self.prepared_statements,
-                );
+                self.extended
+                    .parameter_description_received(&msg.data, &mut self.prepared_statements);
             }
             PgBackendMessageType::ParseComplete => {
                 self.extended.parse_complete(&mut self.prepared_statements);
@@ -681,11 +681,7 @@ impl ConnectionState {
 
     /// Forward an extended buffer to origin, appending the trailing message bytes (Sync or Flush).
     /// Records metrics for any Execute in the buffer.
-    fn extended_buffer_forward_to_origin(
-        &mut self,
-        buffer: ExtendedBuffer,
-        trailing_bytes: &[u8],
-    ) {
+    fn extended_buffer_forward_to_origin(&mut self, buffer: ExtendedBuffer, trailing_bytes: &[u8]) {
         // Record non-cacheable metrics for Execute(s) in the buffer
         if buffer.execute_portal.is_some() {
             metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
@@ -861,7 +857,6 @@ impl ConnectionState {
     /// Attempt to create a cache message from the extended buffer at Sync time.
     /// Returns None if caching is not possible.
     fn buffer_try_cache(&self, buffer: &ExtendedBuffer) -> Option<CacheMessage> {
-
         if self.in_transaction {
             return None;
         }
@@ -1343,8 +1338,9 @@ async fn handle_connection(
             ProxyMode::CacheWrite(msg) => {
                 // Resolve search_path for this connection (expand $user to session_user)
                 // If search_path is unknown, forward to origin instead of caching
-                let Some(resolved_search_path) =
-                    state.search_path_state.resolve(state.session_user.as_deref())
+                let Some(resolved_search_path) = state
+                    .search_path_state
+                    .resolve(state.session_user.as_deref())
                 else {
                     debug!("search_path unknown, forwarding to origin");
                     metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
