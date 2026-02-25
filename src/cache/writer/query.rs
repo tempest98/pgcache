@@ -5,10 +5,12 @@ use tracing::{debug, error, info, instrument, trace};
 use crate::cache::query::limit_rows_needed;
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
-use crate::query::ast::{QueryBody, TableNode};
+use crate::query::ast::{QueryBody, QueryExpr, TableNode};
 use crate::query::constraints::analyze_query_constraints;
 use crate::query::decorrelate::query_expr_decorrelate;
-use crate::query::resolved::{ResolvedTableNode, query_expr_resolve};
+use crate::query::resolved::{
+    ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
+};
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
 
@@ -19,7 +21,70 @@ use super::super::{
 };
 use super::{CacheWriter, POPULATE_POOL_SIZE, PopulationWork};
 
+/// Clone the query, strip LIMIT, and compute max_limit for population.
+/// Set operations force max_limit = None since population runs per-branch.
+fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
+    let is_set_op = matches!(query.body, QueryBody::SetOp(_));
+    let max_limit = if is_set_op {
+        None
+    } else {
+        limit_rows_needed(&query.limit)
+    };
+    let mut base_query = query.clone();
+    base_query.limit = None;
+    (base_query, max_limit)
+}
+
 impl CacheWriter {
+    /// Build population work for a query, handling decorrelation and branch extraction.
+    ///
+    /// Decorrelates the resolved AST so correlated subqueries are merged into JOINs,
+    /// then extracts SELECT branches, collects table metadata, and builds PopulationWork.
+    fn population_work_build(
+        &self,
+        fingerprint: u64,
+        generation: u64,
+        resolved: &ResolvedQueryExpr,
+        max_limit: Option<u64>,
+    ) -> PopulationWork {
+        let population_resolved = query_expr_decorrelate(resolved, &self.aggregate_functions)
+            .map(|d| {
+                if d.transformed {
+                    d.resolved
+                } else {
+                    resolved.clone()
+                }
+            })
+            .unwrap_or_else(|_| resolved.clone());
+
+        let branches: Vec<ResolvedSelectNode> = population_resolved
+            .select_nodes()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let branch_relation_oids: Vec<u32> = branches
+            .iter()
+            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
+            .map(|tn| tn.relation_oid)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let table_metadata: Vec<TableMetadata> = branch_relation_oids
+            .iter()
+            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
+            .collect();
+
+        PopulationWork {
+            fingerprint,
+            generation,
+            table_metadata,
+            branches,
+            max_limit,
+        }
+    }
+
     /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
     async fn table_schema_resolve(
         &self,
@@ -66,43 +131,13 @@ impl CacheWriter {
         Ok(())
     }
 
-    /// Registers a query in the cache and spawns background population.
-    /// Registration is synchronous (updates Cache state), population is async.
-    /// If the query was previously invalidated (CLOCK policy), takes the fast
-    /// readmission path that reuses existing metadata.
-    #[instrument(skip_all)]
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn query_register(
+    /// Ensure all tables referenced in the query exist in the cache.
+    /// Resolves schemas and creates cache tables as needed.
+    async fn cache_tables_ensure(
         &mut self,
-        fingerprint: u64,
-        cacheable_query: &CacheableQuery,
+        base_query: &QueryExpr,
         search_path: &[&str],
-        started_at: Instant,
     ) -> CacheResult<()> {
-        // Fast readmission: reuse metadata from invalidated entry
-        if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
-            && query.invalidated
-        {
-            return self.query_readmit(fingerprint, started_at);
-        }
-
-        let mut relation_oids = Vec::new();
-
-        // Extract max_limit from the incoming query's LIMIT clause,
-        // then strip LIMIT from the stored query (base query only).
-        // For set operations, force max_limit = None — population runs per-branch
-        // so a top-level LIMIT can't be applied during population. All rows are
-        // cached, and the incoming LIMIT is applied at serve time.
-        let is_set_op = matches!(cacheable_query.query.body, QueryBody::SetOp(_));
-        let max_limit = if is_set_op {
-            None
-        } else {
-            limit_rows_needed(&cacheable_query.query.limit)
-        };
-        let has_limit = max_limit.is_some();
-        let mut base_query = cacheable_query.query.clone();
-        base_query.limit = None;
-
         for table_node in base_query.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
             let schema = self
@@ -118,23 +153,27 @@ impl CacheWriter {
                 self.cache.tables.insert_overwrite(table);
             }
         }
+        Ok(())
+    }
 
-        let resolved = query_expr_resolve(&base_query, &self.cache.tables, search_path)
-            .map_err(|e| e.context_transform(CacheError::from))
-            .attach_loc("resolving query expression")
-            .map(predicate_pushdown_apply)?;
-
-        // Decorrelate correlated subqueries for update query generation.
-        // Works entirely on resolved AST — no re-resolution needed.
-        let decorrelated = query_expr_decorrelate(&resolved, &self.aggregate_functions)
+    /// Decorrelate the resolved AST and register update queries for each table.
+    /// Returns the relation OIDs that have update queries registered.
+    fn update_queries_register(
+        &mut self,
+        fingerprint: u64,
+        resolved: &ResolvedQueryExpr,
+        has_limit: bool,
+    ) -> CacheResult<Vec<u32>> {
+        let decorrelated = query_expr_decorrelate(resolved, &self.aggregate_functions)
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("decorrelating correlated subqueries")?;
         let update_source = if decorrelated.transformed {
             &decorrelated.resolved
         } else {
-            &resolved
+            resolved
         };
 
+        let mut relation_oids = Vec::new();
         for (table_node, update_resolved, source) in query_table_update_queries(update_source) {
             let relation_oid = table_node.relation_oid;
             let constraints = update_resolved
@@ -154,17 +193,28 @@ impl CacheWriter {
             self.update_query_register(relation_oid, update_query);
             relation_oids.push(relation_oid);
         }
+        Ok(relation_oids)
+    }
 
-        // Assign generation number synchronously (before any await)
+    /// Assign a generation number and insert the CachedQuery entry.
+    /// Returns the assigned generation number.
+    fn cached_query_insert(
+        &mut self,
+        fingerprint: u64,
+        relation_oids: Vec<u32>,
+        base_query: QueryExpr,
+        resolved: &ResolvedQueryExpr,
+        max_limit: Option<u64>,
+        started_at: Instant,
+    ) -> u64 {
         self.cache.generation_counter += 1;
         let generation = self.cache.generation_counter;
         self.cache.generations.insert(generation);
 
-        // Create CachedQuery entry with Loading state
         let cached_query = CachedQuery {
             fingerprint,
             generation,
-            relation_oids: relation_oids.clone(),
+            relation_oids,
             query: base_query,
             resolved: resolved.clone(),
             max_limit,
@@ -175,47 +225,50 @@ impl CacheWriter {
 
         self.cache.cached_queries.insert_overwrite(cached_query);
         self.active_relations_rebuild();
-        trace!("cached query loading");
+        generation
+    }
 
-        // Extract SELECT branches for population.
-        // When decorrelation was applied, use the decorrelated form so that inner
-        // correlated tables are merged into JOINs. This avoids extracting standalone
-        // correlated branches that reference outer-scope columns and can't run independently.
-        let population_source = if decorrelated.transformed {
-            &decorrelated.resolved
-        } else {
-            &resolved
-        };
-        let branches: Vec<_> = population_source
-            .select_nodes()
-            .into_iter()
-            .cloned()
-            .collect();
+    /// Registers a query in the cache and spawns background population.
+    /// Registration is synchronous (updates Cache state), population is async.
+    /// If the query was previously invalidated (CLOCK policy), takes the fast
+    /// readmission path that reuses existing metadata.
+    #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn query_register(
+        &mut self,
+        fingerprint: u64,
+        cacheable_query: &CacheableQuery,
+        search_path: &[&str],
+        started_at: Instant,
+    ) -> CacheResult<()> {
+        if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
+            && query.invalidated
+        {
+            return self.query_readmit(fingerprint, started_at);
+        }
 
-        // Collect all unique table OIDs across all branches for metadata lookup
-        let branch_relation_oids: Vec<u32> = branches
-            .iter()
-            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
-            .map(|tn| tn.relation_oid)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
+        let (base_query, max_limit) = base_query_prepare(&cacheable_query.query);
 
-        // Collect table metadata needed for population
-        let table_metadata: Vec<TableMetadata> = branch_relation_oids
-            .iter()
-            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
-            .collect();
+        self.cache_tables_ensure(&base_query, search_path).await?;
 
-        // Create work item for population worker
-        let work = PopulationWork {
+        let resolved = query_expr_resolve(&base_query, &self.cache.tables, search_path)
+            .map_err(|e| e.context_transform(CacheError::from))
+            .attach_loc("resolving query expression")
+            .map(predicate_pushdown_apply)?;
+
+        let relation_oids =
+            self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;
+
+        let generation = self.cached_query_insert(
             fingerprint,
-            generation,
-            table_metadata,
-            branches,
+            relation_oids,
+            base_query,
+            &resolved,
             max_limit,
-        };
+            started_at,
+        );
 
+        let work = self.population_work_build(fingerprint, generation, &resolved, max_limit);
         self.populate_work_dispatch(work)?;
         trace!("population work queued for query {fingerprint}");
         Ok(())
@@ -257,45 +310,7 @@ impl CacheWriter {
             max_limit,
         );
 
-        // Use decorrelated form for population branches to avoid standalone
-        // correlated branches that can't run independently.
-        let population_resolved = query_expr_decorrelate(&resolved, &self.aggregate_functions)
-            .map(|d| {
-                if d.transformed {
-                    d.resolved
-                } else {
-                    resolved.clone()
-                }
-            })
-            .unwrap_or_else(|_| resolved.clone());
-
-        let branches: Vec<_> = population_resolved
-            .select_nodes()
-            .into_iter()
-            .cloned()
-            .collect();
-
-        let branch_relation_oids: Vec<u32> = branches
-            .iter()
-            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
-            .map(|tn| tn.relation_oid)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let table_metadata: Vec<TableMetadata> = branch_relation_oids
-            .iter()
-            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
-            .collect();
-
-        let work = PopulationWork {
-            fingerprint,
-            generation: new_generation,
-            table_metadata,
-            branches,
-            max_limit,
-        };
-
+        let work = self.population_work_build(fingerprint, new_generation, &resolved, max_limit);
         self.populate_work_dispatch(work)?;
         trace!("readmission population queued for query {fingerprint}");
         Ok(())
@@ -420,44 +435,8 @@ impl CacheWriter {
             new_max_limit,
         );
 
-        // Use decorrelated form for population branches (same rationale as query_register)
-        let population_resolved = query_expr_decorrelate(&resolved, &self.aggregate_functions)
-            .map(|d| {
-                if d.transformed {
-                    d.resolved
-                } else {
-                    resolved.clone()
-                }
-            })
-            .unwrap_or_else(|_| resolved.clone());
-
-        let branches: Vec<_> = population_resolved
-            .select_nodes()
-            .into_iter()
-            .cloned()
-            .collect();
-
-        let branch_relation_oids: Vec<u32> = branches
-            .iter()
-            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
-            .map(|tn| tn.relation_oid)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let table_metadata: Vec<TableMetadata> = branch_relation_oids
-            .iter()
-            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
-            .collect();
-
-        let work = PopulationWork {
-            fingerprint,
-            generation: new_generation,
-            table_metadata,
-            branches,
-            max_limit: new_max_limit,
-        };
-
+        let work =
+            self.population_work_build(fingerprint, new_generation, &resolved, new_max_limit);
         self.populate_work_dispatch(work)?;
         trace!("limit bump population queued for query {fingerprint}");
         Ok(())
