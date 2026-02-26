@@ -503,6 +503,175 @@ fn correlated_not_exists_inner_prepare(
     Ok((cleaned_query, inner_select.clone()))
 }
 
+/// Extract the single output column from an IN subquery's SELECT list.
+///
+/// IN subqueries must produce exactly one column, and for decorrelation
+/// it must be a simple column reference (not an expression).
+fn in_any_inner_output_column(
+    inner_select: &ResolvedSelectNode,
+) -> DecorrelateResult<ResolvedColumnNode> {
+    let columns = match &inner_select.columns {
+        ResolvedSelectColumns::Columns(cols) => cols,
+        ResolvedSelectColumns::None => {
+            return Err(DecorrelateError::NonDecorrelatable {
+                reason: "IN subquery has no output columns".to_owned(),
+            }
+            .into());
+        }
+    };
+
+    match columns.as_slice() {
+        [col] => match &col.expr {
+            ResolvedColumnExpr::Column(col_node) => Ok(col_node.clone()),
+            ResolvedColumnExpr::Identifier(_)
+            | ResolvedColumnExpr::Function { .. }
+            | ResolvedColumnExpr::Literal(_)
+            | ResolvedColumnExpr::Case(_)
+            | ResolvedColumnExpr::Arithmetic(_)
+            | ResolvedColumnExpr::Subquery(..) => Err(DecorrelateError::NonDecorrelatable {
+                reason: "IN subquery output is not a simple column reference".to_owned(),
+            }
+            .into()),
+        },
+        _ => Err(DecorrelateError::NonDecorrelatable {
+            reason: "IN subquery must have exactly one output column".to_owned(),
+        }
+        .into()),
+    }
+}
+
+/// IN → INNER JOIN + DISTINCT (semi-join).
+///
+/// Merges inner FROM sources into a JOIN with the outer FROM, using both
+/// the IN predicate (test_expr = inner_output_column) and correlation predicates
+/// as the ON condition. Sets DISTINCT to preserve semi-join semantics.
+/// Residual inner predicates are merged into the outer WHERE.
+fn subquery_in_any_decorrelate(
+    select: &ResolvedSelectNode,
+    inner_query: &ResolvedQueryExpr,
+    predicates: &CorrelationPredicates,
+    residual: Option<ResolvedWhereExpr>,
+    test_expr: &ResolvedWhereExpr,
+    inner_output_column: &ResolvedColumnNode,
+) -> Option<ResolvedSelectNode> {
+    let inner_select = inner_query_select(inner_query)?;
+
+    // Build IN predicate: test_expr = inner_output_column
+    let in_predicate = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+        op: BinaryOp::Equal,
+        lexpr: Box::new(test_expr.clone()),
+        rexpr: Box::new(ResolvedWhereExpr::Column(inner_output_column.clone())),
+    });
+
+    // Build correlation condition from WHERE predicates and combine with IN predicate
+    let correlation_condition = correlation_predicates_to_condition(predicates);
+    let join_condition = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+        op: BinaryOp::And,
+        lexpr: Box::new(in_predicate),
+        rexpr: Box::new(correlation_condition),
+    });
+
+    let right = from_sources_to_table_source(&inner_select.from)?;
+    let left = from_sources_to_table_source(&select.from)?;
+
+    let join = ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
+        join_type: JoinType::Inner,
+        left,
+        right,
+        condition: Some(join_condition),
+    }));
+
+    // Merge residual inner predicates into outer WHERE
+    let new_where = merge_where_clauses(&select.where_clause, &residual);
+
+    Some(ResolvedSelectNode {
+        distinct: true,
+        columns: select.columns.clone(),
+        from: vec![join],
+        where_clause: new_where,
+        group_by: select.group_by.clone(),
+        having: select.having.clone(),
+    })
+}
+
+/// NOT IN → LEFT JOIN + IS NULL (anti-join).
+///
+/// Merges inner FROM sources into a LEFT JOIN with the outer FROM. The IN predicate
+/// (test_expr = inner_output_column), correlation predicates, AND residual inner
+/// predicates all go into the ON clause to preserve LEFT JOIN semantics. An IS NULL
+/// check on the inner output column is added to the outer WHERE for anti-join filtering.
+fn subquery_not_in_all_decorrelate(
+    select: &ResolvedSelectNode,
+    inner_query: &ResolvedQueryExpr,
+    predicates: &CorrelationPredicates,
+    residual: Option<ResolvedWhereExpr>,
+    test_expr: &ResolvedWhereExpr,
+    inner_output_column: &ResolvedColumnNode,
+) -> Option<ResolvedSelectNode> {
+    let inner_select = inner_query_select(inner_query)?;
+
+    // Build IN predicate: test_expr = inner_output_column
+    let in_predicate = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+        op: BinaryOp::Equal,
+        lexpr: Box::new(test_expr.clone()),
+        rexpr: Box::new(ResolvedWhereExpr::Column(inner_output_column.clone())),
+    });
+
+    // Build correlation condition from WHERE predicates and combine with IN predicate
+    let correlation_condition = correlation_predicates_to_condition(predicates);
+    let mut on_condition = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+        op: BinaryOp::And,
+        lexpr: Box::new(in_predicate),
+        rexpr: Box::new(correlation_condition),
+    });
+
+    // For NOT IN (anti-join), residual predicates go into the ON clause (not outer WHERE)
+    // to preserve LEFT JOIN semantics — placing them in WHERE would filter out the
+    // NULL-padded rows that represent non-matching outer rows.
+    if let Some(res) = residual {
+        on_condition = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: BinaryOp::And,
+            lexpr: Box::new(on_condition),
+            rexpr: Box::new(res),
+        });
+    }
+
+    let right = from_sources_to_table_source(&inner_select.from)?;
+    let left = from_sources_to_table_source(&select.from)?;
+
+    let join = ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
+        join_type: JoinType::Left,
+        left,
+        right,
+        condition: Some(on_condition),
+    }));
+
+    // IS NULL check on inner output column (anti-join filter)
+    let is_null_check = ResolvedWhereExpr::Unary(ResolvedUnaryExpr {
+        op: UnaryOp::IsNull,
+        expr: Box::new(ResolvedWhereExpr::Column(inner_output_column.clone())),
+    });
+
+    // Merge IS NULL with existing outer WHERE
+    let new_where = match &select.where_clause {
+        Some(existing) => Some(ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: BinaryOp::And,
+            lexpr: Box::new(existing.clone()),
+            rexpr: Box::new(is_null_check),
+        })),
+        None => Some(is_null_check),
+    };
+
+    Some(ResolvedSelectNode {
+        distinct: select.distinct,
+        columns: select.columns.clone(),
+        from: vec![join],
+        where_clause: new_where,
+        group_by: select.group_by.clone(),
+        having: select.having.clone(),
+    })
+}
+
 /// Check whether a `ResolvedColumnExpr` contains any aggregate function call.
 ///
 /// Walks the expression tree looking for `Function { name, .. }` nodes whose name
@@ -970,6 +1139,93 @@ fn conjunct_not_exists_try_decorrelate(
     ))
 }
 
+/// Attempt to decorrelate a correlated IN subquery conjunct.
+///
+/// Returns `Ok(Some(new_select))` on success, `Ok(None)` if the conjunct can't be
+/// decorrelated, or `Err` for unsupported patterns.
+fn conjunct_in_any_try_decorrelate(
+    current_select: &ResolvedSelectNode,
+    query: &ResolvedQueryExpr,
+    outer_refs: &[ResolvedColumnNode],
+    test_expr: &ResolvedWhereExpr,
+) -> DecorrelateResult<Option<ResolvedSelectNode>> {
+    let Some(inner_select) = inner_query_select(query) else {
+        return Ok(None);
+    };
+
+    // Strip GROUP BY/HAVING/LIMIT — safe for IN (membership check, conservative invalidation).
+    // Same rationale as EXISTS: IN checks set membership, so these clauses don't change
+    // which outer rows are affected, and stripping them is conservatively correct for CDC.
+    let (cleaned_query, cleaned_select) = correlated_exists_inner_prepare(query, inner_select);
+
+    let Some(inner_where) = &cleaned_select.where_clause else {
+        return Ok(None);
+    };
+
+    // Extract the single output column (must be a simple column reference)
+    let inner_output_column = in_any_inner_output_column(&cleaned_select)?;
+
+    let (predicates, residual) = where_clause_correlation_partition(inner_where, outer_refs)
+        .ok_or_else(|| {
+            Report::from(DecorrelateError::NonDecorrelatable {
+                reason: "unsupported correlation pattern in IN".to_owned(),
+            })
+        })?;
+
+    Ok(subquery_in_any_decorrelate(
+        current_select,
+        &cleaned_query,
+        &predicates,
+        residual,
+        test_expr,
+        &inner_output_column,
+    ))
+}
+
+/// Attempt to decorrelate a correlated NOT IN (ALL) subquery conjunct.
+///
+/// Returns `Ok(Some(new_select))` on success, `Ok(None)` if the conjunct can't be
+/// decorrelated, or `Err` for unsupported patterns (including GROUP BY/HAVING).
+fn conjunct_not_in_all_try_decorrelate(
+    current_select: &ResolvedSelectNode,
+    query: &ResolvedQueryExpr,
+    outer_refs: &[ResolvedColumnNode],
+    test_expr: &ResolvedWhereExpr,
+) -> DecorrelateResult<Option<ResolvedSelectNode>> {
+    let Some(inner_select) = inner_query_select(query) else {
+        return Ok(None);
+    };
+
+    // Strip LIMIT (safe — boolean check); reject GROUP BY/HAVING (unsafe for anti-join,
+    // same reasoning as NOT EXISTS: the anti-join tests for zero matching rows in the
+    // flattened join, but the original tests for no rows surviving the filter).
+    let (cleaned_query, cleaned_select) =
+        correlated_not_exists_inner_prepare(query, inner_select)?;
+
+    let Some(inner_where) = &cleaned_select.where_clause else {
+        return Ok(None);
+    };
+
+    // Extract the single output column (must be a simple column reference)
+    let inner_output_column = in_any_inner_output_column(&cleaned_select)?;
+
+    let (predicates, residual) = where_clause_correlation_partition(inner_where, outer_refs)
+        .ok_or_else(|| {
+            Report::from(DecorrelateError::NonDecorrelatable {
+                reason: "unsupported correlation pattern in NOT IN".to_owned(),
+            })
+        })?;
+
+    Ok(subquery_not_in_all_decorrelate(
+        current_select,
+        &cleaned_query,
+        &predicates,
+        residual,
+        test_expr,
+        &inner_output_column,
+    ))
+}
+
 /// Apply a join-based decorrelation result to the iteration state.
 ///
 /// On `Some`: replaces current_select with the new node, re-splits its WHERE into
@@ -1004,14 +1260,16 @@ fn join_result_apply(
 /// and flattens them into JOINs. Non-correlated subqueries and non-subquery
 /// predicates are left unchanged.
 ///
-/// For EXISTS, inner GROUP BY/HAVING/LIMIT are stripped before decorrelation —
+/// For EXISTS and IN, inner GROUP BY/HAVING/LIMIT are stripped before decorrelation —
 /// this is safe because it produces conservative (over-) invalidation.
-/// For NOT EXISTS, LIMIT is stripped (boolean check, irrelevant), but GROUP BY/HAVING
-/// are rejected because the anti-join would under-invalidate.
+/// For IN and NOT IN, the test expression equality with the inner output column is
+/// added to the JOIN ON condition alongside correlation predicates from the inner WHERE.
+/// For NOT EXISTS and NOT IN, LIMIT is stripped (boolean check, irrelevant), but
+/// GROUP BY/HAVING are rejected because the anti-join would under-invalidate.
 /// For scalar subqueries, a LEFT JOIN + derived table is used (SELECT list and WHERE).
 ///
 /// Returns `Err(NonDecorrelatable)` if a correlated subquery is found in an
-/// unsupported position (HAVING, OR-connected, IN/ALL type), or if a NOT EXISTS
+/// unsupported position (HAVING, OR-connected), or if a NOT EXISTS/NOT IN
 /// inner subquery has GROUP BY/HAVING.
 fn select_node_decorrelate(
     select: &ResolvedSelectNode,
@@ -1104,19 +1362,93 @@ fn select_node_decorrelate(
                 remaining_conjuncts.push(conjunct);
             }
 
-            // Correlated IN/ALL subquery — reject (scalar Expr falls through to catch-all)
+            // IN (SELECT ... WHERE correlated) → INNER JOIN + DISTINCT (semi-join)
             ResolvedWhereExpr::Subquery {
-                sublink_type: SubLinkType::Any | SubLinkType::All,
+                sublink_type: SubLinkType::Any,
                 outer_refs,
-                ..
+                query,
+                test_expr,
             } if !outer_refs.is_empty() => {
-                return Err(DecorrelateError::NonDecorrelatable {
-                    reason: "correlated IN/ALL subquery".to_owned(),
-                }
-                .into());
+                let test = test_expr.as_deref().ok_or_else(|| {
+                    Report::from(DecorrelateError::NonDecorrelatable {
+                        reason: "correlated IN without test expression".to_owned(),
+                    })
+                })?;
+                current_select.where_clause =
+                    where_expr_conjuncts_join(remaining_conjuncts.clone());
+                let result =
+                    conjunct_in_any_try_decorrelate(&current_select, query, outer_refs, test)?;
+                transformed |= join_result_apply(
+                    result,
+                    conjunct,
+                    &mut current_select,
+                    &mut remaining_conjuncts,
+                );
             }
 
-            // NOT wrapping a correlated non-EXISTS subquery
+            // NOT IN / ALL (SELECT ... WHERE correlated) → LEFT JOIN + IS NULL (anti-join)
+            ResolvedWhereExpr::Subquery {
+                sublink_type: SubLinkType::All,
+                outer_refs,
+                query,
+                test_expr,
+            } if !outer_refs.is_empty() => {
+                let test = test_expr.as_deref().ok_or_else(|| {
+                    Report::from(DecorrelateError::NonDecorrelatable {
+                        reason: "correlated NOT IN without test expression".to_owned(),
+                    })
+                })?;
+                current_select.where_clause =
+                    where_expr_conjuncts_join(remaining_conjuncts.clone());
+                let result =
+                    conjunct_not_in_all_try_decorrelate(&current_select, query, outer_refs, test)?;
+                transformed |= join_result_apply(
+                    result,
+                    conjunct,
+                    &mut current_select,
+                    &mut remaining_conjuncts,
+                );
+            }
+
+            // NOT IN (SELECT ... WHERE correlated) parsed as NOT(ANY) → LEFT JOIN + IS NULL
+            ResolvedWhereExpr::Unary(unary)
+                if unary.op == UnaryOp::Not
+                    && matches!(
+                        unary.expr.as_ref(),
+                        ResolvedWhereExpr::Subquery {
+                            sublink_type: SubLinkType::Any,
+                            outer_refs,
+                            ..
+                        } if !outer_refs.is_empty()
+                    ) =>
+            {
+                let ResolvedWhereExpr::Subquery {
+                    outer_refs,
+                    query,
+                    test_expr,
+                    ..
+                } = unary.expr.as_ref()
+                else {
+                    unreachable!();
+                };
+                let test = test_expr.as_deref().ok_or_else(|| {
+                    Report::from(DecorrelateError::NonDecorrelatable {
+                        reason: "correlated NOT IN without test expression".to_owned(),
+                    })
+                })?;
+                current_select.where_clause =
+                    where_expr_conjuncts_join(remaining_conjuncts.clone());
+                let result =
+                    conjunct_not_in_all_try_decorrelate(&current_select, query, outer_refs, test)?;
+                transformed |= join_result_apply(
+                    result,
+                    conjunct,
+                    &mut current_select,
+                    &mut remaining_conjuncts,
+                );
+            }
+
+            // NOT wrapping a correlated non-EXISTS/non-IN subquery
             ResolvedWhereExpr::Unary(unary) if unary.op == UnaryOp::Not => {
                 if matches!(
                     unary.expr.as_ref(),
@@ -1603,15 +1935,23 @@ mod tests {
     }
 
     #[test]
-    fn test_correlated_in_subquery_rejected() {
+    fn test_correlated_in_subquery_decorrelated() {
         let tables = test_tables();
-        let result = resolve_and_decorrelate(
+        let outcome = resolve_and_decorrelate(
             "SELECT e.id FROM employees e \
              WHERE e.id IN (SELECT o.emp_id FROM orders o WHERE o.status = e.status)",
             &tables,
-        );
+        )
+        .unwrap();
 
-        assert!(result.is_err(), "correlated IN should be rejected");
+        assert!(
+            outcome.transformed,
+            "correlated IN should be decorrelated"
+        );
+        let sql = deparse(&outcome.resolved);
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+        assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
+        assert!(sql.contains("DISTINCT"), "should have DISTINCT: {sql}");
     }
 
     #[test]
@@ -2102,5 +2442,453 @@ mod tests {
         assert!(sql.contains("_dc2"), "second branch derived table: {sql}");
         assert!(sql.contains("_ds1"), "first branch scalar column: {sql}");
         assert!(sql.contains("_ds2"), "second branch scalar column: {sql}");
+    }
+
+    // ==================== IN Decorrelation ====================
+
+    #[test]
+    fn test_in_single_correlation() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, e.name FROM employees e \
+             WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+        assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
+        assert!(sql.contains("DISTINCT"), "should have DISTINCT: {sql}");
+        // IN predicate (test_expr = inner_column)
+        assert!(
+            sql.contains("e.dept_id = d.id"),
+            "should have IN predicate in ON: {sql}"
+        );
+        // Correlation predicate
+        assert!(
+            sql.contains("d.name = e.name"),
+            "should have correlation in ON: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_in_with_residual_predicates() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id IN ( \
+                 SELECT d.id FROM departments d \
+                 WHERE d.name = e.name AND d.location = 'NYC' \
+             )",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+        assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
+        // Residual predicate should be in outer WHERE
+        assert!(
+            sql.contains("d.location = 'NYC'"),
+            "residual in WHERE: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_in_with_outer_where_predicates() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.status = 'active' \
+             AND e.dept_id IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(
+            sql.contains("e.status = 'active'"),
+            "outer predicate preserved: {sql}"
+        );
+        assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
+    }
+
+    #[test]
+    fn test_in_sets_distinct() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        let select = as_select(&outcome.resolved);
+        assert!(select.distinct, "IN decorrelation should set DISTINCT");
+    }
+
+    #[test]
+    fn test_in_with_inner_group_by_stripped() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id IN ( \
+                 SELECT d.id FROM departments d \
+                 WHERE d.name = e.name \
+                 GROUP BY d.id \
+             )",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed, "IN with GROUP BY should be decorrelated");
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+        assert!(
+            !sql.contains("GROUP BY"),
+            "GROUP BY should be stripped: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_in_with_inner_limit_stripped() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id IN ( \
+                 SELECT d.id FROM departments d \
+                 WHERE d.name = e.name \
+                 LIMIT 10 \
+             )",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed, "IN with LIMIT should be decorrelated");
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("JOIN"), "should have JOIN: {sql}");
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+    }
+
+    #[test]
+    fn test_in_outer_query_has_joins() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             JOIN orders o ON o.emp_id = e.id \
+             WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+        assert!(
+            sql.contains("public.orders"),
+            "original join preserved: {sql}"
+        );
+        assert!(
+            sql.contains("public.departments"),
+            "IN table joined: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_in_mixed_with_exists() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.name = e.name) \
+             AND EXISTS (SELECT 1 FROM orders o WHERE o.emp_id = e.id)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+        assert!(!sql.contains("EXISTS"), "should not have EXISTS: {sql}");
+        assert!(
+            sql.contains("public.departments"),
+            "IN table: {sql}"
+        );
+        assert!(sql.contains("public.orders"), "EXISTS table: {sql}");
+    }
+
+    #[test]
+    fn test_non_correlated_in_unchanged() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.location = 'NYC')",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(!outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(
+            sql.contains(" IN ("),
+            "non-correlated IN should remain: {sql}"
+        );
+    }
+
+    // ==================== NOT IN Decorrelation ====================
+
+    #[test]
+    fn test_not_in_single_correlation() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id, e.name FROM employees e \
+             WHERE e.dept_id NOT IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(
+            !sql.contains("<> ALL"),
+            "should not have <> ALL: {sql}"
+        );
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("IS NULL"), "should have IS NULL check: {sql}");
+        // IN predicate (test_expr = inner_column)
+        assert!(
+            sql.contains("e.dept_id = d.id"),
+            "should have IN predicate in ON: {sql}"
+        );
+        // Correlation predicate
+        assert!(
+            sql.contains("d.name = e.name"),
+            "should have correlation in ON: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_not_in_all_syntax() {
+        let tables = test_tables();
+        // <> ALL is the same as NOT IN at the SubLinkType level
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id <> ALL (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("IS NULL"), "should have IS NULL check: {sql}");
+    }
+
+    #[test]
+    fn test_not_in_with_residual_in_on_clause() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id NOT IN ( \
+                 SELECT d.id FROM departments d \
+                 WHERE d.name = e.name AND d.location = 'NYC' \
+             )",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        // Residual should be in ON clause (not outer WHERE) for LEFT JOIN semantics
+        assert!(
+            sql.contains("d.location = 'NYC'"),
+            "residual in ON clause: {sql}"
+        );
+        assert!(sql.contains("IS NULL"), "IS NULL check present: {sql}");
+    }
+
+    #[test]
+    fn test_not_in_with_outer_where_predicates() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.status = 'active' \
+             AND e.dept_id NOT IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(
+            sql.contains("e.status = 'active'"),
+            "outer predicate preserved: {sql}"
+        );
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+        assert!(sql.contains("IS NULL"), "should have IS NULL: {sql}");
+    }
+
+    #[test]
+    fn test_not_in_does_not_set_distinct() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id NOT IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        let select = as_select(&outcome.resolved);
+        assert!(
+            !select.distinct,
+            "NOT IN decorrelation should NOT set DISTINCT"
+        );
+    }
+
+    #[test]
+    fn test_not_in_with_inner_group_by_rejected() {
+        let tables = test_tables();
+        let result = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id NOT IN ( \
+                 SELECT d.id FROM departments d \
+                 WHERE d.name = e.name \
+                 GROUP BY d.id \
+             )",
+            &tables,
+        );
+
+        assert!(
+            result.is_err(),
+            "NOT IN with GROUP BY should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_not_in_with_inner_having_rejected() {
+        let tables = test_tables();
+        let result = resolve_and_decorrelate(
+            "SELECT d.id FROM departments d \
+             WHERE d.id NOT IN ( \
+                 SELECT e.dept_id FROM employees e \
+                 WHERE e.name = d.name \
+                 GROUP BY e.dept_id \
+                 HAVING count(*) > 5 \
+             )",
+            &tables,
+        );
+
+        assert!(
+            result.is_err(),
+            "NOT IN with HAVING should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_not_in_with_inner_limit_stripped() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id NOT IN ( \
+                 SELECT d.id FROM departments d \
+                 WHERE d.name = e.name \
+                 LIMIT 10 \
+             )",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(
+            outcome.transformed,
+            "NOT IN with LIMIT should be decorrelated"
+        );
+        let sql = deparse(&outcome.resolved);
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+    }
+
+    #[test]
+    fn test_not_in_outer_query_has_joins() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             JOIN orders o ON o.emp_id = e.id \
+             WHERE e.dept_id NOT IN (SELECT d.id FROM departments d WHERE d.name = e.name)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(
+            sql.contains("public.orders"),
+            "original join preserved: {sql}"
+        );
+        assert!(
+            sql.contains("public.departments"),
+            "NOT IN table joined: {sql}"
+        );
+        assert!(sql.contains("LEFT JOIN"), "should have LEFT JOIN: {sql}");
+    }
+
+    #[test]
+    fn test_not_in_mixed_with_in_and_exists() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id NOT IN (SELECT d.id FROM departments d WHERE d.name = e.name) \
+             AND e.id IN (SELECT o.emp_id FROM orders o WHERE o.status = e.status) \
+             AND EXISTS (SELECT 1 FROM projects p WHERE p.dept_id = e.dept_id)",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+
+        assert!(
+            !sql.contains("<> ALL"),
+            "should not have <> ALL: {sql}"
+        );
+        assert!(!sql.contains(" IN ("), "should not have IN: {sql}");
+        assert!(!sql.contains("EXISTS"), "should not have EXISTS: {sql}");
+        assert!(
+            sql.contains("public.departments"),
+            "NOT IN table: {sql}"
+        );
+        assert!(sql.contains("public.orders"), "IN table: {sql}");
+        assert!(sql.contains("public.projects"), "EXISTS table: {sql}");
+    }
+
+    #[test]
+    fn test_non_correlated_not_in_unchanged() {
+        let tables = test_tables();
+        let outcome = resolve_and_decorrelate(
+            "SELECT e.id FROM employees e \
+             WHERE e.dept_id NOT IN (SELECT d.id FROM departments d WHERE d.location = 'NYC')",
+            &tables,
+        )
+        .unwrap();
+
+        assert!(!outcome.transformed);
+        let sql = deparse(&outcome.resolved);
+        // PostgreSQL parses NOT IN as NOT(ANY), deparsed as "NOT ... IN (SELECT ...)"
+        assert!(
+            sql.contains("NOT") && sql.contains("IN (SELECT"),
+            "non-correlated NOT IN should remain: {sql}"
+        );
     }
 }

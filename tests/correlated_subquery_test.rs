@@ -1,7 +1,7 @@
 #![allow(clippy::indexing_slicing)]
 #![allow(clippy::unwrap_used)]
 
-//! Correlated subquery caching tests (EXISTS, NOT EXISTS, scalar).
+//! Correlated subquery caching tests (EXISTS, NOT EXISTS, IN, NOT IN, scalar).
 //!
 //! Correlated subqueries reference columns from the outer query. pgcache
 //! decorrelates them into JOINs for update query generation so that CDC
@@ -10,6 +10,8 @@
 //! Decorrelation transforms:
 //! - EXISTS → INNER JOIN + DISTINCT (semi-join)
 //! - NOT EXISTS → LEFT JOIN + IS NULL (anti-join)
+//! - IN → INNER JOIN + DISTINCT (semi-join, with IN predicate in ON)
+//! - NOT IN → LEFT JOIN + IS NULL (anti-join, with NOT IN predicate in ON)
 //! - Scalar subquery → LEFT JOIN + derived table (aggregate or lookup)
 //!
 //! These tests verify:
@@ -19,6 +21,7 @@
 //! - EXISTS with GROUP BY/HAVING in inner query (stripped for update queries)
 //! - Residual predicates on inner tables filter CDC events correctly
 //! - Scalar subqueries in SELECT list and WHERE clause
+//! - IN/NOT IN with correlation predicates and residual filtering
 
 use std::io::Error;
 
@@ -664,6 +667,734 @@ async fn test_correlated_exists_inner_join() -> Result<(), Error> {
     assert_eq!(res.len(), 4); // Alice, Bob
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     assert_row_at(&res, 2, &[("name", "Bob")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// IN — Basic Caching and CDC Invalidation
+// =============================================================================
+
+/// Test correlated IN subquery caching and CDC invalidation.
+///
+/// Pattern: SELECT ... FROM t1 WHERE t1.col IN (SELECT t2.col FROM t2 WHERE t2.ref = t1.ref)
+///
+/// Decorrelated form (for update queries):
+///   SELECT DISTINCT t1.* FROM t1 JOIN t2 ON t1.col = t2.col AND t2.ref = t1.ref
+///
+/// IN is a semi-join, same as EXISTS, with the IN predicate added to the
+/// JOIN ON condition.
+///
+/// CDC behavior after decorrelation:
+/// - INSERT into inner table → invalidates (new match may add outer row to result)
+/// - DELETE from inner table → in-place removal, cache hit (INNER JOIN DELETE
+///   can only shrink the result, serve-time IN re-evaluates)
+#[tokio::test]
+async fn test_correlated_in_basic() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, emp_id INTEGER, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, dept_id) VALUES \
+         (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 10)",
+        &[],
+    )
+    .await?;
+
+    // Alice and Charlie have orders in their department (dept 10)
+    ctx.query(
+        "INSERT INTO orders (id, emp_id, dept_id) VALUES \
+         (100, 1, 10), (101, 3, 10)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Employees who have orders in their own department
+    // Correlation: o.dept_id = e.dept_id, IN predicate: e.id = o.emp_id
+    let query = "SELECT e.name FROM employees e \
+                 WHERE e.id IN ( \
+                     SELECT o.emp_id FROM orders o WHERE o.dept_id = e.dept_id \
+                 ) \
+                 ORDER BY e.name";
+
+    // --- Cache miss, populates cache ---
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // Alice, Charlie + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Charlie")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- CDC INSERT on inner table → invalidates ---
+    // Add order for Bob in dept 20 → Bob should appear
+    ctx.origin_query(
+        "INSERT INTO orders (id, emp_id, dept_id) VALUES (102, 2, 20)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // Alice, Bob, Charlie
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Bob")])?;
+    assert_row_at(&res, 3, &[("name", "Charlie")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- CDC DELETE on inner table → in-place removal, cache hit ---
+    // Direct source: row removed from cache table, serve-time IN
+    // re-evaluates. INNER JOIN DELETE can only shrink the result.
+    ctx.origin_query("DELETE FROM orders WHERE id = 101", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // Alice, Bob
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Bob")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// IN with Correlated Predicate — Semi-Join
+// =============================================================================
+
+/// Test correlated IN subquery where the inner WHERE has a correlation predicate.
+///
+/// Pattern: SELECT ... FROM employees e
+///          WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.location = e.location)
+///
+/// Both the IN predicate (e.dept_id = d.id) and the correlation predicate
+/// (d.location = e.location) appear in the JOIN ON condition.
+///
+/// CDC behavior: INSERT/DELETE/UPDATE on departments → invalidates
+#[tokio::test]
+async fn test_correlated_in_with_correlation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, location TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT, location TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, dept_id, location) VALUES \
+         (1, 'Alice', 10, 'NYC'), (2, 'Bob', 20, 'SF'), (3, 'Charlie', 30, 'NYC')",
+        &[],
+    )
+    .await?;
+
+    // Dept 10 in NYC, dept 20 in SF — Alice's dept matches her location, Bob's matches his
+    // Charlie's dept 30 doesn't exist yet
+    ctx.query(
+        "INSERT INTO departments (id, name, location) VALUES \
+         (10, 'Engineering', 'NYC'), (20, 'Marketing', 'SF')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Employees whose dept_id matches a department in the same location
+    let query = "SELECT e.name FROM employees e \
+                 WHERE e.dept_id IN ( \
+                     SELECT d.id FROM departments d WHERE d.location = e.location \
+                 ) \
+                 ORDER BY e.name";
+
+    // --- Cache miss ---
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // Alice, Bob + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Bob")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- CDC INSERT: add dept 30 in NYC → Charlie should appear ---
+    ctx.origin_query(
+        "INSERT INTO departments (id, name, location) VALUES (30, 'Sales', 'NYC')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // Alice, Bob, Charlie
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Bob")])?;
+    assert_row_at(&res, 3, &[("name", "Charlie")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// IN with Residual Predicates — Constraint Filtering
+// =============================================================================
+
+/// Test IN with residual predicates that create CDC constraints.
+///
+/// Pattern: SELECT ... FROM employees e
+///          WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.id = e.dept_id AND d.status = 'active')
+///
+/// The residual predicate (d.status = 'active') produces constraints on the
+/// inner table's update query. CDC events that don't match should NOT
+/// trigger invalidation.
+#[tokio::test]
+async fn test_correlated_in_residual_constraint_filter() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, dept_id INTEGER, status TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, dept_id) VALUES \
+         (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 30)",
+        &[],
+    )
+    .await?;
+
+    // Dept 10 is active, dept 20 is inactive
+    ctx.query(
+        "INSERT INTO departments (id, dept_id, status) VALUES \
+         (100, 10, 'active'), (101, 20, 'inactive')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Employees in active departments
+    let query = "SELECT e.name FROM employees e \
+                 WHERE e.dept_id IN ( \
+                     SELECT d.dept_id FROM departments d \
+                     WHERE d.dept_id = e.dept_id AND d.status = 'active' \
+                 ) \
+                 ORDER BY e.name";
+
+    // --- Cache miss ---
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3); // Alice + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- Non-matching INSERT: status = 'inactive' does NOT match constraint ---
+    ctx.origin_query(
+        "INSERT INTO departments (id, dept_id, status) VALUES (102, 30, 'inactive')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache hit — 'inactive' doesn't match the 'active' constraint
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- Matching INSERT: status = 'active' DOES match constraint ---
+    ctx.origin_query(
+        "INSERT INTO departments (id, dept_id, status) VALUES (103, 30, 'active')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4); // Alice, Charlie
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Charlie")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// NOT IN — Basic Caching and CDC Invalidation
+// =============================================================================
+
+/// Test correlated NOT IN subquery caching and CDC invalidation.
+///
+/// Pattern: SELECT ... FROM t1 WHERE t1.col NOT IN (SELECT t2.col FROM t2 WHERE t2.ref = t1.ref)
+///
+/// Decorrelated form (for update queries):
+///   SELECT t1.* FROM t1 LEFT JOIN t2 ON t1.col = t2.col AND t2.ref = t1.ref
+///   WHERE t2.col IS NULL
+///
+/// NOT IN is an anti-join, same as NOT EXISTS, with the NOT IN predicate
+/// added to the JOIN ON condition and an IS NULL check in the outer WHERE.
+///
+/// CDC behavior after decorrelation:
+/// - INSERT into inner table → invalidates (new match may exclude outer row)
+/// - DELETE from inner table → invalidates (removed match may include outer row)
+#[tokio::test]
+async fn test_correlated_not_in_basic() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO departments (id, name) VALUES \
+         (1, 'Engineering'), (2, 'Marketing'), (3, 'Sales')",
+        &[],
+    )
+    .await?;
+
+    // Engineering and Sales have employees; Marketing is empty
+    ctx.query(
+        "INSERT INTO employees (id, name, dept_id) VALUES \
+         (10, 'Alice', 1), (11, 'Bob', 3)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Departments whose id does NOT appear among employee dept_ids
+    // Correlation: e.dept_id = d.id, NOT IN predicate: d.id = e.dept_id
+    let query = "SELECT d.name FROM departments d \
+                 WHERE d.id NOT IN ( \
+                     SELECT e.dept_id FROM employees e WHERE e.dept_id = d.id \
+                 ) \
+                 ORDER BY d.name";
+
+    // --- Cache miss ---
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3); // Marketing + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Marketing")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- CDC INSERT on inner table (employees) → invalidates ---
+    // Add employee to Marketing — it should disappear from results
+    ctx.origin_query(
+        "INSERT INTO employees (id, name, dept_id) VALUES (12, 'Carol', 2)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 2); // no departments without employees + RowDesc + CommandComplete
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- CDC DELETE on inner table (employees) → invalidates ---
+    // Remove Bob from Sales — Sales should reappear
+    ctx.origin_query("DELETE FROM employees WHERE id = 11", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3); // Sales + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Sales")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// NOT IN with Correlated Predicate — Anti-Join
+// =============================================================================
+
+/// Test correlated NOT IN where the inner WHERE has a correlation predicate.
+///
+/// Pattern: SELECT ... FROM employees e
+///          WHERE e.id NOT IN (SELECT o.emp_id FROM orders o WHERE o.status = e.status)
+///
+/// Both the NOT IN predicate (e.id = o.emp_id) and the correlation predicate
+/// (o.status = e.status) appear in the LEFT JOIN ON condition.
+/// The IS NULL check on the inner output column completes the anti-join.
+#[tokio::test]
+async fn test_correlated_not_in_with_correlation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, status TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, emp_id INTEGER, status TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, status) VALUES \
+         (1, 'Alice', 'active'), (2, 'Bob', 'active'), (3, 'Charlie', 'inactive')",
+        &[],
+    )
+    .await?;
+
+    // Alice has an active order, Charlie has an inactive order
+    // Bob has no orders matching his status
+    ctx.query(
+        "INSERT INTO orders (id, emp_id, status) VALUES \
+         (100, 1, 'active'), (101, 3, 'inactive')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Employees whose id does NOT appear among orders with a matching status
+    let query = "SELECT e.name FROM employees e \
+                 WHERE e.id NOT IN ( \
+                     SELECT o.emp_id FROM orders o WHERE o.status = e.status \
+                 ) \
+                 ORDER BY e.name";
+
+    // --- Cache miss ---
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    // Alice has matching active order → excluded
+    // Bob has no active orders → included
+    // Charlie has matching inactive order → excluded
+    assert_eq!(res.len(), 3); // Bob + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Bob")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- CDC INSERT: add active order for Bob → Bob should be excluded ---
+    ctx.origin_query(
+        "INSERT INTO orders (id, emp_id, status) VALUES (102, 2, 'active')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    // All three now have matching orders → no results
+    assert_eq!(res.len(), 2); // RowDesc + CommandComplete only
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- CDC DELETE: remove Alice's order → Alice should reappear ---
+    ctx.origin_query("DELETE FROM orders WHERE id = 100", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3); // Alice + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// NOT IN with Residual Predicates — Constraint Filtering
+// =============================================================================
+
+/// Test NOT IN with residual predicates that create CDC constraints.
+///
+/// For NOT IN, residual predicates go in the ON clause (not outer WHERE)
+/// to preserve LEFT JOIN semantics, same as NOT EXISTS. The residual
+/// still produces constraints on the inner table's update query.
+#[tokio::test]
+async fn test_correlated_not_in_residual_constraint_filter() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE blocked_assignments (id INTEGER PRIMARY KEY, dept_id INTEGER, severity TEXT)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, dept_id) VALUES \
+         (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 30)",
+        &[],
+    )
+    .await?;
+
+    // Dept 10 has a critical block, dept 20 has a minor block
+    ctx.query(
+        "INSERT INTO blocked_assignments (id, dept_id, severity) VALUES \
+         (100, 10, 'critical'), (101, 20, 'minor')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Employees not in critically blocked departments
+    let query = "SELECT e.name FROM employees e \
+                 WHERE e.dept_id NOT IN ( \
+                     SELECT ba.dept_id FROM blocked_assignments ba \
+                     WHERE ba.dept_id = e.dept_id AND ba.severity = 'critical' \
+                 ) \
+                 ORDER BY e.name";
+
+    // --- Cache miss ---
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    // Alice excluded (dept 10 critical), Bob included (dept 20 minor), Charlie included (no block)
+    assert_eq!(res.len(), 4); // Bob, Charlie + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Bob")])?;
+    assert_row_at(&res, 2, &[("name", "Charlie")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- Non-matching INSERT: severity = 'minor' does NOT match constraint ---
+    ctx.origin_query(
+        "INSERT INTO blocked_assignments (id, dept_id, severity) VALUES (102, 30, 'minor')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache hit — 'minor' doesn't match the 'critical' constraint
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- Matching INSERT: severity = 'critical' DOES match constraint ---
+    ctx.origin_query(
+        "INSERT INTO blocked_assignments (id, dept_id, severity) VALUES (103, 30, 'critical')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 3); // only Bob
+    assert_row_at(&res, 1, &[("name", "Bob")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// Mixed IN, NOT IN, EXISTS — Multiple Decorrelation Types
+// =============================================================================
+
+/// Test a query combining IN, NOT IN, and EXISTS decorrelation.
+///
+/// All three decorrelation types coexist in the same query:
+/// - IN → INNER JOIN + DISTINCT (semi-join)
+/// - NOT IN → LEFT JOIN + IS NULL (anti-join)
+/// - EXISTS → INNER JOIN + DISTINCT (semi-join)
+#[tokio::test]
+async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE projects (id INTEGER PRIMARY KEY, dept_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "CREATE TABLE suspensions (id INTEGER PRIMARY KEY, emp_id INTEGER)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO employees (id, name, dept_id) VALUES \
+         (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 10), (4, 'Diana', 30)",
+        &[],
+    )
+    .await?;
+
+    // Dept 10 and 20 are active
+    ctx.query(
+        "INSERT INTO departments (id, name, active) VALUES \
+         (10, 'Engineering', 1), (20, 'Marketing', 1), (30, 'Sales', 0)",
+        &[],
+    )
+    .await?;
+
+    // Dept 10 has projects
+    ctx.query(
+        "INSERT INTO projects (id, dept_id) VALUES (100, 10)",
+        &[],
+    )
+    .await?;
+
+    // Bob is suspended
+    ctx.query(
+        "INSERT INTO suspensions (id, emp_id) VALUES (200, 2)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Employees who:
+    // 1. Are in an active department (correlated IN: d.id = e.dept_id is both correlation and IN predicate)
+    // 2. Are NOT suspended (correlated NOT IN: s.emp_id = e.id is both correlation and NOT IN predicate)
+    // 3. Have projects in their department (correlated EXISTS: p.dept_id = e.dept_id)
+    let query = "SELECT e.name FROM employees e \
+                 WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.id = e.dept_id AND d.active = 1) \
+                 AND e.id NOT IN (SELECT s.emp_id FROM suspensions s WHERE s.emp_id = e.id) \
+                 AND EXISTS (SELECT 1 FROM projects p WHERE p.dept_id = e.dept_id) \
+                 ORDER BY e.name";
+
+    // --- Cache miss ---
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    // Alice: dept 10 active ✓, not suspended ✓, dept has projects ✓ → included
+    // Bob: dept 20 active ✓, suspended ✗ → excluded
+    // Charlie: dept 10 active ✓, not suspended ✓, dept has projects ✓ → included
+    // Diana: dept 30 not active ✗ → excluded
+    assert_eq!(res.len(), 4); // Alice, Charlie + RowDesc + CommandComplete
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Charlie")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- Cache hit ---
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // --- CDC: unsuspend Bob (DELETE from suspensions) → Bob still excluded (no projects in dept 20) ---
+    ctx.origin_query("DELETE FROM suspensions WHERE id = 200", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    // Bob's dept 20 has no projects, so he's still excluded
+    assert_eq!(res.len(), 4); // still Alice, Charlie
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    wait_cache_load().await;
+
+    // --- CDC: add project for dept 20 → Bob should appear ---
+    ctx.origin_query(
+        "INSERT INTO projects (id, dept_id) VALUES (101, 20)",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5); // Alice, Bob, Charlie
+    assert_row_at(&res, 1, &[("name", "Alice")])?;
+    assert_row_at(&res, 2, &[("name", "Bob")])?;
+    assert_row_at(&res, 3, &[("name", "Charlie")])?;
     let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
