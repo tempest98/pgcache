@@ -1,4 +1,4 @@
-use tokio_util::bytes::{Buf, BytesMut};
+use tokio_util::bytes::{Buf, Bytes, BytesMut};
 
 use super::{ProtocolError, ProtocolResult};
 use crate::cache::query::CacheableQuery;
@@ -41,7 +41,7 @@ pub struct PreparedStatement {
 pub struct Portal {
     pub name: String,
     pub statement_name: String,
-    pub parameter_values: Vec<Option<Vec<u8>>>,
+    pub parameter_values: Vec<Option<Bytes>>,
     pub parameter_formats: Vec<i16>, // 0=text, 1=binary
     pub result_formats: Vec<i16>,
 }
@@ -68,7 +68,7 @@ pub struct ParsedBindMessage {
     pub portal_name: String,
     pub statement_name: String,
     pub parameter_formats: Vec<i16>,
-    pub parameter_values: Vec<Option<Vec<u8>>>,
+    pub parameter_values: Vec<Option<Bytes>>,
     pub result_formats: Vec<i16>,
 }
 
@@ -260,7 +260,7 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
                 ))
                 .into());
             };
-            let value = value_bytes.to_vec();
+            let value = Bytes::copy_from_slice(value_bytes);
             buf.advance(param_len);
             parameter_values.push(Some(value));
         }
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(result.statement_name, "s1");
         assert_eq!(result.parameter_formats, vec![0]);
         assert_eq!(result.parameter_values.len(), 1);
-        assert_eq!(result.parameter_values[0], Some(b"42".to_vec()));
+        assert_eq!(result.parameter_values[0], Some(Bytes::from_static(b"42")));
         assert_eq!(result.result_formats, vec![0]);
     }
 
@@ -724,7 +724,7 @@ mod tests {
         let portal = Portal {
             name: "p1".to_owned(),
             statement_name: "s1".to_owned(),
-            parameter_values: vec![Some(b"42".to_vec())],
+            parameter_values: vec![Some(Bytes::from_static(b"42"))],
             parameter_formats: vec![0], // text format
             result_formats: vec![0],
         };
@@ -740,7 +740,7 @@ mod tests {
         let portal = Portal {
             name: "p1".to_owned(),
             statement_name: "s1".to_owned(),
-            parameter_values: vec![Some(vec![0, 0, 0, 42])],
+            parameter_values: vec![Some(Bytes::from_static(&[0, 0, 0, 42]))],
             parameter_formats: vec![1], // binary format
             result_formats: vec![0],
         };
@@ -756,7 +756,7 @@ mod tests {
         let portal = Portal {
             name: "p1".to_owned(),
             statement_name: "s1".to_owned(),
-            parameter_values: vec![Some(b"text".to_vec()), Some(vec![0, 0, 0, 42])],
+            parameter_values: vec![Some(Bytes::from_static(b"text")), Some(Bytes::from_static(&[0, 0, 0, 42]))],
             parameter_formats: vec![0, 1], // text, then binary
             result_formats: vec![0],
         };

@@ -257,7 +257,7 @@ fn parameter_to_literal(param: &QueryParameter) -> AstTransformResult<LiteralVal
 
 /// Convert a text format parameter to a LiteralValue based on OID.
 fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
-    let s = String::from_utf8(bytes.to_vec())
+    let s = std::str::from_utf8(bytes)
         .map_err(|_| Report::from(AstTransformError::InvalidUtf8))?;
 
     // Use postgres_types to identify the type from OID
@@ -265,7 +265,7 @@ fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Liter
 
     match pg_type {
         Some(PgType::BOOL) => {
-            let value = matches!(s.as_str(), "t" | "true" | "TRUE" | "1");
+            let value = matches!(s, "t" | "true" | "TRUE" | "1");
             Ok(LiteralValue::Boolean(value))
         }
         Some(PgType::INT2 | PgType::INT4 | PgType::INT8) => {
@@ -297,7 +297,7 @@ fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Liter
             | PgType::NAME
             | PgType::CHAR
             | PgType::UNKNOWN,
-        ) => Ok(LiteralValue::String(s)),
+        ) => Ok(LiteralValue::String(s.to_owned())),
         // Types that pass through as strings (UUID, temporal, numeric)
         Some(
             PgType::UUID
@@ -308,9 +308,9 @@ fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Liter
             | PgType::TIMETZ
             | PgType::INTERVAL
             | PgType::NUMERIC,
-        ) => Ok(LiteralValue::String(s)),
+        ) => Ok(LiteralValue::String(s.to_owned())),
         // Unknown OID or unhandled type - fallback to string
-        _ => Ok(LiteralValue::String(s)),
+        _ => Ok(LiteralValue::String(s.to_owned())),
     }
 }
 
@@ -445,6 +445,8 @@ mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
     #![allow(clippy::unwrap_used)]
 
+    use tokio_util::bytes::Bytes;
+
     use crate::query::ast::{Deparse, query_expr_convert};
 
     use super::*;
@@ -463,7 +465,10 @@ mod tests {
     fn text_params(values: Vec<Option<&[u8]>>) -> QueryParameters {
         let len = values.len();
         QueryParameters {
-            values: values.into_iter().map(|v| v.map(|b| b.to_vec())).collect(),
+            values: values
+                .into_iter()
+                .map(|v| v.map(Bytes::copy_from_slice))
+                .collect(),
             formats: vec![0; len], // 0 = text format
             oids: vec![PgType::TEXT.oid(); len],
         }
@@ -474,7 +479,7 @@ mod tests {
         let len = values.len();
         let (values, oids): (Vec<_>, Vec<_>) = values
             .into_iter()
-            .map(|(v, t)| (v.map(|b| b.to_vec()), t.oid()))
+            .map(|(v, t)| (v.map(Bytes::copy_from_slice), t.oid()))
             .unzip();
         QueryParameters {
             values,
@@ -488,7 +493,7 @@ mod tests {
         let len = values.len();
         let (values, oids): (Vec<_>, Vec<_>) = values
             .into_iter()
-            .map(|(v, t)| (v.map(|b| b.to_vec()), t.oid()))
+            .map(|(v, t)| (v.map(Bytes::copy_from_slice), t.oid()))
             .unzip();
         QueryParameters {
             values,
@@ -627,7 +632,7 @@ mod tests {
     #[test]
     fn test_text_parameter_invalid_integer() {
         let param = QueryParameter {
-            value: Some(b"not_a_number".to_vec()),
+            value: Some(Bytes::from_static(b"not_a_number")),
             format: 0,
             oid: PgType::INT4.oid(),
         };
@@ -663,7 +668,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_bool_true() {
         let param = QueryParameter {
-            value: Some(vec![1]), // PostgreSQL binary bool: 1 = true
+            value: Some(Bytes::from_static(&[1])), // PostgreSQL binary bool: 1 = true
             format: 1,
             oid: PgType::BOOL.oid(),
         };
@@ -675,7 +680,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_bool_false() {
         let param = QueryParameter {
-            value: Some(vec![0]), // PostgreSQL binary bool: 0 = false
+            value: Some(Bytes::from_static(&[0])), // PostgreSQL binary bool: 0 = false
             format: 1,
             oid: PgType::BOOL.oid(),
         };
@@ -687,7 +692,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_int2() {
         let param = QueryParameter {
-            value: Some(vec![0x00, 0x2A]), // 42 in big-endian i16
+            value: Some(Bytes::from_static(&[0x00, 0x2A])), // 42 in big-endian i16
             format: 1,
             oid: PgType::INT2.oid(),
         };
@@ -699,7 +704,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_int4() {
         let param = QueryParameter {
-            value: Some(vec![0x00, 0x00, 0x00, 0x2A]), // 42 in big-endian i32
+            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x2A])), // 42 in big-endian i32
             format: 1,
             oid: PgType::INT4.oid(),
         };
@@ -711,7 +716,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_int8() {
         let param = QueryParameter {
-            value: Some(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A]), // 42 in big-endian i64
+            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A])), // 42 in big-endian i64
             format: 1,
             oid: PgType::INT8.oid(),
         };
@@ -727,7 +732,7 @@ mod tests {
         let bytes = value.to_be_bytes();
 
         let param = QueryParameter {
-            value: Some(bytes.to_vec()),
+            value: Some(Bytes::copy_from_slice(&bytes)),
             format: 1,
             oid: PgType::FLOAT4.oid(),
         };
@@ -747,7 +752,7 @@ mod tests {
         let bytes = value.to_be_bytes();
 
         let param = QueryParameter {
-            value: Some(bytes.to_vec()),
+            value: Some(Bytes::copy_from_slice(&bytes)),
             format: 1,
             oid: PgType::FLOAT8.oid(),
         };
@@ -764,7 +769,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_text() {
         let param = QueryParameter {
-            value: Some(b"hello world".to_vec()),
+            value: Some(Bytes::from_static(b"hello world")),
             format: 1,
             oid: PgType::TEXT.oid(),
         };
@@ -782,7 +787,7 @@ mod tests {
         ];
 
         let param = QueryParameter {
-            value: Some(uuid_bytes.to_vec()),
+            value: Some(Bytes::copy_from_slice(&uuid_bytes)),
             format: 1,
             oid: PgType::UUID.oid(),
         };
@@ -799,7 +804,7 @@ mod tests {
         // Use invalid UTF-8 bytes to test that we get an error when
         // the fallback text interpretation fails
         let param = QueryParameter {
-            value: Some(vec![0xFF, 0xFE]), // Invalid UTF-8 sequence
+            value: Some(Bytes::from_static(&[0xFF, 0xFE])), // Invalid UTF-8 sequence
             format: 1,
             oid: PgType::TIMESTAMP.oid(), // Timestamp not supported in binary
         };
@@ -815,7 +820,7 @@ mod tests {
     fn test_binary_parameter_unsupported_type_valid_utf8_fallback() {
         // Known but unhandled types with valid UTF-8 should fallback to string
         let param = QueryParameter {
-            value: Some(b"2024-01-15".to_vec()), // Valid UTF-8 text representation
+            value: Some(Bytes::from_static(b"2024-01-15")), // Valid UTF-8 text representation
             format: 1,
             oid: PgType::DATE.oid(), // Date not supported in binary
         };

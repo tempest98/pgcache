@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use tokio::sync::oneshot;
-use tokio_util::bytes::BytesMut;
+use tokio_util::bytes::{Bytes, BytesMut};
 
 use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
@@ -49,7 +49,7 @@ pub struct QueryData {
 /// Parameters passed into an extended query
 #[derive(Debug)]
 pub struct QueryParameters {
-    pub values: Vec<Option<Vec<u8>>>,
+    pub values: Vec<Option<Bytes>>,
     pub formats: Vec<i16>,
     pub oids: Vec<u32>,
 }
@@ -92,7 +92,7 @@ impl QueryParameters {
 
 #[derive(Debug)]
 pub struct QueryParameter {
-    pub value: Option<Vec<u8>>,
+    pub value: Option<Bytes>,
     pub format: i16,
     pub oid: u32,
 }
