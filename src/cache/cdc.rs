@@ -8,8 +8,8 @@ use postgres_replication::{
     LogicalReplicationStream,
     protocol::{
         BeginBody, CommitBody, DeleteBody, InsertBody, LogicalReplicationMessage, OriginBody,
-        PrimaryKeepAliveBody, RelationBody, ReplicationMessage, TruncateBody, TypeBody, UpdateBody,
-        XLogDataBody,
+        PrimaryKeepAliveBody, RelationBody, ReplicationMessage, TruncateBody, TupleData, TypeBody,
+        UpdateBody, XLogDataBody,
     },
 };
 use postgres_types::PgLsn;
@@ -485,24 +485,7 @@ impl CdcProcessor {
 
     /// Parse row data from InsertBody into a Vec of column values indexed by position.
     fn parse_insert_row_data(&self, body: &InsertBody) -> Result<Vec<Option<String>>, Error> {
-        let mut row_data = Vec::new();
-
-        // Parse the tuple data from InsertBody
-        let tuple = body.tuple();
-
-        // Extract values from each column in the tuple
-        for column_data in tuple.tuple_data().iter() {
-            let value = match column_data {
-                postgres_replication::protocol::TupleData::Null => None,
-                postgres_replication::protocol::TupleData::UnchangedToast => None, // Treat as NULL for now
-                postgres_replication::protocol::TupleData::Text(data) => {
-                    Some(String::from_utf8_lossy(data).to_string())
-                }
-            };
-            row_data.push(value);
-        }
-
-        Ok(row_data)
+        Ok(tuple_data_parse(body.tuple().tuple_data()))
     }
 
     /// Parse old and new row data from UpdateBody into Vecs of column values indexed by position.
@@ -511,42 +494,18 @@ impl CdcProcessor {
         &self,
         body: &UpdateBody,
     ) -> Result<(Vec<Option<String>>, Vec<Option<String>>), Error> {
-        // Parse new tuple data (always present)
-        let new_tuple = body.new_tuple();
-        let mut new_row_data = Vec::new();
+        let new_row_data = tuple_data_parse(body.new_tuple().tuple_data());
 
-        for column_data in new_tuple.tuple_data().iter() {
-            let value = match column_data {
-                postgres_replication::protocol::TupleData::Null => None,
-                postgres_replication::protocol::TupleData::UnchangedToast => None,
-                postgres_replication::protocol::TupleData::Text(data) => {
-                    Some(String::from_utf8_lossy(data).to_string())
-                }
-            };
-            new_row_data.push(value);
-        }
-
-        let mut key_data = Vec::new();
-        if let Some(key_tuple) = body.key_tuple() {
-            for column_data in key_tuple.tuple_data().iter() {
-                let value = match column_data {
-                    postgres_replication::protocol::TupleData::Null => None,
-                    postgres_replication::protocol::TupleData::UnchangedToast => None,
-                    postgres_replication::protocol::TupleData::Text(data) => {
-                        Some(String::from_utf8_lossy(data).to_string())
-                    }
-                };
-                key_data.push(value);
-            }
-        }
+        let key_data = body
+            .key_tuple()
+            .map(|kt| tuple_data_parse(kt.tuple_data()))
+            .unwrap_or_default();
 
         Ok((key_data, new_row_data))
     }
 
     /// Parse row data from DeleteBody into a Vec of column values indexed by position.
     fn parse_delete_row_data(&self, body: &DeleteBody) -> Result<Vec<Option<String>>, Error> {
-        let mut row_data = Vec::new();
-
         // DeleteBody contains either key_tuple (for tables with REPLICA IDENTITY USING INDEX)
         // or old_tuple (for tables with REPLICA IDENTITY FULL)
         let tuple = if let Some(key_tuple) = body.key_tuple() {
@@ -559,19 +518,7 @@ impl CdcProcessor {
             return Ok(Vec::new());
         };
 
-        // Extract values from each column in the tuple
-        for column_data in tuple.tuple_data().iter() {
-            let value = match column_data {
-                postgres_replication::protocol::TupleData::Null => None,
-                postgres_replication::protocol::TupleData::UnchangedToast => None,
-                postgres_replication::protocol::TupleData::Text(data) => {
-                    Some(String::from_utf8_lossy(data).to_string())
-                }
-            };
-            row_data.push(value);
-        }
-
-        Ok(row_data)
+        Ok(tuple_data_parse(tuple.tuple_data()))
     }
 
     /// Check if there are any cached queries for a specific table by relation OID.
@@ -582,4 +529,15 @@ impl CdcProcessor {
             .map(|set| set.contains(&relation_oid))
             .unwrap_or(false)
     }
+}
+
+/// Convert a slice of replication TupleData into column value strings.
+fn tuple_data_parse(columns: &[TupleData]) -> Vec<Option<String>> {
+    columns
+        .iter()
+        .map(|col| match col {
+            TupleData::Null | TupleData::UnchangedToast => None,
+            TupleData::Text(data) => Some(String::from_utf8_lossy(data).into_owned()),
+        })
+        .collect()
 }
