@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tokio_util::bytes::{Buf, Bytes, BytesMut};
 
 use super::{ProtocolError, ProtocolResult};
@@ -7,7 +9,7 @@ use crate::cache::query::CacheableQuery;
 #[derive(Debug, Clone)]
 pub enum StatementType {
     /// SELECT statement that can be cached
-    Cacheable(Box<CacheableQuery>),
+    Cacheable(Arc<CacheableQuery>),
     /// Non-SELECT statement (INSERT, UPDATE, DELETE, DDL, etc.)
     NonSelect,
     /// SELECT statement that cannot be cached (complex features)

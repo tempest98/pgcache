@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::oneshot;
@@ -6,6 +7,7 @@ use tokio_util::bytes::{Bytes, BytesMut};
 use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
 use crate::proxy::ClientSocket;
+use crate::query::transform::query_expr_parameters_replace;
 use crate::timing::QueryTiming;
 
 /// Whether the pipeline includes a Describe and which type.
@@ -41,7 +43,7 @@ pub struct PipelineContext {
 /// Converted query data ready for processing
 pub struct QueryData {
     pub data: BytesMut,
-    pub cacheable_query: Box<CacheableQuery>,
+    pub cacheable_query: Arc<CacheableQuery>,
     pub query_type: QueryType,
     pub result_formats: Vec<i16>,
 }
@@ -100,8 +102,8 @@ pub struct QueryParameter {
 /// Message types for communication between proxy and cache
 #[derive(Debug)]
 pub enum CacheMessage {
-    Query(BytesMut, Box<CacheableQuery>),
-    QueryParameterized(BytesMut, Box<CacheableQuery>, QueryParameters, Vec<i16>),
+    Query(BytesMut, Arc<CacheableQuery>),
+    QueryParameterized(BytesMut, Arc<CacheableQuery>, QueryParameters, Vec<i16>),
 }
 
 impl CacheMessage {
@@ -126,20 +128,22 @@ impl CacheMessage {
             }),
             CacheMessage::QueryParameterized(
                 data,
-                mut cacheable_query,
+                cacheable_query,
                 parameters,
                 result_formats,
             ) => {
-                // Replace parameters in AST
-                if let Err(e) = cacheable_query.parameters_replace(&parameters) {
-                    return Err((e.context_transform(CacheError::from), data));
+                // Replace parameters in AST, producing a new QueryExpr
+                match query_expr_parameters_replace(&cacheable_query.query, &parameters) {
+                    Ok(replaced_query) => Ok(QueryData {
+                        data,
+                        cacheable_query: Arc::new(CacheableQuery {
+                            query: replaced_query,
+                        }),
+                        query_type: QueryType::Extended,
+                        result_formats,
+                    }),
+                    Err(e) => Err((e.context_transform(CacheError::from), data)),
                 }
-                Ok(QueryData {
-                    data,
-                    cacheable_query,
-                    query_type: QueryType::Extended,
-                    result_formats,
-                })
             }
         }
     }
@@ -185,7 +189,7 @@ pub enum QueryCommand {
     /// Register a new query and spawn background population (fire-and-forget)
     Register {
         fingerprint: u64,
-        cacheable_query: Box<CacheableQuery>,
+        cacheable_query: Arc<CacheableQuery>,
         search_path: Vec<String>,
         started_at: Instant,
     },

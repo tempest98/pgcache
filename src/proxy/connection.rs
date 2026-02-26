@@ -227,7 +227,7 @@ pub(super) struct ConnectionState {
     client_write_buf: VecDeque<BytesMut>,
 
     /// Cache of query fingerprints to cacheability decisions
-    fingerprint_cache: HashMap<u64, Result<Box<CacheableQuery>, ForwardReason>>,
+    fingerprint_cache: HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
 
     /// Whether the connection is currently in a transaction
     in_transaction: bool,
@@ -798,7 +798,7 @@ impl ConnectionState {
             let sql_type = match pg_query::parse(&parsed.sql) {
                 Ok(ast) => match crate::query::ast::query_expr_convert(&ast) {
                     Ok(query) => match CacheableQuery::try_new(&query, &self.func_volatility) {
-                        Ok(cacheable_query) => StatementType::Cacheable(Box::new(cacheable_query)),
+                        Ok(cacheable_query) => StatementType::Cacheable(Arc::new(cacheable_query)),
                         Err(_) => StatementType::UncacheableSelect,
                     },
                     Err(_) => StatementType::NonSelect,
@@ -882,7 +882,7 @@ impl ConnectionState {
         let stmt = self.prepared_statements.get(&portal.statement_name)?;
 
         let cacheable_query = match &stmt.sql_type {
-            StatementType::Cacheable(query) => query.clone(),
+            StatementType::Cacheable(query) => Arc::clone(query),
             StatementType::NonSelect
             | StatementType::UncacheableSelect
             | StatementType::ParseError => return None,

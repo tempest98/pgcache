@@ -29,7 +29,7 @@ pub enum QueryType {
 pub struct QueryRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
-    pub cacheable_query: Box<CacheableQuery>,
+    pub cacheable_query: Arc<CacheableQuery>,
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
     pub reply_tx: oneshot::Sender<CacheReply>,
@@ -268,7 +268,7 @@ impl QueryCache {
     fn query_register_send(
         &self,
         fingerprint: u64,
-        cacheable_query: Box<CacheableQuery>,
+        cacheable_query: Arc<CacheableQuery>,
         search_path: Vec<String>,
     ) -> CacheResult<()> {
         self.query_tx
@@ -285,7 +285,7 @@ impl QueryCache {
     fn query_first_miss_handle(
         &self,
         fingerprint: u64,
-        cacheable_query: Box<CacheableQuery>,
+        cacheable_query: Arc<CacheableQuery>,
         search_path: Vec<String>,
     ) -> CacheResult<()> {
         let immediate_admit =

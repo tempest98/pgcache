@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
 };
 
 use tokio_util::bytes::BytesMut;
@@ -23,13 +24,13 @@ pub(super) enum ForwardReason {
 
 pub(super) enum Action {
     Forward(ForwardReason),
-    CacheCheck(Box<CacheableQuery>),
+    CacheCheck(Arc<CacheableQuery>),
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) async fn handle_query(
     data: &BytesMut,
-    fp_cache: &mut HashMap<u64, Result<Box<CacheableQuery>, ForwardReason>>,
+    fp_cache: &mut HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
     func_volatility: &HashMap<String, FunctionVolatility>,
 ) -> Result<Action, ParseError> {
     let len_bytes: [u8; 4] = data
@@ -49,7 +50,7 @@ pub(super) async fn handle_query(
     match fp_cache.get(&fingerprint) {
         Some(Ok(cacheable_query)) => {
             trace!("cache hit: cacheable true");
-            Ok(Action::CacheCheck(cacheable_query.clone()))
+            Ok(Action::CacheCheck(Arc::clone(cacheable_query)))
         }
         Some(Err(reason)) => {
             trace!("cache hit: cacheable false");
@@ -63,8 +64,9 @@ pub(super) async fn handle_query(
                     // Successfully parsed as SELECT
                     match CacheableQuery::try_new(&query, func_volatility) {
                         Ok(cacheable_query) => {
-                            fp_cache.insert(fingerprint, Ok(Box::new(cacheable_query.clone())));
-                            Ok(Action::CacheCheck(Box::new(cacheable_query)))
+                            let cacheable_query = Arc::new(cacheable_query);
+                            fp_cache.insert(fingerprint, Ok(Arc::clone(&cacheable_query)));
+                            Ok(Action::CacheCheck(cacheable_query))
                         }
                         Err(cacheability_error) => {
                             debug!(%cacheability_error, "uncacheable SELECT");
