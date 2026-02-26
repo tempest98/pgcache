@@ -237,7 +237,7 @@ fn select_stmt_to_select_node(
 }
 
 fn value_list_convert(value_list: &[Node]) -> Result<Vec<Vec<LiteralValue>>, AstError> {
-    let mut rv = Vec::new();
+    let mut rv = Vec::with_capacity(value_list.len());
     for value in value_list {
         let mut row = Vec::new();
         if let Some(NodeEnum::List(node_list)) = &value.node {
@@ -269,7 +269,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
         return Ok(SelectColumns::None);
     }
 
-    let mut columns = Vec::new();
+    let mut columns = Vec::with_capacity(target_list.len());
 
     for target in target_list {
         if let Some(NodeEnum::ResTarget(res_target)) = &target.node
@@ -414,7 +414,7 @@ fn from_clause_convert(
     from_clause: &[Node],
     ctx: &ParseContext,
 ) -> Result<Vec<TableSource>, AstError> {
-    let mut tables = Vec::new();
+    let mut tables = Vec::with_capacity(from_clause.len());
 
     for from_node in from_clause {
         match &from_node.node {
@@ -721,7 +721,7 @@ fn window_def_convert(win_def: &pg_query::protobuf::WindowDef) -> Result<WindowS
 fn window_order_by_convert(
     order_clause: &[pg_query::protobuf::Node],
 ) -> Result<Vec<OrderByClause>, AstError> {
-    let mut order_by = Vec::new();
+    let mut order_by = Vec::with_capacity(order_clause.len());
 
     for sort_node in order_clause {
         if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
@@ -800,7 +800,7 @@ fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
 }
 
 fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
-    let mut args = Vec::new();
+    let mut args = Vec::with_capacity(2);
 
     if let Some(lexpr) = &aexpr.lexpr {
         args.push(node_convert_to_column_expr(lexpr)?);
@@ -927,7 +927,7 @@ fn case_when_convert(node: &Node) -> Result<CaseWhen, AstError> {
 }
 
 fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, AstError> {
-    let mut order_by = Vec::new();
+    let mut order_by = Vec::with_capacity(sort_clause.len());
 
     for sort_node in sort_clause {
         if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
@@ -955,7 +955,7 @@ fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, A
 }
 
 fn group_by_clause_convert(group_clause: &[Node]) -> Result<Vec<ColumnNode>, AstError> {
-    let mut group_by = Vec::new();
+    let mut group_by = Vec::with_capacity(group_clause.len());
     for node in group_clause {
         if let Some(NodeEnum::ColumnRef(col_ref)) = &node.node {
             group_by.push(column_ref_convert(col_ref)?);

@@ -803,7 +803,7 @@ impl SelectNode {
     /// Return table nodes directly in this SELECT's FROM clause.
     /// Traverses JOINs but does NOT descend into subqueries.
     pub fn direct_table_nodes(&self) -> Vec<&TableNode> {
-        let mut tables = Vec::new();
+        let mut tables = Vec::with_capacity(self.from.len());
         for source in &self.from {
             source.direct_table_nodes_collect(&mut tables);
         }

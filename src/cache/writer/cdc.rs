@@ -208,7 +208,7 @@ impl CacheWriter {
     /// Handle TRUNCATE operation.
     #[instrument(skip_all)]
     pub async fn handle_truncate(&self, relation_oids: &[u32]) -> CacheResult<()> {
-        let mut table_names: Vec<String> = Vec::new();
+        let mut table_names: Vec<String> = Vec::with_capacity(relation_oids.len());
 
         for oid in relation_oids {
             if let Some(table_metadata) = self.cache.tables.get1(oid) {
@@ -357,7 +357,7 @@ impl CacheWriter {
                     name: None,
                 })?;
 
-        let mut where_conditions = Vec::new();
+        let mut where_conditions = Vec::with_capacity(table_metadata.primary_key_columns.len());
         for pk_column in &table_metadata.primary_key_columns {
             if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
@@ -374,7 +374,7 @@ impl CacheWriter {
             return Err(CacheError::NoPrimaryKey.into());
         }
 
-        let mut comparison_columns = Vec::new();
+        let mut comparison_columns = Vec::with_capacity(table_metadata.columns.len());
         for column_meta in &table_metadata.columns {
             let position = column_meta.position as usize - 1;
             if let Some(row_value) = row_data.get(position) {
@@ -763,8 +763,8 @@ impl CacheWriter {
         // Extract SELECT body - update queries are always SELECT queries
         let resolved_select = resolved.as_select().ok_or(CacheError::InvalidQuery)?;
 
-        let mut column_names = Vec::new();
-        let mut values = Vec::new();
+        let mut column_names = Vec::with_capacity(table_metadata.columns.len());
+        let mut values = Vec::with_capacity(table_metadata.columns.len());
 
         for column_meta in &table_metadata.columns {
             let position = column_meta.position as usize - 1;
@@ -820,7 +820,7 @@ impl CacheWriter {
         table_metadata: &crate::catalog::TableMetadata,
         row_data: &[Option<String>],
     ) -> CacheResult<String> {
-        let mut where_conditions = Vec::new();
+        let mut where_conditions = Vec::with_capacity(table_metadata.primary_key_columns.len());
 
         for pk_column in &table_metadata.primary_key_columns {
             if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {

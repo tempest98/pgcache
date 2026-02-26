@@ -334,7 +334,7 @@ where
 
         tls.writer_write_all(buf)?;
 
-        let mut cipher_buf = Vec::new();
+        let mut cipher_buf = Vec::with_capacity(buf.len() + 64);
         tls.write_tls(&mut cipher_buf)?;
         cipher_buf
     };
@@ -374,7 +374,7 @@ where
             .lock()
             .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
         tls.send_close_notify();
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(64);
         let _ = tls.write_tls(&mut buf);
         buf
     };
