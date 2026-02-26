@@ -1,6 +1,7 @@
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
 
+use ecow::EcoString;
 use ordered_float::NotNan;
 use pg_query::protobuf::SortByDir;
 use postgres_protocol::escape;
@@ -115,8 +116,8 @@ impl Deparse for LiteralValue {
 // Column reference (potentially qualified: table.column)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ColumnNode {
-    pub table: Option<String>,
-    pub column: String,
+    pub table: Option<EcoString>,
+    pub column: EcoString,
 }
 
 impl ColumnNode {
@@ -464,7 +465,7 @@ pub enum WhereExpr {
 
     // Function calls (for extensibility)
     Function {
-        name: String,
+        name: EcoString,
         args: Vec<WhereExpr>,
         agg_star: bool,
     },
@@ -1004,9 +1005,9 @@ pub enum CteMaterialization {
 /// A CTE definition from a WITH clause.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CteDefinition {
-    pub name: String,
+    pub name: EcoString,
     pub query: QueryExpr,
-    pub column_aliases: Vec<String>,
+    pub column_aliases: Vec<EcoString>,
     pub materialization: CteMaterialization,
 }
 
@@ -1235,7 +1236,7 @@ impl Deparse for SelectColumns {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SelectColumn {
     pub expr: ColumnExpr,
-    pub alias: Option<String>,
+    pub alias: Option<EcoString>,
 }
 
 impl SelectColumn {
@@ -1308,7 +1309,7 @@ impl Deparse for ArithmeticExpr {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ColumnExpr {
     Column(ColumnNode),         // column_name, table.column_name
-    Star(Option<String>),       // * or table.*
+    Star(Option<EcoString>),    // * or table.*
     Function(FunctionCall),     // COUNT(*), SUM(col), etc.
     Literal(LiteralValue),      // Constant values
     Case(CaseExpr),             // CASE WHEN ... THEN ... END
@@ -1413,7 +1414,7 @@ impl Deparse for ColumnExpr {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct FunctionCall {
-    pub name: String,
+    pub name: EcoString,
     pub args: Vec<ColumnExpr>,
     pub agg_star: bool,                // COUNT(*)
     pub agg_distinct: bool,            // COUNT(DISTINCT col)
@@ -1606,8 +1607,8 @@ impl CaseWhen {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableAlias {
-    pub name: String,
-    pub columns: Vec<String>,
+    pub name: EcoString,
+    pub columns: Vec<EcoString>,
 }
 
 impl Deparse for TableAlias {
@@ -1643,9 +1644,9 @@ pub enum TableSource {
 /// external context.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CteRefNode {
-    pub cte_name: String,
+    pub cte_name: EcoString,
     pub query: Box<QueryExpr>,
-    pub column_aliases: Vec<String>,
+    pub column_aliases: Vec<EcoString>,
     pub materialization: CteMaterialization,
     pub alias: Option<TableAlias>,
 }
@@ -1833,8 +1834,8 @@ impl<'a, N: Any> Iterator for TableSourceNodeIter<'a, N> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableNode {
-    pub schema: Option<String>,
-    pub name: String,
+    pub schema: Option<EcoString>,
+    pub name: EcoString,
     pub alias: Option<TableAlias>,
 }
 

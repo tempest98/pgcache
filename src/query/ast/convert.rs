@@ -83,7 +83,7 @@ fn with_clause_extract(
             .iter()
             .filter_map(|n| {
                 if let Some(NodeEnum::String(s)) = &n.node {
-                    Some(s.sval.clone())
+                    Some(EcoString::from(s.sval.as_str()))
                 } else {
                     None
                 }
@@ -110,7 +110,7 @@ fn with_clause_extract(
         let query = select_stmt_to_query_expr_with_ctx(inner_stmt, &ctx)?;
 
         ctes.push(CteDefinition {
-            name: cte.ctename.clone(),
+            name: EcoString::from(cte.ctename.as_str()),
             query,
             column_aliases,
             materialization,
@@ -278,7 +278,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
             let alias = if res_target.name.is_empty() {
                 None
             } else {
-                Some(res_target.name.clone())
+                Some(EcoString::from(res_target.name.as_str()))
             };
 
             match val_node.node.as_ref() {
@@ -307,7 +307,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                             .get(fields.len() - 2)
                             .ok_or(AstError::InvalidTableRef)?;
                         let table = match qualifier.node.as_ref() {
-                            Some(NodeEnum::String(s)) => s.sval.clone(),
+                            Some(NodeEnum::String(s)) => EcoString::from(s.sval.as_str()),
                             _ => return Err(AstError::InvalidTableRef),
                         };
                         columns.push(SelectColumn {
@@ -494,19 +494,19 @@ fn table_node_convert(range_var: &RangeVar, ctx: &ParseContext) -> Result<TableS
     let schema = if range_var.schemaname.is_empty() {
         None
     } else {
-        Some(range_var.schemaname.clone())
+        Some(EcoString::from(range_var.schemaname.as_str()))
     };
 
-    let name = range_var.relname.clone();
+    let name = EcoString::from(range_var.relname.as_str());
 
     let alias = range_var.alias.as_ref().map(|alias_node| TableAlias {
-        name: alias_node.aliasname.clone(),
+        name: EcoString::from(alias_node.aliasname.as_str()),
         columns: alias_node
             .colnames
             .iter()
             .flat_map(|n| {
                 if let Some(NodeEnum::String(string_node)) = &n.node {
-                    Some(string_node.sval.clone())
+                    Some(EcoString::from(string_node.sval.as_str()))
                 } else {
                     None
                 }
@@ -551,13 +551,13 @@ fn table_subquery_node_convert(
     let query = select_stmt_to_query_expr_with_ctx(select_stmt, ctx)?;
 
     let alias = range_subselect.alias.as_ref().map(|alias_node| TableAlias {
-        name: alias_node.aliasname.clone(),
+        name: EcoString::from(alias_node.aliasname.as_str()),
         columns: alias_node
             .colnames
             .iter()
             .flat_map(|n| {
                 if let Some(NodeEnum::String(string_node)) = &n.node {
-                    Some(string_node.sval.clone())
+                    Some(EcoString::from(string_node.sval.as_str()))
                 } else {
                     None
                 }
@@ -577,18 +577,18 @@ fn column_ref_convert(col_ref: &ColumnRef) -> Result<ColumnNode, AstError> {
         return Err(AstError::InvalidTableRef);
     }
 
-    let mut table: Option<String> = None;
-    let mut column: Option<String> = None;
+    let mut table: Option<EcoString> = None;
+    let mut column: Option<EcoString> = None;
 
     for field in &col_ref.fields {
         match field.node.as_ref() {
             Some(NodeEnum::String(s)) => {
                 if column.is_none() {
-                    column = Some(s.sval.clone());
+                    column = Some(EcoString::from(s.sval.as_str()));
                 } else {
                     // If we already have a column, previous value becomes table
                     table = column.clone();
-                    column = Some(s.sval.clone());
+                    column = Some(EcoString::from(s.sval.as_str()));
                 }
             }
             _ => return Err(AstError::InvalidTableRef),
@@ -660,7 +660,7 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
         .funcname
         .iter()
         .filter_map(|n| match &n.node {
-            Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+            Some(NodeEnum::String(s)) => Some(EcoString::from(s.sval.as_str())),
             _ => None,
         })
         .next_back()
@@ -763,7 +763,7 @@ fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstErr
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(FunctionCall {
-        name: "coalesce".to_owned(),
+        name: EcoString::from("coalesce"),
         args,
         agg_star: false,
         agg_distinct: false,
@@ -790,7 +790,7 @@ fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(FunctionCall {
-        name: name.to_owned(),
+        name: EcoString::from(name),
         args,
         agg_star: false,
         agg_distinct: false,
@@ -810,7 +810,7 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
     }
 
     Ok(FunctionCall {
-        name: "nullif".to_owned(),
+        name: EcoString::from("nullif"),
         args,
         agg_star: false,
         agg_distinct: false,
@@ -1048,6 +1048,7 @@ mod tests {
 
     use std::{collections::HashSet, panic};
 
+    use ecow::EcoString;
     use ordered_float::NotNan;
 
     use crate::cache::{SubqueryKind, UpdateQuerySource};
@@ -1120,7 +1121,7 @@ mod tests {
             panic!("expected table");
         };
 
-        assert_eq!(table.schema, Some("test".to_owned()));
+        assert_eq!(table.schema, Some(EcoString::from("test")));
         assert_eq!(table.name, "users");
         assert_eq!(table.alias, None);
 
@@ -1153,7 +1154,7 @@ mod tests {
         };
 
         assert_eq!(table.name, "users");
-        assert_eq!(table.alias.as_ref().unwrap().name, "u".to_owned());
+        assert_eq!(table.alias.as_ref().unwrap().name, "u");
         assert!(table.alias.as_ref().unwrap().columns.is_empty());
 
         // Check column references
@@ -1162,13 +1163,13 @@ mod tests {
 
             // First column: u.id
             if let ColumnExpr::Column(col_ref) = &columns[0].expr {
-                assert_eq!(col_ref.table, Some("u".to_owned()));
+                assert_eq!(col_ref.table, Some(EcoString::from("u")));
                 assert_eq!(col_ref.column, "id");
             }
 
             // Second column: u.name
             if let ColumnExpr::Column(col_ref) = &columns[1].expr {
-                assert_eq!(col_ref.table, Some("u".to_owned()));
+                assert_eq!(col_ref.table, Some(EcoString::from("u")));
                 assert_eq!(col_ref.column, "name");
             }
         }
@@ -1182,13 +1183,13 @@ mod tests {
             assert_eq!(columns.len(), 2);
 
             // First column: id as user_id
-            assert_eq!(columns[0].alias, Some("user_id".to_owned()));
+            assert_eq!(columns[0].alias, Some(EcoString::from("user_id")));
             if let ColumnExpr::Column(col_ref) = &columns[0].expr {
                 assert_eq!(col_ref.column, "id");
             }
 
             // Second column: name as full_name
-            assert_eq!(columns[1].alias, Some("full_name".to_owned()));
+            assert_eq!(columns[1].alias, Some(EcoString::from("full_name")));
             if let ColumnExpr::Column(col_ref) = &columns[1].expr {
                 assert_eq!(col_ref.column, "name");
             }
@@ -1229,7 +1230,7 @@ mod tests {
                     None,
                     "product",
                     Some(&TableAlias {
-                        name: "p".to_owned(),
+                        name: EcoString::from("p"),
                         columns: Vec::new()
                     })
                 )
@@ -1339,15 +1340,15 @@ mod tests {
             columns[0],
             SelectColumn {
                 expr: ColumnExpr::Column(ColumnNode {
-                    table: Some("invoice".to_owned()),
-                    column: "id".to_owned()
+                    table: Some(EcoString::from("invoice")),
+                    column: EcoString::from("id")
                 }),
                 alias: None,
             }
         );
 
         assert!(matches!(columns[1].expr, ColumnExpr::Subquery(_)));
-        assert_eq!(columns[1].alias, Some("one".to_owned()));
+        assert_eq!(columns[1].alias, Some(EcoString::from("one")));
     }
 
     #[test]
@@ -1361,7 +1362,7 @@ mod tests {
         };
 
         assert!(!subquery.lateral);
-        assert_eq!(subquery.alias.as_ref().unwrap().name, "inv".to_owned());
+        assert_eq!(subquery.alias.as_ref().unwrap().name, "inv");
         assert!(subquery.alias.as_ref().unwrap().columns.is_empty());
     }
 
@@ -1376,7 +1377,7 @@ mod tests {
         };
 
         assert!(!subquery.lateral);
-        assert_eq!(subquery.alias.as_ref().unwrap().name, "v".to_owned());
+        assert_eq!(subquery.alias.as_ref().unwrap().name, "v");
 
         let QueryBody::Values(values_clause) = &subquery.query.body else {
             panic!("expected VALUES clause in subquery");
@@ -1441,7 +1442,7 @@ mod tests {
         // Simple table
         TableNode {
             schema: None,
-            name: "users".to_owned(),
+            name: EcoString::from("users"),
             alias: None,
         }
         .deparse(&mut buf);
@@ -1450,10 +1451,10 @@ mod tests {
 
         // Qualified table with alias
         TableNode {
-            schema: Some("public".to_owned()),
-            name: "users".to_owned(),
+            schema: Some(EcoString::from("public")),
+            name: EcoString::from("users"),
             alias: Some(TableAlias {
-                name: "alias".to_owned(),
+                name: EcoString::from("alias"),
                 columns: vec![],
             }),
         }
@@ -1463,10 +1464,10 @@ mod tests {
 
         // table requires quoting
         TableNode {
-            schema: Some("public".to_owned()),
-            name: "userAccount".to_owned(),
+            schema: Some(EcoString::from("public")),
+            name: EcoString::from("userAccount"),
             alias: Some(TableAlias {
-                name: "usrAcc".to_owned(),
+                name: EcoString::from("usrAcc"),
                 columns: vec![],
             }),
         }
@@ -1481,7 +1482,7 @@ mod tests {
         // Simple column
         ColumnNode {
             table: None,
-            column: "id".to_owned(),
+            column: EcoString::from("id"),
         }
         .deparse(&mut buf);
         assert_eq!(buf, "id");
@@ -1489,8 +1490,8 @@ mod tests {
 
         // Qualified column
         ColumnNode {
-            table: Some("users".to_owned()),
-            column: "name".to_owned(),
+            table: Some(EcoString::from("users")),
+            column: EcoString::from("name"),
         }
         .deparse(&mut buf);
         assert_eq!(buf, "users.name");
@@ -1498,8 +1499,8 @@ mod tests {
 
         // table and column require quoting
         ColumnNode {
-            table: Some("Users".to_owned()),
-            column: "firstName".to_owned(),
+            table: Some(EcoString::from("Users")),
+            column: EcoString::from("firstName"),
         }
         .deparse(&mut buf);
         assert_eq!(buf, "\"Users\".\"firstName\"");
@@ -1513,9 +1514,9 @@ mod tests {
         SelectColumn {
             expr: ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             }),
-            alias: Some("alias".to_owned()),
+            alias: Some(EcoString::from("alias")),
         }
         .deparse(&mut buf);
         assert_eq!(buf, " id AS alias");
@@ -1524,10 +1525,10 @@ mod tests {
         // Qualified column
         SelectColumn {
             expr: ColumnExpr::Column(ColumnNode {
-                table: Some("users".to_owned()),
-                column: "name".to_owned(),
+                table: Some(EcoString::from("users")),
+                column: EcoString::from("name"),
             }),
-            alias: Some("alias".to_owned()),
+            alias: Some(EcoString::from("alias")),
         }
         .deparse(&mut buf);
         assert_eq!(buf, " users.name AS alias");
@@ -1537,9 +1538,9 @@ mod tests {
         SelectColumn {
             expr: ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             }),
-            alias: Some("Alias".to_owned()),
+            alias: Some(EcoString::from("Alias")),
         }
         .deparse(&mut buf);
         assert_eq!(buf, " id AS \"Alias\"");
@@ -1637,7 +1638,7 @@ mod tests {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(1))),
         };
@@ -1650,8 +1651,8 @@ mod tests {
         let expr = BinaryExpr {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
-                table: Some("users".to_owned()),
-                column: "name".to_owned(),
+                table: Some(EcoString::from("users")),
+                column: EcoString::from("name"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
         };
@@ -1669,7 +1670,7 @@ mod tests {
             op: UnaryOp::Not,
             expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "active".to_owned(),
+                column: EcoString::from("active"),
             })),
         };
 
@@ -1682,7 +1683,7 @@ mod tests {
             op: UnaryOp::IsNull,
             expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "deleted_at".to_owned(),
+                column: EcoString::from("deleted_at"),
             })),
         };
 
@@ -1695,7 +1696,7 @@ mod tests {
             op: UnaryOp::IsNotNull,
             expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "name".to_owned(),
+                column: EcoString::from("name"),
             })),
         };
 
@@ -1708,7 +1709,7 @@ mod tests {
             op: UnaryOp::IsTrue,
             expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "active".to_owned(),
+                column: EcoString::from("active"),
             })),
         };
 
@@ -1721,7 +1722,7 @@ mod tests {
             op: UnaryOp::IsNotFalse,
             expr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "active".to_owned(),
+                column: EcoString::from("active"),
             })),
         };
 
@@ -1986,17 +1987,17 @@ mod tests {
         assert_eq!(
             tables[0].alias,
             Some(TableAlias {
-                name: "a".to_owned(),
+                name: EcoString::from("a"),
                 columns: vec![]
             })
         );
 
-        assert_eq!(tables[1].schema, Some("public".to_owned()));
+        assert_eq!(tables[1].schema, Some(EcoString::from("public")));
         assert_eq!(tables[1].name, "film_actor");
         assert_eq!(
             tables[1].alias,
             Some(TableAlias {
-                name: "fa".to_owned(),
+                name: EcoString::from("fa"),
                 columns: vec![]
             })
         );
@@ -2129,9 +2130,9 @@ mod tests {
         assert_eq!(columns.len(), 2);
 
         // Verify the condition columns
-        assert_eq!(columns[0].table, Some("u".to_owned()));
+        assert_eq!(columns[0].table, Some(EcoString::from("u")));
         assert_eq!(columns[0].column, "id");
-        assert_eq!(columns[1].table, Some("o".to_owned()));
+        assert_eq!(columns[1].table, Some(EcoString::from("o")));
         assert_eq!(columns[1].column, "user_id");
     }
 
@@ -2171,10 +2172,10 @@ mod tests {
     #[test]
     fn test_function_call_nodes() {
         let func = FunctionCall {
-            name: "COUNT".to_owned(),
+            name: EcoString::from("COUNT"),
             args: vec![ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })],
             agg_star: false,
             agg_distinct: false,
@@ -2195,7 +2196,7 @@ mod tests {
         // Test that TableNode::nodes() returns itself as a leaf node
         let tables: Vec<&TableNode> = ast.nodes().collect();
         assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].schema, Some("public".to_owned()));
+        assert_eq!(tables[0].schema, Some(EcoString::from("public")));
         assert_eq!(tables[0].name, "users");
     }
 
@@ -2260,7 +2261,7 @@ mod tests {
             exprs: vec![
                 WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_owned(),
+                    column: EcoString::from("id"),
                 }),
                 WhereExpr::Value(LiteralValue::Integer(1)),
                 WhereExpr::Value(LiteralValue::Integer(2)),
@@ -2285,7 +2286,7 @@ mod tests {
             exprs: vec![
                 WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "status".to_owned(),
+                    column: EcoString::from("status"),
                 }),
                 WhereExpr::Value(LiteralValue::String("active".to_owned())),
                 WhereExpr::Value(LiteralValue::String("pending".to_owned())),
@@ -2304,7 +2305,7 @@ mod tests {
             exprs: vec![
                 WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_owned(),
+                    column: EcoString::from("id"),
                 }),
                 WhereExpr::Value(LiteralValue::Integer(1)),
                 WhereExpr::Value(LiteralValue::Integer(2)),
@@ -2397,7 +2398,7 @@ mod tests {
         assert_eq!(ast.order_by.len(), 1);
 
         if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
-            assert_eq!(col.table, Some("u".to_owned()));
+            assert_eq!(col.table, Some(EcoString::from("u")));
             assert_eq!(col.column, "name");
         } else {
             panic!("Expected column expression");
@@ -2507,7 +2508,7 @@ mod tests {
 
         assert_eq!(select.group_by.len(), 1);
         assert_eq!(select.group_by[0].column, "status");
-        assert_eq!(select.group_by[0].table, Some("o".to_owned()));
+        assert_eq!(select.group_by[0].table, Some(EcoString::from("o")));
     }
 
     #[test]
@@ -2746,7 +2747,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        assert_eq!(columns[0].alias, Some("total".to_owned()));
+        assert_eq!(columns[0].alias, Some(EcoString::from("total")));
     }
 
     #[test]
@@ -2785,7 +2786,7 @@ mod tests {
     #[test]
     fn test_function_deparse_count_star() {
         let func = FunctionCall {
-            name: "count".to_owned(),
+            name: EcoString::from("count"),
             args: vec![],
             agg_star: true,
             agg_distinct: false,
@@ -2800,10 +2801,10 @@ mod tests {
     #[test]
     fn test_function_deparse_count_distinct() {
         let func = FunctionCall {
-            name: "count".to_owned(),
+            name: EcoString::from("count"),
             args: vec![ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "status".to_owned(),
+                column: EcoString::from("status"),
             })],
             agg_star: false,
             agg_distinct: true,
@@ -3031,10 +3032,10 @@ mod tests {
     #[test]
     fn test_window_function_deparse() {
         let func = FunctionCall {
-            name: "sum".to_owned(),
+            name: EcoString::from("sum"),
             args: vec![ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "amount".to_owned(),
+                column: EcoString::from("amount"),
             })],
             agg_star: false,
             agg_distinct: false,
@@ -3042,12 +3043,12 @@ mod tests {
             over: Some(WindowSpec {
                 partition_by: vec![ColumnExpr::Column(ColumnNode {
                     table: None,
-                    column: "category".to_owned(),
+                    column: EcoString::from("category"),
                 })],
                 order_by: vec![OrderByClause {
                     expr: ColumnExpr::Column(ColumnNode {
                         table: None,
-                        column: "date".to_owned(),
+                        column: EcoString::from("date"),
                     }),
                     direction: OrderDirection::Asc,
                 }],
@@ -3151,11 +3152,11 @@ mod tests {
     #[test]
     fn test_aggregate_order_by_deparse_roundtrip() {
         let func = FunctionCall {
-            name: "string_agg".to_owned(),
+            name: EcoString::from("string_agg"),
             args: vec![
                 ColumnExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_owned(),
+                    column: EcoString::from("name"),
                 }),
                 ColumnExpr::Literal(LiteralValue::String(", ".to_owned())),
             ],
@@ -3164,7 +3165,7 @@ mod tests {
             agg_order: vec![OrderByClause {
                 expr: ColumnExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_owned(),
+                    column: EcoString::from("name"),
                 }),
                 direction: OrderDirection::Asc,
             }],
@@ -3265,7 +3266,7 @@ mod tests {
         let arith = ArithmeticExpr {
             left: Box::new(ColumnExpr::Column(ColumnNode {
                 table: None,
-                column: "amount".to_owned(),
+                column: EcoString::from("amount"),
             })),
             op: ArithmeticOp::Multiply,
             right: Box::new(ColumnExpr::Literal(LiteralValue::Integer(-1))),

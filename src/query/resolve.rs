@@ -313,7 +313,7 @@ fn column_resolve(
                 .ok_or_else(|| {
                     Report::from(ResolveError::ColumnNotFound {
                         table: table_metadata.name.to_string(),
-                        column: column_name.clone(),
+                        column: column_name.to_string(),
                     })
                 })?;
             return Ok(ResolvedColumnNode {
@@ -334,7 +334,7 @@ fn column_resolve(
                     .ok_or_else(|| {
                         Report::from(ResolveError::ColumnNotFound {
                             table: outer_meta.name.to_string(),
-                            column: column_name.clone(),
+                            column: column_name.to_string(),
                         })
                     })?;
             let resolved = ResolvedColumnNode {
@@ -349,7 +349,7 @@ fn column_resolve(
         }
 
         return Err(Report::from(ResolveError::TableNotFound {
-            name: table_qualifier.clone(),
+            name: table_qualifier.to_string(),
         }));
     }
 
@@ -376,7 +376,7 @@ fn column_resolve(
             }
             Err(Report::from(ResolveError::ColumnNotFound {
                 table: "<unknown>".to_owned(),
-                column: column_name.clone(),
+                column: column_name.to_string(),
             }))
         }
         [(table_metadata, alias, column_metadata)] => Ok(ResolvedColumnNode {
@@ -387,7 +387,7 @@ fn column_resolve(
             column_metadata: (*column_metadata).clone(),
         }),
         _ => Err(Report::from(ResolveError::AmbiguousColumn {
-            column: column_name.clone(),
+            column: column_name.to_string(),
         })),
     }
 }
@@ -488,7 +488,7 @@ fn table_source_resolve<'a>(
             let table_metadata =
                 table_metadata_find(table_node, tables, search_path).ok_or_else(|| {
                     Report::from(ResolveError::TableNotFound {
-                        name: table_node.name.clone(),
+                        name: table_node.name.to_string(),
                     })
                 })?;
 
@@ -559,7 +559,7 @@ fn table_source_resolve<'a>(
             let resolved_query = query_expr_resolve(&cte_ref.query, tables, search_path)?;
 
             let alias = TableAlias {
-                name: alias_name.to_owned(),
+                name: EcoString::from(alias_name),
                 columns: cte_ref.column_aliases.clone(),
             };
 

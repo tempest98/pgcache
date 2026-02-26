@@ -706,7 +706,7 @@ fn subquery_scalar_decorrelate(
     let derived_table = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
         query: Box::new(derived_query),
         alias: TableAlias {
-            name: derived_alias.clone(),
+            name: EcoString::from(derived_alias.as_str()),
             columns: Vec::new(),
         },
         subquery_kind: SubqueryKind::Scalar,

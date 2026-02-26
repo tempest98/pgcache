@@ -28,7 +28,7 @@ pub fn resolved_select_node_table_replace_with_values(
             return Err(AstTransformError::MissingTable.into());
         };
         let mut frontier = vec![first_from];
-        let mut found_alias: Option<String> = None;
+        let mut found_alias: Option<EcoString> = None;
         while let Some(cur) = frontier.pop() {
             match cur {
                 ResolvedTableSource::Join(join) => {
@@ -37,13 +37,12 @@ pub fn resolved_select_node_table_replace_with_values(
                 }
                 ResolvedTableSource::Table(table) => {
                     if table.relation_oid == relation_oid {
-                        found_alias = Some(
+                        found_alias = Some(EcoString::from(
                             table
                                 .alias
                                 .as_deref()
-                                .unwrap_or(&table_metadata.name)
-                                .to_owned(),
-                        );
+                                .unwrap_or(&table_metadata.name),
+                        ));
                         break;
                     }
                 }
@@ -89,7 +88,7 @@ pub fn resolved_select_node_table_replace_with_values(
 
     // Build VALUES clause from row_data and collect column names
     let mut values = Vec::new();
-    let mut column_names = Vec::new();
+    let mut column_names: Vec<EcoString> = Vec::new();
     for column_meta in &table_metadata.columns {
         let position = column_meta.position as usize - 1;
         if let Some(row_value) = row_data.get(position) {
@@ -98,7 +97,7 @@ pub fn resolved_select_node_table_replace_with_values(
                 |v| LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.to_string()),
             );
             values.push(value);
-            column_names.push(column_meta.name.to_string());
+            column_names.push(EcoString::from(column_meta.name.as_str()));
         }
     }
 

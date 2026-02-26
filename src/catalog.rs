@@ -66,17 +66,17 @@ impl TableMetadata {
                     table: if let Some(alias) = alias {
                         Some(alias.name.clone())
                     } else {
-                        Some(self.name.to_string())
+                        Some(EcoString::from(self.name.as_str()))
                     },
                     column: if let Some(alias) = alias {
                         alias
                             .columns
                             .get(c.position as usize - 1)
-                            .map(String::as_str)
+                            .map(EcoString::as_str)
                             .unwrap_or(c.name.as_str())
-                            .to_owned()
+                            .into()
                     } else {
-                        c.name.to_string()
+                        EcoString::from(c.name.as_str())
                     },
                 }),
                 alias: None,

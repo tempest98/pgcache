@@ -1,3 +1,4 @@
+use ecow::EcoString;
 use error_set::error_set;
 use ordered_float::NotNan;
 use tracing::trace;
@@ -175,7 +176,7 @@ fn func_call_to_where_expr(func_call: &FuncCall) -> Result<WhereExpr, WhereParse
         .funcname
         .iter()
         .filter_map(|n| match &n.node {
-            Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+            Some(NodeEnum::String(s)) => Some(EcoString::from(s.sval.as_str())),
             _ => None,
         })
         .next_back()
@@ -205,18 +206,18 @@ fn column_ref_extract(col_ref: &ColumnRef) -> Result<ColumnNode, WhereParseError
         return Err(WhereParseError::InvalidColumnRef);
     }
 
-    let mut table: Option<String> = None;
-    let mut column: Option<String> = None;
+    let mut table: Option<EcoString> = None;
+    let mut column: Option<EcoString> = None;
 
     for field in &col_ref.fields {
         match field.node.as_ref() {
             Some(NodeEnum::String(s)) => {
                 if column.is_none() {
-                    column = Some(s.sval.clone());
+                    column = Some(EcoString::from(s.sval.as_str()));
                 } else {
                     // If we already have a column, previous value becomes table
                     table = column.clone();
-                    column = Some(s.sval.clone());
+                    column = Some(EcoString::from(s.sval.as_str()));
                 }
             }
             _ => return Err(WhereParseError::InvalidColumnRef),
@@ -670,7 +671,7 @@ mod tests {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "str".to_owned(),
+                column: EcoString::from("str"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
         }));
@@ -689,7 +690,7 @@ mod tests {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -707,7 +708,7 @@ mod tests {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "active".to_owned(),
+                column: EcoString::from("active"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
         }));
@@ -725,7 +726,7 @@ mod tests {
             op: BinaryOp::GreaterThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "cnt".to_owned(),
+                column: EcoString::from("cnt"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(0))),
         }));
@@ -745,7 +746,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_owned(),
+                    column: EcoString::from("str"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
             })),
@@ -753,7 +754,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "id".to_owned(),
+                    column: EcoString::from("id"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
             })),
@@ -774,7 +775,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_owned(),
+                    column: EcoString::from("str"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
             })),
@@ -782,7 +783,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_owned(),
+                    column: EcoString::from("str"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::String("world".to_owned()))),
             })),
@@ -803,7 +804,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "str".to_owned(),
+                    column: EcoString::from("str"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
             })),
@@ -821,8 +822,8 @@ mod tests {
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
-                table: Some("test".to_owned()),
-                column: "str".to_owned(),
+                table: Some(EcoString::from("test")),
+                column: EcoString::from("str"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
         }));
@@ -840,7 +841,7 @@ mod tests {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "data".to_owned(),
+                column: EcoString::from("data"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
         }));
@@ -869,7 +870,7 @@ mod tests {
             op: BinaryOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -887,7 +888,7 @@ mod tests {
             op: BinaryOp::NotEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -905,7 +906,7 @@ mod tests {
             op: BinaryOp::LessThan,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -923,7 +924,7 @@ mod tests {
             op: BinaryOp::LessThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -941,7 +942,7 @@ mod tests {
             op: BinaryOp::GreaterThanOrEqual,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
         }));
@@ -990,7 +991,7 @@ mod tests {
                     op: BinaryOp::Equal,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "name".to_owned(),
+                        column: EcoString::from("name"),
                     })),
                     rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
                 })),
@@ -998,7 +999,7 @@ mod tests {
                     op: BinaryOp::GreaterThan,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "age".to_owned(),
+                        column: EcoString::from("age"),
                     })),
                     rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(25))),
                 })),
@@ -1007,7 +1008,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "active".to_owned(),
+                    column: EcoString::from("active"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
             })),
@@ -1034,7 +1035,7 @@ mod tests {
                     op: BinaryOp::Equal,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "name".to_owned(),
+                        column: EcoString::from("name"),
                     })),
                     rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
                 })),
@@ -1042,7 +1043,7 @@ mod tests {
                     op: BinaryOp::Equal,
                     lexpr: Box::new(WhereExpr::Column(ColumnNode {
                         table: None,
-                        column: "name".to_owned(),
+                        column: EcoString::from("name"),
                     })),
                     rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_owned()))),
                 })),
@@ -1051,7 +1052,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_owned(),
+                    column: EcoString::from("name"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::String("bob".to_owned()))),
             })),
@@ -1071,7 +1072,7 @@ mod tests {
             op: BinaryOp::Equal,
             lexpr: Box::new(WhereExpr::Column(ColumnNode {
                 table: None,
-                column: "id".to_owned(),
+                column: EcoString::from("id"),
             })),
             rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
         }));
@@ -1091,7 +1092,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_owned(),
+                    column: EcoString::from("name"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
             })),
@@ -1099,7 +1100,7 @@ mod tests {
                 op: BinaryOp::GreaterThan,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "age".to_owned(),
+                    column: EcoString::from("age"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$2".to_owned()))),
             })),
@@ -1120,7 +1121,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "name".to_owned(),
+                    column: EcoString::from("name"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
             })),
@@ -1128,7 +1129,7 @@ mod tests {
                 op: BinaryOp::Equal,
                 lexpr: Box::new(WhereExpr::Column(ColumnNode {
                     table: None,
-                    column: "active".to_owned(),
+                    column: EcoString::from("active"),
                 })),
                 rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
             })),
