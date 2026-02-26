@@ -9,7 +9,7 @@ use pg_query::protobuf::{
     FuncCall, NullTest, NullTestType, ParamRef, SelectStmt, SubLink,
 };
 
-use super::ast::{
+use super::{
     BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, SubLinkType, UnaryExpr,
     UnaryOp, WhereExpr, select_stmt_to_query_expr,
 };
