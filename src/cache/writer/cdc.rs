@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -19,6 +20,9 @@ use crate::settings::CachePolicy;
 use super::super::types::{CachedQueryState, SubqueryKind, UpdateQuery, UpdateQuerySource};
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::CacheWriter;
+
+/// Default capacity for dynamically built SQL strings.
+const SQL_BUFFER_CAPACITY: usize = 1024;
 
 /// Distinguishes INSERT from DELETE so that subquery invalidation logic
 /// can flip Inclusion/Exclusion semantics correctly.
@@ -208,17 +212,22 @@ impl CacheWriter {
     /// Handle TRUNCATE operation.
     #[instrument(skip_all)]
     pub async fn handle_truncate(&self, relation_oids: &[u32]) -> CacheResult<()> {
-        let mut table_names: Vec<String> = Vec::with_capacity(relation_oids.len());
+        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+        sql.push_str("TRUNCATE ");
 
+        let mut first = true;
         for oid in relation_oids {
             if let Some(table_metadata) = self.cache.tables.get1(oid) {
-                table_names.push(format!("{}.{}", table_metadata.schema, table_metadata.name));
+                if !first {
+                    sql.push_str(", ");
+                }
+                let _ = write!(sql, "{}.{}", table_metadata.schema, table_metadata.name);
+                first = false;
             }
         }
 
-        let truncate_sql = format!("TRUNCATE {}", table_names.join(", "));
         self.db_cache
-            .execute(truncate_sql.as_str(), &[])
+            .execute(sql.as_str(), &[])
             .await
             .map_into_report::<CacheError>()?;
 
@@ -357,7 +366,37 @@ impl CacheWriter {
                     name: None,
                 })?;
 
-        let mut where_conditions = Vec::with_capacity(table_metadata.primary_key_columns.len());
+        // Build SELECT ... FROM ... WHERE ... in a single String.
+        // Comparison columns go in the SELECT list, PK conditions in the WHERE clause.
+        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+        sql.push_str("SELECT ");
+
+        let mut first_col = true;
+        for column_meta in &table_metadata.columns {
+            let position = column_meta.position as usize - 1;
+            if let Some(row_value) = row_data.get(position) {
+                let value = row_value
+                    .as_deref()
+                    .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
+                if !first_col {
+                    sql.push_str(", ");
+                }
+                let _ = write!(
+                    sql,
+                    "{} IS DISTINCT FROM {} AS {}",
+                    column_meta.name, value, column_meta.name
+                );
+                first_col = false;
+            }
+        }
+
+        let _ = write!(
+            sql,
+            " FROM {}.{} WHERE ",
+            table_metadata.schema, table_metadata.name
+        );
+
+        let mut has_pk = false;
         for pk_column in &table_metadata.primary_key_columns {
             if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
@@ -365,36 +404,18 @@ impl CacheWriter {
                     let value = row_value
                         .as_deref()
                         .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
-                    where_conditions.push(format!("{pk_column} = {value}"));
+                    if has_pk {
+                        sql.push_str(" AND ");
+                    }
+                    let _ = write!(sql, "{pk_column} = {value}");
+                    has_pk = true;
                 }
             }
         }
 
-        if where_conditions.is_empty() {
+        if !has_pk {
             return Err(CacheError::NoPrimaryKey.into());
         }
-
-        let mut comparison_columns = Vec::with_capacity(table_metadata.columns.len());
-        for column_meta in &table_metadata.columns {
-            let position = column_meta.position as usize - 1;
-            if let Some(row_value) = row_data.get(position) {
-                let value = row_value
-                    .as_deref()
-                    .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
-                comparison_columns.push(format!(
-                    "{} IS DISTINCT FROM {} AS {}",
-                    column_meta.name, value, column_meta.name
-                ));
-            }
-        }
-
-        let sql = format!(
-            "SELECT {} FROM {}.{} WHERE {}",
-            comparison_columns.join(", "),
-            table_metadata.schema,
-            table_metadata.name,
-            where_conditions.join(" AND ")
-        );
 
         self.db_cache
             .query(&sql, &[])
@@ -763,6 +784,7 @@ impl CacheWriter {
         // Extract SELECT body - update queries are always SELECT queries
         let resolved_select = resolved.as_select().ok_or(CacheError::InvalidQuery)?;
 
+        // Collect column names and escaped values for SQL building
         let mut column_names = Vec::with_capacity(table_metadata.columns.len());
         let mut values = Vec::with_capacity(table_metadata.columns.len());
 
@@ -784,31 +806,51 @@ impl CacheWriter {
             row_data,
         )
         .map_err(|e| e.context_transform(CacheError::from))?;
-        let mut select = String::with_capacity(1024);
+        let mut select = String::with_capacity(SQL_BUFFER_CAPACITY);
         crate::query::ast::Deparse::deparse(&value_select, &mut select);
 
         let schema = &table_metadata.schema;
         let table = &table_metadata.name;
-        let column_list = column_names.join(", ");
-        let value_list = values.join(", ");
-        let pk_column_list = table_metadata.primary_key_columns.join(", ");
-        let update_list = column_names
-            .iter()
-            .filter(|&col| {
-                !table_metadata
-                    .primary_key_columns
-                    .contains(&col.to_string())
-            })
-            .map(|col| format!("{col} = EXCLUDED.{col}"))
-            .collect::<Vec<_>>()
-            .join(", ");
 
-        let sql = format!(
-            "INSERT INTO {schema}.{table} ({column_list}) \
-            SELECT {value_list} WHERE EXISTS ({select}) \
-            ON CONFLICT ({pk_column_list}) \
-            DO UPDATE SET {update_list}"
-        );
+        // Build INSERT ... ON CONFLICT ... DO UPDATE SET ... in a single String
+        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+        let _ = write!(sql, "INSERT INTO {schema}.{table} (");
+        for (i, col) in column_names.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(col);
+        }
+        sql.push_str(") SELECT ");
+        for (i, val) in values.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(val);
+        }
+        let _ = write!(sql, " WHERE EXISTS ({select}) ON CONFLICT (");
+        for (i, pk) in table_metadata.primary_key_columns.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(pk);
+        }
+        sql.push_str(") DO UPDATE SET ");
+        let mut first_update = true;
+        for col in &column_names {
+            if table_metadata
+                .primary_key_columns
+                .iter()
+                .any(|pk| pk.as_str() == *col)
+            {
+                continue;
+            }
+            if !first_update {
+                sql.push_str(", ");
+            }
+            let _ = write!(sql, "{col} = EXCLUDED.{col}");
+            first_update = false;
+        }
 
         Ok(sql)
     }
@@ -820,8 +862,14 @@ impl CacheWriter {
         table_metadata: &crate::catalog::TableMetadata,
         row_data: &[Option<String>],
     ) -> CacheResult<String> {
-        let mut where_conditions = Vec::with_capacity(table_metadata.primary_key_columns.len());
+        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+        let _ = write!(
+            sql,
+            "DELETE FROM {}.{} WHERE ",
+            table_metadata.schema, table_metadata.name
+        );
 
+        let mut has_pk = false;
         for pk_column in &table_metadata.primary_key_columns {
             if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
@@ -829,22 +877,19 @@ impl CacheWriter {
                     let value = row_value
                         .as_deref()
                         .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
-                    where_conditions.push(format!("{pk_column} = {value}"));
+                    if has_pk {
+                        sql.push_str(" AND ");
+                    }
+                    let _ = write!(sql, "{pk_column} = {value}");
+                    has_pk = true;
                 }
             }
         }
 
-        if where_conditions.is_empty() {
+        if !has_pk {
             error!("Cannot build DELETE WHERE clause: no primary key values found");
             return Err(CacheError::NoPrimaryKey.into());
         }
-
-        let sql = format!(
-            "DELETE FROM {}.{} WHERE {}",
-            table_metadata.schema,
-            table_metadata.name,
-            where_conditions.join(" AND ")
-        );
 
         Ok(sql)
     }
