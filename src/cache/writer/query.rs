@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{debug, error, info, instrument, trace};
@@ -17,7 +18,7 @@ use crate::query::update::query_table_update_queries;
 use super::super::{
     CacheError, CacheResult, ReportExt,
     query::CacheableQuery,
-    types::{CachedQuery, CachedQueryState, UpdateQueries, UpdateQuery},
+    types::{CachedQuery, CachedQueryState, SharedResolved, UpdateQueries, UpdateQuery},
 };
 use super::{CacheWriter, POPULATE_POOL_SIZE, PopulationWork};
 
@@ -44,7 +45,7 @@ impl CacheWriter {
         &self,
         fingerprint: u64,
         generation: u64,
-        resolved: &ResolvedQueryExpr,
+        resolved: &SharedResolved,
         max_limit: Option<u64>,
     ) -> PopulationWork {
         let population_resolved = query_expr_decorrelate(resolved, &self.aggregate_functions)
@@ -52,10 +53,10 @@ impl CacheWriter {
                 if d.transformed {
                     d.resolved
                 } else {
-                    resolved.clone()
+                    ResolvedQueryExpr::clone(resolved)
                 }
             })
-            .unwrap_or_else(|_| resolved.clone());
+            .unwrap_or_else(|_| ResolvedQueryExpr::clone(resolved));
 
         let branches: Vec<ResolvedSelectNode> = population_resolved
             .select_nodes()
@@ -65,7 +66,7 @@ impl CacheWriter {
 
         let branch_relation_oids: Vec<u32> = branches
             .iter()
-            .flat_map(|branch| branch.nodes::<ResolvedTableNode>())
+            .flat_map(|branch: &ResolvedSelectNode| branch.nodes::<ResolvedTableNode>())
             .map(|tn| tn.relation_oid)
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -161,7 +162,7 @@ impl CacheWriter {
     fn update_queries_register(
         &mut self,
         fingerprint: u64,
-        resolved: &ResolvedQueryExpr,
+        resolved: &SharedResolved,
         has_limit: bool,
     ) -> CacheResult<Vec<u32>> {
         let decorrelated = query_expr_decorrelate(resolved, &self.aggregate_functions)
@@ -203,7 +204,7 @@ impl CacheWriter {
         fingerprint: u64,
         relation_oids: Vec<u32>,
         base_query: QueryExpr,
-        resolved: &ResolvedQueryExpr,
+        resolved: SharedResolved,
         max_limit: Option<u64>,
         started_at: Instant,
     ) -> u64 {
@@ -216,7 +217,7 @@ impl CacheWriter {
             generation,
             relation_oids,
             query: base_query,
-            resolved: resolved.clone(),
+            resolved,
             max_limit,
             cached_bytes: 0,
             registration_started_at: Some(started_at),
@@ -251,10 +252,11 @@ impl CacheWriter {
 
         self.cache_tables_ensure(&base_query, search_path).await?;
 
-        let resolved = query_expr_resolve(&base_query, &self.cache.tables, search_path)
-            .map_err(|e| e.context_transform(CacheError::from))
-            .attach_loc("resolving query expression")
-            .map(predicate_pushdown_apply)?;
+        let resolved: SharedResolved =
+            Arc::new(query_expr_resolve(&base_query, &self.cache.tables, search_path)
+                .map_err(|e| e.context_transform(CacheError::from))
+                .attach_loc("resolving query expression")
+                .map(predicate_pushdown_apply)?);
 
         let relation_oids =
             self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;
@@ -263,7 +265,7 @@ impl CacheWriter {
             fingerprint,
             relation_oids,
             base_query,
-            &resolved,
+            Arc::clone(&resolved),
             max_limit,
             started_at,
         );
@@ -291,7 +293,7 @@ impl CacheWriter {
             return Ok(());
         };
 
-        let resolved = cached.resolved.clone();
+        let resolved = Arc::clone(&cached.resolved);
         let max_limit = cached.max_limit;
 
         cached.generation = new_generation;
@@ -326,7 +328,7 @@ impl CacheWriter {
             let started_at = query.registration_started_at.take();
             Some((
                 query.generation,
-                query.resolved.clone(),
+                Arc::clone(&query.resolved),
                 query.max_limit,
                 started_at,
             ))
@@ -396,7 +398,7 @@ impl CacheWriter {
         };
 
         // Collect data needed before mutating
-        let resolved = cached_query.resolved.clone();
+        let resolved = Arc::clone(&cached_query.resolved);
         let relation_oids = cached_query.relation_oids.clone();
         let old_generation = cached_query.generation;
 

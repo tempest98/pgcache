@@ -12,13 +12,13 @@ use tracing::{debug, error, trace};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::metrics::names;
 use crate::pg;
-use crate::query::resolved::{ResolvedQueryExpr, ResolvedSelectNode};
+use crate::query::resolved::ResolvedSelectNode;
 use crate::settings::{CachePolicy, Settings};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcCommand, QueryCommand},
-    types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView},
+    types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved},
 };
 use super::population::population_worker;
 
@@ -265,7 +265,7 @@ impl CacheWriter {
         fingerprint: u64,
         state: CachedQueryState,
         generation: u64,
-        resolved: &ResolvedQueryExpr,
+        resolved: &SharedResolved,
         max_limit: Option<u64>,
     ) {
         if let Ok(mut view) = self.state_view.write() {
@@ -274,7 +274,7 @@ impl CacheWriter {
                 CachedQueryView {
                     state,
                     generation,
-                    resolved: Some(resolved.clone()),
+                    resolved: Some(Arc::clone(resolved)),
                     max_limit,
                     referenced: false,
                 },
@@ -388,7 +388,7 @@ impl CacheWriter {
         };
 
         let old_generation = query.generation;
-        let resolved = query.resolved.clone();
+        let resolved = Arc::clone(&query.resolved);
 
         // 1. Assign new generation (insert before removing old — keeps old gen valid for re-stamp)
         self.cache.generation_counter += 1;
@@ -405,7 +405,7 @@ impl CacheWriter {
         // 3. Re-execute query against cache DB (discard results).
         //    The CustomScan tracker side-effect updates dshash from old_gen to new_gen.
         let mut sql = String::with_capacity(512);
-        crate::query::ast::Deparse::deparse(&resolved, &mut sql);
+        crate::query::ast::Deparse::deparse(&*resolved, &mut sql);
         let _ = self
             .db_cache
             .query(&sql, &[])

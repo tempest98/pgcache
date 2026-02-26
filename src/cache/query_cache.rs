@@ -8,7 +8,6 @@ use tracing::{error, instrument, trace};
 use crate::metrics::names;
 
 use crate::query::ast::{LimitClause, query_expr_fingerprint};
-use crate::query::resolved::ResolvedQueryExpr;
 use crate::settings::{CachePolicy, Settings};
 use crate::timing::QueryTiming;
 
@@ -16,7 +15,7 @@ use super::{
     CacheError, CacheResult,
     messages::{CacheReply, PipelineContext, PipelineDescribe, QueryCommand},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
-    types::{CacheStateView, CachedQueryState, CachedQueryView},
+    types::{CacheStateView, CachedQueryState, CachedQueryView, SharedResolved},
 };
 use crate::proxy::ClientSocket;
 
@@ -46,7 +45,7 @@ pub struct QueryRequest {
 pub struct WorkerRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
-    pub resolved: ResolvedQueryExpr,
+    pub resolved: SharedResolved,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
     pub result_formats: Vec<i16>,
@@ -126,7 +125,7 @@ impl QueryCache {
                 ..
             }) if limit_is_sufficient(*max_limit, rows_needed) => {
                 self.clock_reference_set(&fingerprint);
-                self.worker_request_send(msg, resolved.clone(), *generation)
+                self.worker_request_send(msg, Arc::clone(resolved), *generation)
             }
 
             // Cache hit: Ready but insufficient rows — forward and request limit bump
@@ -221,7 +220,7 @@ impl QueryCache {
     fn worker_request_send(
         &self,
         msg: QueryRequest,
-        resolved: ResolvedQueryExpr,
+        resolved: SharedResolved,
         generation: u64,
     ) -> CacheResult<()> {
         let mut timing = msg.timing;

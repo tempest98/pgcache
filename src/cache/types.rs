@@ -10,6 +10,10 @@ use crate::{
     settings::{CachePolicy, Settings},
 };
 
+/// Shared resolved query expression, wrapped in Arc to avoid deep cloning
+/// on every cache hit (the coordinator→worker path).
+pub type SharedResolved = Arc<ResolvedQueryExpr>;
+
 /// State of a cached query
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedQueryState {
@@ -32,7 +36,7 @@ pub struct CachedQuery {
     pub generation: u64,
     pub relation_oids: Vec<u32>,
     pub query: QueryExpr,
-    pub resolved: ResolvedQueryExpr,
+    pub resolved: SharedResolved,
     /// Maximum rows cached for this fingerprint.
     /// `None` = all rows cached (query seen without LIMIT, or OFFSET-only).
     /// `Some(n)` = up to `n` rows cached (max LIMIT+OFFSET across all variants seen).
@@ -208,7 +212,7 @@ pub struct CachedQueryView {
     /// Generation number (0 for Loading placeholder before writer assigns real value)
     pub generation: u64,
     /// Resolved query (None for Loading placeholder before writer resolves)
-    pub resolved: Option<ResolvedQueryExpr>,
+    pub resolved: Option<SharedResolved>,
     /// Maximum rows cached for this fingerprint (None = all rows)
     pub max_limit: Option<u64>,
     /// CLOCK reference bit — set by coordinator on cache hit, read/cleared by writer during eviction
