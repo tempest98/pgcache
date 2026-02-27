@@ -2008,6 +2008,7 @@ dependencies = [
  "criterion",
  "ecow",
  "error_set",
+ "futures-util",
  "hotpath",
  "iddqd",
  "lexopt",

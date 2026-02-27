@@ -41,6 +41,7 @@ hotpath-off = ["hotpath/hotpath-off"]
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = "0.7.18"
 tokio-stream = "0.1.18"
+futures-util = "0.3.32"
 
 tokio-postgres = { path = "../rust-postgres/tokio-postgres", default-features = false, features = ["runtime"] }
 postgres-protocol = { path = "../rust-postgres/postgres-protocol" }

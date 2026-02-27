@@ -1,11 +1,10 @@
 use std::fmt::Write;
-use std::rc::Rc;
 use std::time::Instant;
 
+use futures_util::stream::FuturesUnordered;
 use postgres_protocol::escape;
-use tokio::sync::mpsc;
-use tokio::task::spawn_local;
 use tokio_postgres::Row;
+use tokio_stream::StreamExt;
 use tracing::{debug, error, instrument, trace};
 
 use crate::catalog::TableMetadata;
@@ -701,11 +700,7 @@ impl CacheWriter {
 
         // Process in batches
         loop {
-            let (tx, mut rx) =
-                mpsc::channel::<(u64, Result<u64, tokio_postgres::Error>)>(pool_size);
-
-            // Build SQL and spawn tasks inline, tracking batch count
-            let mut batch_count = 0;
+            let mut futures = FuturesUnordered::new();
             for (idx, update_query) in query_iter.by_ref().take(pool_size) {
                 let fingerprint = update_query.fingerprint;
                 let sql = self.cache_upsert_with_predicate_sql(
@@ -717,19 +712,15 @@ impl CacheWriter {
                 let conn = self
                     .cache_pool
                     .get(idx % pool_size)
-                    .map(Rc::clone)
                     .ok_or(CacheError::Other)?;
-                let tx = tx.clone();
 
-                spawn_local(async move {
+                futures.push(async move {
                     let result = conn.execute(sql.as_str(), &[]).await;
-                    let _ = tx.send((fingerprint, result)).await;
+                    (fingerprint, result)
                 });
-                batch_count += 1;
             }
-            drop(tx); // Close sender so rx completes when all tasks finish
 
-            if batch_count == 0 {
+            if futures.is_empty() {
                 break;
             }
 
@@ -737,7 +728,7 @@ impl CacheWriter {
             let mut batch_matched = false;
             let mut batch_error: Option<CacheError> = None;
 
-            while let Some((fingerprint, result)) = rx.recv().await {
+            while let Some((fingerprint, result)) = futures.next().await {
                 total_executed += 1;
                 match result {
                     Ok(1) => {
