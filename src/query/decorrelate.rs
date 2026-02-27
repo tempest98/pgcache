@@ -895,18 +895,16 @@ fn subquery_scalar_decorrelate(
         })
     };
 
-    let join_condition =
-        predicates
-            .rest
-            .iter()
-            .map(predicate_to_join_eq)
-            .fold(predicate_to_join_eq(&predicates.first), |acc, next| {
-                ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
-                    op: BinaryOp::And,
-                    lexpr: Box::new(acc),
-                    rexpr: Box::new(next),
-                })
-            });
+    let join_condition = predicates.rest.iter().map(predicate_to_join_eq).fold(
+        predicate_to_join_eq(&predicates.first),
+        |acc, next| {
+            ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+                op: BinaryOp::And,
+                lexpr: Box::new(acc),
+                rexpr: Box::new(next),
+            })
+        },
+    );
 
     // Build scalar column ref: _dcN._dsN
     let scalar_column_ref = synthetic_column_node(
@@ -1026,11 +1024,7 @@ fn select_columns_decorrelate(
         match &col.expr {
             ResolvedColumnExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
                 let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
-                match left_join_derived(
-                    &select.from,
-                    result.derived_table,
-                    result.join_condition,
-                ) {
+                match left_join_derived(&select.from, result.derived_table, result.join_condition) {
                     Some(new_from) => {
                         select.from = new_from;
                         new_cols.push(ResolvedSelectColumn {
@@ -1117,8 +1111,7 @@ fn conjunct_not_exists_try_decorrelate(
     };
 
     // Strip LIMIT (safe); reject GROUP BY/HAVING (unsafe for anti-join)
-    let (cleaned_query, cleaned_select) =
-        correlated_not_exists_inner_prepare(query, inner_select)?;
+    let (cleaned_query, cleaned_select) = correlated_not_exists_inner_prepare(query, inner_select)?;
 
     let Some(inner_where) = &cleaned_select.where_clause else {
         return Ok(None);
@@ -1199,8 +1192,7 @@ fn conjunct_not_in_all_try_decorrelate(
     // Strip LIMIT (safe — boolean check); reject GROUP BY/HAVING (unsafe for anti-join,
     // same reasoning as NOT EXISTS: the anti-join tests for zero matching rows in the
     // flattened join, but the original tests for no rows surviving the filter).
-    let (cleaned_query, cleaned_select) =
-        correlated_not_exists_inner_prepare(query, inner_select)?;
+    let (cleaned_query, cleaned_select) = correlated_not_exists_inner_prepare(query, inner_select)?;
 
     let Some(inner_where) = &cleaned_select.where_clause else {
         return Ok(None);
@@ -1310,8 +1302,7 @@ fn select_node_decorrelate(
             } if !outer_refs.is_empty() => {
                 current_select.where_clause =
                     where_expr_conjuncts_join(remaining_conjuncts.clone());
-                let result =
-                    conjunct_exists_try_decorrelate(&current_select, query, outer_refs)?;
+                let result = conjunct_exists_try_decorrelate(&current_select, query, outer_refs)?;
                 transformed |= join_result_apply(
                     result,
                     conjunct,
@@ -1657,7 +1648,10 @@ mod tests {
 
     /// Flatten all JoinNodes from the FROM clause by recursively walking the source tree.
     fn select_joins(select: &ResolvedSelectNode) -> Vec<&ResolvedJoinNode> {
-        fn collect_from_source<'a>(source: &'a ResolvedTableSource, out: &mut Vec<&'a ResolvedJoinNode>) {
+        fn collect_from_source<'a>(
+            source: &'a ResolvedTableSource,
+            out: &mut Vec<&'a ResolvedJoinNode>,
+        ) {
             match source {
                 ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => {}
                 ResolvedTableSource::Join(join) => {
@@ -1823,7 +1817,10 @@ mod tests {
 
         assert!(!outcome.transformed);
         let select = as_select(&outcome.resolved);
-        assert!(where_has_subquery(&select.where_clause), "subquery should remain");
+        assert!(
+            where_has_subquery(&select.where_clause),
+            "subquery should remain"
+        );
     }
 
     // ==================== EXISTS Decorrelation ====================
@@ -1841,7 +1838,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         let joins = select_joins(select);
         assert_eq!(joins.len(), 1);
         assert_eq!(joins[0].join_type, JoinType::Inner);
@@ -1864,12 +1864,18 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         let joins = select_joins(select);
         assert_eq!(joins.len(), 1);
         let on = deparse_expr(joins[0].condition.as_ref().unwrap());
         assert!(on.contains("o.emp_id = e.id"), "first correlation: {on}");
-        assert!(on.contains("o.status = e.status"), "second correlation: {on}");
+        assert!(
+            on.contains("o.status = e.status"),
+            "second correlation: {on}"
+        );
     }
 
     #[test]
@@ -1885,10 +1891,16 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         assert!(!select_joins(select).is_empty(), "should have JOIN");
         let where_str = deparse_expr(select.where_clause.as_ref().unwrap());
-        assert!(where_str.contains("o.status = 'active'"), "residual in WHERE: {where_str}");
+        assert!(
+            where_str.contains("o.status = 'active'"),
+            "residual in WHERE: {where_str}"
+        );
     }
 
     #[test]
@@ -1905,7 +1917,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         let tables = from_table_names(select);
         assert!(tables.contains(&"departments"), "original join table");
         assert!(tables.contains(&"orders"), "decorrelated join table");
@@ -1928,7 +1943,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         let tables = from_table_names(select);
         assert!(tables.contains(&"customers"), "inner join table preserved");
         assert!(tables.contains(&"orders"), "inner table preserved");
@@ -1948,7 +1966,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         let tables = from_table_names(select);
         assert!(tables.contains(&"orders"), "first subquery table");
         assert!(tables.contains(&"projects"), "second subquery table");
@@ -1983,7 +2004,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "NOT EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "NOT EXISTS should be removed"
+        );
         let joins = select_joins(select);
         assert_eq!(joins.len(), 1);
         assert_eq!(joins[0].join_type, JoinType::Left);
@@ -2025,7 +2049,10 @@ mod tests {
         .unwrap();
 
         let select = as_select(&outcome.resolved);
-        assert!(where_has_is_null(&select.where_clause), "should have IS NULL in WHERE");
+        assert!(
+            where_has_is_null(&select.where_clause),
+            "should have IS NULL in WHERE"
+        );
     }
 
     // ==================== Rejection Cases ====================
@@ -2057,7 +2084,10 @@ mod tests {
 
         assert!(outcome.transformed, "correlated IN should be decorrelated");
         let select = as_select(&outcome.resolved);
-        assert!(!where_has_subquery(&select.where_clause), "IN should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "IN should be removed"
+        );
         assert!(!select_joins(select).is_empty(), "should have JOIN");
         assert!(select.distinct);
     }
@@ -2073,12 +2103,24 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.transformed, "correlated scalar subquery in SELECT should be decorrelated");
+        assert!(
+            outcome.transformed,
+            "correlated scalar subquery in SELECT should be decorrelated"
+        );
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(from_derived_aliases(select).contains(&"_dc1"), "derived table alias _dc1");
-        assert!(derived_scalar_aliases(select).contains(&"_ds1"), "scalar column alias _ds1");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            from_derived_aliases(select).contains(&"_dc1"),
+            "derived table alias _dc1"
+        );
+        assert!(
+            derived_scalar_aliases(select).contains(&"_ds1"),
+            "scalar column alias _ds1"
+        );
     }
 
     #[test]
@@ -2110,10 +2152,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.transformed, "EXISTS with GROUP BY should be decorrelated");
+        assert!(
+            outcome.transformed,
+            "EXISTS with GROUP BY should be decorrelated"
+        );
         let select = as_select(&outcome.resolved);
         assert!(!select_joins(select).is_empty(), "should have JOIN");
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         assert!(select.group_by.is_empty(), "GROUP BY should be stripped");
     }
 
@@ -2132,10 +2180,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.transformed, "EXISTS with HAVING should be decorrelated");
+        assert!(
+            outcome.transformed,
+            "EXISTS with HAVING should be decorrelated"
+        );
         let select = as_select(&outcome.resolved);
         assert!(!select_joins(select).is_empty(), "should have JOIN");
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
         assert!(select.having.is_none(), "HAVING should be stripped");
     }
 
@@ -2153,10 +2207,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.transformed, "EXISTS with LIMIT should be decorrelated");
+        assert!(
+            outcome.transformed,
+            "EXISTS with LIMIT should be decorrelated"
+        );
         let select = as_select(&outcome.resolved);
         assert!(!select_joins(select).is_empty(), "should have JOIN");
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be removed"
+        );
     }
 
     // ==================== NOT EXISTS: Inner Clause Handling ====================
@@ -2211,11 +2271,20 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.transformed, "NOT EXISTS with LIMIT should be decorrelated");
+        assert!(
+            outcome.transformed,
+            "NOT EXISTS with LIMIT should be decorrelated"
+        );
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(!where_has_subquery(&select.where_clause), "NOT EXISTS should be removed");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "NOT EXISTS should be removed"
+        );
     }
 
     // ==================== Mixed Cases ====================
@@ -2235,9 +2304,15 @@ mod tests {
         let select = as_select(&outcome.resolved);
 
         // Correlated EXISTS decorrelated into JOIN
-        assert!(from_table_names(select).contains(&"orders"), "correlated subquery decorrelated");
+        assert!(
+            from_table_names(select).contains(&"orders"),
+            "correlated subquery decorrelated"
+        );
         // Non-correlated EXISTS should remain as subquery
-        assert!(where_has_subquery(&select.where_clause), "non-correlated EXISTS should remain");
+        assert!(
+            where_has_subquery(&select.where_clause),
+            "non-correlated EXISTS should remain"
+        );
     }
 
     #[test]
@@ -2255,8 +2330,14 @@ mod tests {
         let select = as_select(&outcome.resolved);
 
         let where_str = deparse_expr(select.where_clause.as_ref().unwrap());
-        assert!(where_str.contains("e.status = 'active'"), "outer predicate preserved: {where_str}");
-        assert!(!select_joins(select).is_empty(), "correlation should be JOIN");
+        assert!(
+            where_str.contains("e.status = 'active'"),
+            "outer predicate preserved: {where_str}"
+        );
+        assert!(
+            !select_joins(select).is_empty(),
+            "correlation should be JOIN"
+        );
     }
 
     // ==================== Scalar SELECT List Decorrelation ====================
@@ -2275,9 +2356,18 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(from_derived_aliases(select).contains(&"_dc1"), "derived table alias");
-        assert!(derived_scalar_aliases(select).contains(&"_ds1"), "scalar column alias");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            from_derived_aliases(select).contains(&"_dc1"),
+            "derived table alias"
+        );
+        assert!(
+            derived_scalar_aliases(select).contains(&"_ds1"),
+            "scalar column alias"
+        );
         assert!(derived_has_group_by(select), "aggregate needs GROUP BY");
     }
 
@@ -2295,9 +2385,15 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
         assert!(derived_has_group_by(select), "aggregate needs GROUP BY");
-        assert!(!from_derived_aliases(select).is_empty(), "should have derived table");
+        assert!(
+            !from_derived_aliases(select).is_empty(),
+            "should have derived table"
+        );
     }
 
     #[test]
@@ -2314,7 +2410,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
         assert!(derived_has_group_by(select), "aggregate needs GROUP BY");
     }
 
@@ -2354,8 +2453,14 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(select.group_by.is_empty(), "non-aggregate should not have GROUP BY");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            select.group_by.is_empty(),
+            "non-aggregate should not have GROUP BY"
+        );
     }
 
     #[test]
@@ -2389,10 +2494,16 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         // Scalar subquery decorrelated as LEFT JOIN with derived table
-        assert!(from_derived_aliases(select).contains(&"_dc1"), "scalar derived table");
+        assert!(
+            from_derived_aliases(select).contains(&"_dc1"),
+            "scalar derived table"
+        );
         // EXISTS decorrelated as INNER JOIN + DISTINCT
         assert!(select.distinct, "EXISTS should set DISTINCT");
-        assert!(!where_has_subquery(&select.where_clause), "EXISTS should be decorrelated");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "EXISTS should be decorrelated"
+        );
     }
 
     // ==================== Scalar WHERE Clause Decorrelation ====================
@@ -2410,9 +2521,18 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(from_derived_aliases(select).contains(&"_dc1"), "derived table alias");
-        assert!(derived_scalar_aliases(select).contains(&"_ds1"), "scalar column alias");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            from_derived_aliases(select).contains(&"_dc1"),
+            "derived table alias"
+        );
+        assert!(
+            derived_scalar_aliases(select).contains(&"_ds1"),
+            "scalar column alias"
+        );
     }
 
     #[test]
@@ -2428,8 +2548,14 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(from_derived_aliases(select).contains(&"_dc1"), "derived table alias");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            from_derived_aliases(select).contains(&"_dc1"),
+            "derived table alias"
+        );
     }
 
     #[test]
@@ -2463,9 +2589,18 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(select.group_by.is_empty(), "non-aggregate should not have GROUP BY");
-        assert!(from_derived_aliases(select).contains(&"_dc1"), "derived table alias");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            select.group_by.is_empty(),
+            "non-aggregate should not have GROUP BY"
+        );
+        assert!(
+            from_derived_aliases(select).contains(&"_dc1"),
+            "derived table alias"
+        );
     }
 
     // ==================== Self-Join / Alias Handling ====================
@@ -2484,8 +2619,14 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
-        assert!(from_derived_aliases(select).contains(&"_dc1"), "derived table alias");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
+        assert!(
+            from_derived_aliases(select).contains(&"_dc1"),
+            "derived table alias"
+        );
         assert!(derived_has_group_by(select), "aggregate needs GROUP BY");
     }
 
@@ -2515,10 +2656,22 @@ mod tests {
         let left = as_select(&set_op.left);
         let right = as_select(&set_op.right);
 
-        assert!(from_derived_aliases(left).contains(&"_dc1"), "first branch derived table");
-        assert!(from_derived_aliases(right).contains(&"_dc2"), "second branch derived table");
-        assert!(derived_scalar_aliases(left).contains(&"_ds1"), "first branch scalar column");
-        assert!(derived_scalar_aliases(right).contains(&"_ds2"), "second branch scalar column");
+        assert!(
+            from_derived_aliases(left).contains(&"_dc1"),
+            "first branch derived table"
+        );
+        assert!(
+            from_derived_aliases(right).contains(&"_dc2"),
+            "second branch derived table"
+        );
+        assert!(
+            derived_scalar_aliases(left).contains(&"_ds1"),
+            "first branch scalar column"
+        );
+        assert!(
+            derived_scalar_aliases(right).contains(&"_ds2"),
+            "second branch scalar column"
+        );
     }
 
     // ==================== IN Decorrelation ====================
@@ -2536,7 +2689,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "IN should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "IN should be removed"
+        );
         let joins = select_joins(select);
         assert_eq!(joins.len(), 1);
         assert_eq!(joins[0].join_type, JoinType::Inner);
@@ -2562,10 +2718,16 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "IN should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "IN should be removed"
+        );
         assert!(!select_joins(select).is_empty(), "should have JOIN");
         let where_str = deparse_expr(select.where_clause.as_ref().unwrap());
-        assert!(where_str.contains("d.location = 'NYC'"), "residual in WHERE: {where_str}");
+        assert!(
+            where_str.contains("d.location = 'NYC'"),
+            "residual in WHERE: {where_str}"
+        );
     }
 
     #[test]
@@ -2583,7 +2745,10 @@ mod tests {
         let select = as_select(&outcome.resolved);
 
         let where_str = deparse_expr(select.where_clause.as_ref().unwrap());
-        assert!(where_str.contains("e.status = 'active'"), "outer predicate preserved: {where_str}");
+        assert!(
+            where_str.contains("e.status = 'active'"),
+            "outer predicate preserved: {where_str}"
+        );
         assert!(!select_joins(select).is_empty(), "should have JOIN");
     }
 
@@ -2615,10 +2780,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.transformed, "IN with GROUP BY should be decorrelated");
+        assert!(
+            outcome.transformed,
+            "IN with GROUP BY should be decorrelated"
+        );
         let select = as_select(&outcome.resolved);
         assert!(!select_joins(select).is_empty(), "should have JOIN");
-        assert!(!where_has_subquery(&select.where_clause), "IN should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "IN should be removed"
+        );
         assert!(select.group_by.is_empty(), "GROUP BY should be stripped");
     }
 
@@ -2639,7 +2810,10 @@ mod tests {
         assert!(outcome.transformed, "IN with LIMIT should be decorrelated");
         let select = as_select(&outcome.resolved);
         assert!(!select_joins(select).is_empty(), "should have JOIN");
-        assert!(!where_has_subquery(&select.where_clause), "IN should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "IN should be removed"
+        );
     }
 
     #[test]
@@ -2656,7 +2830,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "IN should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "IN should be removed"
+        );
         let tables = from_table_names(select);
         assert!(tables.contains(&"orders"), "original join preserved");
         assert!(tables.contains(&"departments"), "IN table joined");
@@ -2676,7 +2853,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "subqueries should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "subqueries should be removed"
+        );
         let tables = from_table_names(select);
         assert!(tables.contains(&"departments"), "IN table");
         assert!(tables.contains(&"orders"), "EXISTS table");
@@ -2694,7 +2874,10 @@ mod tests {
 
         assert!(!outcome.transformed);
         let select = as_select(&outcome.resolved);
-        assert!(where_has_subquery(&select.where_clause), "non-correlated IN should remain");
+        assert!(
+            where_has_subquery(&select.where_clause),
+            "non-correlated IN should remain"
+        );
     }
 
     // ==================== NOT IN Decorrelation ====================
@@ -2735,7 +2918,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
         assert!(where_has_is_null(&select.where_clause));
     }
 
@@ -2760,7 +2946,10 @@ mod tests {
         assert_eq!(joins[0].join_type, JoinType::Left);
         // Residual should be in ON clause (not outer WHERE) for LEFT JOIN semantics
         let on = deparse_expr(joins[0].condition.as_ref().unwrap());
-        assert!(on.contains("d.location = 'NYC'"), "residual in ON clause: {on}");
+        assert!(
+            on.contains("d.location = 'NYC'"),
+            "residual in ON clause: {on}"
+        );
         assert!(where_has_is_null(&select.where_clause));
     }
 
@@ -2779,9 +2968,15 @@ mod tests {
         let select = as_select(&outcome.resolved);
 
         let where_str = deparse_expr(select.where_clause.as_ref().unwrap());
-        assert!(where_str.contains("e.status = 'active'"), "outer predicate preserved: {where_str}");
+        assert!(
+            where_str.contains("e.status = 'active'"),
+            "outer predicate preserved: {where_str}"
+        );
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
         assert!(where_has_is_null(&select.where_clause));
     }
 
@@ -2815,10 +3010,7 @@ mod tests {
             &tables,
         );
 
-        assert!(
-            result.is_err(),
-            "NOT IN with GROUP BY should be rejected"
-        );
+        assert!(result.is_err(), "NOT IN with GROUP BY should be rejected");
     }
 
     #[test]
@@ -2835,10 +3027,7 @@ mod tests {
             &tables,
         );
 
-        assert!(
-            result.is_err(),
-            "NOT IN with HAVING should be rejected"
-        );
+        assert!(result.is_err(), "NOT IN with HAVING should be rejected");
     }
 
     #[test]
@@ -2855,10 +3044,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.transformed, "NOT IN with LIMIT should be decorrelated");
+        assert!(
+            outcome.transformed,
+            "NOT IN with LIMIT should be decorrelated"
+        );
         let select = as_select(&outcome.resolved);
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
     }
 
     #[test]
@@ -2879,7 +3074,10 @@ mod tests {
         assert!(tables.contains(&"orders"), "original join preserved");
         assert!(tables.contains(&"departments"), "NOT IN table joined");
         let joins = select_joins(select);
-        assert!(joins.iter().any(|j| j.join_type == JoinType::Left), "should have LEFT JOIN");
+        assert!(
+            joins.iter().any(|j| j.join_type == JoinType::Left),
+            "should have LEFT JOIN"
+        );
     }
 
     #[test]
@@ -2897,7 +3095,10 @@ mod tests {
         assert!(outcome.transformed);
         let select = as_select(&outcome.resolved);
 
-        assert!(!where_has_subquery(&select.where_clause), "all subqueries should be removed");
+        assert!(
+            !where_has_subquery(&select.where_clause),
+            "all subqueries should be removed"
+        );
         let tables = from_table_names(select);
         assert!(tables.contains(&"departments"), "NOT IN table");
         assert!(tables.contains(&"orders"), "IN table");
@@ -2916,6 +3117,9 @@ mod tests {
 
         assert!(!outcome.transformed);
         let select = as_select(&outcome.resolved);
-        assert!(where_has_subquery(&select.where_clause), "non-correlated NOT IN should remain");
+        assert!(
+            where_has_subquery(&select.where_clause),
+            "non-correlated NOT IN should remain"
+        );
     }
 }

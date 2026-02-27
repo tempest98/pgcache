@@ -18,7 +18,9 @@ use crate::settings::{CachePolicy, Settings};
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcCommand, QueryCommand},
-    types::{ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved},
+    types::{
+        ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
+    },
 };
 use super::population::population_worker;
 

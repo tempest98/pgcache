@@ -252,11 +252,12 @@ impl CacheWriter {
 
         self.cache_tables_ensure(&base_query, search_path).await?;
 
-        let resolved: SharedResolved =
-            Arc::new(query_expr_resolve(&base_query, &self.cache.tables, search_path)
+        let resolved: SharedResolved = Arc::new(
+            query_expr_resolve(&base_query, &self.cache.tables, search_path)
                 .map_err(|e| e.context_transform(CacheError::from))
                 .attach_loc("resolving query expression")
-                .map(predicate_pushdown_apply)?);
+                .map(predicate_pushdown_apply)?,
+        );
 
         let relation_oids =
             self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;

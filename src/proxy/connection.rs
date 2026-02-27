@@ -432,7 +432,6 @@ impl ConnectionState {
             extended: ExtendedPending::new(),
         }
     }
-
 }
 
 impl ConnectionState {

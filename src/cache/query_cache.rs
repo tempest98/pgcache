@@ -169,10 +169,7 @@ impl QueryCache {
                     self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
                     self.query_register_send(fingerprint, msg.cacheable_query, msg.search_path)
                 } else {
-                    self.cached_query_state_set(
-                        &fingerprint,
-                        CachedQueryState::Pending(new_count),
-                    );
+                    self.cached_query_state_set(&fingerprint, CachedQueryState::Pending(new_count));
                     Ok(())
                 }
             }
@@ -226,18 +223,24 @@ impl QueryCache {
         let mut timing = msg.timing;
         timing.lookup_complete_at = Some(Instant::now());
 
-        let (has_sync, has_parse, has_bind, pipeline_describe, parameter_description, forward_bytes) =
-            match msg.pipeline {
-                Some(pipeline) => (
-                    true,
-                    pipeline.has_parse,
-                    pipeline.has_bind,
-                    pipeline.describe,
-                    pipeline.parameter_description,
-                    Some(pipeline.buffered_bytes),
-                ),
-                None => (false, false, false, PipelineDescribe::None, None, None),
-            };
+        let (
+            has_sync,
+            has_parse,
+            has_bind,
+            pipeline_describe,
+            parameter_description,
+            forward_bytes,
+        ) = match msg.pipeline {
+            Some(pipeline) => (
+                true,
+                pipeline.has_parse,
+                pipeline.has_bind,
+                pipeline.describe,
+                pipeline.parameter_description,
+                Some(pipeline.buffered_bytes),
+            ),
+            None => (false, false, false, PipelineDescribe::None, None, None),
+        };
 
         self.worker_tx
             .send(WorkerRequest {

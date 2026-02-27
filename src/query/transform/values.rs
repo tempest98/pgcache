@@ -38,10 +38,7 @@ pub fn resolved_select_node_table_replace_with_values(
                 ResolvedTableSource::Table(table) => {
                     if table.relation_oid == relation_oid {
                         found_alias = Some(EcoString::from(
-                            table
-                                .alias
-                                .as_deref()
-                                .unwrap_or(&table_metadata.name),
+                            table.alias.as_deref().unwrap_or(&table_metadata.name),
                         ));
                         break;
                     }

@@ -10,12 +10,12 @@ use crate::query::ast::{
     SelectColumns, SelectNode, TableAlias, TableNode, TableSource, WhereExpr, WindowSpec,
 };
 use crate::query::resolved::{
-    ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr, ResolvedCaseWhen,
-    ResolvedColumnExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedLimitClause,
-    ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr,
-    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode,
-    ResolvedTableNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedUnaryExpr,
-    ResolvedWhereExpr, ResolvedWindowSpec, ResolveError, ResolveResult,
+    ResolveError, ResolveResult, ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr,
+    ResolvedCaseWhen, ResolvedColumnExpr, ResolvedColumnNode, ResolvedJoinNode,
+    ResolvedLimitClause, ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody,
+    ResolvedQueryExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource, ResolvedTableSubqueryNode,
+    ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowSpec,
 };
 
 /// Resolution scope tracking available tables and their aliases
@@ -735,9 +735,7 @@ fn order_by_resolve(
 
 /// Convert ORDER BY clauses to use unqualified Identifier expressions.
 /// Used for set operations where ORDER BY references output columns by name.
-fn order_by_as_identifiers(
-    order_by: &[OrderByClause],
-) -> Vec<ResolvedOrderByClause> {
+fn order_by_as_identifiers(order_by: &[OrderByClause]) -> Vec<ResolvedOrderByClause> {
     order_by
         .iter()
         .map(|clause| {

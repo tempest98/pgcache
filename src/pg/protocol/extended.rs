@@ -758,7 +758,10 @@ mod tests {
         let portal = Portal {
             name: "p1".to_owned(),
             statement_name: "s1".to_owned(),
-            parameter_values: vec![Some(Bytes::from_static(b"text")), Some(Bytes::from_static(&[0, 0, 0, 42]))],
+            parameter_values: vec![
+                Some(Bytes::from_static(b"text")),
+                Some(Bytes::from_static(&[0, 0, 0, 42])),
+            ],
             parameter_formats: vec![0, 1], // text, then binary
             result_formats: vec![0],
         };

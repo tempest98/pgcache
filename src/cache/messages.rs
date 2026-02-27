@@ -126,12 +126,7 @@ impl CacheMessage {
                 query_type: QueryType::Simple,
                 result_formats: Vec::new(),
             }),
-            CacheMessage::QueryParameterized(
-                data,
-                cacheable_query,
-                parameters,
-                result_formats,
-            ) => {
+            CacheMessage::QueryParameterized(data, cacheable_query, parameters, result_formats) => {
                 // Replace parameters in AST, producing a new QueryExpr
                 match query_expr_parameters_replace(&cacheable_query.query, &parameters) {
                     Ok(replaced_query) => Ok(QueryData {

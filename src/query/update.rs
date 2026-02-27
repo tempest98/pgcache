@@ -613,7 +613,11 @@ mod tests {
         assert_eq!(result.len(), 2);
 
         let a = result.iter().find(|(t, _, _)| t == "a").unwrap();
-        assert_eq!(a.2, UpdateQuerySource::FromClause, "preserved side is FromClause");
+        assert_eq!(
+            a.2,
+            UpdateQuerySource::FromClause,
+            "preserved side is FromClause"
+        );
 
         let b = result.iter().find(|(t, _, _)| t == "b").unwrap();
         assert_eq!(
@@ -716,6 +720,10 @@ mod tests {
         assert_eq!(a.2, UpdateQuerySource::FromClause);
 
         let c = result.iter().find(|(t, _, _)| t == "c").unwrap();
-        assert_eq!(c.2, UpdateQuerySource::FromClause, "c is not on optional side");
+        assert_eq!(
+            c.2,
+            UpdateQuerySource::FromClause,
+            "c is not on optional side"
+        );
     }
 }

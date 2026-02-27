@@ -268,9 +268,8 @@ where
     T::Err: fmt::Display,
 {
     let s = arg_string(parser)?;
-    s.parse().map_err(|e: T::Err| {
-        Report::from(ConfigError::ArgumentError(e.to_string().into()))
-    })
+    s.parse()
+        .map_err(|e: T::Err| Report::from(ConfigError::ArgumentError(e.to_string().into())))
 }
 
 /// Require an `Option<T>` to be `Some`, or return `ArgumentMissing`.
@@ -356,9 +355,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
             Long("metrics_socket") => args.metrics_socket = Some(arg_parse(&mut parser)?),
             Long("log_level") => args.log_level = Some(arg_string(&mut parser)?),
             Long("cache_policy") => args.cache_policy = Some(arg_enum(&mut parser)?),
-            Long("admission_threshold") => {
-                args.admission_threshold = Some(arg_parse(&mut parser)?)
-            }
+            Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -502,9 +499,7 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
         cache_size: args.cache_size,
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
-        metrics: args
-            .metrics_socket
-            .map(|socket| MetricsSettings { socket }),
+        metrics: args.metrics_socket.map(|socket| MetricsSettings { socket }),
         log_level: args.log_level,
         cache_policy: args.cache_policy.unwrap_or_default(),
         admission_threshold: args.admission_threshold.unwrap_or(2),
@@ -1087,7 +1082,10 @@ socket = "127.0.0.1:5434"
         assert_eq!(settings.replication.host, "origin.example.com");
         assert_eq!(settings.replication.port, 5432);
         assert_eq!(settings.replication.user, "origin_user");
-        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(
+            settings.replication.password,
+            Some("origin_pass".to_owned())
+        );
         assert_eq!(settings.replication.database, "origin_db");
     }
 
@@ -1105,7 +1103,10 @@ socket = "127.0.0.1:5434"
         assert_eq!(settings.replication.host, "replica.example.com");
         assert_eq!(settings.replication.port, 5432);
         assert_eq!(settings.replication.user, "origin_user");
-        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(
+            settings.replication.password,
+            Some("origin_pass".to_owned())
+        );
     }
 
     #[test]
@@ -1123,7 +1124,10 @@ socket = "127.0.0.1:5434"
         assert_eq!(settings.replication.port, 6432);
         // Remaining fields cascade from origin
         assert_eq!(settings.replication.user, "origin_user");
-        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(
+            settings.replication.password,
+            Some("origin_pass".to_owned())
+        );
         assert_eq!(settings.replication.database, "origin_db");
     }
 
@@ -1210,7 +1214,10 @@ socket = "127.0.0.1:5434"
         assert_eq!(settings.replication.host, "origin.example.com");
         assert_eq!(settings.replication.port, 5432);
         assert_eq!(settings.replication.user, "origin_user");
-        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(
+            settings.replication.password,
+            Some("origin_pass".to_owned())
+        );
         assert_eq!(settings.replication.database, "origin_db");
         assert_eq!(settings.replication.ssl_mode, SslMode::Disable);
     }
@@ -1228,7 +1235,10 @@ socket = "127.0.0.1:5434"
         // Remaining fields inherited from origin
         assert_eq!(settings.replication.port, 5432);
         assert_eq!(settings.replication.user, "origin_user");
-        assert_eq!(settings.replication.password, Some("origin_pass".to_owned()));
+        assert_eq!(
+            settings.replication.password,
+            Some("origin_pass".to_owned())
+        );
         assert_eq!(settings.replication.database, "origin_db");
     }
 

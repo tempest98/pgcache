@@ -1324,18 +1324,12 @@ async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
     .await?;
 
     // Dept 10 has projects
-    ctx.query(
-        "INSERT INTO projects (id, dept_id) VALUES (100, 10)",
-        &[],
-    )
-    .await?;
+    ctx.query("INSERT INTO projects (id, dept_id) VALUES (100, 10)", &[])
+        .await?;
 
     // Bob is suspended
-    ctx.query(
-        "INSERT INTO suspensions (id, emp_id) VALUES (200, 2)",
-        &[],
-    )
-    .await?;
+    ctx.query("INSERT INTO suspensions (id, emp_id) VALUES (200, 2)", &[])
+        .await?;
 
     wait_for_cdc().await;
 
@@ -1382,11 +1376,8 @@ async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
     wait_cache_load().await;
 
     // --- CDC: add project for dept 20 → Bob should appear ---
-    ctx.origin_query(
-        "INSERT INTO projects (id, dept_id) VALUES (101, 20)",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("INSERT INTO projects (id, dept_id) VALUES (101, 20)", &[])
+        .await?;
 
     wait_for_cdc().await;
 

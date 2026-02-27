@@ -1677,6 +1677,5 @@ impl Deparse for ResolvedQueryExpr {
     }
 }
 
-
 // Re-export public resolution functions so existing imports continue to work
 pub use super::resolve::{query_expr_resolve, select_node_resolve};

@@ -257,8 +257,7 @@ fn parameter_to_literal(param: &QueryParameter) -> AstTransformResult<LiteralVal
 
 /// Convert a text format parameter to a LiteralValue based on OID.
 fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| Report::from(AstTransformError::InvalidUtf8))?;
+    let s = std::str::from_utf8(bytes).map_err(|_| Report::from(AstTransformError::InvalidUtf8))?;
 
     // Use postgres_types to identify the type from OID
     let pg_type = PgType::from_oid(oid);
@@ -716,7 +715,9 @@ mod tests {
     #[test]
     fn test_binary_parameter_int8() {
         let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A])), // 42 in big-endian i64
+            value: Some(Bytes::from_static(&[
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A,
+            ])), // 42 in big-endian i64
             format: 1,
             oid: PgType::INT8.oid(),
         };

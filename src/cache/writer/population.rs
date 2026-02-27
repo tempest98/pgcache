@@ -322,8 +322,7 @@ async fn population_stream(
     }
 
     if !value_tuples.is_empty() {
-        population_batch_flush(db_cache, &insert.prefix, &insert.suffix, &mut value_tuples)
-            .await?;
+        population_batch_flush(db_cache, &insert.prefix, &insert.suffix, &mut value_tuples).await?;
     }
 
     Ok(cached_bytes)
