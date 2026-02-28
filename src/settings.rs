@@ -35,15 +35,24 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
-/// SSL/TLS connection mode for PostgreSQL connections
+/// SSL/TLS connection mode for PostgreSQL connections.
+///
+/// Matches PostgreSQL semantics:
+/// - `disable`: no encryption
+/// - `require`: encrypt but don't verify the server certificate
+/// - `verify-full`: encrypt and verify the server certificate against trusted CAs
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SslMode {
     /// No TLS encryption (default for backwards compatibility)
     #[default]
     Disable,
-    /// Require TLS encryption, fail if not supported
+    /// Require TLS encryption, but don't verify the server certificate.
+    /// Matches PostgreSQL's `sslmode=require`.
     Require,
+    /// Require TLS encryption and verify the server certificate against trusted CAs.
+    /// Matches PostgreSQL's `sslmode=verify-full`.
+    VerifyFull,
 }
 
 /// Error returned when parsing an invalid SSL mode string
@@ -54,7 +63,7 @@ impl fmt::Display for ParseSslModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "invalid SSL mode: '{}', expected 'disable' or 'require'",
+            "invalid SSL mode: '{}', expected 'disable', 'require', or 'verify-full'",
             self.0
         )
     }
@@ -109,6 +118,7 @@ impl FromStr for SslMode {
         match s.to_lowercase().as_str() {
             "disable" => Ok(SslMode::Disable),
             "require" => Ok(SslMode::Require),
+            "verify-full" | "verify_full" => Ok(SslMode::VerifyFull),
             _ => Err(ParseSslModeError(s.to_owned())),
         }
     }
@@ -515,9 +525,9 @@ impl Settings {
     fn print_usage_and_exit(name: &str) -> ! {
         println!(
             "Usage: {name} -c|--config TOML_FILE --origin_host HOST --origin_port PORT --origin_user USER --origin_database DB \n \
-            [--origin_password PASSWORD] [--origin_ssl_mode disable|require] \n \
+            [--origin_password PASSWORD] [--origin_ssl_mode disable|require|verify-full] \n \
             [--replication_host HOST] [--replication_port PORT] [--replication_user USER] [--replication_database DB] \n \
-            [--replication_password PASSWORD] [--replication_ssl_mode disable|require] \n \
+            [--replication_password PASSWORD] [--replication_ssl_mode disable|require|verify-full] \n \
             --cache_host HOST --cache_port PORT --cache_user USER --cache_database DB \n \
             --cdc_publication_name NAME --cdc_slot_name SLOT_NAME \n \
             --listen_socket IP_AND_PORT \n \

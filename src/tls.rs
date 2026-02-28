@@ -17,7 +17,9 @@ use rootcause::Report;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 use crate::result::MapIntoReport;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use crate::settings::SslMode;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use rustls_pemfile::{certs, private_key};
 use std::fs::File;
 use std::io::BufReader;
@@ -51,11 +53,78 @@ error_set! {
 /// Result type with location-tracking error reports for TLS operations.
 pub type TlsResult<T> = Result<T, Report<TlsError>>;
 
-/// Build a rustls ClientConfig using webpki root certificates
+/// A certificate verifier that accepts any server certificate.
+///
+/// Used for `sslmode=require` where we want encryption without verification.
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
+/// Build a rustls ClientConfig that skips server certificate verification.
+///
+/// This matches PostgreSQL's `sslmode=require` behavior: the connection is
+/// encrypted, but the server's certificate is not validated. Suitable for
+/// self-signed certificates or private CAs.
+pub fn tls_config_no_verify_build() -> Arc<ClientConfig> {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
+/// Build a rustls ClientConfig using webpki root certificates.
 ///
 /// This configuration trusts the standard set of root CA certificates
-/// and does not use client authentication.
-pub fn tls_config_build() -> Arc<ClientConfig> {
+/// and does not use client authentication. Matches PostgreSQL's
+/// `sslmode=verify-full` behavior.
+pub fn tls_config_verify_build() -> Arc<ClientConfig> {
     let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -98,6 +167,7 @@ const SSL_REQUEST: &[u8] = &[0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 ///
 /// # Arguments
 /// * `stream` - Plain TCP connection to the PostgreSQL server
+/// * `ssl_mode` - TLS verification mode (Require = no verify, VerifyFull = verify)
 /// * `server_name` - Hostname for TLS certificate verification
 ///
 /// # Returns
@@ -105,6 +175,7 @@ const SSL_REQUEST: &[u8] = &[0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 /// * `Err(TlsError)` - If SSL not supported or TLS handshake fails
 pub async fn pg_tls_connect(
     mut stream: TcpStream,
+    ssl_mode: SslMode,
     server_name: &str,
 ) -> TlsResult<RustlsTlsStream<TcpStream>> {
     tracing::debug!("pg_tls_connect: sending SSLRequest to {}", server_name);
@@ -128,7 +199,11 @@ pub async fn pg_tls_connect(
         b'S' => {
             // Server accepts SSL - proceed with TLS handshake
             tracing::debug!("pg_tls_connect: server accepts SSL, starting TLS handshake");
-            let config = tls_config_build();
+            let config = match ssl_mode {
+                SslMode::Require => tls_config_no_verify_build(),
+                SslMode::VerifyFull => tls_config_verify_build(),
+                SslMode::Disable => unreachable!("pg_tls_connect called with SslMode::Disable"),
+            };
             let connector = TlsConnector::from(config);
             let server_name: ServerName<'_> = server_name
                 .to_owned()
@@ -411,10 +486,17 @@ mod tests {
     }
 
     #[test]
-    fn test_tls_config_build() {
+    fn test_tls_config_verify_build() {
         init_crypto_provider();
-        let config = tls_config_build();
+        let config = tls_config_verify_build();
         // Just verify it doesn't panic and returns a valid config
+        assert!(Arc::strong_count(&config) == 1);
+    }
+
+    #[test]
+    fn test_tls_config_no_verify_build() {
+        init_crypto_provider();
+        let config = tls_config_no_verify_build();
         assert!(Arc::strong_count(&config) == 1);
     }
 
@@ -431,7 +513,7 @@ mod tests {
     #[test]
     fn test_make_rustls_connect() {
         init_crypto_provider();
-        let config = tls_config_build();
+        let config = tls_config_verify_build();
         let mut make_tls: MakeRustlsConnect = MakeRustlsConnect::new(config);
         // Should succeed with valid hostname
         // Need to specify type parameter for MakeTlsConnect trait method

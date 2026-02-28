@@ -1248,8 +1248,8 @@ async fn origin_connect(
         if let Ok(stream) = TcpStream::connect(addr).await {
             return match ssl_mode {
                 SslMode::Disable => Ok(TlsStream::plain(stream)),
-                SslMode::Require => {
-                    let tls_stream = tls::pg_tls_connect(stream, server_name)
+                SslMode::Require | SslMode::VerifyFull => {
+                    let tls_stream = tls::pg_tls_connect(stream, ssl_mode, server_name)
                         .await
                         .map_err(|e| {
                             Report::from(ConnectionError::TlsError(io::Error::other(

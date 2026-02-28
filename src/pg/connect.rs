@@ -43,8 +43,14 @@ pub async fn config_connect(
     ssl_mode: SslMode,
     context: &str,
 ) -> Result<Client, Error> {
-    match ssl_mode {
-        SslMode::Disable => {
+    let tls_config = match ssl_mode {
+        SslMode::Disable => None,
+        SslMode::Require => Some(tls::tls_config_no_verify_build()),
+        SslMode::VerifyFull => Some(tls::tls_config_verify_build()),
+    };
+
+    match tls_config {
+        None => {
             let (client, connection) = config.connect(NoTls).await?;
             let context = context.to_owned();
             tokio::spawn(async move {
@@ -54,8 +60,8 @@ pub async fn config_connect(
             });
             Ok(client)
         }
-        SslMode::Require => {
-            let tls_connector = tls::MakeRustlsConnect::new(tls::tls_config_build());
+        Some(config_tls) => {
+            let tls_connector = tls::MakeRustlsConnect::new(config_tls);
             let (client, connection) = config.connect(tls_connector).await?;
             let context = context.to_owned();
             tokio::spawn(async move {
