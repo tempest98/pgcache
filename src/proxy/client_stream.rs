@@ -13,7 +13,9 @@ use nix::libc;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 
-use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf, tls_poll_shutdown, tls_poll_write};
+use super::tls_stream::{
+    PendingWrite, TlsReadHalf, TlsStream, TlsWriteHalf, tls_poll_shutdown, tls_poll_write,
+};
 use crate::tls::ClientTlsState;
 
 // ============================================================================
@@ -68,6 +70,7 @@ pub enum ClientSocket {
     Tls {
         tcp: TcpStream,
         tls_state: ClientTlsState,
+        pending: Option<PendingWrite>,
     },
 }
 
@@ -79,9 +82,11 @@ impl AsyncWrite for ClientSocket {
     ) -> Poll<io::Result<usize>> {
         match &mut *self {
             ClientSocket::Plain(tcp) => Pin::new(tcp).poll_write(cx, buf),
-            ClientSocket::Tls { tcp, tls_state } => {
-                tls_poll_write(Pin::new(tcp), tls_state, cx, buf)
-            }
+            ClientSocket::Tls {
+                tcp,
+                tls_state,
+                pending,
+            } => tls_poll_write(Pin::new(tcp), tls_state, cx, buf, pending),
         }
     }
 
@@ -95,7 +100,9 @@ impl AsyncWrite for ClientSocket {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             ClientSocket::Plain(tcp) => Pin::new(tcp).poll_shutdown(cx),
-            ClientSocket::Tls { tcp, tls_state } => tls_poll_shutdown(Pin::new(tcp), tls_state, cx),
+            ClientSocket::Tls { tcp, tls_state, .. } => {
+                tls_poll_shutdown(Pin::new(tcp), tls_state, cx)
+            }
         }
     }
 }
@@ -151,6 +158,7 @@ impl ClientSocketSource {
                 Ok(ClientSocket::Tls {
                     tcp,
                     tls_state: Arc::clone(tls_state),
+                    pending: None,
                 })
             }
         }

@@ -1,6 +1,6 @@
 num_workers = 2
 #cache_size = 500000
-#log_level = "trace"
+log_level = "trace"
 #log_level = "debug"
 
 [origin]
@@ -10,12 +10,6 @@ user = "postgres"
 #database = "origin"
 database = "pagila"
 #database = "conta_azul"
-
-#host = "ep-orange-river-afs4ceae.c-2.us-west-2.aws.neon.tech"
-#port = 5432
-#user = "neondb_owner"
-#database = "neondb"
-#ssl_mode = "require"
 
 [cache]
 host = "localhost"

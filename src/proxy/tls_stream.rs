@@ -18,6 +18,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 
+use tracing::{debug, trace};
+
 use crate::tls::SharedTlsState;
 
 // ============================================================================
@@ -151,6 +153,7 @@ impl<T: TlsConnectionOps> TlsStream<T> {
                     TlsWriteHalf::Tls {
                         tcp: write,
                         tls_state: Arc::clone(tls_state),
+                        pending: None,
                     },
                 )
             }
@@ -186,17 +189,50 @@ impl<T: TlsConnectionOps> AsyncRead for TlsReadHalf<'_, T> {
 
 /// Poll TLS read: read ciphertext from TCP, decrypt, return plaintext.
 ///
-/// Uses a loop to handle TLS 1.3 session tickets, which are post-handshake
-/// messages that produce no plaintext when processed. Without the loop,
-/// consuming a session ticket would cause us to return Pending incorrectly.
+/// Single loop with three phases — ordering is critical:
+/// 1. Drain all unconsumed ciphertext into rustls first, since `tcp_buf` is
+///    stack-local and would be lost if we returned early
+/// 2. Only after all ciphertext is consumed, check for buffered plaintext
+/// 3. Read more ciphertext from TCP
 fn poll_tls_read<T: TlsConnectionOps>(
     tcp: &mut ReadHalf<'_>,
     tls_state: &SharedTlsState<T>,
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
 ) -> Poll<io::Result<()>> {
+    let mut tcp_buf = [0u8; 16 * 1024];
+    let mut consumed = 0usize;
+    let mut filled = 0usize;
+
     loop {
-        // First, check if there's already-buffered plaintext from previous reads or handshake
+        // Phase 1: drain unconsumed ciphertext into rustls. Must complete
+        // before returning plaintext — tcp_buf is stack-local and would be
+        // lost across calls.
+        if let Some(remaining @ &[_, ..]) = tcp_buf.get(consumed..filled) {
+            let mut tls = tls_state
+                .lock()
+                .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
+
+            let mut cursor = std::io::Cursor::new(remaining);
+            match tls.read_tls(&mut cursor) {
+                Ok(n) => {
+                    trace!("tls: read_tls consumed {n}/{} bytes", remaining.len());
+                    consumed += n;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+
+            if let Err(e) = tls.process_new_packets() {
+                debug!(
+                    "tls: process_new_packets failed, consumed={consumed} filled={filled}: {e}"
+                );
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
+            }
+
+            continue;
+        }
+
+        // Phase 2: all ciphertext consumed, check for buffered plaintext
         {
             let mut tls = tls_state
                 .lock()
@@ -214,41 +250,39 @@ fn poll_tls_read<T: TlsConnectionOps>(
             }
         }
 
-        // Read ciphertext from TCP
-        let mut tcp_buf = [0u8; 16 * 1024];
-        let mut tcp_read_buf = ReadBuf::new(&mut tcp_buf);
-
-        match Pin::new(&mut *tcp).poll_read(cx, &mut tcp_read_buf) {
+        // Phase 3: read ciphertext from TCP
+        let mut read_buf = ReadBuf::new(&mut tcp_buf);
+        match Pin::new(&mut *tcp).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
-                let n = tcp_read_buf.filled().len();
-                if n == 0 {
+                filled = read_buf.filled().len();
+                consumed = 0;
+                if filled == 0 {
                     return Poll::Ready(Ok(()));
                 }
-
-                // Decrypt ciphertext
-                let mut tls = tls_state
-                    .lock()
-                    .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
-
-                let ciphertext = tcp_read_buf.filled();
-                let mut cursor = std::io::Cursor::new(ciphertext);
-                match tls.read_tls(&mut cursor) {
-                    Ok(0) => return Poll::Ready(Ok(())),
-                    Ok(_) => {}
-                    Err(e) => return Poll::Ready(Err(e)),
-                }
-
-                if let Err(e) = tls.process_new_packets() {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
-                }
-
-                // Loop back to check for plaintext - if the ciphertext was a session ticket,
-                // we'll have no plaintext and need to read more TCP data
+                trace!("tls: tcp read {filled} bytes");
             }
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
     }
+}
+
+// ============================================================================
+// PendingWrite - buffered ciphertext awaiting TCP write
+// ============================================================================
+
+/// Ciphertext that was encrypted but not yet fully written to TCP.
+///
+/// When `poll_write` returns `Pending` or achieves only a partial write,
+/// the already-encrypted ciphertext must be retained. Re-encrypting the same
+/// plaintext would advance the TLS sequence number, causing the peer to fail
+/// decryption due to an AEAD nonce mismatch.
+pub struct PendingWrite {
+    ciphertext: Vec<u8>,
+    /// Number of ciphertext bytes already written to TCP.
+    offset: usize,
+    /// Original plaintext length, returned to the caller on completion.
+    plaintext_len: usize,
 }
 
 // ============================================================================
@@ -264,6 +298,7 @@ pub enum TlsWriteHalf<'a, T: TlsConnectionOps> {
     Tls {
         tcp: WriteHalf<'a>,
         tls_state: SharedTlsState<T>,
+        pending: Option<PendingWrite>,
     },
 }
 
@@ -278,6 +313,7 @@ impl<T: TlsConnectionOps> TlsWriteHalf<'_, T> {
             TlsWriteHalf::Tls { tcp, .. } => tcp.writable().await,
         }
     }
+
 }
 
 impl<T: TlsConnectionOps> AsyncWrite for TlsWriteHalf<'_, T> {
@@ -288,9 +324,11 @@ impl<T: TlsConnectionOps> AsyncWrite for TlsWriteHalf<'_, T> {
     ) -> Poll<io::Result<usize>> {
         match &mut *self {
             TlsWriteHalf::Plain(tcp) => Pin::new(tcp).poll_write(cx, buf),
-            TlsWriteHalf::Tls { tcp, tls_state } => {
-                tls_poll_write(Pin::new(tcp), tls_state, cx, buf)
-            }
+            TlsWriteHalf::Tls {
+                tcp,
+                tls_state,
+                pending,
+            } => tls_poll_write(Pin::new(tcp), tls_state, cx, buf, pending),
         }
     }
 
@@ -304,7 +342,9 @@ impl<T: TlsConnectionOps> AsyncWrite for TlsWriteHalf<'_, T> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             TlsWriteHalf::Plain(tcp) => Pin::new(tcp).poll_shutdown(cx),
-            TlsWriteHalf::Tls { tcp, tls_state } => tls_poll_shutdown(Pin::new(tcp), tls_state, cx),
+            TlsWriteHalf::Tls { tcp, tls_state, .. } => {
+                tls_poll_shutdown(Pin::new(tcp), tls_state, cx)
+            }
         }
     }
 }
@@ -316,43 +356,65 @@ impl<T: TlsConnectionOps> AsyncWrite for TlsWriteHalf<'_, T> {
 /// Encrypt plaintext and write ciphertext to a TCP stream.
 ///
 /// This is the core TLS write implementation shared by TlsWriteHalf and ClientSocket.
+///
+/// The `pending` buffer ensures that ciphertext is never lost. Encrypting
+/// plaintext advances the TLS write sequence number irreversibly — if the
+/// TCP write returns `Pending` or is partial, re-encrypting the same plaintext
+/// on retry would produce a record with the wrong sequence number, causing the
+/// peer to fail AEAD decryption.
 pub fn tls_poll_write<T, W>(
     tcp: Pin<&mut W>,
     tls_state: &SharedTlsState<T>,
     cx: &mut Context<'_>,
     buf: &[u8],
+    pending: &mut Option<PendingWrite>,
 ) -> Poll<io::Result<usize>>
 where
     T: TlsConnectionOps,
     W: AsyncWrite,
 {
-    // Encrypt plaintext
-    let ciphertext = {
-        let mut tls = tls_state
-            .lock()
-            .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
+    // If we have buffered ciphertext from a previous attempt, retry that
+    // without re-encrypting.
+    let mut pw = match pending.take() {
+        Some(pw) => pw,
+        None => {
+            let mut tls = tls_state
+                .lock()
+                .map_err(|_| io::Error::other("TLS state lock poisoned"))?;
 
-        tls.writer_write_all(buf)?;
+            tls.writer_write_all(buf)?;
 
-        let mut cipher_buf = Vec::with_capacity(buf.len() + 64);
-        tls.write_tls(&mut cipher_buf)?;
-        cipher_buf
-    };
+            let mut cipher_buf = Vec::with_capacity(buf.len() + 64);
+            tls.write_tls(&mut cipher_buf)?;
 
-    // Write ciphertext to TCP
-    match tcp.poll_write(cx, &ciphertext) {
-        Poll::Ready(Ok(n)) => {
-            if n == ciphertext.len() {
-                Poll::Ready(Ok(buf.len()))
-            } else {
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "partial TLS ciphertext write",
-                )))
+            PendingWrite {
+                ciphertext: cipher_buf,
+                offset: 0,
+                plaintext_len: buf.len(),
             }
         }
-        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-        Poll::Pending => Poll::Pending,
+    };
+
+    match pw.ciphertext.get(pw.offset..) {
+        None | Some(&[]) => Poll::Ready(Ok(pw.plaintext_len)),
+        Some(remaining) => match tcp.poll_write(cx, remaining) {
+            Poll::Ready(Ok(n)) => {
+                pw.offset += n;
+                if pw.offset >= pw.ciphertext.len() {
+                    Poll::Ready(Ok(pw.plaintext_len))
+                } else {
+                    // Partial write — save progress and register for wakeup.
+                    cx.waker().wake_by_ref();
+                    *pending = Some(pw);
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => {
+                *pending = Some(pw);
+                Poll::Pending
+            }
+        },
     }
 }
 
