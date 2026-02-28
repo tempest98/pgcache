@@ -64,8 +64,18 @@ impl CacheWriter {
             self.state_gauges_update();
         }
 
-        self.update_queries_execute_concurrent(relation_oid, &row_data)
+        let matched = self
+            .update_queries_execute_concurrent(relation_oid, &row_data)
             .await?;
+
+        if matched {
+            let total = self.cache.update_queries.get(&relation_oid)
+                .map_or(0, |q| q.queries.len() as u64);
+            let freshness_count = total.saturating_sub(invalidation_count);
+            if freshness_count > 0 {
+                metrics::counter!(names::CACHE_FRESHNESS_HITS).increment(freshness_count);
+            }
+        }
 
         metrics::histogram!(names::CACHE_HANDLE_INSERT_SECONDS)
             .record(start.elapsed().as_secs_f64());
@@ -108,6 +118,15 @@ impl CacheWriter {
         let matched = self
             .update_queries_execute_concurrent(relation_oid, &new_row_data)
             .await?;
+
+        if matched {
+            let total = self.cache.update_queries.get(&relation_oid)
+                .map_or(0, |q| q.queries.len() as u64);
+            let freshness_count = total.saturating_sub(invalidation_count);
+            if freshness_count > 0 {
+                metrics::counter!(names::CACHE_FRESHNESS_HITS).increment(freshness_count);
+            }
+        }
 
         if !matched {
             let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
@@ -173,13 +192,15 @@ impl CacheWriter {
         };
 
         let delete_sql = self.cache_delete_sql(table_metadata, &row_data)?;
-        self.db_cache
+        let rows_deleted = self
+            .db_cache
             .execute(delete_sql.as_str(), &[])
             .await
             .map_into_report::<CacheError>()?;
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables
+        let mut invalidation_count = 0u64;
         if self.cache.update_queries.contains_key(&relation_oid) {
             let fp_list = self
                 .update_queries_check_invalidate(
@@ -191,7 +212,7 @@ impl CacheWriter {
                 )
                 .attach_loc("checking delete invalidations")?;
 
-            let invalidation_count = fp_list.len() as u64;
+            invalidation_count = fp_list.len() as u64;
             for fp in fp_list {
                 self.cache_query_cdc_invalidate(fp)
                     .await
@@ -200,6 +221,15 @@ impl CacheWriter {
             if invalidation_count > 0 {
                 metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
                 self.state_gauges_update();
+            }
+        }
+
+        if rows_deleted > 0 {
+            let total = self.cache.update_queries.get(&relation_oid)
+                .map_or(0, |q| q.queries.len() as u64);
+            let freshness_count = total.saturating_sub(invalidation_count);
+            if freshness_count > 0 {
+                metrics::counter!(names::CACHE_FRESHNESS_HITS).increment(freshness_count);
             }
         }
 

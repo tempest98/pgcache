@@ -71,6 +71,7 @@ pub mod names {
 
     // Cache performance metrics
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
+    pub const CACHE_FRESHNESS_HITS: &str = "pgcache.cache.freshness_hits";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
     pub const CACHE_READMISSIONS: &str = "pgcache.cache.readmissions";
 

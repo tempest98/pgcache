@@ -281,7 +281,7 @@ impl CacheWriter {
     /// Reuses existing metadata (relation_oids, resolved, update_queries) and
     /// dispatches population work without re-resolving tables.
     fn query_readmit(&mut self, fingerprint: u64, started_at: Instant) -> CacheResult<()> {
-        info!("readmitting query {fingerprint}");
+        debug!("readmitting query {fingerprint}");
         metrics::counter!(names::CACHE_READMISSIONS).increment(1);
 
         // Assign new generation
