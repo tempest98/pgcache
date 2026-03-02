@@ -1742,12 +1742,12 @@ mod tests {
             match source {
                 ResolvedTableSource::Table(_) => {}
                 ResolvedTableSource::Subquery(sub) => {
-                    if let ResolvedQueryBody::Select(inner) = &sub.query.body {
-                        if let ResolvedSelectColumns::Columns(cols) = &inner.columns {
-                            for col in cols {
-                                if let Some(alias) = &col.alias {
-                                    out.push(alias);
-                                }
+                    if let ResolvedQueryBody::Select(inner) = &sub.query.body
+                        && let ResolvedSelectColumns::Columns(cols) = &inner.columns
+                    {
+                        for col in cols {
+                            if let Some(alias) = &col.alias {
+                                out.push(alias);
                             }
                         }
                     }
@@ -1782,7 +1782,7 @@ mod tests {
                 }
             }
         }
-        select.from.iter().any(|s| check_source(s))
+        select.from.iter().any(check_source)
     }
 
     /// Deparse a single WHERE expression for targeted predicate checks.
