@@ -280,6 +280,223 @@ async fn test_generation_purge() -> Result<(), Error> {
     Ok(())
 }
 
+/// Test that generation-0 entries are promoted (not purged) by pgcache_generation_zero_promote.
+///
+/// Gen-0 entries represent rows tracked before a generation was assigned. The promote
+/// function moves them to a real generation so they survive the current purge cycle
+/// and become purgeable in future cycles.
+#[tokio::test]
+async fn test_generation_zero_promote() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    // Create test table and populate
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
+
+    ctx.query(
+        "insert into test (id, data) values (1, 'foo'), (2, 'bar'), (3, 'baz')",
+        &[],
+    )
+    .await?;
+
+    wait_for_cdc().await;
+
+    // Cache a query so the table exists in the cache DB (generation 1)
+    let _res = ctx
+        .simple_query("select id, data from test where id = 1")
+        .await?;
+
+    wait_cache_load().await;
+
+    // Execute cached query to record row access at generation 1
+    let _res = ctx
+        .simple_query("select id, data from test where id = 1")
+        .await?;
+
+    // Connect directly to cache DB
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+
+    // Verify normal gen-1 entry exists for id=1
+    let gen1_entries = cache_db
+        .query(
+            "SELECT d.generation FROM pgcache_generation_dump() d \
+            WHERE d.generation = 1",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    assert!(
+        !gen1_entries.is_empty(),
+        "Should have generation 1 entries from cache hit"
+    );
+
+    // Inject gen-0 entries directly — simulates rows tracked before a generation was assigned
+    let table_oid: u32 = cache_db
+        .query_one("SELECT 'test'::regclass::oid", &[])
+        .await
+        .map_err(Error::other)?
+        .get(0);
+
+    cache_db
+        .execute(
+            "SELECT pgcache_generation_record($1, 9001, 0)",
+            &[&table_oid],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    cache_db
+        .execute(
+            "SELECT pgcache_generation_record($1, 9002, 0)",
+            &[&table_oid],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    // Verify gen-0 entries exist
+    let gen0_before = cache_db
+        .query(
+            "SELECT d.pk_hash FROM pgcache_generation_dump() d WHERE d.generation = 0",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    assert_eq!(gen0_before.len(), 2, "Should have 2 gen-0 entries");
+
+    // Promote gen-0 entries to generation 5
+    let promoted: i64 = cache_db
+        .query_one("SELECT pgcache_generation_zero_promote(5)", &[])
+        .await
+        .map_err(Error::other)?
+        .get(0);
+
+    assert_eq!(promoted, 2, "Should have promoted exactly 2 entries");
+
+    // Gen-0 entries should be gone
+    let gen0_after = cache_db
+        .query(
+            "SELECT d.pk_hash FROM pgcache_generation_dump() d WHERE d.generation = 0",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    assert!(gen0_after.is_empty(), "No gen-0 entries should remain");
+
+    // Entries should now be at generation 5
+    let gen5 = cache_db
+        .query(
+            "SELECT d.pk_hash FROM pgcache_generation_dump() d WHERE d.generation = 5",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    assert_eq!(gen5.len(), 2, "Both entries should now be at generation 5");
+
+    // Purge at threshold 4 — promoted entries at gen 5 should survive
+    let purged_low: i64 = cache_db
+        .query_one("SELECT pgcache_generation_purge_all(4)", &[])
+        .await
+        .map_err(Error::other)?
+        .get(0);
+
+    // Gen-1 entries should be purged, but gen-5 entries survive
+    assert!(purged_low >= 0, "Purge should succeed");
+
+    let gen5_after_low_purge = cache_db
+        .query(
+            "SELECT d.pk_hash FROM pgcache_generation_dump() d WHERE d.generation = 5",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    assert_eq!(
+        gen5_after_low_purge.len(),
+        2,
+        "Gen-5 entries should survive purge at threshold 4"
+    );
+
+    // Purge at threshold 5 — promoted entries should now be removed
+    let purged_high: i64 = cache_db
+        .query_one("SELECT pgcache_generation_purge_all(5)", &[])
+        .await
+        .map_err(Error::other)?
+        .get(0);
+
+    assert_eq!(purged_high, 2, "Should purge the 2 promoted entries");
+
+    let gen5_after_high_purge = cache_db
+        .query(
+            "SELECT d.pk_hash FROM pgcache_generation_dump() d WHERE d.generation = 5",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    assert!(
+        gen5_after_high_purge.is_empty(),
+        "Gen-5 entries should be purged at threshold 5"
+    );
+
+    Ok(())
+}
+
+/// Test that generation-0 promote is a no-op when no gen-0 entries exist
+#[tokio::test]
+async fn test_generation_zero_promote_noop() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query("create table test (id integer primary key, data text)", &[])
+        .await?;
+
+    ctx.query("insert into test (id, data) values (1, 'foo')", &[])
+        .await?;
+
+    wait_for_cdc().await;
+
+    // Cache and hit a query to create gen-1 entries
+    let _res = ctx
+        .simple_query("select id, data from test where id = 1")
+        .await?;
+
+    wait_cache_load().await;
+
+    let _res = ctx
+        .simple_query("select id, data from test where id = 1")
+        .await?;
+
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+
+    // No gen-0 entries exist — promote should return 0
+    let promoted: i64 = cache_db
+        .query_one("SELECT pgcache_generation_zero_promote(10)", &[])
+        .await
+        .map_err(Error::other)?
+        .get(0);
+
+    assert_eq!(promoted, 0, "No entries to promote when none are gen-0");
+
+    // Existing gen-1 entries should be unaffected
+    let gen1 = cache_db
+        .query(
+            "SELECT d.pk_hash FROM pgcache_generation_dump() d WHERE d.generation = 1",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    assert!(
+        !gen1.is_empty(),
+        "Existing gen-1 entries should be unaffected by promote"
+    );
+
+    Ok(())
+}
+
 /// Test that generation tracking works with JOIN queries
 #[tokio::test]
 async fn test_generation_tracking_join() -> Result<(), Error> {

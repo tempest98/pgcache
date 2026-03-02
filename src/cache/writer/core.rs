@@ -563,8 +563,33 @@ impl CacheWriter {
         }
     }
 
+    /// Promote generation-0 entries to `generation_counter + 1` so they become
+    /// purgeable in future cycles. Only bumps the counter if entries were promoted.
+    async fn generation_zero_promote(&mut self) -> CacheResult<()> {
+        let new_gen = self.cache.generation_counter + 1;
+        let promoted: i64 = self
+            .db_cache
+            .query_one(
+                "SELECT pgcache_generation_zero_promote($1)",
+                &[&(new_gen as i64)],
+            )
+            .await
+            .map_into_report::<CacheError>()?
+            .get(0);
+
+        if promoted > 0 {
+            self.cache.generation_counter = new_gen;
+            debug!("promoted {promoted} gen-0 entries to generation {new_gen}");
+        }
+
+        Ok(())
+    }
+
     /// Purge rows with generation <= threshold.
+    /// First promotes any gen-0 entries so they become purgeable in future cycles.
     pub(super) async fn generation_purge(&mut self, threshold: u64) -> CacheResult<i64> {
+        self.generation_zero_promote().await?;
+
         if threshold > 0 {
             let deleted: i64 = self
                 .db_cache
