@@ -288,7 +288,7 @@ impl CacheWriter {
         };
 
         debug!("evicting query {fingerprint}");
-        self.active_relations_rebuild();
+        self.relations_dirty = true;
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
 

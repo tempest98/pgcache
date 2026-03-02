@@ -60,6 +60,12 @@ pub struct CacheWriter {
     active_relations: ActiveRelations,
     /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
     pub(super) aggregate_functions: HashSet<String>,
+    /// Publication name for dynamic table management.
+    publication_name: String,
+    /// OIDs currently in the publication (mirrors the origin-side state).
+    publication_oids: HashSet<u32>,
+    /// Set when a removal path changes active relations; drained by command handlers.
+    pub(super) relations_dirty: bool,
 }
 
 impl CacheWriter {
@@ -157,6 +163,9 @@ impl CacheWriter {
             cache_pool,
             active_relations,
             aggregate_functions,
+            publication_name: settings.cdc.publication_name.clone(),
+            publication_oids: HashSet::new(),
+            relations_dirty: false,
         })
     }
 
@@ -199,6 +208,7 @@ impl CacheWriter {
                 }
             }
         }
+        self.publication_dirty_drain().await?;
         self.state_gauges_update();
         Ok(())
     }
@@ -242,12 +252,14 @@ impl CacheWriter {
                 }
             }
         }
+        self.publication_dirty_drain().await?;
         self.state_gauges_update();
         Ok(())
     }
 
     /// Rebuild the shared active relations set from current cached queries.
-    pub(super) fn active_relations_rebuild(&self) {
+    /// Returns `true` if the set changed.
+    pub(super) fn active_relations_rebuild(&self) -> bool {
         let oids: HashSet<u32> = self
             .cache
             .cached_queries
@@ -256,8 +268,78 @@ impl CacheWriter {
             .collect();
 
         if let Ok(mut set) = self.active_relations.write() {
+            if *set == oids {
+                return false;
+            }
             *set = oids;
+            return true;
         }
+        false
+    }
+
+    /// Synchronize the origin publication's table list with active relations.
+    /// Compares `publication_oids` (current publication state) with the shared
+    /// active relations set and issues ALTER PUBLICATION as needed.
+    pub(super) async fn publication_update(&mut self) -> CacheResult<()> {
+        let new_oids: HashSet<u32> = self
+            .active_relations
+            .read()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+
+        if new_oids == self.publication_oids {
+            return Ok(());
+        }
+
+        let sql = if new_oids.is_empty() {
+            // Drop all tables from the publication
+            let table_list =
+                self.oids_to_table_list(&self.publication_oids.iter().copied().collect::<Vec<_>>());
+            format!(
+                "ALTER PUBLICATION {} DROP TABLE {}",
+                self.publication_name, table_list
+            )
+        } else {
+            let table_list = self.oids_to_table_list(&new_oids.iter().copied().collect::<Vec<_>>());
+            format!(
+                "ALTER PUBLICATION {} SET TABLE {}",
+                self.publication_name, table_list
+            )
+        };
+
+        debug!("publication update: {sql}");
+        self.db_origin
+            .execute(&sql, &[])
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("updating publication table list")?;
+        self.publication_oids = new_oids;
+        Ok(())
+    }
+
+    /// Resolve a list of OIDs to a comma-separated `schema.table` string.
+    fn oids_to_table_list(&self, oids: &[u32]) -> String {
+        oids.iter()
+            .filter_map(|oid| {
+                self.cache
+                    .tables
+                    .get1(oid)
+                    .map(|t| format!("{}.{}", t.schema, t.name))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Drain the dirty flag: rebuild active relations and update the publication if changed.
+    async fn publication_dirty_drain(&mut self) -> CacheResult<()> {
+        if !self.relations_dirty {
+            return Ok(());
+        }
+        self.relations_dirty = false;
+        if self.active_relations_rebuild() {
+            self.publication_update().await?;
+        }
+        Ok(())
     }
 
     // Helper methods
@@ -467,7 +549,7 @@ impl CacheWriter {
         }
 
         if !stale_fingerprints.is_empty() {
-            self.active_relations_rebuild();
+            self.relations_dirty = true;
         }
 
         // Remove stale Pending and Invalidated entries from state_view

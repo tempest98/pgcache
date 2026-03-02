@@ -38,43 +38,26 @@ pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
 
     debug!("cdc provisioning connected");
 
-    // Check if publication exists
-    let pub_exists = client
-        .query_opt(
-            "SELECT 1 FROM pg_publication WHERE pubname = $1",
-            &[&publication_name],
-        )
+    // Drop and recreate publication to ensure clean state.
+    // Created empty — tables are added dynamically as queries register.
+    let drop_pub = format!("DROP PUBLICATION IF EXISTS {}", publication_name);
+    client
+        .execute(&drop_pub, &[])
         .await
-        .map_into_report::<PgCdcError>()?
-        .is_some();
+        .map_into_report::<PgCdcError>()
+        .attach_loc("dropping existing publication")?;
 
-    if !pub_exists {
-        debug!("Creating publication: {}", publication_name);
-        // Note: publication names can't be parameterized, must use format!
-        // publish_via_partition_root ensures CDC reports parent table OID for partition changes
-        let create_pub = format!(
-            "CREATE PUBLICATION {} FOR ALL TABLES WITH (publish_via_partition_root = true)",
-            publication_name
-        );
-        client
-            .execute(&create_pub, &[])
-            .await
-            .map_into_report::<PgCdcError>()
-            .attach_loc("creating publication")?;
-        debug!("Publication created successfully");
-    } else {
-        debug!("Publication already exists: {}", publication_name);
-        // Ensure publish_via_partition_root is enabled for partitioned table support
-        let alter_pub = format!(
-            "ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
-            publication_name
-        );
-        client
-            .execute(&alter_pub, &[])
-            .await
-            .map_into_report::<PgCdcError>()
-            .attach_loc("setting publish_via_partition_root")?;
-    }
+    // publish_via_partition_root ensures CDC reports parent table OID for partition changes
+    let create_pub = format!(
+        "CREATE PUBLICATION {} WITH (publish_via_partition_root = true)",
+        publication_name
+    );
+    client
+        .execute(&create_pub, &[])
+        .await
+        .map_into_report::<PgCdcError>()
+        .attach_loc("creating publication")?;
+    debug!("Publication created (empty)");
 
     // Check if replication slot exists
     let slot_exists = client

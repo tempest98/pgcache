@@ -125,14 +125,16 @@ pub struct TempDBs {
 }
 
 /// Test context combining all resources needed for integration tests.
-/// Provides convenient methods for executing queries and checking metrics.
+/// Fields are ordered for correct drop sequence: drop clients first
+/// (closing connections and allowing spawned tasks to exit), then kill
+/// pgcache, and finally tear down temp databases.
 pub struct TestContext {
-    pub dbs: TempDBs,
-    pub pgcache: PgCacheProcess,
-    pub cache_port: u16,   // port pgcache proxy is listening on
-    pub metrics_port: u16, // port for HTTP metrics endpoint
     pub cache: Client,     // connected through pgcache proxy
     pub origin: Client,    // direct connection to origin database
+    pub cache_port: u16,   // port pgcache proxy is listening on
+    pub metrics_port: u16, // port for HTTP metrics endpoint
+    pub pgcache: PgCacheProcess,
+    pub dbs: TempDBs,
 }
 
 impl TestContext {
@@ -146,6 +148,21 @@ impl TestContext {
             metrics_port,
             cache,
             origin,
+        })
+    }
+
+    /// Set up a test context with a small cache to force eviction.
+    pub async fn setup_small_cache(cache_size: usize) -> Result<Self, Error> {
+        let (dbs, origin) = start_databases().await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_small_cache(&dbs, cache_size).await?;
+        Ok(Self {
+            cache,
+            origin,
+            cache_port,
+            metrics_port,
+            pgcache,
+            dbs,
         })
     }
 
@@ -223,6 +240,7 @@ impl TestContext {
             .await
             .map_err(Error::other)
     }
+
 }
 
 pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
@@ -278,21 +296,8 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
         }
     });
 
-    origin_client
-        .execute(
-            "CREATE PUBLICATION pub_test FOR ALL TABLES WITH (publish_via_partition_root = true)",
-            &[],
-        )
-        .await
-        .map_err(Error::other)?;
-
-    origin_client
-        .query(
-            "SELECT * FROM pg_create_logical_replication_slot('slot_test', 'pgoutput')",
-            &[],
-        )
-        .await
-        .map_err(Error::other)?;
+    // Publication and replication slot are created by pgcache's replication_provision().
+    // The test only needs wal_level=logical on the origin (set in PgTempDBBuilder above).
 
     Ok((
         TempDBs {
@@ -398,6 +403,25 @@ pub async fn connect_pgcache_clock(
             "--admission_threshold",
             &threshold_str,
         ],
+    );
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
+/// Connect to pgcache with a small cache size to force eviction.
+pub async fn connect_pgcache_small_cache(
+    dbs: &TempDBs,
+    cache_size: usize,
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let cache_size_str = cache_size.to_string();
+    let mut pgcache = pgcache_spawn(
+        dbs,
+        listen_port,
+        metrics_port,
+        &["--cache_policy", "fifo", "--cache_size", &cache_size_str],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
     let client = pgcache_client_connect(listen_port).await?;

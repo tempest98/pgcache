@@ -198,7 +198,7 @@ impl CacheWriter {
     }
 
     /// Assign a generation number and insert the CachedQuery entry.
-    /// Returns the assigned generation number.
+    /// Returns `(generation, relations_changed)`.
     fn cached_query_insert(
         &mut self,
         fingerprint: u64,
@@ -207,7 +207,7 @@ impl CacheWriter {
         resolved: SharedResolved,
         max_limit: Option<u64>,
         started_at: Instant,
-    ) -> u64 {
+    ) -> (u64, bool) {
         self.cache.generation_counter += 1;
         let generation = self.cache.generation_counter;
         self.cache.generations.insert(generation);
@@ -225,8 +225,8 @@ impl CacheWriter {
         };
 
         self.cache.cached_queries.insert_overwrite(cached_query);
-        self.active_relations_rebuild();
-        generation
+        let changed = self.active_relations_rebuild();
+        (generation, changed)
     }
 
     /// Registers a query in the cache and spawns background population.
@@ -245,7 +245,7 @@ impl CacheWriter {
         if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
             && query.invalidated
         {
-            return self.query_readmit(fingerprint, started_at);
+            return self.query_readmit(fingerprint, started_at).await;
         }
 
         let (base_query, max_limit) = base_query_prepare(&cacheable_query.query);
@@ -262,7 +262,7 @@ impl CacheWriter {
         let relation_oids =
             self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;
 
-        let generation = self.cached_query_insert(
+        let (generation, relations_changed) = self.cached_query_insert(
             fingerprint,
             relation_oids,
             base_query,
@@ -270,6 +270,10 @@ impl CacheWriter {
             max_limit,
             started_at,
         );
+
+        if relations_changed {
+            self.publication_update().await?;
+        }
 
         let work = self.population_work_build(fingerprint, generation, &resolved, max_limit);
         self.populate_work_dispatch(work)?;
@@ -280,7 +284,7 @@ impl CacheWriter {
     /// Fast readmission for a CDC-invalidated query.
     /// Reuses existing metadata (relation_oids, resolved, update_queries) and
     /// dispatches population work without re-resolving tables.
-    fn query_readmit(&mut self, fingerprint: u64, started_at: Instant) -> CacheResult<()> {
+    async fn query_readmit(&mut self, fingerprint: u64, started_at: Instant) -> CacheResult<()> {
         debug!("readmitting query {fingerprint}");
         metrics::counter!(names::CACHE_READMISSIONS).increment(1);
 
@@ -302,7 +306,9 @@ impl CacheWriter {
         cached.cached_bytes = 0;
         cached.registration_started_at = Some(started_at);
         self.cache.cached_queries.insert_overwrite(cached);
-        self.active_relations_rebuild();
+        if self.active_relations_rebuild() {
+            self.publication_update().await?;
+        }
 
         // Update state view to Loading
         self.state_view_update(
@@ -378,7 +384,7 @@ impl CacheWriter {
                 view.cached_queries.remove(&fingerprint);
             }
 
-            self.active_relations_rebuild();
+            self.relations_dirty = true;
             debug!("cleaned up failed query {fingerprint}");
         }
     }
