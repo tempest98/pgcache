@@ -66,7 +66,7 @@ For each inequality constraint in the cached query, the new query must have a co
 ### What Cannot Be Subsumed
 
 - **OR predicates**: Constraint analysis correctly treats these as opaque (no constraints extracted).
-- **LIMIT queries**: If the cached query has `max_limit = Some(n)`, it may not have all matching rows. Only consider cached queries where `max_limit` is None.
+- **LIMIT queries**: If the cached query has a LIMIT (`has_limit` is true on its `UpdateQuery`), it may not have all matching rows. Only consider `UpdateQuery` entries where `has_limit` is false.
 - **Different join structures**: A cached single-table query can't subsume a joined query.
 - **Disjunctive coverage**: Cached `{tenant_id = 1}` + `{tenant_id = 2}` together cover `{tenant_id IN (1,2)}`, but detecting this requires reasoning about unions. Not worth the complexity.
 - **Functions/expressions in predicates**: Constraint analysis only extracts column-vs-literal comparisons.
@@ -83,73 +83,132 @@ For subsumption, this means: executing the subsumed query once against the cache
 
 ### At the Coordinator (query_cache.rs)
 
-On cache miss, the coordinator currently sends `QueryCommand::Register` to the writer and forwards the query to origin. With subsumption:
+On cache miss, the coordinator currently forwards the query to origin and sends `QueryCommand::Register` to the writer. With subsumption, the coordinator **defers the origin forward** to give the writer a chance to detect subsumption:
 
 1. Cache miss detected (no fingerprint match)
-2. Forward query to origin as usual (don't block the client)
-3. Send registration to writer as usual — but include a **oneshot channel** for the writer to respond on
+2. Set state to `Loading` in `CacheStateView` (so request coalescing can queue subsequent arrivals)
+3. **Do not forward to origin yet** — push the `QueryRequest` into the coalescing waiting queue as the first waiter (see `request-coalescing.md`)
+4. Send `Register` to the writer
+5. Continue processing other messages in the `select!` loop — the coordinator never blocks
+
+The held first request sits in the waiting queue alongside any subsequent requests that arrive while the writer processes registration.
 
 ### At the Writer (writer/query.rs)
 
 During `query_register`, after resolving the query and extracting constraints:
 
-1. Check subsumption: for each table in the query, look at existing cached queries where `max_limit` is None and `state` is Ready
-2. Check if the new query's constraints imply the cached query's constraints (per table)
-3. If **subsumed**:
+1. **Check subsumption per table**: for each table in the new query (identified by relation OID), look up existing `UpdateQuery` entries in `self.cache.update_queries` for that OID. Only consider entries where `has_limit` is false and the parent `CachedQuery` state is `Ready`.
+2. For each such `UpdateQuery`, check if the new query's constraints on that table imply the cached query's constraints (i.e., the cached constraints are a subset of the new constraints — see Subsumption Check Function below).
+3. **All tables must be covered**: subsumption succeeds only if every table referenced by the new query has at least one covering `UpdateQuery`.
+4. If **subsumed**:
    - Assign a new generation
    - Execute the query against the cache DB with `mem.query_generation` set (stamps rows, same as `cache_query_generation_bump`)
    - Register metadata (CachedQuery, update queries, etc.)
-   - Send back resolved query + generation via the oneshot channel
-4. If **not subsumed**:
+   - Update `CacheStateView` to `Ready`
+   - Send `WriterNotify::Registered { fingerprint, subsumed: Some(SubsumeResult { ... }) }`
+5. If **not subsumed**:
+   - Send `WriterNotify::Registered { fingerprint, subsumed: None }` **immediately** (before dispatching population)
    - Proceed with normal registration (origin population)
-   - Drop the oneshot (coordinator ignores)
+
+The `Registered` notification is always sent promptly — before population is dispatched. This gives the coordinator a fast answer about the held first request's fate.
+
+If the cache DB query for generation stamping fails (e.g., cache table was dropped by concurrent eviction), send `Registered { subsumed: None }` and fall back to normal population.
 
 ### Back at the Coordinator
 
-If the oneshot resolves with a response:
-- The query is already being served from origin for this first execution (forwarded above)
-- Update `CacheStateView` to Ready with the resolved query + generation
-- All subsequent executions are immediate cache hits
+The coordinator handles `WriterNotify::Registered` in its `select!` loop (see `request-coalescing.md` for the full event loop):
 
-This means the very first execution still goes to origin (we forwarded before we knew), but every execution after that is served from cache with zero population latency. The alternative — waiting for the writer's response before deciding to forward — would add latency to the first execution on the coordinator thread, which we want to avoid.
+- **Subsumed** (`subsumed: Some(...)`): state is already `Ready` (writer set it). Drain the entire waiting queue (first request + any coalesced requests) via `worker_request_send` — all served from cache. No origin round-trip.
+- **Not subsumed** (`subsumed: None`): pop the first waiter from the queue and forward it to origin via `reply_forward`. State remains `Loading`. Remaining coalesced waiters stay in the queue and drain when `WriterNotify::Ready` arrives from population.
+
+This is critical for queries that are called infrequently — potentially only once. Forwarding to origin eagerly would mean the only execution misses the cache. By deferring the forward, subsumption can serve even the first execution from cache.
+
+**Latency tradeoff**: Every first-miss now waits for the writer to process registration and check subsumption before being forwarded (if not subsumed). This adds a few milliseconds (resolve + constraint analysis + subsumption check) to the non-subsumed path. This is small relative to a typical origin round-trip and is the cost of giving subsumption a chance to skip origin entirely.
+
+### Shared Writer→Coordinator Channel
+
+Both subsumption and request coalescing use the same `WriterNotify` channel (see `request-coalescing.md`). No per-Register oneshot is needed. The `Registered` variant carries the subsumption result; the `Ready` and `Failed` variants handle population completion:
+
+```rust
+enum WriterNotify {
+    /// Registration processed — subsumption check complete.
+    /// Sent immediately after the check, before population dispatch.
+    Registered {
+        fingerprint: u64,
+        /// Some if subsumed (query is immediately Ready).
+        /// None if not subsumed (population dispatched, first request should be forwarded).
+        subsumed: Option<SubsumeResult>,
+    },
+    /// Population completed — query is Ready.
+    Ready {
+        fingerprint: u64,
+        generation: u64,
+        resolved: SharedResolved,
+        max_limit: Option<u64>,
+    },
+    /// Population failed.
+    Failed {
+        fingerprint: u64,
+    },
+}
+```
+
+The coordinator's `select!` loop handles all three variants. See `request-coalescing.md` for the full event loop.
 
 ## Key Implementation Points
 
 ### Subsumption Check Function
 
-A function on `QueryConstraints` (or standalone) that checks whether one constraint set subsumes another. For v1, equality-only:
+The check must be **per-table**, not across the full `column_constraints` set. A cross-table `is_subset` check would incorrectly conclude subsumption when one table is covered but another isn't (e.g., a cached `orders` query would appear to subsume a join of `orders` and `items`).
+
+The `table_constraints` field on `QueryConstraints` is already grouped by table name — use it for the comparison:
 
 ```rust
-/// Returns true if every row matching `self`'s constraints also matches
-/// `other`'s constraints. In other words, `other`'s constraint set is a
-/// subset of `self`'s constraint set (more constraints = narrower result).
-fn is_subsumed_by(&self, other: &QueryConstraints) -> bool {
-    // Every constraint in `other` must appear in `self`
-    other.column_constraints.is_subset(&self.column_constraints)
+/// Returns true if all of `cached`'s constraints on `table` are implied by
+/// `new`'s constraints on the same table. For v1, equality-only: every
+/// (column, op, value) triple in `cached` must appear in `new`.
+fn table_constraints_subsumed(
+    new: &QueryConstraints,
+    cached: &QueryConstraints,
+    table: &str,
+) -> bool {
+    let cached_for_table = cached.table_constraints.get(table);
+    let new_for_table = new.table_constraints.get(table);
+
+    match (cached_for_table, new_for_table) {
+        // Cached has no constraints on this table → all rows loaded. Subsumed.
+        (None, _) => true,
+        // Cached has constraints but new doesn't → new is broader. Not subsumed.
+        (Some(cached_cs), None) => cached_cs.is_empty(),
+        // Both have constraints → every cached constraint must appear in new.
+        (Some(cached_cs), Some(new_cs)) => {
+            cached_cs.iter().all(|c| new_cs.contains(c))
+        }
+    }
+}
+```
+
+The outer check iterates all tables in the new query and requires each to be covered:
+
+```rust
+/// Check if an existing UpdateQuery covers the new query's constraints
+/// for a specific table.
+fn query_subsumption_check(
+    new_constraints: &QueryConstraints,
+    update_queries: &[UpdateQuery],
+    table: &str,
+) -> bool {
+    update_queries.iter().any(|uq| {
+        !uq.has_limit && table_constraints_subsumed(new_constraints, &uq.constraints, table)
+    })
 }
 ```
 
 Note: this only works for equality constraints in v1. For inequality subsumption (e.g., `id > 10` implies `id > 5`), each constraint would need pairwise implication checking rather than simple set containment.
 
-### Constraints on CacheStateView
+### Lookup Path
 
-The writer already has constraints via `UpdateQuery`. The subsumption check happens at the writer, which has full access to all cached query metadata. No changes to `CacheStateView` needed.
-
-### Oneshot on QueryCommand::Register
-
-Add an optional oneshot sender to `QueryCommand::Register` for the writer to respond when subsumption is detected:
-
-```rust
-QueryCommand::Register {
-    fingerprint: u64,
-    cacheable_query: Box<CacheableQuery>,
-    search_path: Vec<String>,
-    started_at: Instant,
-    /// Writer responds here if the query is subsumed (skip population).
-    /// Contains (generation, resolved) for the coordinator to update state.
-    subsume_tx: Option<oneshot::Sender<SubsumeResult>>,
-}
-```
+The subsumption check happens at the writer, which has full access to all cached query metadata. The lookup goes through `self.cache.update_queries` (an `IdHashMap<UpdateQueries>` keyed by relation OID). For each table in the new query, look up the `UpdateQueries` entry by OID and check its `queries: Vec<UpdateQuery>` for a covering entry. No changes to `CacheStateView` needed.
 
 ### Generation Stamping
 
@@ -159,6 +218,15 @@ SET mem.query_generation = <new_gen>
 → execute resolved query against cache DB (stamps rows as side-effect)
 → SET mem.query_generation = 0
 ```
+
+### Observability
+
+Track subsumption for visibility into the optimization's impact:
+
+- **Counter**: `cache_subsumptions` — number of queries that skipped population via subsumption
+- **Histogram**: `cache_subsumption_latency_seconds` — time from subsumption check through generation stamping (should be low single-digit milliseconds)
+
+Without instrumentation, subsumption is invisible — queries silently skip population and appear as normal cache hits.
 
 ## Value Proposition
 
