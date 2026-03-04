@@ -3,11 +3,11 @@ use std::time::Instant;
 
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio_util::bytes::BytesMut;
-use tracing::{error, instrument, trace};
+use tracing::{error, info, instrument, trace};
 
 use crate::metrics::names;
 
-use crate::query::ast::{LimitClause, query_expr_fingerprint};
+use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprint};
 use crate::settings::{CachePolicy, Settings};
 use crate::timing::QueryTiming;
 
@@ -72,6 +72,30 @@ pub struct WorkerRequest {
     pub forward_bytes: Option<BytesMut>,
 }
 
+/// Parsed allowlist entry: (optional schema, table name), both lowercased.
+type AllowlistEntry = (Option<String>, String);
+
+/// Parsed and ready-to-match allowlist. None = all tables cacheable.
+type Allowlist = Option<Vec<AllowlistEntry>>;
+
+/// Parse an allowlist entry string into (optional schema, table name).
+/// Supports "table" and "schema.table" forms.
+fn allowlist_entry_parse(entry: &str) -> AllowlistEntry {
+    let entry = entry.trim();
+    match entry.rsplit_once('.') {
+        Some((schema, table)) => (Some(schema.to_lowercase()), table.to_lowercase()),
+        None => (None, entry.to_lowercase()),
+    }
+}
+
+/// Parse config strings into a ready-to-match allowlist.
+fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
+    tables
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|entries| entries.iter().map(|e| allowlist_entry_parse(e)).collect())
+}
+
 /// Query cache coordinator - routes queries and delegates writes to the writer thread.
 #[derive(Debug, Clone)]
 pub struct QueryCache {
@@ -80,6 +104,7 @@ pub struct QueryCache {
     state_view: Arc<RwLock<CacheStateView>>,
     cache_policy: CachePolicy,
     admission_threshold: u32,
+    cache_tables: Allowlist,
 }
 
 impl QueryCache {
@@ -89,18 +114,57 @@ impl QueryCache {
         worker_tx: UnboundedSender<WorkerRequest>,
         state_view: Arc<RwLock<CacheStateView>>,
     ) -> CacheResult<Self> {
+        let cache_tables = allowlist_parse(&settings.cache_tables);
+        match &cache_tables {
+            Some(entries) => {
+                let names: Vec<&str> = settings
+                    .cache_tables
+                    .as_ref()
+                    .map(|v| v.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                info!("table allowlist enabled: {names:?}");
+                let _ = entries; // silence unused warning
+            }
+            None => info!("table allowlist disabled, all tables cacheable"),
+        }
+
         Ok(Self {
             query_tx,
             worker_tx,
             state_view,
             cache_policy: settings.cache_policy,
             admission_threshold: settings.admission_threshold,
+            cache_tables,
+        })
+    }
+
+    /// Check whether all tables in the query are in the allowlist.
+    /// Returns true if no allowlist is configured (all tables allowed).
+    fn query_allowlist_check(&self, query: &QueryExpr) -> bool {
+        let Some(entries) = &self.cache_tables else {
+            return true;
+        };
+        query.nodes::<TableNode>().all(|t| {
+            let table_name = t.name.to_lowercase();
+            let table_schema = t.schema.as_ref().map(|s| s.to_lowercase());
+            entries.iter().any(|(ws, wt)| {
+                *wt == table_name
+                    && match ws {
+                        Some(ws) => table_schema.as_deref() == Some(ws.as_str()),
+                        None => true,
+                    }
+            })
         })
     }
 
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> CacheResult<()> {
+        if !self.query_allowlist_check(&msg.cacheable_query.query) {
+            metrics::counter!(names::QUERIES_ALLOWLIST_SKIPPED).increment(1);
+            return reply_forward(msg.reply_tx, msg.pipeline, msg.data);
+        }
+
         let fingerprint = query_expr_fingerprint(&msg.cacheable_query.query);
         trace!("{fingerprint}");
 

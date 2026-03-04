@@ -43,6 +43,7 @@ pub struct MetricsSnapshot {
     pub queries_cache_hit: u64,
     pub queries_cache_miss: u64,
     pub queries_cache_error: u64,
+    pub queries_allowlist_skipped: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -181,6 +182,21 @@ impl TestContext {
         })
     }
 
+    /// Set up a test context with a table allowlist.
+    pub async fn setup_allowlist(cache_tables: &str) -> Result<Self, Error> {
+        let (dbs, origin) = start_databases().await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_allowlist(&dbs, cache_tables).await?;
+        Ok(Self {
+            cache,
+            origin,
+            cache_port,
+            metrics_port,
+            pgcache,
+            dbs,
+        })
+    }
+
     /// Execute query through pgcache proxy
     pub async fn query<T>(
         &mut self,
@@ -240,7 +256,6 @@ impl TestContext {
             .await
             .map_err(Error::other)
     }
-
 }
 
 pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
@@ -428,6 +443,24 @@ pub async fn connect_pgcache_small_cache(
     Ok((pgcache, listen_port, metrics_port, client))
 }
 
+/// Connect to pgcache with a table allowlist.
+pub async fn connect_pgcache_allowlist(
+    dbs: &TempDBs,
+    cache_tables: &str,
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let mut pgcache = pgcache_spawn(
+        dbs,
+        listen_port,
+        metrics_port,
+        &["--cache_policy", "fifo", "--cache_tables", cache_tables],
+    );
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
 /// Connect to pgcache with TLS enabled on the proxy.
 pub async fn connect_pgcache_tls(
     dbs: &TempDBs,
@@ -541,6 +574,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut queries_cache_hit = 0u64;
     let mut queries_cache_miss = 0u64;
     let mut queries_cache_error = 0u64;
+    let mut queries_allowlist_skipped = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -563,6 +597,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_queries_cache_hit" => queries_cache_hit = value,
                 "pgcache_queries_cache_miss" => queries_cache_miss = value,
                 "pgcache_queries_cache_error" => queries_cache_error = value,
+                "pgcache_queries_allowlist_skipped" => queries_allowlist_skipped = value,
                 _ => {}
             }
         }
@@ -592,6 +627,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         queries_cache_hit,
         queries_cache_miss,
         queries_cache_error,
+        queries_allowlist_skipped,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -731,6 +767,8 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         queries_cache_hit: after.queries_cache_hit - before.queries_cache_hit,
         queries_cache_miss: after.queries_cache_miss - before.queries_cache_miss,
         queries_cache_error: after.queries_cache_error - before.queries_cache_error,
+        queries_allowlist_skipped: after.queries_allowlist_skipped
+            - before.queries_allowlist_skipped,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

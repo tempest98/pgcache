@@ -222,6 +222,11 @@ struct SettingsToml {
     cache_policy: Option<CachePolicy>,
     #[serde(default)]
     admission_threshold: Option<u32>,
+    /// Only cache queries referencing these tables.
+    /// Supports both unqualified ("orders") and schema-qualified ("audit.orders") names.
+    /// If omitted or empty, all tables are cacheable.
+    #[serde(default)]
+    cache_tables: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +254,10 @@ pub struct Settings {
     /// Number of times a query must be seen before admission to cache (default: 2)
     /// Only used with clock policy; fifo always admits immediately.
     pub admission_threshold: u32,
+    /// Only cache queries referencing these tables.
+    /// Supports both unqualified ("orders") and schema-qualified ("audit.orders") names.
+    /// If omitted or empty, all tables are cacheable (current behavior).
+    pub cache_tables: Option<Vec<String>>,
 }
 
 /// Parse the next CLI argument as a string.
@@ -287,6 +296,18 @@ fn require<T>(value: Option<T>, name: &'static str) -> ConfigResult<T> {
     value.ok_or_else(|| Report::from(ConfigError::ArgumentMissing { name }))
 }
 
+/// Parse a comma-separated string into `Option<Vec<String>>`.
+/// Returns `None` if the input is `None` or results in an empty list.
+fn cache_tables_parse(csv: Option<String>) -> Option<Vec<String>> {
+    csv.map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+    })
+    .filter(|v| !v.is_empty())
+}
+
 /// Raw CLI argument values before merging with config file.
 #[derive(Default)]
 struct CliArgs {
@@ -317,6 +338,7 @@ struct CliArgs {
     log_level: Option<String>,
     cache_policy: Option<CachePolicy>,
     admission_threshold: Option<u32>,
+    cache_tables: Option<String>,
 }
 
 fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
@@ -366,6 +388,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
             Long("log_level") => args.log_level = Some(arg_string(&mut parser)?),
             Long("cache_policy") => args.cache_policy = Some(arg_enum(&mut parser)?),
             Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
+            Long("cache_tables") => args.cache_tables = Some(arg_string(&mut parser)?),
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -459,6 +482,7 @@ fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> Confi
             .admission_threshold
             .or(config.admission_threshold)
             .unwrap_or(2),
+        cache_tables: cache_tables_parse(args.cache_tables).or(config.cache_tables.take()),
     })
 }
 
@@ -513,6 +537,7 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
         log_level: args.log_level,
         cache_policy: args.cache_policy.unwrap_or_default(),
         admission_threshold: args.admission_threshold.unwrap_or(2),
+        cache_tables: cache_tables_parse(args.cache_tables),
     })
 }
 
@@ -537,6 +562,7 @@ impl Settings {
             [--admission_threshold N] (default: 2, clock policy only) \n \
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
             [--metrics_socket IP_AND_PORT] \n \
+            [--cache_tables TABLE1,TABLE2,...] (restrict caching to these tables) \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug)"
         );
         std::process::exit(1);
@@ -1079,6 +1105,7 @@ socket = "127.0.0.1:5434"
             log_level: None,
             cache_policy: None,
             admission_threshold: None,
+            cache_tables: None,
         }
     }
 

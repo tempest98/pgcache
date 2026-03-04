@@ -43,6 +43,7 @@ pub mod names {
     pub const QUERIES_CACHE_HIT: &str = "pgcache.queries.cache_hit";
     pub const QUERIES_CACHE_MISS: &str = "pgcache.queries.cache_miss";
     pub const QUERIES_CACHE_ERROR: &str = "pgcache.queries.cache_error";
+    pub const QUERIES_ALLOWLIST_SKIPPED: &str = "pgcache.queries.allowlist_skipped";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
