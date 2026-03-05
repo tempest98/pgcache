@@ -227,6 +227,10 @@ struct SettingsToml {
     /// If omitted or empty, all tables are cacheable.
     #[serde(default)]
     cache_tables: Option<Vec<String>>,
+    /// Queries to pin in cache at startup. Pinned queries are pre-registered,
+    /// protected from eviction, and auto-readmitted after CDC invalidation.
+    #[serde(default)]
+    pinned_queries: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +262,9 @@ pub struct Settings {
     /// Supports both unqualified ("orders") and schema-qualified ("audit.orders") names.
     /// If omitted or empty, all tables are cacheable (current behavior).
     pub cache_tables: Option<Vec<String>>,
+    /// Queries to pin in cache at startup. Pinned queries are pre-registered,
+    /// protected from eviction, and auto-readmitted after CDC invalidation.
+    pub pinned_queries: Option<Vec<String>>,
 }
 
 /// Parse the next CLI argument as a string.
@@ -308,6 +315,20 @@ fn cache_tables_parse(csv: Option<String>) -> Option<Vec<String>> {
     .filter(|v| !v.is_empty())
 }
 
+/// Parse a semicolon-separated string into `Option<Vec<String>>`.
+/// Semicolons are used instead of commas because SQL queries contain commas.
+/// Returns `None` if the input is `None` or results in an empty list.
+fn pinned_queries_parse(input: Option<String>) -> Option<Vec<String>> {
+    input
+        .map(|s| {
+            s.split(';')
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+}
+
 /// Raw CLI argument values before merging with config file.
 #[derive(Default)]
 struct CliArgs {
@@ -339,6 +360,7 @@ struct CliArgs {
     cache_policy: Option<CachePolicy>,
     admission_threshold: Option<u32>,
     cache_tables: Option<String>,
+    pinned_queries: Option<String>,
 }
 
 fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
@@ -389,6 +411,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
             Long("cache_policy") => args.cache_policy = Some(arg_enum(&mut parser)?),
             Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
             Long("cache_tables") => args.cache_tables = Some(arg_string(&mut parser)?),
+            Long("pinned_queries") => args.pinned_queries = Some(arg_string(&mut parser)?),
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -483,6 +506,7 @@ fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> Confi
             .or(config.admission_threshold)
             .unwrap_or(2),
         cache_tables: cache_tables_parse(args.cache_tables).or(config.cache_tables.take()),
+        pinned_queries: pinned_queries_parse(args.pinned_queries).or(config.pinned_queries.take()),
     })
 }
 
@@ -538,6 +562,7 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
         cache_policy: args.cache_policy.unwrap_or_default(),
         admission_threshold: args.admission_threshold.unwrap_or(2),
         cache_tables: cache_tables_parse(args.cache_tables),
+        pinned_queries: pinned_queries_parse(args.pinned_queries),
     })
 }
 
@@ -563,6 +588,7 @@ impl Settings {
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
             [--metrics_socket IP_AND_PORT] \n \
             [--cache_tables TABLE1,TABLE2,...] (restrict caching to these tables) \n \
+            [--pinned_queries QUERY1;QUERY2;...] (pin queries in cache at startup, semicolon-separated) \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug)"
         );
         std::process::exit(1);
@@ -1106,6 +1132,7 @@ socket = "127.0.0.1:5434"
             cache_policy: None,
             admission_threshold: None,
             cache_tables: None,
+            pinned_queries: None,
         }
     }
 
@@ -1338,5 +1365,102 @@ socket = "127.0.0.1:5434"
 
         assert_eq!(settings.cdc.publication_name, "my_pub");
         assert_eq!(settings.cdc.slot_name, "my_slot");
+    }
+
+    // ==================== pinned_queries Tests ====================
+
+    #[test]
+    fn settings_build_pinned_queries_default_none() {
+        let args = base_cli_args();
+        let settings = settings_build(args, None).expect("build settings");
+        assert!(settings.pinned_queries.is_none());
+    }
+
+    #[test]
+    fn settings_build_pinned_queries_from_toml() {
+        let mut config = base_toml_config();
+        config.pinned_queries = Some(vec![
+            "SELECT * FROM users WHERE true".to_owned(),
+            "SELECT * FROM orders WHERE true".to_owned(),
+        ]);
+        let args = CliArgs::default();
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0], "SELECT * FROM users WHERE true");
+        assert_eq!(pinned[1], "SELECT * FROM orders WHERE true");
+    }
+
+    #[test]
+    fn settings_build_pinned_queries_cli_semicolon() {
+        let args = CliArgs {
+            pinned_queries: Some(
+                "SELECT id, name FROM a WHERE true;SELECT id, name FROM b WHERE true".to_owned(),
+            ),
+            ..base_cli_args()
+        };
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0], "SELECT id, name FROM a WHERE true");
+        assert_eq!(pinned[1], "SELECT id, name FROM b WHERE true");
+    }
+
+    #[test]
+    fn settings_build_pinned_queries_cli_overrides_toml() {
+        let mut config = base_toml_config();
+        config.pinned_queries = Some(vec!["SELECT * FROM toml_table WHERE true".to_owned()]);
+        let args = CliArgs {
+            pinned_queries: Some("SELECT * FROM cli_table WHERE true".to_owned()),
+            ..CliArgs::default()
+        };
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0], "SELECT * FROM cli_table WHERE true");
+    }
+
+    #[test]
+    fn toml_parse_pinned_queries() {
+        let toml_str = r#"
+num_workers = 4
+
+pinned_queries = [
+    "SELECT * FROM settings WHERE true",
+    "SELECT id, name FROM lookup WHERE true",
+]
+
+[origin]
+host = "origin.example.com"
+port = 5432
+user = "origin_user"
+database = "origin_db"
+
+[cache]
+host = "localhost"
+port = 5433
+user = "cache_user"
+database = "cache_db"
+
+[cdc]
+publication_name = "test_pub"
+slot_name = "test_slot"
+
+[listen]
+socket = "127.0.0.1:5434"
+"#;
+
+        let settings: SettingsToml = toml::from_str(toml_str).expect("parse TOML");
+
+        let pinned = settings.pinned_queries.expect("pinned_queries present");
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0], "SELECT * FROM settings WHERE true");
+        assert_eq!(pinned[1], "SELECT id, name FROM lookup WHERE true");
     }
 }

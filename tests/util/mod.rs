@@ -45,6 +45,8 @@ pub struct MetricsSnapshot {
     pub queries_cache_error: u64,
     pub queries_allowlist_skipped: u64,
     pub cache_subsumptions: u64,
+    pub cache_invalidations: u64,
+    pub cache_readmissions: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -188,6 +190,54 @@ impl TestContext {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) =
             connect_pgcache_allowlist(&dbs, cache_tables).await?;
+        Ok(Self {
+            cache,
+            origin,
+            cache_port,
+            metrics_port,
+            pgcache,
+            dbs,
+        })
+    }
+
+    /// Set up a test context with pinned queries.
+    /// The `before_start` closure runs against the origin database after tables
+    /// are created but before pgcache spawns, so pinned queries can reference
+    /// existing tables.
+    pub async fn setup_pinned<F, Fut>(pinned_queries: &str, before_start: F) -> Result<Self, Error>
+    where
+        F: FnOnce(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<Client, Error>>,
+    {
+        let (dbs, origin) = start_databases().await?;
+        // Run setup closure to create tables/data before pgcache starts
+        let origin = before_start(origin).await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_pinned(&dbs, pinned_queries).await?;
+        Ok(Self {
+            cache,
+            origin,
+            cache_port,
+            metrics_port,
+            pgcache,
+            dbs,
+        })
+    }
+
+    /// Set up a test context with pinned queries and a small cache to force eviction.
+    pub async fn setup_pinned_small_cache<F, Fut>(
+        pinned_queries: &str,
+        cache_size: usize,
+        before_start: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnOnce(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<Client, Error>>,
+    {
+        let (dbs, origin) = start_databases().await?;
+        let origin = before_start(origin).await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_pinned_small_cache(&dbs, pinned_queries, cache_size).await?;
         Ok(Self {
             cache,
             origin,
@@ -464,6 +514,51 @@ pub async fn connect_pgcache_allowlist(
     Ok((pgcache, listen_port, metrics_port, client))
 }
 
+/// Connect to pgcache with pinned queries (FIFO policy).
+pub async fn connect_pgcache_pinned(
+    dbs: &TempDBs,
+    pinned_queries: &str,
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let mut pgcache = pgcache_spawn(
+        dbs,
+        listen_port,
+        metrics_port,
+        &["--cache_policy", "fifo", "--pinned_queries", pinned_queries],
+    );
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
+/// Connect to pgcache with pinned queries and a small cache size (FIFO policy).
+pub async fn connect_pgcache_pinned_small_cache(
+    dbs: &TempDBs,
+    pinned_queries: &str,
+    cache_size: usize,
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let cache_size_str = cache_size.to_string();
+    let mut pgcache = pgcache_spawn(
+        dbs,
+        listen_port,
+        metrics_port,
+        &[
+            "--cache_policy",
+            "fifo",
+            "--pinned_queries",
+            pinned_queries,
+            "--cache_size",
+            &cache_size_str,
+        ],
+    );
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
 /// Connect to pgcache with TLS enabled on the proxy.
 pub async fn connect_pgcache_tls(
     dbs: &TempDBs,
@@ -579,6 +674,8 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut queries_cache_error = 0u64;
     let mut queries_allowlist_skipped = 0u64;
     let mut cache_subsumptions = 0u64;
+    let mut cache_invalidations = 0u64;
+    let mut cache_readmissions = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -603,6 +700,8 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_queries_cache_error" => queries_cache_error = value,
                 "pgcache_queries_allowlist_skipped" => queries_allowlist_skipped = value,
                 "pgcache_cache_subsumptions" => cache_subsumptions = value,
+                "pgcache_cache_invalidations" => cache_invalidations = value,
+                "pgcache_cache_readmissions" => cache_readmissions = value,
                 _ => {}
             }
         }
@@ -634,6 +733,8 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         queries_cache_error,
         queries_allowlist_skipped,
         cache_subsumptions,
+        cache_invalidations,
+        cache_readmissions,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -805,6 +906,8 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         queries_allowlist_skipped: after.queries_allowlist_skipped
             - before.queries_allowlist_skipped,
         cache_subsumptions: after.cache_subsumptions - before.cache_subsumptions,
+        cache_invalidations: after.cache_invalidations - before.cache_invalidations,
+        cache_readmissions: after.cache_readmissions - before.cache_readmissions,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

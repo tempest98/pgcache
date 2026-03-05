@@ -220,6 +220,10 @@ impl std::fmt::Debug for QueryCommand {
                 .field("fingerprint", fingerprint)
                 .field("max_limit", max_limit)
                 .finish(),
+            Self::Readmit { fingerprint } => f
+                .debug_struct("Readmit")
+                .field("fingerprint", fingerprint)
+                .finish(),
         }
     }
 }
@@ -245,6 +249,8 @@ pub enum QueryCommand {
         subsumption_tx: oneshot::Sender<SubsumptionResult>,
         /// What to do when the query is not subsumed by existing cached data.
         admit_action: AdmitAction,
+        /// Pinned queries are protected from eviction and auto-readmitted after invalidation.
+        pinned: bool,
     },
 
     /// Query population completed successfully
@@ -263,6 +269,10 @@ pub enum QueryCommand {
         /// New max_limit value (None = unlimited)
         max_limit: Option<u64>,
     },
+
+    /// Readmit a pinned query after CDC invalidation.
+    /// Deferred via the writer's internal channel to avoid inline population during CDC processing.
+    Readmit { fingerprint: u64 },
 }
 
 /// Commands for CDC mutations and relation tracking, sent to the writer thread

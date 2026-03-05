@@ -332,6 +332,39 @@ impl QueryCache {
             })
     }
 
+    /// Register pinned queries at startup by sending Register commands with `pinned: true`.
+    pub fn pinned_queries_register(&self, pinned: &[crate::cache::PinnedQuery]) -> CacheResult<()> {
+        for pq in pinned {
+            // Set Loading state in CacheStateView
+            if let Ok(mut view) = self.state_view.write() {
+                view.cached_queries.insert(
+                    pq.fingerprint,
+                    CachedQueryView {
+                        state: CachedQueryState::Loading,
+                        generation: 0,
+                        resolved: None,
+                        max_limit: None,
+                        referenced: false,
+                    },
+                );
+            }
+
+            let (subsumption_tx, _subsumption_rx) = oneshot::channel();
+            self.query_tx
+                .send(QueryCommand::Register {
+                    fingerprint: pq.fingerprint,
+                    cacheable_query: Arc::clone(&pq.cacheable_query),
+                    search_path: vec!["public".to_owned()],
+                    started_at: Instant::now(),
+                    subsumption_tx,
+                    admit_action: AdmitAction::Admit,
+                    pinned: true,
+                })
+                .map_err(|_| CacheError::WorkerSend)?;
+        }
+        Ok(())
+    }
+
     /// Send a Register command to the writer thread with a subsumption oneshot.
     fn query_register_send(
         &self,
@@ -349,6 +382,7 @@ impl QueryCache {
                 started_at: Instant::now(),
                 subsumption_tx,
                 admit_action,
+                pinned: false,
             })
             .map_err(|_| CacheError::WorkerSend.into())
     }

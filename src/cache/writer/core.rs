@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -66,6 +67,8 @@ pub struct CacheWriter {
     publication_oids: HashSet<u32>,
     /// Set when a removal path changes active relations; drained by command handlers.
     pub(super) relations_dirty: bool,
+    /// Writer's own command channel for sending deferred commands (e.g., pinned readmit from CDC).
+    pub(super) query_tx: UnboundedSender<QueryCommand>,
 }
 
 impl CacheWriter {
@@ -166,6 +169,7 @@ impl CacheWriter {
             publication_name: settings.cdc.publication_name.clone(),
             publication_oids: HashSet::new(),
             relations_dirty: false,
+            query_tx,
         })
     }
 
@@ -179,6 +183,7 @@ impl CacheWriter {
                 started_at,
                 subsumption_tx,
                 admit_action,
+                pinned,
             } => {
                 trace!("command query register {fingerprint}");
                 let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
@@ -190,6 +195,7 @@ impl CacheWriter {
                         started_at,
                         subsumption_tx,
                         admit_action,
+                        pinned,
                     )
                     .await
                 {
@@ -214,6 +220,12 @@ impl CacheWriter {
                 trace!("command limit bump {fingerprint} max_limit={max_limit:?}");
                 if let Err(e) = self.limit_bump_handle(fingerprint, max_limit).await {
                     error!("limit bump failed: {e} {fingerprint}");
+                }
+            }
+            QueryCommand::Readmit { fingerprint } => {
+                trace!("command readmit {fingerprint}");
+                if let Err(e) = self.query_readmit(fingerprint, Instant::now()).await {
+                    error!("pinned readmit failed: {e} {fingerprint}");
                 }
             }
         }
@@ -428,6 +440,7 @@ impl CacheWriter {
         /// Bounds re-stamping work and prevents pathological case where all queries are referenced.
         const MAX_BUMPS: usize = 5;
         let mut bumps = 0;
+        let mut pinned_skips = 0;
 
         while self
             .cache
@@ -441,8 +454,22 @@ impl CacheWriter {
                 break;
             };
             let fingerprint = query.fingerprint;
+            let query_pinned = query.pinned;
 
-            // For CLOCK policy, check reference bit before evicting
+            // Pinned queries are never evicted — always bump to move past them.
+            // Unlike CLOCK bumps, pinned bumps are not bounded by MAX_BUMPS.
+            if query_pinned {
+                trace!("pinned bump {fingerprint}");
+                metrics::counter!(names::CACHE_EVICTIONS, "result" => "pinned_bump").increment(1);
+                self.cache_query_generation_bump(fingerprint).await?;
+                pinned_skips += 1;
+                if pinned_skips >= self.cache.cached_queries.len() {
+                    break; // all remaining candidates are pinned
+                }
+                continue;
+            }
+
+            // CLOCK second-chance: referenced queries get bumped (bounded by MAX_BUMPS)
             if self.cache.cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS {
                 let referenced = self
                     .state_view
@@ -452,7 +479,6 @@ impl CacheWriter {
                     .unwrap_or(false);
 
                 if referenced {
-                    // Second chance: bump generation to move to back of eviction order
                     trace!("clock bump {fingerprint}");
                     metrics::counter!(names::CACHE_EVICTIONS, "result" => "bump").increment(1);
                     self.cache_query_generation_bump(fingerprint).await?;
@@ -466,6 +492,7 @@ impl CacheWriter {
             metrics::counter!(names::CACHE_EVICTIONS).increment(1);
             self.cache_query_evict(fingerprint).await?;
             bumps = 0;
+            pinned_skips = 0;
         }
 
         self.stale_entries_cleanup();
@@ -542,7 +569,7 @@ impl CacheWriter {
             .cache
             .cached_queries
             .iter()
-            .filter(|q| q.invalidated && q.generation < cleanup_threshold)
+            .filter(|q| q.invalidated && !q.pinned && q.generation < cleanup_threshold)
             .map(|q| q.fingerprint)
             .collect();
 

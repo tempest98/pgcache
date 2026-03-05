@@ -209,6 +209,7 @@ impl CacheWriter {
 
     /// Assign a generation number and insert the CachedQuery entry.
     /// Returns `(generation, relations_changed)`.
+    #[allow(clippy::too_many_arguments)]
     fn cached_query_insert(
         &mut self,
         fingerprint: u64,
@@ -217,6 +218,7 @@ impl CacheWriter {
         resolved: SharedResolved,
         max_limit: Option<u64>,
         started_at: Instant,
+        pinned: bool,
     ) -> (u64, bool) {
         self.cache.generation_counter += 1;
         let generation = self.cache.generation_counter;
@@ -232,6 +234,7 @@ impl CacheWriter {
             cached_bytes: 0,
             registration_started_at: Some(started_at),
             invalidated: false,
+            pinned,
         };
 
         self.cache.cached_queries.insert_overwrite(cached_query);
@@ -334,6 +337,7 @@ impl CacheWriter {
         fingerprint: u64,
         resolution: QueryResolution,
         started_at: Instant,
+        pinned: bool,
     ) -> CacheResult<Option<(u64, SharedResolved)>> {
         let subsume_start = Instant::now();
 
@@ -344,6 +348,7 @@ impl CacheWriter {
             Arc::clone(&resolution.resolved),
             resolution.max_limit,
             started_at,
+            pinned,
         );
 
         if relations_changed {
@@ -412,6 +417,7 @@ impl CacheWriter {
     /// readmission path that reuses existing metadata.
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_register(
         &mut self,
         fingerprint: u64,
@@ -420,6 +426,7 @@ impl CacheWriter {
         started_at: Instant,
         subsumption_tx: oneshot::Sender<SubsumptionResult>,
         admit_action: AdmitAction,
+        pinned: bool,
     ) -> CacheResult<()> {
         // Fast readmit path for invalidated queries — skip subsumption
         if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
@@ -443,7 +450,7 @@ impl CacheWriter {
             let fallback_max_limit = resolution.max_limit;
 
             match self
-                .query_subsume(fingerprint, resolution, started_at)
+                .query_subsume(fingerprint, resolution, started_at, pinned)
                 .await?
             {
                 Some((generation, resolved)) => {
@@ -502,6 +509,7 @@ impl CacheWriter {
             Arc::clone(&resolution.resolved),
             resolution.max_limit,
             started_at,
+            pinned,
         );
 
         if relations_changed {
@@ -522,7 +530,11 @@ impl CacheWriter {
     /// Fast readmission for a CDC-invalidated query.
     /// Reuses existing metadata (relation_oids, resolved, update_queries) and
     /// dispatches population work without re-resolving tables.
-    async fn query_readmit(&mut self, fingerprint: u64, started_at: Instant) -> CacheResult<()> {
+    pub(super) async fn query_readmit(
+        &mut self,
+        fingerprint: u64,
+        started_at: Instant,
+    ) -> CacheResult<()> {
         debug!("readmitting query {fingerprint}");
         metrics::counter!(names::CACHE_READMISSIONS).increment(1);
 

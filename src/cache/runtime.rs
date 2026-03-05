@@ -206,7 +206,11 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
 
 /// Main cache runtime - handles proxy queries and CDC events
 #[instrument(skip_all)]
-pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> CacheResult<()> {
+pub fn cache_run(
+    settings: &Settings,
+    cache_rx: Receiver<ProxyMessage>,
+    pinned: &[crate::cache::PinnedQuery],
+) -> CacheResult<()> {
     // Reset cache database before starting anything
     cache_database_reset(settings).attach_loc("resetting cache database")?;
 
@@ -275,6 +279,10 @@ pub fn cache_run(settings: &Settings, cache_rx: Receiver<ProxyMessage>) -> Cache
             )
             .await
             .attach_loc("creating query cache")?;
+
+            qcache
+                .pinned_queries_register(pinned)
+                .attach_loc("registering pinned queries")?;
 
             LocalSet::new()
                 .run_until(async move {

@@ -16,6 +16,7 @@ use crate::query::transform::resolved_select_node_table_replace_with_values;
 
 use crate::settings::CachePolicy;
 
+use super::super::messages::QueryCommand;
 use super::super::types::{CachedQueryState, SubqueryKind, UpdateQuery, UpdateQuerySource};
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::CacheWriter;
@@ -330,6 +331,18 @@ impl CacheWriter {
     /// cached_queries entry and update_queries for reuse on readmission.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn cache_query_cdc_invalidate(&mut self, fingerprint: u64) -> CacheResult<()> {
+        // Pinned queries: defer readmission to the writer event loop
+        if self
+            .cache
+            .cached_queries
+            .get1(&fingerprint)
+            .is_some_and(|q| q.pinned)
+        {
+            debug!("pinned query invalidated, deferring readmit {fingerprint}");
+            let _ = self.query_tx.send(QueryCommand::Readmit { fingerprint });
+            return Ok(());
+        }
+
         if self.cache.cache_policy == CachePolicy::Fifo {
             return self.cache_query_evict(fingerprint).await;
         }

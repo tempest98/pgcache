@@ -5,6 +5,7 @@ use std::time::Instant;
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
 use crate::{
+    cache::query::CacheableQuery,
     catalog::TableMetadata,
     query::{ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr},
     settings::{CachePolicy, Settings},
@@ -47,6 +48,8 @@ pub struct CachedQuery {
     pub registration_started_at: Option<Instant>,
     /// True when in Invalidated state (kept in cached_queries for metadata reuse on readmission)
     pub invalidated: bool,
+    /// Pinned queries are protected from eviction and auto-readmitted after CDC invalidation.
+    pub pinned: bool,
 }
 
 impl BiHashItem for CachedQuery {
@@ -217,4 +220,10 @@ pub struct CachedQueryView {
     pub max_limit: Option<u64>,
     /// CLOCK reference bit — set by coordinator on cache hit, read/cleared by writer during eviction
     pub referenced: bool,
+}
+
+/// A pre-validated pinned query, ready for registration.
+pub struct PinnedQuery {
+    pub fingerprint: u64,
+    pub cacheable_query: Arc<CacheableQuery>,
 }

@@ -2,7 +2,6 @@ use std::{collections::HashMap, mem, sync::Arc, thread, time::Duration};
 
 use rootcause::Report;
 
-use crate::catalog::FunctionVolatility;
 use crate::result::{MapIntoReport, ReportExt};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -67,6 +66,7 @@ impl<'scope> ProxyCacheState<'scope> {
         &mut self,
         scope: &'scope thread::Scope<'scope, 'env>,
         settings: &'settings Settings,
+        pinned: &'settings [PinnedQuery],
     ) {
         self.backoff = None;
         self.attempts += 1;
@@ -76,7 +76,7 @@ impl<'scope> ProxyCacheState<'scope> {
             self.attempts
         );
 
-        if let Some((new_handle, new_tx)) = cache_restart_attempt(scope, settings).await {
+        if let Some((new_handle, new_tx)) = cache_restart_attempt(scope, settings, pinned).await {
             self.handle = Some(new_handle);
             // Update all subscribers with the new cache sender
             self.updater.sender_update(new_tx.clone());
@@ -116,12 +116,14 @@ impl<'scope> ProxyCacheState<'scope> {
 }
 
 use crate::{
-    cache::{CacheResult, cache_run},
-    catalog::function_volatility_map_load,
+    cache::query::CacheableQuery,
+    cache::{CacheResult, PinnedQuery, cache_run},
+    catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{
         cdc::{replication_cleanup, replication_provision},
         connect,
     },
+    query::ast::{query_expr_convert, query_expr_fingerprint},
     settings::Settings,
     tls,
 };
@@ -206,13 +208,14 @@ type Cache<'scope> = (
 fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
+    pinned: &'settings [PinnedQuery],
 ) -> Result<Cache<'scope>, std::io::Error> {
     const DEFAULT_CHANNEL_SIZE: usize = 100;
     let (cache_tx, cache_rx) = channel(DEFAULT_CHANNEL_SIZE);
 
     let cache_handle = thread::Builder::new()
         .name("cache".to_owned())
-        .spawn_scoped(scope, || cache_run(settings, cache_rx))?;
+        .spawn_scoped(scope, || cache_run(settings, cache_rx, pinned))?;
 
     Ok((cache_handle, cache_tx))
 }
@@ -223,13 +226,14 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
 async fn cache_restart_attempt<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
+    pinned: &'settings [PinnedQuery],
 ) -> Option<Cache<'scope>> {
     if let Err(e) = replication_provision(settings).await {
         error!("replication provision failed: {:?}", e);
         return None;
     }
 
-    match cache_create(scope, settings) {
+    match cache_create(scope, settings, pinned) {
         Ok(cache) => Some(cache),
         Err(e) => {
             error!("cache creation failed: {:?}", e);
@@ -304,11 +308,65 @@ async fn function_volatility_load(
     Ok(Arc::new(map))
 }
 
+/// Parse and validate pinned queries at startup, returning only those that are cacheable.
+fn pinned_queries_validate(
+    settings: &Settings,
+    func_volatility: &HashMap<String, FunctionVolatility>,
+) -> Vec<PinnedQuery> {
+    let Some(queries) = &settings.pinned_queries else {
+        return Vec::new();
+    };
+
+    queries
+        .iter()
+        .filter_map(|sql| {
+            let ast = match pg_query::parse(sql) {
+                Ok(ast) => ast,
+                Err(e) => {
+                    tracing::warn!("pinned query not parseable, skipping: {sql} ({e})");
+                    return None;
+                }
+            };
+            let query_expr = match query_expr_convert(&ast) {
+                Ok(q) => q,
+                Err(e) => {
+                    tracing::warn!("pinned query not convertible, skipping: {sql} ({e})");
+                    return None;
+                }
+            };
+            let cacheable_query = match CacheableQuery::try_new(&query_expr, func_volatility) {
+                Ok(cq) => cq,
+                Err(e) => {
+                    tracing::warn!("pinned query not cacheable, skipping: {sql} ({e})");
+                    return None;
+                }
+            };
+            let fingerprint = query_expr_fingerprint(&query_expr);
+            info!("pinned query validated: {sql} (fingerprint: {fingerprint})");
+            Some(PinnedQuery {
+                fingerprint,
+                cacheable_query: Arc::new(cacheable_query),
+            })
+        })
+        .collect()
+}
+
 #[tracing::instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
     // Load TLS config if certificates are provided
     let tls_acceptor = tls_config_load(settings)?;
+
+    // Pre-scope setup: load function volatilities and validate pinned queries.
+    // These must outlive thread::scope so spawned threads can borrow them.
+    let pre_rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_into_report::<ConnectionError>()?;
+    let _ = pre_rt.block_on(async { replication_provision(settings).await });
+    let func_volatility = pre_rt.block_on(function_volatility_load(settings))?;
+    let pinned = pinned_queries_validate(settings, &func_volatility);
+    drop(pre_rt);
 
     thread::scope(|scope| {
         let rt = Builder::new_current_thread()
@@ -316,10 +374,7 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
             .build()
             .map_into_report::<ConnectionError>()?;
 
-        let _ = rt.block_on(async { replication_provision(settings).await });
-        let func_volatility = rt.block_on(function_volatility_load(settings))?;
-
-        let (cache_handle, cache_tx) = cache_create(scope, settings)
+        let (cache_handle, cache_tx) = cache_create(scope, settings, &pinned)
             .map_into_report::<ConnectionError>()
             .attach_loc("creating cache thread")?;
         let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
@@ -384,7 +439,7 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
                     // Branch 3: Backoff timer expired - retry restart
                     _ = ProxyCacheState::backoff_wait(&mut cache_state.backoff) => {
                         cache_state
-                            .handle_backoff_expired(scope, settings)
+                            .handle_backoff_expired(scope, settings, &pinned)
                             .await;
                     }
                 }
@@ -400,4 +455,117 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::catalog::FunctionVolatility;
+    use crate::settings::{
+        CachePolicy, CdcSettings, ListenSettings, PgSettings, Settings, SslMode,
+    };
+
+    use super::pinned_queries_validate;
+
+    fn test_settings(pinned_queries: Option<Vec<String>>) -> Settings {
+        let pg = PgSettings {
+            host: "localhost".to_owned(),
+            port: 5432,
+            user: "test".to_owned(),
+            password: None,
+            database: "test".to_owned(),
+            ssl_mode: SslMode::Disable,
+        };
+        Settings {
+            origin: pg.clone(),
+            replication: pg.clone(),
+            cache: pg,
+            cdc: CdcSettings {
+                publication_name: "pub".to_owned(),
+                slot_name: "slot".to_owned(),
+            },
+            listen: ListenSettings {
+                socket: "127.0.0.1:5432".parse().expect("valid socket"),
+            },
+            num_workers: 1,
+            cache_size: None,
+            tls_cert: None,
+            tls_key: None,
+            metrics: None,
+            log_level: None,
+            cache_policy: CachePolicy::Clock,
+            admission_threshold: 2,
+            cache_tables: None,
+            pinned_queries,
+        }
+    }
+
+    #[test]
+    fn pinned_queries_validate_none_returns_empty() {
+        let settings = test_settings(None);
+        let result = pinned_queries_validate(&settings, &HashMap::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn pinned_queries_validate_valid_query_accepted() {
+        let settings = test_settings(Some(vec![
+            "SELECT id, name FROM users WHERE active = true".to_owned(),
+        ]));
+        let result = pinned_queries_validate(&settings, &HashMap::new());
+        assert_eq!(result.len(), 1);
+        assert_ne!(result[0].fingerprint, 0);
+    }
+
+    #[test]
+    fn pinned_queries_validate_multiple_queries() {
+        let settings = test_settings(Some(vec![
+            "SELECT * FROM users WHERE true".to_owned(),
+            "SELECT * FROM orders WHERE true".to_owned(),
+        ]));
+        let result = pinned_queries_validate(&settings, &HashMap::new());
+        assert_eq!(result.len(), 2);
+        // Different queries should have different fingerprints
+        assert_ne!(result[0].fingerprint, result[1].fingerprint);
+    }
+
+    #[test]
+    fn pinned_queries_validate_unparseable_skipped() {
+        let settings = test_settings(Some(vec!["NOT VALID SQL !!!".to_owned()]));
+        let result = pinned_queries_validate(&settings, &HashMap::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn pinned_queries_validate_non_cacheable_skipped() {
+        // INSERT is not cacheable
+        let settings = test_settings(Some(vec!["INSERT INTO users (id) VALUES (1)".to_owned()]));
+        let result = pinned_queries_validate(&settings, &HashMap::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn pinned_queries_validate_mixed_valid_and_invalid() {
+        let settings = test_settings(Some(vec![
+            "SELECT * FROM users WHERE true".to_owned(),
+            "NOT VALID SQL".to_owned(),
+            "SELECT * FROM orders WHERE true".to_owned(),
+        ]));
+        let result = pinned_queries_validate(&settings, &HashMap::new());
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn pinned_queries_validate_non_cacheable_function_in_where_rejected() {
+        let mut fv = HashMap::new();
+        fv.insert("random".to_owned(), FunctionVolatility::Volatile);
+
+        // Volatile function in WHERE clause makes query non-cacheable
+        let settings = test_settings(Some(vec![
+            "SELECT id FROM users WHERE random() > 0.5".to_owned(),
+        ]));
+        let result = pinned_queries_validate(&settings, &fv);
+        assert!(result.is_empty());
+    }
 }

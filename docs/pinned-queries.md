@@ -230,3 +230,24 @@ Pinned status is ephemeral — it exists only in the running process, derived fr
 6. **Dynamic pin**: With pgcache running, add a query to `pinned_queries` and trigger config reload. Verify the new query enters Loading → Ready.
 
 7. **Dynamic unpin**: Remove a query from `pinned_queries` and trigger config reload. Verify the query loses eviction protection (can now be evicted under memory pressure).
+
+---
+
+## Future Work
+
+### Search Path for Pinned Queries
+Pinned queries currently use `["public"]` as the default search path. Schema-qualified table names work, but unqualified tables resolve to `public` only. Revisit this to support configurable search paths or infer from origin defaults.
+
+### Dynamic Config Reload
+The `Pin`/`Unpin` commands and `watch::Sender<Vec<PinnedQuery>>` channel described above are deferred. Initial implementation supports startup-only pinning. Dynamic reload (SIGHUP, admin command) will be added as a follow-up.
+
+### Pinned Tables Config
+Add a `pinned_tables` config option as syntactic sugar for pinning `SELECT * FROM <table>` queries:
+
+```toml
+pinned_tables = ["settings", "products"]
+# equivalent to:
+pinned_queries = ["select * from settings", "select * from products"]
+```
+
+Both options can coexist — `pinned_tables` entries are expanded and merged with explicit `pinned_queries`.

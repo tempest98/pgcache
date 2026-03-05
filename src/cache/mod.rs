@@ -31,8 +31,8 @@ pub use messages::{
 };
 pub use runtime::cache_run;
 pub use types::{
-    Cache, CachedQuery, CachedQueryState, CachedQueryView, SubqueryKind, UpdateQueries,
-    UpdateQuery, UpdateQuerySource,
+    Cache, CachedQuery, CachedQueryState, CachedQueryView, PinnedQuery, SubqueryKind,
+    UpdateQueries, UpdateQuery, UpdateQuerySource,
 };
 
 error_set! {
