@@ -13,7 +13,9 @@ use crate::timing::QueryTiming;
 
 use super::{
     CacheError, CacheResult,
-    messages::{CacheReply, PipelineContext, PipelineDescribe, QueryCommand},
+    messages::{
+        AdmitAction, CacheReply, PipelineContext, PipelineDescribe, QueryCommand, SubsumptionResult,
+    },
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     types::{CacheStateView, CachedQueryState, CachedQueryView, SharedResolved},
 };
@@ -220,40 +222,40 @@ impl QueryCache {
                 reply_forward(msg.reply_tx, msg.pipeline, msg.data)
             }
 
-            // Pending — forward to origin, increment hit count, admit if threshold reached
+            // Pending — hold request, check subsumption, increment hit count, admit if threshold reached
             Some(CachedQueryView {
                 state: CachedQueryState::Pending(hit_count),
                 ..
             }) => {
                 let new_count = hit_count + 1;
                 trace!("pending {fingerprint} count={new_count}");
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data)?;
 
                 if new_count >= self.admission_threshold {
                     self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                    self.query_register_send(fingerprint, msg.cacheable_query, msg.search_path)
+                    self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
+                        .await
                 } else {
                     self.cached_query_state_set(&fingerprint, CachedQueryState::Pending(new_count));
-                    Ok(())
+                    self.subsumption_await(msg, fingerprint, AdmitAction::CheckOnly)
+                        .await
                 }
             }
 
-            // Invalidated — forward to origin, fast-readmit (skip admission gate)
+            // Invalidated — hold request, check subsumption, fast-readmit (skip admission gate)
             Some(CachedQueryView {
                 state: CachedQueryState::Invalidated,
                 ..
             }) => {
                 trace!("invalidated readmit {fingerprint}");
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data)?;
                 self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                self.query_register_send(fingerprint, msg.cacheable_query, msg.search_path)
+                self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
+                    .await
             }
 
-            // Cache miss — new query
+            // Cache miss — hold request, check subsumption
             None => {
                 trace!("cache miss {fingerprint}");
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data)?;
-                self.query_first_miss_handle(fingerprint, msg.cacheable_query, msg.search_path)
+                self.query_first_miss_handle(fingerprint, msg).await
             }
         }
     }
@@ -330,12 +332,14 @@ impl QueryCache {
             })
     }
 
-    /// Send a Register command to the writer thread.
+    /// Send a Register command to the writer thread with a subsumption oneshot.
     fn query_register_send(
         &self,
         fingerprint: u64,
         cacheable_query: Arc<CacheableQuery>,
         search_path: Vec<String>,
+        subsumption_tx: oneshot::Sender<SubsumptionResult>,
+        admit_action: AdmitAction,
     ) -> CacheResult<()> {
         self.query_tx
             .send(QueryCommand::Register {
@@ -343,16 +347,49 @@ impl QueryCache {
                 cacheable_query,
                 search_path,
                 started_at: Instant::now(),
+                subsumption_tx,
+                admit_action,
             })
             .map_err(|_| CacheError::WorkerSend.into())
     }
 
-    /// Handle first cache miss: register immediately (FIFO/threshold≤1) or start Pending.
-    fn query_first_miss_handle(
+    /// Hold a request, send Register with subsumption oneshot, and route
+    /// based on the writer's response. Subsumed → serve from cache,
+    /// NotSubsumed → forward to origin.
+    async fn subsumption_await(
+        &self,
+        msg: QueryRequest,
+        fingerprint: u64,
+        admit_action: AdmitAction,
+    ) -> CacheResult<()> {
+        let (subsumption_tx, subsumption_rx) = oneshot::channel();
+
+        self.query_register_send(
+            fingerprint,
+            Arc::clone(&msg.cacheable_query),
+            msg.search_path.clone(),
+            subsumption_tx,
+            admit_action,
+        )?;
+
+        match subsumption_rx.await {
+            Ok(SubsumptionResult::Subsumed {
+                generation,
+                resolved,
+                ..
+            }) => self.worker_request_send(msg, resolved, generation),
+            Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
+                reply_forward(msg.reply_tx, msg.pipeline, msg.data)
+            }
+        }
+    }
+
+    /// Handle first cache miss: hold request, check subsumption.
+    /// Register immediately (FIFO/threshold≤1) or start Pending.
+    async fn query_first_miss_handle(
         &self,
         fingerprint: u64,
-        cacheable_query: Arc<CacheableQuery>,
-        search_path: Vec<String>,
+        msg: QueryRequest,
     ) -> CacheResult<()> {
         let immediate_admit =
             self.cache_policy == CachePolicy::Fifo || self.admission_threshold <= 1;
@@ -378,10 +415,12 @@ impl QueryCache {
 
         if immediate_admit {
             trace!("send to writer {fingerprint}");
-            self.query_register_send(fingerprint, cacheable_query, search_path)
+            self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
+                .await
         } else {
             trace!("pending new {fingerprint}");
-            Ok(())
+            self.subsumption_await(msg, fingerprint, AdmitAction::CheckOnly)
+                .await
         }
     }
 }

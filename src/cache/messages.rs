@@ -10,6 +10,20 @@ use crate::proxy::ClientSocket;
 use crate::query::transform::query_expr_parameters_replace;
 use crate::timing::QueryTiming;
 
+use super::types::SharedResolved;
+
+/// Result of a subsumption check, sent from the writer back to the coordinator
+/// via a oneshot channel included in the Register command.
+pub enum SubsumptionResult {
+    /// Data already in cache. State is Ready, serve immediately.
+    Subsumed {
+        generation: u64,
+        resolved: SharedResolved,
+    },
+    /// Not subsumed. Forward to origin; population dispatched if admit_action was Admit.
+    NotSubsumed,
+}
+
 /// Whether the pipeline includes a Describe and which type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineDescribe {
@@ -179,14 +193,58 @@ pub struct ProxyMessage {
 }
 
 /// Commands for query registration lifecycle, sent to the writer thread
-#[derive(Debug)]
+impl std::fmt::Debug for QueryCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Register { fingerprint, .. } => f
+                .debug_struct("Register")
+                .field("fingerprint", fingerprint)
+                .finish_non_exhaustive(),
+            Self::Ready {
+                fingerprint,
+                cached_bytes,
+            } => f
+                .debug_struct("Ready")
+                .field("fingerprint", fingerprint)
+                .field("cached_bytes", cached_bytes)
+                .finish(),
+            Self::Failed { fingerprint } => f
+                .debug_struct("Failed")
+                .field("fingerprint", fingerprint)
+                .finish(),
+            Self::LimitBump {
+                fingerprint,
+                max_limit,
+            } => f
+                .debug_struct("LimitBump")
+                .field("fingerprint", fingerprint)
+                .field("max_limit", max_limit)
+                .finish(),
+        }
+    }
+}
+
+/// Controls what the writer does when a query is not subsumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitAction {
+    /// Register and populate when not subsumed (first miss, threshold reached, invalidated).
+    Admit,
+    /// Do nothing when not subsumed (pending below threshold).
+    CheckOnly,
+}
+
 pub enum QueryCommand {
-    /// Register a new query and spawn background population (fire-and-forget)
+    /// Register a new query. The writer checks subsumption and responds
+    /// via `subsumption_tx` before optionally dispatching population.
     Register {
         fingerprint: u64,
         cacheable_query: Arc<CacheableQuery>,
         search_path: Vec<String>,
         started_at: Instant,
+        /// Writer sends subsumption result back so the coordinator can route the held request.
+        subsumption_tx: oneshot::Sender<SubsumptionResult>,
+        /// What to do when the query is not subsumed by existing cached data.
+        admit_action: AdmitAction,
     },
 
     /// Query population completed successfully

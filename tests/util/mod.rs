@@ -44,6 +44,7 @@ pub struct MetricsSnapshot {
     pub queries_cache_miss: u64,
     pub queries_cache_error: u64,
     pub queries_allowlist_skipped: u64,
+    pub cache_subsumptions: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -356,7 +357,9 @@ fn pgcache_spawn(
         .arg("--listen_socket")
         .arg(&listen_socket)
         .arg("--metrics_socket")
-        .arg(&metrics_socket);
+        .arg(&metrics_socket)
+        .arg("--log_level")
+        .arg("info");
 
     for arg in extra_args {
         cmd.arg(arg);
@@ -575,6 +578,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut queries_cache_miss = 0u64;
     let mut queries_cache_error = 0u64;
     let mut queries_allowlist_skipped = 0u64;
+    let mut cache_subsumptions = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -598,6 +602,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_queries_cache_miss" => queries_cache_miss = value,
                 "pgcache_queries_cache_error" => queries_cache_error = value,
                 "pgcache_queries_allowlist_skipped" => queries_allowlist_skipped = value,
+                "pgcache_cache_subsumptions" => cache_subsumptions = value,
                 _ => {}
             }
         }
@@ -628,6 +633,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         queries_cache_miss,
         queries_cache_error,
         queries_allowlist_skipped,
+        cache_subsumptions,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -722,6 +728,35 @@ pub async fn assert_cache_hit(
     Ok(after)
 }
 
+/// Assert that the last query was subsumed (cache hit via subsumption).
+/// Returns updated metrics snapshot for chaining.
+pub async fn assert_subsume_hit(
+    ctx: &mut TestContext,
+    before: MetricsSnapshot,
+) -> Result<MetricsSnapshot, Error> {
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "expected cache hit from subsumption"
+    );
+    assert_eq!(delta.queries_cache_miss, 0, "unexpected cache miss");
+    assert_eq!(delta.cache_subsumptions, 1, "expected subsumption");
+    Ok(after)
+}
+
+/// Assert that the last query was NOT subsumed.
+/// Returns updated metrics snapshot for chaining.
+pub async fn assert_not_subsumed(
+    ctx: &mut TestContext,
+    before: MetricsSnapshot,
+) -> Result<MetricsSnapshot, Error> {
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&before, &after);
+    assert_eq!(delta.cache_subsumptions, 0, "unexpected subsumption");
+    Ok(after)
+}
+
 /// Run a pgproto data file against the proxy and return the combined output.
 /// pgproto prints protocol trace to stderr; we merge stdout and stderr.
 /// Panics if pgproto is not found or exits with a non-zero status.
@@ -769,6 +804,7 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         queries_cache_error: after.queries_cache_error - before.queries_cache_error,
         queries_allowlist_skipped: after.queries_allowlist_skipped
             - before.queries_allowlist_skipped,
+        cache_subsumptions: after.cache_subsumptions - before.cache_subsumptions,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

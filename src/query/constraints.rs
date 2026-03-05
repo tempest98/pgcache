@@ -262,6 +262,38 @@ fn propagate_constraints(
 /// Subquery terms in WHERE clauses are naturally skipped by `analyze_equality_expr`,
 /// so outer constraints (e.g., `AND tenant_id = 1`) are still correctly extracted
 /// even when subqueries are present.
+/// Returns true if the cached query's equality constraints on `table` are implied
+/// by the new query's constraints. Every (column, Equal, value) triple in cached
+/// must appear in new. This is equality-only subsumption (v1).
+///
+/// When the cached query has no constraints on a table, it loaded all rows — subsumed.
+/// When the cached query has constraints but the new query doesn't for that table,
+/// the new query is broader — not subsumed (unless all cached constraints are non-equality).
+pub fn table_constraints_subsumed(
+    new: &QueryConstraints,
+    cached: &QueryConstraints,
+    table: &str,
+) -> bool {
+    let cached_for_table = cached.table_constraints.get(table);
+    let new_for_table = new.table_constraints.get(table);
+
+    match (cached_for_table, new_for_table) {
+        // Cached has no constraints on this table → full scan, all rows loaded. Subsumed.
+        (None, _) => true,
+        // Cached has constraints but new doesn't → new is broader than cached.
+        // Can't subsume: the cached data is restricted, but the new query wants everything.
+        (Some(_), None) => false,
+        // Both have constraints → equality-only subsumption.
+        // If cached has any non-equality constraints, we can't reason about whether
+        // the cached data is a superset, so reject subsumption.
+        // Otherwise, every cached equality constraint must appear in new.
+        (Some(cached_cs), Some(new_cs)) => {
+            cached_cs.iter().all(|(_, op, _)| *op == BinaryOp::Equal)
+                && cached_cs.iter().all(|c| new_cs.contains(c))
+        }
+    }
+}
+
 pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstraints {
     // Step 1: Collect all constraint information (constraints + equivalences)
     let (constraints, equivalences) = collect_query_constraints(resolved);
@@ -1023,6 +1055,106 @@ mod tests {
         let constraints = analyze_query_constraints(&resolved);
 
         assert_eq!(constraints.column_constraints.len(), 0);
+    }
+
+    // ========== Subsumption tests ==========
+
+    #[test]
+    fn test_subsumption_cached_no_constraints() {
+        // Cached: SELECT * FROM users (no WHERE) → full scan covers everything
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_same_equality() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_new_narrower() {
+        // Cached has fewer equality constraints → new is narrower. Subsumed.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = 1 AND name = 'alice'",
+            &tables,
+        ));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_different_values() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 2", &tables));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_cached_has_extra_constraint() {
+        // Cached is narrower than new → not subsumed
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = 1 AND name = 'alice'",
+            &tables,
+        ));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_new_no_constraints() {
+        // New has no constraints but cached does → new is broader, not subsumed
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
+        let new = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_rejects_non_equality() {
+        // Cached has inequality constraints — can't reason about coverage in v1
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 5", &tables));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 10", &tables));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
     }
 
     #[test]

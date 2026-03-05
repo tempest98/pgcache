@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::cache::query::limit_rows_needed;
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
-use crate::query::ast::{QueryBody, QueryExpr, TableNode};
-use crate::query::constraints::analyze_query_constraints;
+use crate::query::ast::{Deparse, QueryBody, QueryExpr, TableNode};
+use crate::query::constraints::{analyze_query_constraints, table_constraints_subsumed};
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::resolved::{
     ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
@@ -16,11 +17,20 @@ use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
 
 use super::super::{
-    CacheError, CacheResult, ReportExt,
+    CacheError, CacheResult, MapIntoReport, ReportExt,
+    messages::{AdmitAction, SubsumptionResult},
     query::CacheableQuery,
     types::{CachedQuery, CachedQueryState, SharedResolved, UpdateQueries, UpdateQuery},
 };
 use super::{CacheWriter, POPULATE_POOL_SIZE, PopulationWork};
+
+/// Intermediate result from resolving a query before subsumption check or population.
+struct QueryResolution {
+    resolved: SharedResolved,
+    relation_oids: Vec<u32>,
+    base_query: QueryExpr,
+    max_limit: Option<u64>,
+}
 
 /// Clone the query, strip LIMIT, and compute max_limit for population.
 /// Set operations force max_limit = None since population runs per-branch.
@@ -229,25 +239,14 @@ impl CacheWriter {
         (generation, changed)
     }
 
-    /// Registers a query in the cache and spawns background population.
-    /// Registration is synchronous (updates Cache state), population is async.
-    /// If the query was previously invalidated (CLOCK policy), takes the fast
-    /// readmission path that reuses existing metadata.
-    #[instrument(skip_all)]
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn query_register(
+    /// Resolve a query's tables and AST, register update queries, and extract constraints.
+    /// This is the first phase of registration, before subsumption or population.
+    async fn query_resolve(
         &mut self,
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
-        started_at: Instant,
-    ) -> CacheResult<()> {
-        if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
-            && query.invalidated
-        {
-            return self.query_readmit(fingerprint, started_at).await;
-        }
-
+    ) -> CacheResult<QueryResolution> {
         let (base_query, max_limit) = base_query_prepare(&cacheable_query.query);
 
         self.cache_tables_ensure(&base_query, search_path).await?;
@@ -262,12 +261,88 @@ impl CacheWriter {
         let relation_oids =
             self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;
 
-        let (generation, relations_changed) = self.cached_query_insert(
-            fingerprint,
+        Ok(QueryResolution {
+            resolved,
             relation_oids,
             base_query,
-            Arc::clone(&resolved),
             max_limit,
+        })
+    }
+
+    /// Check whether all tables in the new query are covered by existing cached queries.
+    /// Returns true only if every relation_oid has at least one Ready, non-limited
+    /// UpdateQuery whose equality constraints are implied by the new query's constraints.
+    fn subsumption_check(&self, resolution: &QueryResolution) -> bool {
+        if resolution.relation_oids.is_empty() {
+            return false;
+        }
+
+        // Set operations (UNION/INTERSECT/EXCEPT) require per-branch constraint
+        // analysis which isn't implemented yet. Reject unconditionally for now.
+        let Some(select) = resolution.resolved.as_select() else {
+            return false;
+        };
+
+        let new_constraints = analyze_query_constraints(select);
+
+        for &oid in &resolution.relation_oids {
+            let Some(update_queries) = self.cache.update_queries.get(&oid) else {
+                return false;
+            };
+
+            let Some(table_meta) = self.cache.tables.get1(&oid) else {
+                return false;
+            };
+            let table_name = &table_meta.name;
+
+            let table_covered = update_queries.queries.iter().any(|uq| {
+                if uq.has_limit {
+                    return false;
+                }
+
+                let parent = self.cache.cached_queries.get1(&uq.fingerprint);
+
+                let parent_ready =
+                    parent.is_some_and(|q| !q.invalidated && q.registration_started_at.is_none());
+                if !parent_ready {
+                    return false;
+                }
+
+                // Only single-table cached queries are subsumption candidates.
+                // Multi-table queries have implicit join filtering that constraint
+                // analysis doesn't capture, so we can't safely reason about coverage.
+                let parent_single_table = parent.is_some_and(|q| q.relation_oids.len() == 1);
+                if !parent_single_table {
+                    return false;
+                }
+
+                table_constraints_subsumed(&new_constraints, &uq.constraints, table_name)
+            });
+
+            if !table_covered {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Handle a subsumed query: assign generation, stamp rows in cache DB, mark Ready.
+    /// Returns (generation, resolved) on success. Falls back to None if cache DB execution fails.
+    async fn query_subsume(
+        &mut self,
+        fingerprint: u64,
+        resolution: QueryResolution,
+        started_at: Instant,
+    ) -> CacheResult<Option<(u64, SharedResolved)>> {
+        let subsume_start = Instant::now();
+
+        let (generation, relations_changed) = self.cached_query_insert(
+            fingerprint,
+            resolution.relation_oids,
+            resolution.base_query,
+            Arc::clone(&resolution.resolved),
+            resolution.max_limit,
             started_at,
         );
 
@@ -275,7 +350,170 @@ impl CacheWriter {
             self.publication_update().await?;
         }
 
-        let work = self.population_work_build(fingerprint, generation, &resolved, max_limit);
+        // Stamp rows: SET generation, execute query, reset generation
+        let set_gen_sql = format!("SET mem.query_generation = {generation}");
+        if let Err(e) = self
+            .db_cache
+            .execute(&set_gen_sql, &[])
+            .await
+            .map_into_report::<CacheError>()
+        {
+            error!("subsumption generation set failed: {e}");
+            return Ok(None);
+        }
+
+        let mut sql = String::with_capacity(512);
+        resolution.resolved.deparse(&mut sql);
+
+        let cache_exec_result = self
+            .db_cache
+            .query(&sql, &[])
+            .await
+            .map_into_report::<CacheError>();
+
+        // Always reset generation, even on failure
+        let _ = self
+            .db_cache
+            .execute("SET mem.query_generation = 0", &[])
+            .await;
+
+        if let Err(e) = cache_exec_result {
+            error!("subsumption cache query failed: {e}");
+            return Ok(None);
+        }
+
+        // Mark Ready in state view
+        self.state_view_update(
+            fingerprint,
+            CachedQueryState::Ready,
+            generation,
+            &resolution.resolved,
+            resolution.max_limit,
+        );
+
+        // Clear registration_started_at to signal completion
+        if let Some(mut q) = self.cache.cached_queries.get1_mut(&fingerprint) {
+            q.registration_started_at = None;
+        }
+
+        metrics::counter!(names::CACHE_SUBSUMPTIONS).increment(1);
+        metrics::histogram!(names::CACHE_SUBSUMPTION_LATENCY_SECONDS)
+            .record(subsume_start.elapsed().as_secs_f64());
+
+        debug!("query subsumed {fingerprint}");
+        Ok(Some((generation, resolution.resolved)))
+    }
+
+    /// Registers a query in the cache. Checks subsumption first — if the data
+    /// is already cached by a broader query, stamps rows and marks Ready immediately.
+    /// Otherwise, dispatches population (if `admit_action` is `Admit`).
+    ///
+    /// If the query was previously invalidated (CLOCK policy), takes the fast
+    /// readmission path that reuses existing metadata.
+    #[instrument(skip_all)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn query_register(
+        &mut self,
+        fingerprint: u64,
+        cacheable_query: &CacheableQuery,
+        search_path: &[&str],
+        started_at: Instant,
+        subsumption_tx: oneshot::Sender<SubsumptionResult>,
+        admit_action: AdmitAction,
+    ) -> CacheResult<()> {
+        // Fast readmit path for invalidated queries — skip subsumption
+        if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
+            && query.invalidated
+        {
+            let _ = subsumption_tx.send(SubsumptionResult::NotSubsumed);
+            return self.query_readmit(fingerprint, started_at).await;
+        }
+
+        // Phase 1: Resolve
+        let resolution = self
+            .query_resolve(fingerprint, cacheable_query, search_path)
+            .await?;
+
+        // Phase 2: Subsumption check
+        let subsumed = self.subsumption_check(&resolution);
+
+        if subsumed {
+            // Phase 3a: Subsume — stamp rows, mark Ready
+            let fallback_resolved = Arc::clone(&resolution.resolved);
+            let fallback_max_limit = resolution.max_limit;
+
+            match self
+                .query_subsume(fingerprint, resolution, started_at)
+                .await?
+            {
+                Some((generation, resolved)) => {
+                    let _ = subsumption_tx.send(SubsumptionResult::Subsumed {
+                        generation,
+                        resolved,
+                    });
+                    return Ok(());
+                }
+                None => {
+                    // Cache DB execution failed — fall back to population.
+                    // The query was already inserted by query_subsume, so we need
+                    // to clean it up and re-insert properly, or just populate.
+                    // Since cached_query_insert was already called, just dispatch population.
+                    let _ = subsumption_tx.send(SubsumptionResult::NotSubsumed);
+                    let generation = self
+                        .cache
+                        .cached_queries
+                        .get1(&fingerprint)
+                        .map(|q| q.generation)
+                        .unwrap_or(0);
+                    if generation > 0 {
+                        let work = self.population_work_build(
+                            fingerprint,
+                            generation,
+                            &fallback_resolved,
+                            fallback_max_limit,
+                        );
+                        self.populate_work_dispatch(work)?;
+                        trace!("subsumption fallback: population queued {fingerprint}");
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Phase 3b: Not subsumed
+        let _ = subsumption_tx.send(SubsumptionResult::NotSubsumed);
+
+        if admit_action == AdmitAction::CheckOnly {
+            // Pending below threshold — don't register, don't populate.
+            // Clean up the update_queries we registered in query_resolve.
+            for &oid in &resolution.relation_oids {
+                if let Some(mut queries) = self.cache.update_queries.get_mut(&oid) {
+                    queries.queries.retain(|q| q.fingerprint != fingerprint);
+                }
+            }
+            return Ok(());
+        }
+
+        // Register and populate
+        let (generation, relations_changed) = self.cached_query_insert(
+            fingerprint,
+            resolution.relation_oids,
+            resolution.base_query,
+            Arc::clone(&resolution.resolved),
+            resolution.max_limit,
+            started_at,
+        );
+
+        if relations_changed {
+            self.publication_update().await?;
+        }
+
+        let work = self.population_work_build(
+            fingerprint,
+            generation,
+            &resolution.resolved,
+            resolution.max_limit,
+        );
         self.populate_work_dispatch(work)?;
         trace!("population work queued for query {fingerprint}");
         Ok(())

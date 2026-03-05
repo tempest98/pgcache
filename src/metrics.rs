@@ -75,6 +75,8 @@ pub mod names {
     pub const CACHE_FRESHNESS_HITS: &str = "pgcache.cache.freshness_hits";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
     pub const CACHE_READMISSIONS: &str = "pgcache.cache.readmissions";
+    pub const CACHE_SUBSUMPTIONS: &str = "pgcache.cache.subsumptions";
+    pub const CACHE_SUBSUMPTION_LATENCY_SECONDS: &str = "pgcache.cache.subsumption_latency_seconds";
 
     // Cache state metrics (admission/eviction policy)
     pub const CACHE_QUERIES_PENDING: &str = "pgcache.cache.queries_pending";

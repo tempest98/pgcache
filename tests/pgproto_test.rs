@@ -5,6 +5,7 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, metrics_delta, pgproto_run, wait_cache_load,
+    wait_for_cdc,
 };
 
 mod util;
@@ -141,6 +142,10 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
         "expected unsupported increment for INSERT, got {}",
         delta.queries_unsupported,
     );
+
+    // Wait for CDC to invalidate the cached SELECT * FROM proto_test
+    // so the verification query isn't served from stale cache via subsumption
+    wait_for_cdc().await;
 
     // Verify the INSERT actually executed on origin
     let rows = ctx

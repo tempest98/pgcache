@@ -177,11 +177,20 @@ impl CacheWriter {
                 cacheable_query,
                 search_path,
                 started_at,
+                subsumption_tx,
+                admit_action,
             } => {
                 trace!("command query register {fingerprint}");
                 let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
                 if let Err(e) = self
-                    .query_register(fingerprint, &cacheable_query, &search_path_refs, started_at)
+                    .query_register(
+                        fingerprint,
+                        &cacheable_query,
+                        &search_path_refs,
+                        started_at,
+                        subsumption_tx,
+                        admit_action,
+                    )
                     .await
                 {
                     error!("query register failed: {e} {fingerprint}");
