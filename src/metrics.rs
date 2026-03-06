@@ -1,16 +1,15 @@
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::mpsc;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use rootcause::Report;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 
 /// Metrics subsystem errors.
 #[derive(Debug)]
 pub enum MetricsError {
-    /// The background metrics thread failed before sending a result.
-    ThreadStart,
-    /// Prometheus recorder build failed (includes tokio runtime creation).
+    /// Prometheus recorder build failed.
     Build(String),
     /// A global metrics recorder was already installed.
     RecorderInstall,
@@ -19,7 +18,6 @@ pub enum MetricsError {
 impl fmt::Display for MetricsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MetricsError::ThreadStart => write!(f, "metrics thread failed to start"),
             MetricsError::Build(msg) => write!(f, "{msg}"),
             MetricsError::RecorderInstall => {
                 write!(f, "global metrics recorder already installed")
@@ -129,62 +127,98 @@ pub mod names {
 
 /// Install the Prometheus metrics recorder.
 ///
-/// If `metrics_socket` is provided, starts an HTTP server on that address
-/// serving Prometheus metrics at `/metrics`.
+/// If `metrics_socket` is provided, spawns an HTTP server on that address
+/// serving Prometheus metrics at `/metrics` with CORS headers enabled.
 pub fn prometheus_install(metrics_socket: Option<SocketAddr>) -> MetricsResult<()> {
-    // Configure Prometheus with quantiles for histograms
-    let mut builder = PrometheusBuilder::new()
+    let recorder = PrometheusBuilder::new()
         .set_quantiles(&[0.5, 0.95, 0.99])
-        .map_err(|e| MetricsError::Build(e.to_string()))?;
+        .map_err(|e| MetricsError::Build(e.to_string()))?
+        .build_recorder();
 
-    // Optionally bind HTTP listener
-    if let Some(socket) = metrics_socket {
-        builder = builder.with_http_listener(socket);
-    }
+    let handle = recorder.handle();
 
-    // build() requires a tokio runtime context, so we create the runtime
-    // in a background thread, build the recorder there, and send it back.
-    // Errors are stringified because BuildError may not be Send.
-    let (tx, rx) = mpsc::sync_channel(1);
-
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tx.send(Err(format!("tokio runtime creation failed: {e}")));
-                return;
-            }
-        };
-
-        // Enter runtime context so build() can set up the HTTP listener
-        let _guard = rt.enter();
-
-        let (prometheus, exporter_future) = match builder.build() {
-            Ok(result) => result,
-            Err(e) => {
-                let _ = tx.send(Err(format!("prometheus build failed: {e}")));
-                return;
-            }
-        };
-
-        let _ = tx.send(Ok(prometheus));
-
-        // Run the HTTP exporter (blocks until shutdown)
-        if let Err(e) = rt.block_on(exporter_future) {
-            tracing::error!("prometheus exporter failed: {e:?}");
-        }
-    });
-
-    let prometheus = rx
-        .recv()
-        .map_err(|_| Report::new(MetricsError::ThreadStart))?
-        .map_err(|msg| Report::new(MetricsError::Build(msg)))?;
-
-    metrics::set_global_recorder(prometheus)
+    metrics::set_global_recorder(recorder)
         .map_err(|_| Report::new(MetricsError::RecorderInstall))?;
 
+    if let Some(socket) = metrics_socket {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("metrics tokio runtime");
+            rt.block_on(metrics_server_run(socket, handle));
+        });
+    }
+
     Ok(())
+}
+
+/// Minimal HTTP server that serves Prometheus metrics with CORS headers.
+async fn metrics_server_run(addr: SocketAddr, handle: PrometheusHandle) {
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("metrics server bind failed on {addr}: {e}");
+            return;
+        }
+    };
+
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("metrics server accept error: {e}");
+                continue;
+            }
+        };
+
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            // Read enough of the request to determine method and path.
+            // We don't need to parse the full request for this simple server.
+            let mut buf = [0u8; 1024];
+            let n = match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+
+            let request = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
+            let first_line = request.lines().next().unwrap_or("");
+
+            let response = if first_line.starts_with("OPTIONS ") {
+                // CORS preflight
+                "HTTP/1.1 204 No Content\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                 Access-Control-Allow-Headers: *\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+                    .to_owned()
+            } else if first_line.starts_with("GET /health") {
+                "HTTP/1.1 200 OK\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Content-Type: text/plain\r\n\
+                     Content-Length: 2\r\n\
+                     Connection: close\r\n\r\nOK"
+                    .to_owned()
+            } else if first_line.starts_with("GET ") {
+                let body = handle.render();
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Access-Control-Allow-Origin: *\r\n\
+                     Content-Type: text/plain; charset=utf-8\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                "HTTP/1.1 405 Method Not Allowed\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+                    .to_owned()
+            };
+
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
 }
