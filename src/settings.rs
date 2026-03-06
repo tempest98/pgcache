@@ -231,6 +231,10 @@ struct SettingsToml {
     /// protected from eviction, and auto-readmitted after CDC invalidation.
     #[serde(default)]
     pinned_queries: Option<Vec<String>>,
+    /// Tables to pin in cache at startup. Syntactic sugar — each table name is
+    /// expanded to `SELECT * FROM {table} WHERE true` and merged with `pinned_queries`.
+    #[serde(default)]
+    pinned_tables: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +333,30 @@ fn pinned_queries_parse(input: Option<String>) -> Option<Vec<String>> {
         .filter(|v| !v.is_empty())
 }
 
+/// Expand table names into pinned queries (`SELECT * FROM {table} WHERE true`)
+/// and merge with any explicit pinned queries.
+fn pinned_tables_expand_and_merge(
+    pinned_queries: Option<Vec<String>>,
+    pinned_tables: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let expanded = pinned_tables.map(|tables| {
+        tables
+            .into_iter()
+            .map(|t| format!("SELECT * FROM {t} WHERE true"))
+            .collect::<Vec<_>>()
+    });
+
+    match (pinned_queries, expanded) {
+        (Some(mut queries), Some(tables)) => {
+            queries.extend(tables);
+            Some(queries)
+        }
+        (Some(queries), None) => Some(queries),
+        (None, Some(tables)) => Some(tables),
+        (None, None) => None,
+    }
+}
+
 /// Raw CLI argument values before merging with config file.
 #[derive(Default)]
 struct CliArgs {
@@ -361,6 +389,7 @@ struct CliArgs {
     admission_threshold: Option<u32>,
     cache_tables: Option<String>,
     pinned_queries: Option<String>,
+    pinned_tables: Option<String>,
 }
 
 fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
@@ -412,6 +441,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
             Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
             Long("cache_tables") => args.cache_tables = Some(arg_string(&mut parser)?),
             Long("pinned_queries") => args.pinned_queries = Some(arg_string(&mut parser)?),
+            Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -506,7 +536,10 @@ fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> Confi
             .or(config.admission_threshold)
             .unwrap_or(2),
         cache_tables: cache_tables_parse(args.cache_tables).or(config.cache_tables.take()),
-        pinned_queries: pinned_queries_parse(args.pinned_queries).or(config.pinned_queries.take()),
+        pinned_queries: pinned_tables_expand_and_merge(
+            pinned_queries_parse(args.pinned_queries).or(config.pinned_queries.take()),
+            cache_tables_parse(args.pinned_tables).or(config.pinned_tables.take()),
+        ),
     })
 }
 
@@ -562,7 +595,10 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
         cache_policy: args.cache_policy.unwrap_or_default(),
         admission_threshold: args.admission_threshold.unwrap_or(2),
         cache_tables: cache_tables_parse(args.cache_tables),
-        pinned_queries: pinned_queries_parse(args.pinned_queries),
+        pinned_queries: pinned_tables_expand_and_merge(
+            pinned_queries_parse(args.pinned_queries),
+            cache_tables_parse(args.pinned_tables),
+        ),
     })
 }
 
@@ -589,6 +625,7 @@ impl Settings {
             [--metrics_socket IP_AND_PORT] \n \
             [--cache_tables TABLE1,TABLE2,...] (restrict caching to these tables) \n \
             [--pinned_queries QUERY1;QUERY2;...] (pin queries in cache at startup, semicolon-separated) \n \
+            [--pinned_tables TABLE1,TABLE2,...] (pin SELECT * FROM table WHERE true for each table) \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug)"
         );
         std::process::exit(1);
@@ -1133,6 +1170,7 @@ socket = "127.0.0.1:5434"
             admission_threshold: None,
             cache_tables: None,
             pinned_queries: None,
+            pinned_tables: None,
         }
     }
 
@@ -1462,5 +1500,115 @@ socket = "127.0.0.1:5434"
         assert_eq!(pinned.len(), 2);
         assert_eq!(pinned[0], "SELECT * FROM settings WHERE true");
         assert_eq!(pinned[1], "SELECT id, name FROM lookup WHERE true");
+    }
+
+    // ==================== pinned_tables Tests ====================
+
+    #[test]
+    fn settings_build_pinned_tables_expands_to_queries() {
+        let mut config = base_toml_config();
+        config.pinned_tables = Some(vec!["settings".to_owned(), "products".to_owned()]);
+        let args = CliArgs::default();
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0], "SELECT * FROM settings WHERE true");
+        assert_eq!(pinned[1], "SELECT * FROM products WHERE true");
+    }
+
+    #[test]
+    fn settings_build_pinned_tables_merged_with_pinned_queries() {
+        let mut config = base_toml_config();
+        config.pinned_queries = Some(vec!["SELECT id, name FROM users WHERE true".to_owned()]);
+        config.pinned_tables = Some(vec!["settings".to_owned()]);
+        let args = CliArgs::default();
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0], "SELECT id, name FROM users WHERE true");
+        assert_eq!(pinned[1], "SELECT * FROM settings WHERE true");
+    }
+
+    #[test]
+    fn settings_build_pinned_tables_cli_csv() {
+        let args = CliArgs {
+            pinned_tables: Some("settings,products".to_owned()),
+            ..base_cli_args()
+        };
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0], "SELECT * FROM settings WHERE true");
+        assert_eq!(pinned[1], "SELECT * FROM products WHERE true");
+    }
+
+    #[test]
+    fn settings_build_pinned_tables_schema_qualified() {
+        let mut config = base_toml_config();
+        config.pinned_tables = Some(vec!["analytics.events".to_owned()]);
+        let args = CliArgs::default();
+
+        let settings = settings_build(args, Some(config)).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0], "SELECT * FROM analytics.events WHERE true");
+    }
+
+    #[test]
+    fn settings_build_pinned_tables_cli_merges_with_pinned_queries_cli() {
+        let args = CliArgs {
+            pinned_queries: Some("SELECT id FROM users WHERE true".to_owned()),
+            pinned_tables: Some("settings".to_owned()),
+            ..base_cli_args()
+        };
+
+        let settings = settings_build(args, None).expect("build settings");
+
+        let pinned = settings.pinned_queries.expect("pinned queries set");
+        assert_eq!(pinned.len(), 2);
+        assert_eq!(pinned[0], "SELECT id FROM users WHERE true");
+        assert_eq!(pinned[1], "SELECT * FROM settings WHERE true");
+    }
+
+    #[test]
+    fn toml_parse_pinned_tables() {
+        let toml_str = r#"
+num_workers = 4
+
+pinned_tables = ["settings", "products"]
+
+[origin]
+host = "origin.example.com"
+port = 5432
+user = "origin_user"
+database = "origin_db"
+
+[cache]
+host = "localhost"
+port = 5433
+user = "cache_user"
+database = "cache_db"
+
+[cdc]
+publication_name = "test_pub"
+slot_name = "test_slot"
+
+[listen]
+socket = "127.0.0.1:5434"
+"#;
+
+        let settings: SettingsToml = toml::from_str(toml_str).expect("parse TOML");
+
+        let tables = settings.pinned_tables.expect("pinned_tables present");
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0], "settings");
+        assert_eq!(tables[1], "products");
     }
 }
