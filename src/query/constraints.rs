@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use ecow::EcoString;
+
 use crate::query::ast::{BinaryOp, LiteralValue, MultiOp};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
@@ -38,7 +40,7 @@ pub struct QueryConstraints {
     pub equivalences: HashSet<ColumnEquivalence>,
 
     /// Constraints organized by table for quick lookup
-    pub table_constraints: HashMap<String, Vec<(String, BinaryOp, LiteralValue)>>,
+    pub table_constraints: HashMap<EcoString, Vec<(EcoString, BinaryOp, LiteralValue)>>,
 }
 
 impl QueryConstraints {
@@ -302,14 +304,14 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
     let column_constraints = propagate_constraints(constraints, &equivalences);
 
     // Step 3: Organize by table for quick lookup
-    let mut table_constraints: HashMap<String, Vec<(String, BinaryOp, LiteralValue)>> =
+    let mut table_constraints: HashMap<EcoString, Vec<(EcoString, BinaryOp, LiteralValue)>> =
         HashMap::new();
     for constraint in &column_constraints {
         table_constraints
-            .entry(constraint.column.table.to_string())
+            .entry(constraint.column.table.clone())
             .or_default()
             .push((
-                constraint.column.column.to_string(),
+                constraint.column.column.clone(),
                 constraint.op,
                 constraint.value.clone(),
             ));
