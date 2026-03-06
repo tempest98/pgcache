@@ -223,9 +223,7 @@ fn poll_tls_read<T: TlsConnectionOps>(
             }
 
             if let Err(e) = tls.process_new_packets() {
-                debug!(
-                    "tls: process_new_packets failed, consumed={consumed} filled={filled}: {e}"
-                );
+                debug!("tls: process_new_packets failed, consumed={consumed} filled={filled}: {e}");
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
             }
 
@@ -313,7 +311,6 @@ impl<T: TlsConnectionOps> TlsWriteHalf<'_, T> {
             TlsWriteHalf::Tls { tcp, .. } => tcp.writable().await,
         }
     }
-
 }
 
 impl<T: TlsConnectionOps> AsyncWrite for TlsWriteHalf<'_, T> {

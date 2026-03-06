@@ -70,7 +70,10 @@ impl CacheWriter {
             .await?;
 
         if matched {
-            let total = self.cache.update_queries.get(&relation_oid)
+            let total = self
+                .cache
+                .update_queries
+                .get(&relation_oid)
                 .map_or(0, |q| q.queries.len() as u64);
             let freshness_count = total.saturating_sub(invalidation_count);
             if freshness_count > 0 {
@@ -121,7 +124,10 @@ impl CacheWriter {
             .await?;
 
         if matched {
-            let total = self.cache.update_queries.get(&relation_oid)
+            let total = self
+                .cache
+                .update_queries
+                .get(&relation_oid)
                 .map_or(0, |q| q.queries.len() as u64);
             let freshness_count = total.saturating_sub(invalidation_count);
             if freshness_count > 0 {
@@ -226,7 +232,10 @@ impl CacheWriter {
         }
 
         if rows_deleted > 0 {
-            let total = self.cache.update_queries.get(&relation_oid)
+            let total = self
+                .cache
+                .update_queries
+                .get(&relation_oid)
                 .map_or(0, |q| q.queries.len() as u64);
             let freshness_count = total.saturating_sub(invalidation_count);
             if freshness_count > 0 {
