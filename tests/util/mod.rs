@@ -186,10 +186,10 @@ impl TestContext {
     }
 
     /// Set up a test context with a table allowlist.
-    pub async fn setup_allowlist(cache_tables: &str) -> Result<Self, Error> {
+    pub async fn setup_allowlist(allowed_tables: &str) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_allowlist(&dbs, cache_tables).await?;
+            connect_pgcache_allowlist(&dbs, allowed_tables).await?;
         Ok(Self {
             cache,
             origin,
@@ -499,7 +499,7 @@ pub async fn connect_pgcache_small_cache(
 /// Connect to pgcache with a table allowlist.
 pub async fn connect_pgcache_allowlist(
     dbs: &TempDBs,
-    cache_tables: &str,
+    allowed_tables: &str,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     let listen_port = find_available_port()?;
     let metrics_port = find_available_port()?;
@@ -507,7 +507,7 @@ pub async fn connect_pgcache_allowlist(
         dbs,
         listen_port,
         metrics_port,
-        &["--cache_policy", "fifo", "--cache_tables", cache_tables],
+        &["--cache_policy", "fifo", "--allowed_tables", allowed_tables],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
     let client = pgcache_client_connect(listen_port).await?;

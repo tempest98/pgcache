@@ -18,7 +18,7 @@ mod util;
 #[tokio::test]
 async fn test_pinned_query_cache_hit_on_first_request() -> Result<(), Error> {
     let mut ctx = TestContext::setup_pinned(
-        "SELECT id, name FROM pin_table WHERE true",
+        "SELECT id, name FROM pin_table",
         |origin| async move {
             origin
                 .execute(
@@ -45,7 +45,7 @@ async fn test_pinned_query_cache_hit_on_first_request() -> Result<(), Error> {
     // First client request — should be a cache hit (pinned query already populated)
     let m = ctx.metrics().await?;
     let res = ctx
-        .simple_query("SELECT id, name FROM pin_table WHERE true")
+        .simple_query("SELECT id, name FROM pin_table")
         .await?;
     assert_row_at(&res, 1, &[("id", "1"), ("name", "alice")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("name", "bob")])?;
@@ -63,7 +63,7 @@ async fn test_pinned_query_cache_hit_on_first_request() -> Result<(), Error> {
 async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
     let pinned_sql = "SELECT p.id, p.name, d.detail \
         FROM pin_parent p JOIN pin_detail d ON d.parent_id = p.id \
-        WHERE true ORDER BY d.detail";
+        ORDER BY d.detail";
 
     let mut ctx = TestContext::setup_pinned(pinned_sql, |origin| async move {
         origin
@@ -163,7 +163,7 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
 /// triggers eviction. The pinned query should survive while others are evicted.
 #[tokio::test]
 async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
-    let pinned_sql = "SELECT id, data FROM pin_survive WHERE true";
+    let pinned_sql = "SELECT id, data FROM pin_survive";
 
     let mut ctx = TestContext::setup_pinned_small_cache(
         pinned_sql,
@@ -221,14 +221,11 @@ async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
     let m = assert_cache_hit(&mut ctx, m).await?;
 
     // Register non-pinned queries to fill the cache and trigger eviction
-    ctx.simple_query("SELECT id, data FROM evict_x WHERE true")
-        .await?;
+    ctx.simple_query("SELECT id, data FROM evict_x").await?;
     wait_cache_load().await;
-    ctx.simple_query("SELECT id, data FROM evict_y WHERE true")
-        .await?;
+    ctx.simple_query("SELECT id, data FROM evict_y").await?;
     wait_cache_load().await;
-    ctx.simple_query("SELECT id, data FROM evict_z WHERE true")
-        .await?;
+    ctx.simple_query("SELECT id, data FROM evict_z").await?;
     wait_cache_load().await;
 
     // Extra wait for eviction to complete
@@ -272,7 +269,7 @@ async fn test_pinned_query_invalid_sql_skipped() -> Result<(), Error> {
     // Normal queries work fine — first request is a cache miss (pass-through)
     let m = ctx.metrics().await?;
     let res = ctx
-        .simple_query("SELECT id, data FROM normal_table WHERE true")
+        .simple_query("SELECT id, data FROM normal_table")
         .await?;
     assert_row_at(&res, 1, &[("id", "1"), ("data", "works")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
@@ -280,7 +277,7 @@ async fn test_pinned_query_invalid_sql_skipped() -> Result<(), Error> {
     wait_cache_load().await;
 
     let res = ctx
-        .simple_query("SELECT id, data FROM normal_table WHERE true")
+        .simple_query("SELECT id, data FROM normal_table")
         .await?;
     assert_row_at(&res, 1, &[("id", "1"), ("data", "works")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;

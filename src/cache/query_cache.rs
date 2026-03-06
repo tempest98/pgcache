@@ -106,7 +106,7 @@ pub struct QueryCache {
     state_view: Arc<RwLock<CacheStateView>>,
     cache_policy: CachePolicy,
     admission_threshold: u32,
-    cache_tables: Allowlist,
+    allowed_tables: Allowlist,
 }
 
 impl QueryCache {
@@ -116,11 +116,11 @@ impl QueryCache {
         worker_tx: UnboundedSender<WorkerRequest>,
         state_view: Arc<RwLock<CacheStateView>>,
     ) -> CacheResult<Self> {
-        let cache_tables = allowlist_parse(&settings.cache_tables);
-        match &cache_tables {
+        let allowed_tables = allowlist_parse(&settings.allowed_tables);
+        match &allowed_tables {
             Some(entries) => {
                 let names: Vec<&str> = settings
-                    .cache_tables
+                    .allowed_tables
                     .as_ref()
                     .map(|v| v.iter().map(String::as_str).collect())
                     .unwrap_or_default();
@@ -136,14 +136,14 @@ impl QueryCache {
             state_view,
             cache_policy: settings.cache_policy,
             admission_threshold: settings.admission_threshold,
-            cache_tables,
+            allowed_tables,
         })
     }
 
     /// Check whether all tables in the query are in the allowlist.
     /// Returns true if no allowlist is configured (all tables allowed).
     fn query_allowlist_check(&self, query: &QueryExpr) -> bool {
-        let Some(entries) = &self.cache_tables else {
+        let Some(entries) = &self.allowed_tables else {
             return true;
         };
         query.nodes::<TableNode>().all(|t| {

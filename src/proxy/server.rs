@@ -496,7 +496,7 @@ mod tests {
             log_level: None,
             cache_policy: CachePolicy::Clock,
             admission_threshold: 2,
-            cache_tables: None,
+            allowed_tables: None,
             pinned_queries,
         }
     }
@@ -521,8 +521,8 @@ mod tests {
     #[test]
     fn pinned_queries_validate_multiple_queries() {
         let settings = test_settings(Some(vec![
-            "SELECT * FROM users WHERE true".to_owned(),
-            "SELECT * FROM orders WHERE true".to_owned(),
+            "SELECT * FROM users".to_owned(),
+            "SELECT * FROM orders".to_owned(),
         ]));
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert_eq!(result.len(), 2);
@@ -548,9 +548,9 @@ mod tests {
     #[test]
     fn pinned_queries_validate_mixed_valid_and_invalid() {
         let settings = test_settings(Some(vec![
-            "SELECT * FROM users WHERE true".to_owned(),
+            "SELECT * FROM users".to_owned(),
             "NOT VALID SQL".to_owned(),
-            "SELECT * FROM orders WHERE true".to_owned(),
+            "SELECT * FROM orders".to_owned(),
         ]));
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert_eq!(result.len(), 2);
