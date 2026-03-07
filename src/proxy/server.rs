@@ -467,6 +467,8 @@ pub fn proxy_run(settings: &Settings, cancel: CancellationToken) -> ConnectionRe
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+
     use std::collections::HashMap;
 
     use crate::catalog::FunctionVolatility;

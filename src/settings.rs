@@ -634,6 +634,8 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
+
     use super::*;
 
     fn base_settings() -> PgSettings {
@@ -1434,9 +1436,7 @@ socket = "127.0.0.1:5434"
     #[test]
     fn settings_build_pinned_queries_cli_semicolon() {
         let args = CliArgs {
-            pinned_queries: Some(
-                "SELECT id, name FROM a;SELECT id, name FROM b".to_owned(),
-            ),
+            pinned_queries: Some("SELECT id, name FROM a;SELECT id, name FROM b".to_owned()),
             ..base_cli_args()
         };
 
