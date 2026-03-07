@@ -20,6 +20,7 @@ use tokio::{
 use tokio_postgres::{Client, Error};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, trace};
@@ -85,7 +86,8 @@ impl CdcProcessor {
 
     /// Starts the CDC replication stream and processes incoming messages.
     /// Uses tokio::select! for concurrent message processing and periodic keep-alives.
-    pub async fn run(&mut self) -> Result<(), Error> {
+    /// Returns Ok(()) on graceful shutdown via cancellation token.
+    pub async fn run(&mut self, cancel: CancellationToken) -> Result<(), Error> {
         // Start replication stream
         let slot = self.slot_name.as_str();
         let publ = self.publication_name.as_str();
@@ -102,6 +104,10 @@ impl CdcProcessor {
 
         loop {
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!("CDC shutdown signal received");
+                    break;
+                }
                 // Handle incoming replication messages
                 msg_result = stream.next() => {
                     trace!("cdc stream result {msg_result:?}");

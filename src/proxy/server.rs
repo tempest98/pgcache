@@ -9,6 +9,7 @@ use tokio::{
     sync::mpsc::{UnboundedSender, channel, unbounded_channel},
     time::{Sleep, sleep},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
 use crate::metrics::names;
@@ -67,6 +68,7 @@ impl<'scope> ProxyCacheState<'scope> {
         scope: &'scope thread::Scope<'scope, 'env>,
         settings: &'settings Settings,
         pinned: &'settings [PinnedQuery],
+        cancel: CancellationToken,
     ) {
         self.backoff = None;
         self.attempts += 1;
@@ -76,7 +78,9 @@ impl<'scope> ProxyCacheState<'scope> {
             self.attempts
         );
 
-        if let Some((new_handle, new_tx)) = cache_restart_attempt(scope, settings, pinned).await {
+        if let Some((new_handle, new_tx)) =
+            cache_restart_attempt(scope, settings, pinned, cancel).await
+        {
             self.handle = Some(new_handle);
             // Update all subscribers with the new cache sender
             self.updater.sender_update(new_tx.clone());
@@ -209,13 +213,14 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     pinned: &'settings [PinnedQuery],
+    cancel: CancellationToken,
 ) -> Result<Cache<'scope>, std::io::Error> {
     const DEFAULT_CHANNEL_SIZE: usize = 100;
     let (cache_tx, cache_rx) = channel(DEFAULT_CHANNEL_SIZE);
 
     let cache_handle = thread::Builder::new()
         .name("cache".to_owned())
-        .spawn_scoped(scope, || cache_run(settings, cache_rx, pinned))?;
+        .spawn_scoped(scope, || cache_run(settings, cache_rx, pinned, cancel))?;
 
     Ok((cache_handle, cache_tx))
 }
@@ -227,13 +232,14 @@ async fn cache_restart_attempt<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     pinned: &'settings [PinnedQuery],
+    cancel: CancellationToken,
 ) -> Option<Cache<'scope>> {
     if let Err(e) = replication_provision(settings).await {
         error!("replication provision failed: {:?}", e);
         return None;
     }
 
-    match cache_create(scope, settings, pinned) {
+    match cache_create(scope, settings, pinned, cancel) {
         Ok(cache) => Some(cache),
         Err(e) => {
             error!("cache creation failed: {:?}", e);
@@ -353,7 +359,7 @@ fn pinned_queries_validate(
 
 #[tracing::instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
+pub fn proxy_run(settings: &Settings, cancel: CancellationToken) -> ConnectionResult<()> {
     // Load TLS config if certificates are provided
     let tls_acceptor = tls_config_load(settings)?;
 
@@ -374,7 +380,8 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
             .build()
             .map_into_report::<ConnectionError>()?;
 
-        let (cache_handle, cache_tx) = cache_create(scope, settings, &pinned)
+        let cache_cancel = cancel.child_token();
+        let (cache_handle, cache_tx) = cache_create(scope, settings, &pinned, cache_cancel.clone())
             .map_into_report::<ConnectionError>()
             .attach_loc("creating cache thread")?;
         let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
@@ -403,6 +410,10 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
             let mut cur_worker = 0;
             loop {
                 tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("proxy shutdown signal received");
+                        break;
+                    }
                     // Branch 1: Accept new connections
                     result = listener.accept() => {
                         let (socket, _) = result.map_err(|e| {
@@ -439,20 +450,17 @@ pub fn proxy_run(settings: &Settings) -> ConnectionResult<()> {
                     // Branch 3: Backoff timer expired - retry restart
                     _ = ProxyCacheState::backoff_wait(&mut cache_state.backoff) => {
                         cache_state
-                            .handle_backoff_expired(scope, settings, &pinned)
+                            .handle_backoff_expired(scope, settings, &pinned, cache_cancel.child_token())
                             .await;
                     }
                 }
             }
 
-            #[expect(unreachable_code)]
-            {
-                replication_cleanup(settings)
-                    .await
-                    .map_err(|r| r.context_transform(ConnectionError::CdcError))
-                    .attach_loc("cleaning up replication")?;
-                Ok(())
-            }
+            replication_cleanup(settings)
+                .await
+                .map_err(|r| r.context_transform(ConnectionError::CdcError))
+                .attach_loc("cleaning up replication")?;
+            Ok(())
         })
     })
 }

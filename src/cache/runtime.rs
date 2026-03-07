@@ -11,6 +11,7 @@ use tokio::{
     task::{LocalSet, spawn_local},
 };
 use tokio_postgres::{Config, NoTls};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
 
 use crate::{
@@ -210,6 +211,7 @@ pub fn cache_run(
     settings: &Settings,
     cache_rx: Receiver<ProxyMessage>,
     pinned: &[crate::cache::PinnedQuery],
+    cancel: CancellationToken,
 ) -> CacheResult<()> {
     // Reset cache database before starting anything
     cache_database_reset(settings).attach_loc("resetting cache database")?;
@@ -234,6 +236,7 @@ pub fn cache_run(
         let state_view_writer = Arc::clone(&state_view);
         let active_relations_writer = Arc::clone(&active_relations);
         let settings_writer = settings.clone();
+        let cancel_writer = cancel.child_token();
         let _writer_handle = thread::Builder::new()
             .name("cache writer".to_owned())
             .spawn_scoped(scope, move || {
@@ -243,6 +246,7 @@ pub fn cache_run(
                     cdc_cmd_rx,
                     state_view_writer,
                     active_relations_writer,
+                    cancel_writer,
                 )
             })
             .map_into_report::<CacheError>()
@@ -250,21 +254,23 @@ pub fn cache_run(
 
         // Spawn worker thread (executes cached queries - read-only)
         let (worker_tx, worker_rx) = unbounded_channel();
+        let cancel_worker = cancel.child_token();
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
-            .spawn_scoped(scope, || worker_run(settings, worker_rx))
+            .spawn_scoped(scope, || worker_run(settings, worker_rx, cancel_worker))
             .map_into_report::<CacheError>()
             .attach_loc("spawning worker thread")?;
 
         // Spawn CDC thread -- sends CdcCommand directly to writer
         let (cdc_exit_tx, mut cdc_exit_rx) = oneshot::channel::<()>();
         let active_relations_cdc = Arc::clone(&active_relations);
+        let cancel_cdc = cancel.child_token();
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
             .spawn_scoped(scope, move || {
                 // cdc_exit_tx drops when this closure returns, signaling the runtime
                 let _cdc_exit = cdc_exit_tx;
-                cdc_run(settings, cdc_cmd_tx, active_relations_cdc)
+                cdc_run(settings, cdc_cmd_tx, active_relations_cdc, cancel_cdc)
             })
             .map_into_report::<CacheError>()
             .attach_loc("spawning CDC thread")?;
@@ -290,6 +296,10 @@ pub fn cache_run(
                     loop {
                         // Block until at least one message arrives
                         tokio::select! {
+                            _ = cancel.cancelled() => {
+                                debug!("cache coordinator shutdown signal received");
+                                break;
+                            }
                             _ = query_tx.closed() => {
                                 error!("writer thread exited unexpectedly");
                                 return Err(CacheError::WriterFailure.into());
@@ -330,6 +340,7 @@ pub fn cache_run(
 fn worker_run(
     settings: &Settings,
     mut worker_rx: UnboundedReceiver<WorkerRequest>,
+    cancel: CancellationToken,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -347,8 +358,15 @@ fn worker_run(
                 loop {
                     // Block for at least one request (track wait time)
                     let wait_start = Instant::now();
-                    let Some(msg) = worker_rx.recv().await else {
-                        break;
+                    let msg = tokio::select! {
+                        _ = cancel.cancelled() => {
+                            debug!("cache worker shutdown signal received");
+                            break;
+                        }
+                        msg = worker_rx.recv() => {
+                            let Some(msg) = msg else { break };
+                            msg
+                        }
                     };
                     metrics::histogram!(names::CACHE_WORKER_WAIT_SECONDS)
                         .record(wait_start.elapsed().as_secs_f64());
@@ -387,6 +405,7 @@ fn cdc_run(
     settings: &Settings,
     cdc_tx: UnboundedSender<CdcCommand>,
     active_relations: ActiveRelations,
+    cancel: CancellationToken,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -399,10 +418,9 @@ fn cdc_run(
             .await
             .attach_loc("initializing CDC processor")?;
 
-        // CDC should run forever - any return (Ok or Err) is unexpected
-        match cdc.run().await {
+        match cdc.run(cancel).await {
             Ok(()) => {
-                error!("cdc.run() exited unexpectedly without error");
+                debug!("cdc.run() exited");
             }
             Err(e) => {
                 error!("cdc.run() failed: {e}");

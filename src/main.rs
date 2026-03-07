@@ -1,4 +1,3 @@
-use std::process::exit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -9,6 +8,7 @@ use pgcache_lib::metrics::prometheus_install;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use rootcause::Report;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(not(feature = "console"))]
 use pgcache_lib::tracing_utils::SimpeFormatter;
@@ -60,40 +60,45 @@ fn main() -> Result<(), Report> {
         tracing::subscriber::set_global_default(subscriber)?;
     }
 
+    let cancel = CancellationToken::new();
+
     let sigint = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))?;
 
     thread::scope(|scope| {
+        let cancel_proxy = cancel.child_token();
         let proxy_handle = thread::Builder::new()
             .name("proxy".to_owned())
-            .spawn_scoped(scope, || proxy_run(&settings))?;
+            .spawn_scoped(scope, || proxy_run(&settings, cancel_proxy))?;
 
         let sleep_duration = Duration::from_millis(500);
 
-        let mut res = Ok(());
-        while !sigint.load(Ordering::Relaxed) {
-            if proxy_handle.is_finished() {
-                res = proxy_handle
-                    .join()
-                    .unwrap_or_else(|_panic| {
-                        Err(
-                            ConnectionError::IoError(io::Error::other("proxy thread panicked"))
-                                .into(),
-                        )
-                    })
-                    .map_err(|e| e.into_dynamic());
-                break;
-            }
-
+        // Wait for either SIGINT or proxy thread to finish
+        while !sigint.load(Ordering::Relaxed) && !proxy_handle.is_finished() {
             sleep(sleep_duration);
         }
-        info!("process terminating {res:?}");
+
+        // Signal all threads to shut down
+        info!("shutting down");
+        cancel.cancel();
+
+        // Wait for proxy thread to finish
+        let res = proxy_handle
+            .join()
+            .unwrap_or_else(|_panic| {
+                Err(
+                    ConnectionError::IoError(io::Error::other("proxy thread panicked"))
+                        .into(),
+                )
+            })
+            .map_err(|e| e.into_dynamic());
+
+        info!("process terminated {res:?}");
 
         // print the report.
         #[cfg(feature = "hotpath")]
         drop(_guard);
 
-        //kill the process
-        exit(if res.is_ok() { 0 } else { 1 });
+        res
     })
 }

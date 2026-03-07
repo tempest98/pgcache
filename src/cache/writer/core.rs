@@ -8,6 +8,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, Config, NoTls};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
 
 use crate::catalog::{TableMetadata, aggregate_functions_load};
@@ -648,6 +649,7 @@ pub fn writer_run(
     mut cdc_rx: UnboundedReceiver<CdcCommand>,
     state_view: Arc<RwLock<CacheStateView>>,
     active_relations: ActiveRelations,
+    cancel: CancellationToken,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -667,6 +669,10 @@ pub fn writer_run(
 
                 loop {
                     tokio::select! {
+                        _ = cancel.cancelled() => {
+                            debug!("writer shutdown signal received");
+                            break;
+                        }
                         // Handle query commands from coordinator
                         msg = query_rx.recv() => {
                             match msg {
