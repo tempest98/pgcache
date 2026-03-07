@@ -17,6 +17,9 @@ use tracing::info;
 #[cfg(not(feature = "console"))]
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<(), Report> {
     // Install rustls crypto provider for TLS support
     rustls::crypto::aws_lc_rs::default_provider()
