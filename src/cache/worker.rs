@@ -115,7 +115,7 @@ async fn handle_cached_query_text(
 
     // Generate SQL query from resolved AST (with schema-qualified table names)
     #[cfg(feature = "hotpath")]
-    let _m = hotpath::functions::MeasurementGuard::new("hcqt:deparse", false, false);
+    let _m = hotpath::functions::MeasurementGuard::new("hcqt:deparse", false, false, false);
 
     let mut sql = String::new();
     msg.resolved.deparse(&mut sql);
@@ -130,7 +130,7 @@ async fn handle_cached_query_text(
 
     // Send query to cache database
     #[cfg(feature = "hotpath")]
-    let _m = hotpath::functions::MeasurementGuard::new("hcqt:send_query", false, false);
+    let _m = hotpath::functions::MeasurementGuard::new("hcqt:send_query", false, false, false);
 
     conn.simple_query_send(&combined_sql)
         .await
@@ -143,7 +143,7 @@ async fn handle_cached_query_text(
 
     // Stream results to client
     #[cfg(feature = "hotpath")]
-    let _m = hotpath::functions::MeasurementGuard::new("hcqt:stream", false, false);
+    let _m = hotpath::functions::MeasurementGuard::new("hcqt:stream", false, false, false);
 
     let CacheConnection {
         stream,
@@ -185,7 +185,7 @@ async fn handle_cached_query_text(
                 };
 
                 #[cfg(feature = "hotpath")]
-                let _match = hotpath::functions::MeasurementGuard::new("hcqt:match", false, false);
+                let _match = hotpath::functions::MeasurementGuard::new("hcqt:match", false, false, false);
 
                 match (state, frame.message_type) {
                     (TextResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {

@@ -27,7 +27,7 @@ fn main() -> Result<(), Report> {
         .map_err(|_| io::Error::other("crypto provider already installed"))?;
 
     #[cfg(feature = "hotpath")]
-    let _guard = hotpath::FunctionsGuardBuilder::new("pgcache")
+    let _guard = hotpath::HotpathGuardBuilder::new("pgcache")
         .percentiles(&[50, 95, 99])
         .format(hotpath::Format::Table)
         .build();
