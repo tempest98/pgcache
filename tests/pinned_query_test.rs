@@ -17,9 +17,8 @@ mod util;
 /// query can resolve and populate during cache initialization.
 #[tokio::test]
 async fn test_pinned_query_cache_hit_on_first_request() -> Result<(), Error> {
-    let mut ctx = TestContext::setup_pinned(
-        "SELECT id, name FROM pin_table",
-        |origin| async move {
+    let mut ctx =
+        TestContext::setup_pinned("SELECT id, name FROM pin_table", |origin| async move {
             origin
                 .execute(
                     "CREATE TABLE pin_table (id INTEGER PRIMARY KEY, name TEXT)",
@@ -35,18 +34,15 @@ async fn test_pinned_query_cache_hit_on_first_request() -> Result<(), Error> {
                 .await
                 .map_err(Error::other)?;
             Ok(origin)
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     // Wait for pinned query to finish populating
     wait_cache_load().await;
 
     // First client request — should be a cache hit (pinned query already populated)
     let m = ctx.metrics().await?;
-    let res = ctx
-        .simple_query("SELECT id, name FROM pin_table")
-        .await?;
+    let res = ctx.simple_query("SELECT id, name FROM pin_table").await?;
     assert_row_at(&res, 1, &[("id", "1"), ("name", "alice")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("name", "bob")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
@@ -110,9 +106,6 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
         &[("id", "1"), ("name", "alice"), ("detail", "original")],
     )?;
     let m = assert_cache_hit(&mut ctx, m).await?;
-
-    // Snapshot before CDC mutation
-    let m = ctx.metrics().await?;
 
     // CDC: insert a new detail row that joins into the result set.
     // This triggers invalidation on the join table.
@@ -218,7 +211,7 @@ async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
     // Verify pinned query is serving hits
     let m = ctx.metrics().await?;
     ctx.simple_query(pinned_sql).await?;
-    let m = assert_cache_hit(&mut ctx, m).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     // Register non-pinned queries to fill the cache and trigger eviction
     ctx.simple_query("SELECT id, data FROM evict_x").await?;
