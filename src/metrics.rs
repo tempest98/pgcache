@@ -1,5 +1,6 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::Response;
@@ -10,6 +11,9 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use rootcause::Report;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+
+use crate::cache::StatusRequest;
+use crate::proxy::{SharedProxyStatus, StatusSender};
 
 /// Metrics subsystem errors.
 #[derive(Debug)]
@@ -130,15 +134,11 @@ pub mod names {
     pub const CACHE_WORKER_CONN_WAIT_SECONDS: &str = "pgcache.cache.worker_conn_wait_seconds";
 }
 
-/// Install the Prometheus metrics recorder.
+/// Install the global Prometheus metrics recorder.
 ///
-/// If `metrics_socket` is provided, spawns an HTTP server on that address
-/// serving Prometheus metrics at `/metrics` with CORS headers enabled.
-/// The server shuts down gracefully when the cancellation token is cancelled.
-pub fn prometheus_install(
-    metrics_socket: Option<SocketAddr>,
-    cancel: CancellationToken,
-) -> MetricsResult<()> {
+/// This only builds the recorder and sets it as global. Call `admin_server_spawn`
+/// separately to start the HTTP server once the status channel is available.
+pub fn metrics_recorder_install() -> MetricsResult<PrometheusHandle> {
     let recorder = PrometheusBuilder::new()
         .set_quantiles(&[0.5, 0.95, 0.99])
         .map_err(|e| MetricsError::Build(e.to_string()))?
@@ -149,28 +149,51 @@ pub fn prometheus_install(
     metrics::set_global_recorder(recorder)
         .map_err(|_| Report::new(MetricsError::RecorderInstall))?;
 
-    if let Some(socket) = metrics_socket {
-        std::thread::Builder::new()
-            .name("http".to_owned())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("metrics tokio runtime");
-                rt.block_on(metrics_server_run(socket, handle, cancel));
-            })
-            .map_err(|e| Report::new(MetricsError::Build(format!("http thread spawn: {e}"))))?;
-    }
+    Ok(handle)
+}
 
+/// Spawn the admin HTTP server thread.
+///
+/// Serves `/metrics`, `/healthz`, `/readyz`, and `/status` endpoints.
+/// The `/status` endpoint sends a `StatusRequest` to the cache writer and
+/// returns the JSON response.
+pub fn admin_server_spawn(
+    addr: SocketAddr,
+    metrics: PrometheusHandle,
+    cancel: CancellationToken,
+    shared_proxy_status: SharedProxyStatus,
+    status_tx: StatusSender,
+) -> Result<(), std::io::Error> {
+    std::thread::Builder::new()
+        .name("http".to_owned())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("admin server tokio runtime");
+            rt.block_on(admin_server_run(
+                addr,
+                metrics,
+                cancel,
+                shared_proxy_status,
+                status_tx,
+            ));
+        })?;
     Ok(())
 }
 
-/// HTTP server that serves Prometheus metrics via hyper.
-async fn metrics_server_run(addr: SocketAddr, handle: PrometheusHandle, cancel: CancellationToken) {
+/// Admin HTTP server that serves metrics, health, and status endpoints.
+async fn admin_server_run(
+    addr: SocketAddr,
+    handle: PrometheusHandle,
+    cancel: CancellationToken,
+    shared_proxy_status: SharedProxyStatus,
+    status_tx: StatusSender,
+) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("metrics server bind failed on {addr}: {e}");
+            tracing::error!("admin server bind failed on {addr}: {e}");
             return;
         }
     };
@@ -182,7 +205,7 @@ async fn metrics_server_run(addr: SocketAddr, handle: PrometheusHandle, cancel: 
                 match result {
                     Ok((stream, _)) => stream,
                     Err(e) => {
-                        tracing::warn!("metrics server accept error: {e}");
+                        tracing::warn!("admin server accept error: {e}");
                         continue;
                     }
                 }
@@ -190,9 +213,13 @@ async fn metrics_server_run(addr: SocketAddr, handle: PrometheusHandle, cancel: 
         };
 
         let handle = handle.clone();
+        let shared_proxy_status = shared_proxy_status.clone();
+        let status_tx = status_tx.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request: http::Request<hyper::body::Incoming>| {
                 let h = handle.clone();
+                let proxy_status = shared_proxy_status.clone();
+                let status_tx = status_tx.clone();
                 async move {
                     match request.uri().path() {
                         "/metrics" => {
@@ -202,9 +229,22 @@ async fn metrics_server_run(addr: SocketAddr, handle: PrometheusHandle, cancel: 
                                 .header("Access-Control-Allow-Origin", "*")
                                 .body(Full::new(Bytes::from(body)))
                         }
-                        "/healthz" | "/readyz" => Response::builder()
+                        "/healthz" => Response::builder()
                             .header("Content-Type", "text/plain")
                             .body(Full::new(Bytes::from("OK"))),
+                        "/readyz" => {
+                            if proxy_status.is_ready() {
+                                Response::builder()
+                                    .header("Content-Type", "text/plain")
+                                    .body(Full::new(Bytes::from("OK")))
+                            } else {
+                                Response::builder()
+                                    .status(503)
+                                    .header("Content-Type", "text/plain")
+                                    .body(Full::new(Bytes::from("not ready")))
+                            }
+                        }
+                        "/status" => status_handle(status_tx).await,
                         _ => Response::builder()
                             .status(404)
                             .body(Full::new(Bytes::from("Not Found"))),
@@ -216,10 +256,44 @@ async fn metrics_server_run(addr: SocketAddr, handle: PrometheusHandle, cancel: 
                 .serve_connection(TokioIo::new(stream), service)
                 .await
             {
-                tracing::debug!("metrics connection error: {e}");
+                tracing::debug!("admin connection error: {e}");
             }
         });
     }
 
-    tracing::debug!("metrics server shutting down");
+    tracing::debug!("admin server shutting down");
+}
+
+/// Handle a `/status` request by querying the cache writer via the status channel.
+async fn status_handle(
+    status_tx: StatusSender,
+) -> Result<Response<Full<Bytes>>, http::Error> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let req = StatusRequest { reply_tx };
+
+    if status_tx.send(req).await.is_err() {
+        return Response::builder()
+            .status(503)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(r#"{"error":"cache unavailable"}"#)));
+    }
+
+    match tokio::time::timeout(Duration::from_secs(2), reply_rx).await {
+        Ok(Ok(response)) => {
+            let body = serde_json::to_string(&response).unwrap_or_else(|e| {
+                format!(r#"{{"error":"serialization failed: {e}"}}"#)
+            });
+            Response::builder()
+                .header("Content-Type", "application/json")
+                .body(Full::new(Bytes::from(body)))
+        }
+        Ok(Err(_)) => Response::builder()
+            .status(503)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(r#"{"error":"cache channel closed"}"#))),
+        Err(_) => Response::builder()
+            .status(503)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(r#"{"error":"status request timed out"}"#))),
+    }
 }

@@ -4,16 +4,19 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::{LocalSet, spawn_local};
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
+use tokio::task::{LocalSet, spawn_local, yield_now};
 use tokio_postgres::{Client, Config, NoTls};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
 
+use crate::cache::status::{
+    CacheStatusData, CdcStatusData, QueryStatusData, StatusRequest, StatusResponse,
+};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::metrics::names;
 use crate::pg;
+use crate::query::ast::Deparse;
 use crate::query::resolved::ResolvedSelectNode;
 use crate::settings::{CachePolicy, Settings};
 
@@ -622,6 +625,68 @@ impl CacheWriter {
         Ok(())
     }
 
+    /// Build and send a status response for an admin `/status` request.
+    async fn status_respond(&self, req: StatusRequest) {
+        let cache = &self.cache;
+
+        let cache_status = CacheStatusData {
+            size_bytes: cache.current_size,
+            size_limit_bytes: cache.cache_size,
+            generation: cache.generation_counter,
+            tables_tracked: cache.tables.len(),
+            policy: format!("{:?}", cache.cache_policy),
+        };
+
+        let mut queries: Vec<QueryStatusData> = Vec::with_capacity(cache.cached_queries.len());
+        for q in &cache.cached_queries {
+            let mut sql_preview = String::with_capacity(128);
+            Deparse::deparse(&*q.resolved, &mut sql_preview);
+            sql_preview.truncate(200);
+
+            let tables: Vec<String> = q
+                .relation_oids
+                .iter()
+                .filter_map(|oid| {
+                    cache
+                        .tables
+                        .get1(oid)
+                        .map(|t| format!("{}.{}", t.schema, t.name))
+                })
+                .collect();
+
+            let state = self
+                .state_view
+                .read()
+                .ok()
+                .and_then(|view| {
+                    view.cached_queries
+                        .get(&q.fingerprint)
+                        .map(|v| format!("{:?}", v.state))
+                })
+                .unwrap_or_else(|| "Unknown".to_owned());
+
+            queries.push(QueryStatusData {
+                fingerprint: q.fingerprint,
+                sql_preview,
+                tables,
+                state,
+                cached_bytes: q.cached_bytes,
+                max_limit: q.max_limit,
+                pinned: q.pinned,
+            });
+
+            yield_now().await;
+        }
+
+        let response = StatusResponse {
+            cache: cache_status,
+            cdc: CdcStatusData::default(),
+            queries,
+        };
+
+        let _ = req.reply_tx.send(response);
+    }
+
     /// Purge rows with generation <= threshold.
     /// First promotes any gen-0 entries so they become purgeable in future cycles.
     pub(super) async fn generation_purge(&mut self, threshold: u64) -> CacheResult<i64> {
@@ -650,6 +715,7 @@ pub fn writer_run(
     state_view: Arc<RwLock<CacheStateView>>,
     active_relations: ActiveRelations,
     cancel: CancellationToken,
+    mut status_rx: Receiver<StatusRequest>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -713,6 +779,12 @@ pub fn writer_run(
                                     debug!("writer internal channel closed, shutting down");
                                     break;
                                 }
+                            }
+                        }
+                        // Handle status requests from admin HTTP server
+                        msg = status_rx.recv() => {
+                            if let Some(req) = msg {
+                                writer.status_respond(req).await;
                             }
                         }
                     }

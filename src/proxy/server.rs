@@ -1,18 +1,20 @@
 use std::{collections::HashMap, mem, sync::Arc, thread, time::Duration};
 
+use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
 
 use crate::result::{MapIntoReport, ReportExt};
 use tokio::{
     net::{TcpListener, TcpStream},
     runtime::Builder,
-    sync::mpsc::{UnboundedSender, channel, unbounded_channel},
+    sync::mpsc::{Receiver, UnboundedSender, channel, unbounded_channel},
     time::{Sleep, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
-use crate::metrics::names;
+use crate::cache::StatusRequest;
+use crate::metrics::{admin_server_spawn, names};
 
 /// Initial backoff delay for cache restart attempts
 const INITIAL_BACKOFF_MS: u64 = 100;
@@ -22,8 +24,10 @@ const STEADY_STATE_BACKOFF_MS: u64 = 60_000;
 struct ProxyCacheState<'scope> {
     handle: Option<thread::ScopedJoinHandle<'scope, CacheResult<()>>>,
     updater: CacheSenderUpdater,
+    status_updater: StatusSenderUpdater,
     /// Current sender for detecting when the cache thread exits via `.closed()`.
     current_tx: CacheSenderInner,
+    shared_status: SharedProxyStatus,
     alive: bool,
     attempts: u32,
     backoff: Option<std::pin::Pin<Box<Sleep>>>,
@@ -34,12 +38,16 @@ impl<'scope> ProxyCacheState<'scope> {
     fn new(
         handle: thread::ScopedJoinHandle<'scope, CacheResult<()>>,
         updater: CacheSenderUpdater,
+        status_updater: StatusSenderUpdater,
         current_tx: CacheSenderInner,
+        shared_status: SharedProxyStatus,
     ) -> Self {
         Self {
             handle: Some(handle),
             updater,
+            status_updater,
             current_tx,
+            shared_status,
             alive: true,
             attempts: 0,
             backoff: None,
@@ -50,9 +58,11 @@ impl<'scope> ProxyCacheState<'scope> {
     fn handle_exit(&mut self) {
         self.alive = false;
         self.attempts += 1;
+        self.shared_status.status_set(ProxyStatus::Degraded);
 
         // Mark cache as unavailable immediately so connections fall back to origin
         self.updater.sender_clear();
+        self.status_updater.sender_clear();
 
         let exit_result = self.handle.take().map(|h| h.join());
         error!(
@@ -78,12 +88,16 @@ impl<'scope> ProxyCacheState<'scope> {
             self.attempts
         );
 
+        // Create a fresh status channel for the restarted cache
+        let (new_status_tx, status_rx) = channel::<StatusRequest>(2);
+
         if let Some((new_handle, new_tx)) =
-            cache_restart_attempt(scope, settings, pinned, cancel).await
+            cache_restart_attempt(scope, settings, pinned, cancel, status_rx).await
         {
             self.handle = Some(new_handle);
-            // Update all subscribers with the new cache sender
+            // Update all subscribers with the new cache and status senders
             self.updater.sender_update(new_tx.clone());
+            self.status_updater.sender_update(new_status_tx);
             self.current_tx = new_tx;
             self.restart_reset();
             debug!("cache thread restarted successfully");
@@ -101,6 +115,7 @@ impl<'scope> ProxyCacheState<'scope> {
         self.alive = true;
         self.attempts = 0;
         self.backoff_ms = INITIAL_BACKOFF_MS;
+        self.shared_status.status_set(ProxyStatus::Normal);
     }
 
     fn backoff_schedule(&mut self) {
@@ -119,6 +134,7 @@ impl<'scope> ProxyCacheState<'scope> {
     }
 }
 
+use super::SharedProxyStatus;
 use crate::{
     cache::query::CacheableQuery,
     cache::{CacheResult, PinnedQuery, cache_run},
@@ -133,7 +149,10 @@ use crate::{
 };
 
 use super::cache_sender::CacheSenderInner;
-use super::{CacheSender, CacheSenderUpdater, ConnectionError, ConnectionResult, connection_run};
+use super::{
+    CacheSender, CacheSenderUpdater, ConnectionError, ConnectionResult, ProxyStatus,
+    StatusSenderUpdater, connection_run,
+};
 
 type Worker<'scope> = (
     thread::ScopedJoinHandle<'scope, ConnectionResult<()>>,
@@ -214,13 +233,16 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     pinned: &'settings [PinnedQuery],
     cancel: CancellationToken,
+    status_rx: Receiver<StatusRequest>,
 ) -> Result<Cache<'scope>, std::io::Error> {
     const DEFAULT_CHANNEL_SIZE: usize = 100;
     let (cache_tx, cache_rx) = channel(DEFAULT_CHANNEL_SIZE);
 
     let cache_handle = thread::Builder::new()
         .name("cache".to_owned())
-        .spawn_scoped(scope, || cache_run(settings, cache_rx, pinned, cancel))?;
+        .spawn_scoped(scope, || {
+            cache_run(settings, cache_rx, pinned, cancel, status_rx)
+        })?;
 
     Ok((cache_handle, cache_tx))
 }
@@ -233,13 +255,14 @@ async fn cache_restart_attempt<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     pinned: &'settings [PinnedQuery],
     cancel: CancellationToken,
+    status_rx: Receiver<StatusRequest>,
 ) -> Option<Cache<'scope>> {
     if let Err(e) = replication_provision(settings).await {
         error!("replication provision failed: {:?}", e);
         return None;
     }
 
-    match cache_create(scope, settings, pinned, cancel) {
+    match cache_create(scope, settings, pinned, cancel, status_rx) {
         Ok(cache) => Some(cache),
         Err(e) => {
             error!("cache creation failed: {:?}", e);
@@ -359,7 +382,12 @@ fn pinned_queries_validate(
 
 #[tracing::instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn proxy_run(settings: &Settings, cancel: CancellationToken) -> ConnectionResult<()> {
+pub fn proxy_run(
+    settings: &Settings,
+    cancel: CancellationToken,
+    shared_proxy_status: SharedProxyStatus,
+    metrics_handle: PrometheusHandle,
+) -> ConnectionResult<()> {
     // Load TLS config if certificates are provided
     let tls_acceptor = tls_config_load(settings)?;
 
@@ -381,11 +409,36 @@ pub fn proxy_run(settings: &Settings, cancel: CancellationToken) -> ConnectionRe
             .map_into_report::<ConnectionError>()?;
 
         let cache_cancel = cancel.child_token();
-        let (cache_handle, cache_tx) = cache_create(scope, settings, &pinned, cache_cancel.clone())
-            .map_into_report::<ConnectionError>()
-            .attach_loc("creating cache thread")?;
+
+        // Create status channel for admin HTTP → cache writer communication
+        let (status_tx, status_rx) = channel::<StatusRequest>(2);
+
+        let (cache_handle, cache_tx) =
+            cache_create(scope, settings, &pinned, cache_cancel.clone(), status_rx)
+                .map_into_report::<ConnectionError>()
+                .attach_loc("creating cache thread")?;
         let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
-        let mut cache_state = ProxyCacheState::new(cache_handle, updater, cache_tx);
+        let (status_updater, status_sender) = StatusSenderUpdater::new(status_tx);
+        let mut cache_state = ProxyCacheState::new(
+            cache_handle,
+            updater,
+            status_updater,
+            cache_tx,
+            shared_proxy_status.clone(),
+        );
+
+        // Spawn admin HTTP server now that the status channel is available
+        if let Some(ref m) = settings.metrics {
+            admin_server_spawn(
+                m.socket,
+                metrics_handle,
+                cancel.child_token(),
+                shared_proxy_status,
+                status_sender,
+            )
+            .map_into_report::<ConnectionError>()
+            .attach_loc("spawning admin server")?;
+        }
 
         let resources = WorkerResources {
             cache_sender,

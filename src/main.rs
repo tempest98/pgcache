@@ -4,7 +4,8 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-use pgcache_lib::metrics::prometheus_install;
+use pgcache_lib::proxy::SharedProxyStatus;
+use pgcache_lib::metrics::metrics_recorder_install;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use rootcause::Report;
@@ -34,12 +35,12 @@ fn main() -> Result<(), Report> {
 
     let settings = Settings::from_args()?;
     let cancel = CancellationToken::new();
+    let shared_proxy_status = SharedProxyStatus::new();
 
-    let metrics_socket = settings.metrics.as_ref().map(|m| m.socket);
-    prometheus_install(metrics_socket, cancel.child_token())?;
+    let metrics_handle = metrics_recorder_install()?;
 
-    if let Some(socket) = metrics_socket {
-        info!("Prometheus metrics available at http://{}/metrics", socket);
+    if let Some(ref m) = settings.metrics {
+        info!("Admin server will listen on http://{}", m.socket);
     }
 
     #[cfg(feature = "console")]
@@ -67,9 +68,13 @@ fn main() -> Result<(), Report> {
 
     thread::scope(|scope| {
         let cancel_proxy = cancel.child_token();
+        let shared_proxy_status = shared_proxy_status.clone();
+        let metrics_handle = metrics_handle.clone();
         let proxy_handle = thread::Builder::new()
             .name("proxy".to_owned())
-            .spawn_scoped(scope, || proxy_run(&settings, cancel_proxy))?;
+            .spawn_scoped(scope, || {
+                proxy_run(&settings, cancel_proxy, shared_proxy_status, metrics_handle)
+            })?;
 
         let sleep_duration = Duration::from_millis(500);
 

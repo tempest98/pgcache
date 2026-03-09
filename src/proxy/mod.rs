@@ -6,11 +6,13 @@ pub mod search_path;
 mod server;
 mod tls_stream;
 
-pub use cache_sender::{CacheSendError, CacheSender, CacheSenderUpdater};
+pub use cache_sender::{CacheSendError, CacheSender, CacheSenderUpdater, StatusSender, StatusSenderUpdater};
 
 pub use client_stream::{ClientSocket, ClientSocketSource};
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use error_set::error_set;
 use nix::errno::Errno;
@@ -75,10 +77,43 @@ pub(crate) enum ProxyMode {
 }
 
 /// Proxy health status.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ProxyStatus {
-    Normal,
-    Degraded,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProxyStatus {
+    Normal = 0,
+    Degraded = 1,
+}
+
+/// Shared atomic wrapper for `ProxyStatus`.
+/// Written by the proxy accept loop, read by the HTTP server for `/readyz`.
+#[derive(Clone)]
+pub struct SharedProxyStatus(Arc<AtomicU8>);
+
+impl Default for SharedProxyStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedProxyStatus {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(ProxyStatus::Normal as u8)))
+    }
+
+    pub fn status_set(&self, status: ProxyStatus) {
+        self.0.store(status as u8, Ordering::Relaxed);
+    }
+
+    pub fn status_get(&self) -> ProxyStatus {
+        match self.0.load(Ordering::Relaxed) {
+            0 => ProxyStatus::Normal,
+            _ => ProxyStatus::Degraded,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.status_get() == ProxyStatus::Normal
+    }
 }
 
 use crate::cache::{CacheMessage, CacheReply};

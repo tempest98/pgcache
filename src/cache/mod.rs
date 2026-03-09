@@ -21,6 +21,7 @@ pub(crate) mod messages;
 pub(crate) mod query;
 mod query_cache;
 mod runtime;
+pub(crate) mod status;
 mod types;
 mod worker;
 mod writer;
@@ -28,6 +29,9 @@ mod writer;
 // Re-export public types
 pub use messages::{
     CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
+};
+pub use status::{
+    CacheStatusData, CdcStatusData, QueryStatusData, StatusRequest, StatusResponse,
 };
 pub use runtime::cache_run;
 pub use types::{

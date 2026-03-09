@@ -16,7 +16,7 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     cache::{
-        CacheError, CacheResult, MapIntoReport, ReportExt,
+        CacheError, CacheResult, MapIntoReport, ReportExt, StatusRequest,
         cdc::CdcProcessor,
         messages::{CacheReply, CdcCommand, ProxyMessage},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
@@ -212,6 +212,7 @@ pub fn cache_run(
     cache_rx: Receiver<ProxyMessage>,
     pinned: &[crate::cache::PinnedQuery],
     cancel: CancellationToken,
+    status_rx: Receiver<StatusRequest>,
 ) -> CacheResult<()> {
     // Reset cache database before starting anything
     cache_database_reset(settings).attach_loc("resetting cache database")?;
@@ -247,6 +248,7 @@ pub fn cache_run(
                     state_view_writer,
                     active_relations_writer,
                     cancel_writer,
+                    status_rx,
                 )
             })
             .map_into_report::<CacheError>()
