@@ -87,6 +87,11 @@ nix = { version = "0.31.2", features = ["fs", "signal"] }
 metrics = "0.24.3"
 metrics-util = "0.20.1"
 metrics-exporter-prometheus = "0.18.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
 
 [dev-dependencies]
 pgtemp = "0.7.1"

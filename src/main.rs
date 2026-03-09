@@ -33,8 +33,10 @@ fn main() -> Result<(), Report> {
         .build();
 
     let settings = Settings::from_args()?;
+    let cancel = CancellationToken::new();
+
     let metrics_socket = settings.metrics.as_ref().map(|m| m.socket);
-    prometheus_install(metrics_socket)?;
+    prometheus_install(metrics_socket, cancel.child_token())?;
 
     if let Some(socket) = metrics_socket {
         info!("Prometheus metrics available at http://{}/metrics", socket);
@@ -59,8 +61,6 @@ fn main() -> Result<(), Report> {
             .finish();
         tracing::subscriber::set_global_default(subscriber)?;
     }
-
-    let cancel = CancellationToken::new();
 
     let sigint = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))?;

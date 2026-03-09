@@ -2023,12 +2023,17 @@ name = "pgcache"
 version = "0.4.4"
 dependencies = [
  "async-stream",
+ "bytes",
  "console-subscriber",
  "criterion",
  "ecow",
  "error_set",
  "futures-util",
  "hotpath",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iddqd",
  "lexopt",
  "metrics",
