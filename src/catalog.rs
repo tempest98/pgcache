@@ -58,9 +58,10 @@ impl TableMetadata {
     /// and respect any column aliases defined in the TableAlias.
     ///
     pub fn select_columns(&self, alias: Option<&TableAlias>) -> SelectColumns {
-        let columns = self
-            .columns
-            .iter()
+        let mut sorted_columns: Vec<_> = self.columns.iter().collect();
+        sorted_columns.sort_by_key(|c| c.position);
+        let columns = sorted_columns
+            .into_iter()
             .map(|c| SelectColumn {
                 expr: ColumnExpr::Column(ColumnNode {
                     table: if let Some(alias) = alias {
@@ -91,9 +92,10 @@ impl TableMetadata {
     /// Creates `ResolvedSelectColumns::Columns` with fully qualified column references.
     /// If a table_alias is provided, columns will use that alias for deparsing.
     pub fn resolved_select_columns(&self, table_alias: Option<&str>) -> ResolvedSelectColumns {
-        let columns = self
-            .columns
-            .iter()
+        let mut sorted_columns: Vec<_> = self.columns.iter().collect();
+        sorted_columns.sort_by_key(|c| c.position);
+        let columns = sorted_columns
+            .into_iter()
             .map(|c| ResolvedSelectColumn {
                 expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
                     schema: self.schema.clone(),

@@ -690,7 +690,10 @@ fn select_columns_resolve(
                             Some(q) => alias.is_some_and(|a| a == q) || table_metadata.name == *q,
                         };
                         if matches {
-                            for column_metadata in &table_metadata.columns {
+                            let mut sorted_columns: Vec<_> =
+                                table_metadata.columns.iter().collect();
+                            sorted_columns.sort_by_key(|c| c.position);
+                            for column_metadata in sorted_columns {
                                 resolved_cols.push(ResolvedSelectColumn {
                                     expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
                                         schema: table_metadata.schema.clone(),
