@@ -7,7 +7,7 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use tokio_postgres::types::Type;
 
-use pgcache_lib::catalog::{ColumnMetadata, TableMetadata};
+use pgcache_lib::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use pgcache_lib::query::ast::{query_expr_convert, query_expr_fingerprint};
 use pgcache_lib::query::resolved::query_expr_resolve;
 use pgcache_lib::query::transform::predicate_pushdown_apply;
@@ -375,13 +375,13 @@ limit
 // ---------------------------------------------------------------------------
 
 fn table_metadata_build(name: &str, oid: u32, column_defs: &[(&str, Type, bool)]) -> TableMetadata {
-    let mut columns = BiHashMap::new();
+    let mut col_vec = Vec::new();
     let mut pk_cols = Vec::new();
     for (i, &(col_name, ref data_type, is_pk)) in column_defs.iter().enumerate() {
         if is_pk {
             pk_cols.push(col_name.to_owned());
         }
-        columns.insert_overwrite(ColumnMetadata {
+        col_vec.push(ColumnMetadata {
             name: col_name.into(),
             position: (i + 1) as i16,
             type_oid: 25,
@@ -395,7 +395,7 @@ fn table_metadata_build(name: &str, oid: u32, column_defs: &[(&str, Type, bool)]
         relation_oid: oid,
         name: name.into(),
         schema: "public".into(),
-        columns,
+        columns: ColumnStore::new(col_vec),
         primary_key_columns: pk_cols,
         indexes: Vec::new(),
     }
@@ -447,13 +447,13 @@ fn test_catalog_build() -> BiHashMap<TableMetadata> {
 /// which means long names like `"timestamp with time zone"` (24 bytes) will
 /// exercise ecow's heap path post-migration.
 fn typed_table_build(name: &str, oid: u32, cols: &[(&str, Type, &str, bool)]) -> TableMetadata {
-    let mut columns = BiHashMap::new();
+    let mut col_vec = Vec::new();
     let mut pk_cols = Vec::new();
     for (i, (col_name, data_type, type_name, is_pk)) in cols.iter().enumerate() {
         if *is_pk {
             pk_cols.push(col_name.to_string());
         }
-        columns.insert_overwrite(ColumnMetadata {
+        col_vec.push(ColumnMetadata {
             name: EcoString::from(*col_name),
             position: (i + 1) as i16,
             type_oid: 0,
@@ -467,7 +467,7 @@ fn typed_table_build(name: &str, oid: u32, cols: &[(&str, Type, &str, bool)]) ->
         relation_oid: oid,
         name: name.into(),
         schema: "public".into(),
-        columns,
+        columns: ColumnStore::new(col_vec),
         primary_key_columns: pk_cols,
         indexes: Vec::new(),
     }

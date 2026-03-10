@@ -4,7 +4,7 @@ use rootcause::Report;
 use tokio_postgres::types::Type;
 
 use crate::cache::SubqueryKind;
-use crate::catalog::{ColumnMetadata, TableMetadata};
+use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::query::ast::{
     ColumnExpr, ColumnNode, LimitClause, LiteralValue, OrderByClause, QueryBody, QueryExpr,
     SelectColumns, SelectNode, TableAlias, TableNode, TableSource, WhereExpr, WindowSpec,
@@ -133,17 +133,13 @@ impl<'a> ResolutionScope<'a> {
     /// the subquery alias.
     fn derived_table_scope_add(&mut self, resolved_query: &ResolvedQueryExpr, alias: &str) {
         let columns = derived_table_columns_extract(resolved_query);
-        let mut column_map = BiHashMap::new();
-        for col in columns {
-            column_map.insert_overwrite(col);
-        }
 
         let synthetic_metadata = TableMetadata {
             relation_oid: 0,
             name: alias.into(),
             schema: "".into(),
             primary_key_columns: Vec::new(),
-            columns: column_map,
+            columns: ColumnStore::new(columns),
             indexes: Vec::new(),
         };
 
@@ -159,13 +155,13 @@ impl<'a> ResolutionScope<'a> {
         let mut matches = Vec::new();
 
         for (table_metadata, alias) in &self.tables {
-            if let Some(col_meta) = table_metadata.columns.get1(column) {
+            if let Some(col_meta) = table_metadata.columns.get(column) {
                 matches.push((*table_metadata, *alias, col_meta));
             }
         }
 
         for (table_metadata, alias) in &self.derived_tables {
-            if let Some(col_meta) = table_metadata.columns.get1(column) {
+            if let Some(col_meta) = table_metadata.columns.get(column) {
                 matches.push((table_metadata, Some(alias.as_str()), col_meta));
             }
         }
@@ -309,7 +305,7 @@ fn column_resolve(
         if let Some((table_metadata, alias)) = scope.table_scope_find(table_qualifier) {
             let column_metadata = table_metadata
                 .columns
-                .get1(column_name.as_str())
+                .get(column_name.as_str())
                 .ok_or_else(|| {
                     Report::from(ResolveError::ColumnNotFound {
                         table: table_metadata.name.to_string(),
@@ -330,7 +326,7 @@ fn column_resolve(
             let column_metadata =
                 outer_meta
                     .columns
-                    .get1(column_name.as_str())
+                    .get(column_name.as_str())
                     .ok_or_else(|| {
                         Report::from(ResolveError::ColumnNotFound {
                             table: outer_meta.name.to_string(),
@@ -360,7 +356,7 @@ fn column_resolve(
             // Fall back to outer scope (correlated reference)
             let outer_match = scope.outer_tables.iter().find_map(|(meta, alias)| {
                 meta.columns
-                    .get1(column_name.as_str())
+                    .get(column_name.as_str())
                     .map(|col_meta| (meta, alias.as_deref(), col_meta))
             });
             if let Some((outer_meta, outer_alias, col_meta)) = outer_match {
@@ -690,10 +686,7 @@ fn select_columns_resolve(
                             Some(q) => alias.is_some_and(|a| a == q) || table_metadata.name == *q,
                         };
                         if matches {
-                            let mut sorted_columns: Vec<_> =
-                                table_metadata.columns.iter().collect();
-                            sorted_columns.sort_by_key(|c| c.position);
-                            for column_metadata in sorted_columns {
+                            for column_metadata in table_metadata.columns.iter() {
                                 resolved_cols.push(ResolvedSelectColumn {
                                     expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
                                         schema: table_metadata.schema.clone(),
@@ -1096,29 +1089,26 @@ mod tests {
 
     // Helper function to create test table metadata
     fn test_table_metadata(name: &str, relation_oid: u32) -> TableMetadata {
-        let mut columns = BiHashMap::new();
-
-        // Add id column
-        columns.insert_overwrite(ColumnMetadata {
-            name: "id".into(),
-            position: 1,
-            type_oid: 23,
-            data_type: Type::INT4,
-            type_name: "int4".into(),
-            cache_type_name: "int4".into(),
-            is_primary_key: true,
-        });
-
-        // Add name column
-        columns.insert_overwrite(ColumnMetadata {
-            name: "name".into(),
-            position: 2,
-            type_oid: 25,
-            data_type: Type::TEXT,
-            type_name: "text".into(),
-            cache_type_name: "text".into(),
-            is_primary_key: false,
-        });
+        let columns = ColumnStore::new([
+            ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23,
+                data_type: Type::INT4,
+                type_name: "int4".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            },
+            ColumnMetadata {
+                name: "name".into(),
+                position: 2,
+                type_oid: 25,
+                data_type: Type::TEXT,
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
+                is_primary_key: false,
+            },
+        ]);
 
         TableMetadata {
             relation_oid,
@@ -1136,18 +1126,18 @@ mod tests {
         relation_oid: u32,
         column_names: &[&str],
     ) -> TableMetadata {
-        let mut columns = BiHashMap::new();
-        for (i, col_name) in column_names.iter().enumerate() {
-            columns.insert_overwrite(ColumnMetadata {
-                name: (*col_name).into(),
-                position: (i + 1) as i16,
-                type_oid: 25,
-                data_type: Type::TEXT,
-                type_name: "text".into(),
-                cache_type_name: "text".into(),
-                is_primary_key: i == 0,
-            });
-        }
+        let columns =
+            ColumnStore::new(column_names.iter().enumerate().map(|(i, col_name)| {
+                ColumnMetadata {
+                    name: (*col_name).into(),
+                    position: (i + 1) as i16,
+                    type_oid: 25,
+                    data_type: Type::TEXT,
+                    type_name: "text".into(),
+                    cache_type_name: "text".into(),
+                    is_primary_key: i == 0,
+                }
+            }));
         TableMetadata {
             relation_oid,
             name: name.into(),

@@ -279,10 +279,9 @@ fn resolved_column_expr_alias_update(
 
 #[cfg(test)]
 mod tests {
-    use iddqd::BiHashMap;
     use postgres_types::Type;
 
-    use crate::catalog::{ColumnMetadata, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{BinaryOp, Deparse, JoinType, LiteralValue};
     use crate::query::resolved::{
         ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectColumn,
@@ -309,10 +308,11 @@ mod tests {
     }
 
     fn table_metadata(name: &str, oid: u32, cols: &[(&str, &str)]) -> TableMetadata {
-        let mut columns = BiHashMap::new();
-        for (i, &(col_name, type_name)) in cols.iter().enumerate() {
-            columns.insert_overwrite(column_metadata(col_name, (i + 1) as i16, type_name));
-        }
+        let columns = ColumnStore::new(
+            cols.iter()
+                .enumerate()
+                .map(|(i, &(col_name, type_name))| column_metadata(col_name, (i + 1) as i16, type_name)),
+        );
         TableMetadata {
             relation_oid: oid,
             name: name.into(),

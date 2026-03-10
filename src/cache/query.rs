@@ -584,7 +584,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{query_expr_convert, query_expr_fingerprint};
     use crate::query::resolved::select_node_resolve;
 
@@ -625,10 +625,9 @@ mod tests {
     /// Create test table metadata with given column names.
     /// First column is the primary key (INT4), rest are TEXT.
     fn test_table(name: &str, relation_oid: u32, column_names: &[&str]) -> TableMetadata {
-        let mut columns = BiHashMap::new();
-        for (i, col_name) in column_names.iter().enumerate() {
+        let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, col_name)| {
             let is_pk = i == 0;
-            columns.insert_overwrite(ColumnMetadata {
+            ColumnMetadata {
                 name: (*col_name).into(),
                 position: (i + 1) as i16,
                 type_oid: if is_pk { 23 } else { 25 },
@@ -636,8 +635,8 @@ mod tests {
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
-            });
-        }
+            }
+        }));
         TableMetadata {
             relation_oid,
             name: name.into(),

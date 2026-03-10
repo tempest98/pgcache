@@ -3,7 +3,6 @@
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ecow::EcoString;
-use iddqd::BiHashMap;
 use postgres_replication::{
     LogicalReplicationStream,
     protocol::{
@@ -25,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, trace};
 
-use crate::catalog::{ColumnMetadata, TableMetadata, cache_type_name_resolve};
+use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata, cache_type_name_resolve};
 use crate::metrics::names;
 use crate::pg::cdc::connect_replication;
 use crate::settings::Settings;
@@ -446,7 +445,7 @@ impl CdcProcessor {
         let schema_name: EcoString = relation_body.namespace().unwrap_or("unknown_schema").into();
 
         // Build column metadata from relation body
-        let mut columns = BiHashMap::new();
+        let mut columns = Vec::new();
         let mut primary_key_columns = Vec::new();
 
         for (idx, column) in relation_body.columns().iter().enumerate() {
@@ -476,7 +475,7 @@ impl CdcProcessor {
                 primary_key_columns.push(column.name().unwrap_or("unknown_column").to_owned());
             }
 
-            columns.insert_overwrite(column_metadata);
+            columns.push(column_metadata);
         }
 
         TableMetadata {
@@ -484,7 +483,7 @@ impl CdcProcessor {
             schema: schema_name,
             relation_oid,
             primary_key_columns,
-            columns,
+            columns: ColumnStore::new(columns),
             indexes: Vec::new(), // Indexes are queried separately in cache_table_register
         }
     }

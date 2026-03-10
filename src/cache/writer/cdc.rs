@@ -449,7 +449,7 @@ impl CacheWriter {
 
         let mut has_pk = false;
         for pk_column in &table_metadata.primary_key_columns {
-            if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
+            if let Some(column_meta) = table_metadata.columns.get(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
                 if let Some(row_value) = row_data.get(position) {
                     let value = row_value
@@ -490,7 +490,7 @@ impl CacheWriter {
         };
 
         for (column_name, op, constraint_value) in constraints {
-            if let Some(column_meta) = table_metadata.columns.get1(column_name.as_str()) {
+            if let Some(column_meta) = table_metadata.columns.get(column_name.as_str()) {
                 let position = column_meta.position as usize - 1;
                 if let Some(row_value) = row_data.get(position) {
                     let matches = match row_value {
@@ -914,7 +914,7 @@ impl CacheWriter {
 
         let mut has_pk = false;
         for pk_column in &table_metadata.primary_key_columns {
-            if let Some(column_meta) = table_metadata.columns.get1(pk_column.as_str()) {
+            if let Some(column_meta) = table_metadata.columns.get(pk_column.as_str()) {
                 let position = column_meta.position as usize - 1;
                 if let Some(row_value) = row_data.get(position) {
                     let value = row_value

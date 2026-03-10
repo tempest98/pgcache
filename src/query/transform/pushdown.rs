@@ -387,7 +387,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{LiteralValue, query_expr_convert};
     use crate::query::resolved::query_expr_resolve;
 
@@ -396,18 +396,18 @@ mod tests {
         relation_oid: u32,
         column_names: &[&str],
     ) -> TableMetadata {
-        let mut columns = BiHashMap::new();
-        for (i, col_name) in column_names.iter().enumerate() {
-            columns.insert_overwrite(ColumnMetadata {
-                name: (*col_name).into(),
-                position: (i + 1) as i16,
-                type_oid: 25,
-                data_type: Type::TEXT,
-                type_name: "text".into(),
-                cache_type_name: "text".into(),
-                is_primary_key: i == 0,
-            });
-        }
+        let columns =
+            ColumnStore::new(column_names.iter().enumerate().map(|(i, col_name)| {
+                ColumnMetadata {
+                    name: (*col_name).into(),
+                    position: (i + 1) as i16,
+                    type_oid: 25,
+                    data_type: Type::TEXT,
+                    type_name: "text".into(),
+                    cache_type_name: "text".into(),
+                    is_primary_key: i == 0,
+                }
+            }));
         TableMetadata {
             relation_oid,
             name: name.into(),

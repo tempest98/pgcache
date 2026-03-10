@@ -1,9 +1,10 @@
-use iddqd::BiHashMap;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
 use tracing::instrument;
 
-use crate::catalog::{ColumnMetadata, IndexMetadata, TableMetadata, cache_type_name_resolve};
+use crate::catalog::{
+    ColumnMetadata, ColumnStore, IndexMetadata, TableMetadata, cache_type_name_resolve,
+};
 
 use super::super::{CacheError, CacheResult, MapIntoReport};
 use super::CacheWriter;
@@ -29,7 +30,7 @@ impl CacheWriter {
         let rows = self.query_table_columns_get(schema, table).await?;
 
         let mut primary_key_columns: Vec<String> = Vec::new();
-        let mut columns: BiHashMap<ColumnMetadata> = BiHashMap::with_capacity(rows.len());
+        let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
         let mut relation_oid: Option<u32> = None;
         let mut schema: Option<&str> = schema;
 
@@ -72,7 +73,7 @@ impl CacheWriter {
                 primary_key_columns.push(column.name.to_string());
             }
 
-            columns.insert_overwrite(column);
+            columns.push(column);
         }
 
         let Some(relation_oid) = relation_oid else {
@@ -94,7 +95,7 @@ impl CacheWriter {
             schema: schema.into(),
             relation_oid,
             primary_key_columns,
-            columns,
+            columns: ColumnStore::new(columns),
             indexes,
         };
 
@@ -296,9 +297,8 @@ impl CacheWriter {
         let schema = &table_metadata.schema;
         let table = &table_metadata.name;
 
-        let mut columns: Vec<&ColumnMetadata> = table_metadata.columns.iter().collect();
-        columns.sort_by_key(|c| c.position);
-        let column_defs: Vec<String> = columns
+        let column_defs: Vec<String> = table_metadata
+            .columns
             .iter()
             .map(|c| format!("    \"{}\" {}", c.name, c.cache_type_name))
             .collect();

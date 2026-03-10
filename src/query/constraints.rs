@@ -332,7 +332,7 @@ mod tests {
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
 
-    use crate::catalog::{ColumnMetadata, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{QueryBody, query_expr_convert};
     use crate::query::resolved::select_node_resolve;
 
@@ -350,27 +350,26 @@ mod tests {
 
     // Helper function to create test table metadata
     fn test_table_metadata(name: &str, relation_oid: u32) -> TableMetadata {
-        let mut columns = BiHashMap::new();
-
-        columns.insert_overwrite(ColumnMetadata {
-            name: "id".into(),
-            position: 1,
-            type_oid: 23,
-            data_type: Type::INT4,
-            type_name: "int4".into(),
-            cache_type_name: "int4".into(),
-            is_primary_key: true,
-        });
-
-        columns.insert_overwrite(ColumnMetadata {
-            name: "name".into(),
-            position: 2,
-            type_oid: 25,
-            data_type: Type::TEXT,
-            type_name: "text".into(),
-            cache_type_name: "text".into(),
-            is_primary_key: false,
-        });
+        let columns = ColumnStore::new([
+            ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23,
+                data_type: Type::INT4,
+                type_name: "int4".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            },
+            ColumnMetadata {
+                name: "name".into(),
+                position: 2,
+                type_oid: 25,
+                data_type: Type::TEXT,
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
+                is_primary_key: false,
+            },
+        ]);
 
         TableMetadata {
             relation_oid,
@@ -462,22 +461,20 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("a", 1001));
         tables.insert_overwrite(test_table_metadata("b", 1002));
 
-        let mut c_columns = BiHashMap::new();
-        c_columns.insert_overwrite(ColumnMetadata {
-            name: "id".into(),
-            position: 1,
-            type_oid: 23,
-            data_type: Type::INT4,
-            type_name: "int4".into(),
-            cache_type_name: "int4".into(),
-            is_primary_key: true,
-        });
         tables.insert_overwrite(TableMetadata {
             relation_oid: 1003,
             name: "c".into(),
             schema: "public".into(),
             primary_key_columns: vec!["id".to_owned()],
-            columns: c_columns,
+            columns: ColumnStore::new([ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23,
+                data_type: Type::INT4,
+                type_name: "int4".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            }]),
             indexes: Vec::new(),
         });
 

@@ -62,7 +62,7 @@ fn expr_comparison_evaluate(
     // Find column position and get row value
     let row_value = table_metadata
         .columns
-        .get1(column_ref.column.as_str())
+        .get(column_ref.column.as_str())
         .and_then(|col| {
             let pos = col.position as usize - 1;
             row_data.get(pos)
@@ -117,7 +117,7 @@ fn column_value_get<'a>(
 ) -> Option<&'a str> {
     table_metadata
         .columns
-        .get1(col.column.as_str())
+        .get(col.column.as_str())
         .and_then(|col_meta| {
             let pos = col_meta.position as usize - 1;
             row_data.get(pos)?.as_deref()
@@ -226,10 +226,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::catalog::ColumnMetadata;
+    use crate::catalog::{ColumnMetadata, ColumnStore};
     use crate::query::ast::{ColumnNode, UnaryExpr};
     use ecow::EcoString;
-    use iddqd::BiHashMap;
     use ordered_float::NotNan;
     use tokio_postgres::types::Type;
 
@@ -416,37 +415,35 @@ mod tests {
 
     // Helper function to create test table metadata
     fn create_test_table_metadata() -> TableMetadata {
-        let mut columns = BiHashMap::new();
-
-        columns.insert_overwrite(ColumnMetadata {
-            name: "id".into(),
-            position: 1,
-            type_oid: 23, // INT4
-            data_type: Type::INT4,
-            type_name: "integer".into(),
-            cache_type_name: "int4".into(),
-            is_primary_key: true,
-        });
-
-        columns.insert_overwrite(ColumnMetadata {
-            name: "name".into(),
-            position: 2,
-            type_oid: 25, // TEXT
-            data_type: Type::TEXT,
-            type_name: "text".into(),
-            cache_type_name: "text".into(),
-            is_primary_key: false,
-        });
-
-        columns.insert_overwrite(ColumnMetadata {
-            name: "active".into(),
-            position: 3,
-            type_oid: 16, // BOOL
-            data_type: Type::BOOL,
-            type_name: "boolean".into(),
-            cache_type_name: "bool".into(),
-            is_primary_key: false,
-        });
+        let columns = ColumnStore::new([
+            ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23, // INT4
+                data_type: Type::INT4,
+                type_name: "integer".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            },
+            ColumnMetadata {
+                name: "name".into(),
+                position: 2,
+                type_oid: 25, // TEXT
+                data_type: Type::TEXT,
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
+                is_primary_key: false,
+            },
+            ColumnMetadata {
+                name: "active".into(),
+                position: 3,
+                type_oid: 16, // BOOL
+                data_type: Type::BOOL,
+                type_name: "boolean".into(),
+                cache_type_name: "bool".into(),
+                is_primary_key: false,
+            },
+        ]);
 
         TableMetadata {
             name: "test_table".into(),
@@ -1317,8 +1314,9 @@ mod tests {
         let table_metadata = create_test_table_metadata();
 
         // Add a float column to metadata for testing
-        let mut columns = BiHashMap::new();
-        columns.insert_overwrite(ColumnMetadata {
+        let mut table_metadata = table_metadata;
+        let mut cols: Vec<ColumnMetadata> = table_metadata.columns.iter().cloned().collect();
+        cols.push(ColumnMetadata {
             name: "price".into(),
             position: 4,
             type_oid: 701, // FLOAT8
@@ -1327,17 +1325,7 @@ mod tests {
             cache_type_name: "float8".into(),
             is_primary_key: false,
         });
-
-        let mut table_metadata = table_metadata;
-        table_metadata.columns.insert_overwrite(ColumnMetadata {
-            name: "price".into(),
-            position: 4,
-            type_oid: 701,
-            data_type: Type::FLOAT8,
-            type_name: "double precision".into(),
-            cache_type_name: "float8".into(),
-            is_primary_key: false,
-        });
+        table_metadata.columns = ColumnStore::new(cols);
 
         let row_data = vec![
             Some("1".to_owned()),

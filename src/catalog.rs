@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
-use iddqd::{BiHashItem, BiHashMap, bi_upcast};
+use iddqd::{BiHashItem, bi_upcast};
 use tokio_postgres::types::{Kind, Type};
 use tokio_postgres::{Client, Error};
 
@@ -17,6 +17,70 @@ use crate::query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectColumns, Tab
 use crate::query::resolved::{
     ResolvedColumnExpr, ResolvedColumnNode, ResolvedSelectColumn, ResolvedSelectColumns,
 };
+
+/// Column storage: sorted by position with O(1) name lookups.
+///
+/// Columns are stored once in position order (table definition order).
+/// A name→index map provides fast lookups by column name.
+#[derive(Debug, Clone)]
+pub struct ColumnStore {
+    /// Columns sorted by position (table definition order)
+    sorted: Vec<ColumnMetadata>,
+    /// Column name → index into `sorted`
+    by_name: HashMap<EcoString, usize>,
+}
+
+impl ColumnStore {
+    /// Build a `ColumnStore` from an unsorted iterator of columns.
+    pub fn new(columns: impl IntoIterator<Item = ColumnMetadata>) -> Self {
+        let mut sorted: Vec<ColumnMetadata> = columns.into_iter().collect();
+        sorted.sort_by_key(|c| c.position);
+        let by_name = sorted
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), i))
+            .collect();
+        Self { sorted, by_name }
+    }
+
+    /// Look up a column by name.
+    pub fn get(&self, name: &str) -> Option<&ColumnMetadata> {
+        let &idx = self.by_name.get(name)?;
+        self.sorted.get(idx)
+    }
+
+    /// Iterate columns in position order.
+    pub fn iter(&self) -> std::slice::Iter<'_, ColumnMetadata> {
+        self.sorted.iter()
+    }
+
+    /// Number of columns.
+    pub fn len(&self) -> usize {
+        self.sorted.len()
+    }
+
+    /// Whether the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a ColumnStore {
+    type Item = &'a ColumnMetadata;
+    type IntoIter = std::slice::Iter<'a, ColumnMetadata>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.sorted.iter()
+    }
+}
+
+impl PartialEq for ColumnStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.sorted == other.sorted
+    }
+}
+
+impl Eq for ColumnStore {}
 
 /// Metadata about a database table.
 ///
@@ -33,8 +97,8 @@ pub struct TableMetadata {
     pub schema: EcoString,
     /// Names of columns that form the primary key
     pub primary_key_columns: Vec<String>,
-    /// Column metadata indexed by name and position
-    pub columns: BiHashMap<ColumnMetadata>,
+    /// Column metadata sorted by position with name lookups
+    pub columns: ColumnStore,
     /// Index metadata for non-primary-key indexes
     pub indexes: Vec<IndexMetadata>,
 }
@@ -58,10 +122,9 @@ impl TableMetadata {
     /// and respect any column aliases defined in the TableAlias.
     ///
     pub fn select_columns(&self, alias: Option<&TableAlias>) -> SelectColumns {
-        let mut sorted_columns: Vec<_> = self.columns.iter().collect();
-        sorted_columns.sort_by_key(|c| c.position);
-        let columns = sorted_columns
-            .into_iter()
+        let columns = self
+            .columns
+            .iter()
             .map(|c| SelectColumn {
                 expr: ColumnExpr::Column(ColumnNode {
                     table: if let Some(alias) = alias {
@@ -92,10 +155,9 @@ impl TableMetadata {
     /// Creates `ResolvedSelectColumns::Columns` with fully qualified column references.
     /// If a table_alias is provided, columns will use that alias for deparsing.
     pub fn resolved_select_columns(&self, table_alias: Option<&str>) -> ResolvedSelectColumns {
-        let mut sorted_columns: Vec<_> = self.columns.iter().collect();
-        sorted_columns.sort_by_key(|c| c.position);
-        let columns = sorted_columns
-            .into_iter()
+        let columns = self
+            .columns
+            .iter()
             .map(|c| ResolvedSelectColumn {
                 expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
                     schema: self.schema.clone(),
@@ -164,21 +226,6 @@ impl std::hash::Hash for ColumnMetadata {
         self.cache_type_name.hash(state);
         self.is_primary_key.hash(state);
     }
-}
-
-impl BiHashItem for ColumnMetadata {
-    type K1<'a> = &'a str;
-    type K2<'a> = i16;
-
-    fn key1(&self) -> Self::K1<'_> {
-        self.name.as_str()
-    }
-
-    fn key2(&self) -> Self::K2<'_> {
-        self.position
-    }
-
-    bi_upcast!();
 }
 
 /// Metadata about a table index.
