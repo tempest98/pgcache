@@ -33,7 +33,7 @@ impl CacheConnection {
 
         let mut conn = Self {
             stream,
-            read_buf: BytesMut::with_capacity(8 * 1024),
+            read_buf: BytesMut::with_capacity(64 * 1024),
             codec: PgBackendMessageCodec::default(),
         };
 
