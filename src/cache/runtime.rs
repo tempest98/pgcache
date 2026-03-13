@@ -29,7 +29,8 @@ use crate::{
     settings::Settings,
 };
 
-const DEFAULT_POOL_SIZE: usize = 8;
+/// Minimum number of connections in the cache worker pool.
+const MIN_POOL_SIZE: usize = 4;
 
 /// Handles a proxy message by converting it to a query request and dispatching it
 async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) {
@@ -351,7 +352,8 @@ fn worker_run(
 
     debug!("worker loop");
     rt.block_on(async {
-        let (conn_tx, mut conn_rx) = connection_pool_create(settings, DEFAULT_POOL_SIZE)
+        let pool_size = (settings.num_workers * 2).max(MIN_POOL_SIZE);
+        let (conn_tx, mut conn_rx) = connection_pool_create(settings, pool_size)
             .await
             .attach_loc("creating connection pool")?;
 

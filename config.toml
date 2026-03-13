@@ -1,4 +1,4 @@
-num_workers = 2
+num_workers = 1
 #cache_size = 500000
 #log_level = "trace"
 #log_level = "debug"

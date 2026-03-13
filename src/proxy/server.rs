@@ -20,6 +20,8 @@ use crate::metrics::{admin_server_spawn, names};
 const INITIAL_BACKOFF_MS: u64 = 100;
 /// Maximum backoff delay (steady state) for cache restart attempts
 const STEADY_STATE_BACKOFF_MS: u64 = 60_000;
+/// Minimum buffer size for the proxy→cache command channel.
+const MIN_CHANNEL_SIZE: usize = 100;
 
 struct ProxyCacheState<'scope> {
     handle: Option<thread::ScopedJoinHandle<'scope, CacheResult<()>>>,
@@ -235,8 +237,8 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
 ) -> Result<Cache<'scope>, std::io::Error> {
-    const DEFAULT_CHANNEL_SIZE: usize = 100;
-    let (cache_tx, cache_rx) = channel(DEFAULT_CHANNEL_SIZE);
+    let channel_size = (settings.num_workers * 50).max(MIN_CHANNEL_SIZE);
+    let (cache_tx, cache_rx) = channel(channel_size);
 
     let cache_handle = thread::Builder::new()
         .name("cache".to_owned())

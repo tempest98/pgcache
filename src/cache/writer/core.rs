@@ -29,11 +29,11 @@ use super::super::{
 };
 use super::population::population_worker;
 
-/// Number of persistent population workers.
-pub const POPULATE_POOL_SIZE: usize = 3;
+/// Minimum number of persistent population workers.
+const MIN_POPULATE_POOL_SIZE: usize = 2;
 
-/// Number of connections in the cache pool for concurrent CDC updates.
-const CACHE_POOL_SIZE: usize = 4;
+/// Minimum number of connections in the cache pool for concurrent CDC updates.
+const MIN_CACHE_POOL_SIZE: usize = 2;
 
 /// Work item for population worker pool.
 pub struct PopulationWork {
@@ -110,9 +110,10 @@ impl CacheWriter {
             .attach_loc("loading aggregate functions")?;
 
         // Spawn persistent population workers (each with its own cache connection)
-        let mut populate_txs = Vec::with_capacity(POPULATE_POOL_SIZE);
+        let populate_pool_size = settings.num_workers.max(MIN_POPULATE_POOL_SIZE);
+        let mut populate_txs = Vec::with_capacity(populate_pool_size);
 
-        for i in 0..POPULATE_POOL_SIZE {
+        for i in 0..populate_pool_size {
             let (cache_conn, cache_conn_task) = Config::new()
                 .host(&settings.cache.host)
                 .port(settings.cache.port)
@@ -140,8 +141,9 @@ impl CacheWriter {
         }
 
         // Create cache connection pool for concurrent CDC updates
-        let mut cache_pool = Vec::with_capacity(CACHE_POOL_SIZE);
-        for i in 0..CACHE_POOL_SIZE {
+        let cache_pool_size = (settings.num_workers / 2).max(MIN_CACHE_POOL_SIZE);
+        let mut cache_pool = Vec::with_capacity(cache_pool_size);
+        for i in 0..cache_pool_size {
             let (pool_conn, pool_conn_task) = Config::new()
                 .host(&settings.cache.host)
                 .port(settings.cache.port)

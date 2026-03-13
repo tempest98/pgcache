@@ -22,7 +22,7 @@ use super::super::{
     query::CacheableQuery,
     types::{CachedQuery, CachedQueryState, SharedResolved, UpdateQueries, UpdateQuery},
 };
-use super::{CacheWriter, POPULATE_POOL_SIZE, PopulationWork};
+use super::{CacheWriter, PopulationWork};
 
 /// Intermediate result from resolving a query before subsumption check or population.
 struct QueryResolution {
@@ -129,7 +129,7 @@ impl CacheWriter {
     /// Dispatch population work to next worker using round-robin scheduling.
     fn populate_work_dispatch(&mut self, work: PopulationWork) -> CacheResult<()> {
         let idx = self.populate_next;
-        self.populate_next = (self.populate_next + 1) % POPULATE_POOL_SIZE;
+        self.populate_next = (self.populate_next + 1) % self.populate_txs.len();
 
         let Some(tx) = self.populate_txs.get(idx) else {
             return Err(CacheError::Other.into());
