@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::runtime::Builder;
@@ -54,7 +54,7 @@ pub struct CacheWriter {
     pub(super) cache: Cache,
     pub(super) db_cache: Client,
     pub(super) db_origin: Rc<Client>,
-    pub(super) state_view: Arc<RwLock<CacheStateView>>,
+    pub(super) state_view: Arc<CacheStateView>,
     /// Channels to persistent population workers (round-robin dispatch).
     pub(super) populate_txs: Vec<UnboundedSender<PopulationWork>>,
     /// Index for round-robin dispatch to population workers.
@@ -78,7 +78,7 @@ pub struct CacheWriter {
 impl CacheWriter {
     pub async fn new(
         settings: &Settings,
-        state_view: Arc<RwLock<CacheStateView>>,
+        state_view: Arc<CacheStateView>,
         active_relations: ActiveRelations,
         query_tx: UnboundedSender<QueryCommand>,
     ) -> CacheResult<Self> {
@@ -373,18 +373,16 @@ impl CacheWriter {
         resolved: &SharedResolved,
         max_limit: Option<u64>,
     ) {
-        if let Ok(mut view) = self.state_view.write() {
-            view.cached_queries.insert(
-                fingerprint,
-                CachedQueryView {
-                    state,
-                    generation,
-                    resolved: Some(Arc::clone(resolved)),
-                    max_limit,
-                    referenced: false,
-                },
-            );
-        }
+        self.state_view.cached_queries.insert(
+            fingerprint,
+            CachedQueryView {
+                state,
+                generation,
+                resolved: Some(Arc::clone(resolved)),
+                max_limit,
+                referenced: false,
+            },
+        );
     }
 
     /// Update cache state gauges with current values.
@@ -393,13 +391,13 @@ impl CacheWriter {
         metrics::gauge!(names::CACHE_QUERIES_REGISTERED)
             .set(self.cache.cached_queries.len() as f64);
 
-        if let Ok(view) = self.state_view.read() {
+        {
             let mut loading_count = 0;
             let mut pending_count = 0;
             let mut invalidated_count = 0;
 
-            for q in view.cached_queries.values() {
-                match q.state {
+            for entry in self.state_view.cached_queries.iter() {
+                match entry.value().state {
                     CachedQueryState::Loading => loading_count += 1,
                     CachedQueryState::Pending(_) => pending_count += 1,
                     CachedQueryState::Invalidated => invalidated_count += 1,
@@ -473,9 +471,9 @@ impl CacheWriter {
             if self.cache.cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS {
                 let referenced = self
                     .state_view
-                    .read()
-                    .ok()
-                    .and_then(|view| view.cached_queries.get(&fingerprint).map(|e| e.referenced))
+                    .cached_queries
+                    .get(&fingerprint)
+                    .map(|e| e.referenced)
                     .unwrap_or(false);
 
                 if referenced {
@@ -548,9 +546,7 @@ impl CacheWriter {
         }
 
         // 7. Clear reference bit and update generation in state_view
-        if let Ok(mut view) = self.state_view.write()
-            && let Some(entry) = view.cached_queries.get_mut(&fingerprint)
-        {
+        if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint) {
             entry.referenced = false;
             entry.generation = new_generation;
         }
@@ -589,14 +585,12 @@ impl CacheWriter {
         }
 
         // Remove stale Pending and Invalidated entries from state_view
-        if let Ok(mut view) = self.state_view.write() {
-            view.cached_queries.retain(|_fp, entry| {
-                !matches!(
-                    entry.state,
-                    CachedQueryState::Pending(_) | CachedQueryState::Invalidated
-                ) || entry.generation >= cleanup_threshold
-            });
-        }
+        self.state_view.cached_queries.retain(|_fp, entry| {
+            !matches!(
+                entry.state,
+                CachedQueryState::Pending(_) | CachedQueryState::Invalidated
+            ) || entry.generation >= cleanup_threshold
+        });
     }
 
     /// Promote generation-0 entries to `generation_counter + 1` so they become
@@ -652,13 +646,9 @@ impl CacheWriter {
 
             let state = self
                 .state_view
-                .read()
-                .ok()
-                .and_then(|view| {
-                    view.cached_queries
-                        .get(&q.fingerprint)
-                        .map(|v| format!("{:?}", v.state))
-                })
+                .cached_queries
+                .get(&q.fingerprint)
+                .map(|entry| format!("{:?}", entry.value().state))
                 .unwrap_or_else(|| "Unknown".to_owned());
 
             queries.push(QueryStatusData {
@@ -708,7 +698,7 @@ pub fn writer_run(
     settings: &Settings,
     mut query_rx: UnboundedReceiver<QueryCommand>,
     mut cdc_rx: UnboundedReceiver<CdcCommand>,
-    state_view: Arc<RwLock<CacheStateView>>,
+    state_view: Arc<CacheStateView>,
     active_relations: ActiveRelations,
     cancel: CancellationToken,
     mut status_rx: Receiver<StatusRequest>,

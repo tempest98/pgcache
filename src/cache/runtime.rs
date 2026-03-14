@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -227,7 +227,7 @@ pub fn cache_run(
             .map_into_report::<CacheError>()?;
 
         // Create shared state view for coordinator to read cache state
-        let state_view = Arc::new(RwLock::new(CacheStateView::default()));
+        let state_view = Arc::new(CacheStateView::default());
 
         // Shared set of active relation OIDs (writer writes, CDC reads)
         let active_relations: ActiveRelations =

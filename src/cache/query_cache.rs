@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
@@ -103,7 +103,7 @@ fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
 pub struct QueryCache {
     query_tx: UnboundedSender<QueryCommand>,
     worker_tx: UnboundedSender<WorkerRequest>,
-    state_view: Arc<RwLock<CacheStateView>>,
+    state_view: Arc<CacheStateView>,
     cache_policy: CachePolicy,
     admission_threshold: u32,
     allowed_tables: Allowlist,
@@ -114,7 +114,7 @@ impl QueryCache {
         settings: &Settings,
         query_tx: UnboundedSender<QueryCommand>,
         worker_tx: UnboundedSender<WorkerRequest>,
-        state_view: Arc<RwLock<CacheStateView>>,
+        state_view: Arc<CacheStateView>,
     ) -> CacheResult<Self> {
         let allowed_tables = allowlist_parse(&settings.allowed_tables);
         match &allowed_tables {
@@ -175,9 +175,9 @@ impl QueryCache {
         let lookup_start = Instant::now();
         let cache_entry = self
             .state_view
-            .read()
-            .ok()
-            .and_then(|view| view.cached_queries.get(&fingerprint).cloned());
+            .cached_queries
+            .get(&fingerprint)
+            .map(|entry| entry.clone());
         metrics::histogram!(names::CACHE_LOOKUP_LATENCY_SECONDS)
             .record(lookup_start.elapsed().as_secs_f64());
 
@@ -263,8 +263,7 @@ impl QueryCache {
     /// Set the CLOCK reference bit for eviction tracking.
     fn clock_reference_set(&self, fingerprint: &u64) {
         if self.cache_policy == CachePolicy::Clock
-            && let Ok(mut view) = self.state_view.write()
-            && let Some(entry) = view.cached_queries.get_mut(fingerprint)
+            && let Some(mut entry) = self.state_view.cached_queries.get_mut(fingerprint)
         {
             entry.referenced = true;
         }
@@ -272,9 +271,7 @@ impl QueryCache {
 
     /// Update a cached query's state in the shared view.
     fn cached_query_state_set(&self, fingerprint: &u64, state: CachedQueryState) {
-        if let Ok(mut view) = self.state_view.write()
-            && let Some(entry) = view.cached_queries.get_mut(fingerprint)
-        {
+        if let Some(mut entry) = self.state_view.cached_queries.get_mut(fingerprint) {
             entry.state = state;
         }
     }
@@ -336,18 +333,16 @@ impl QueryCache {
     pub fn pinned_queries_register(&self, pinned: &[crate::cache::PinnedQuery]) -> CacheResult<()> {
         for pq in pinned {
             // Set Loading state in CacheStateView
-            if let Ok(mut view) = self.state_view.write() {
-                view.cached_queries.insert(
-                    pq.fingerprint,
-                    CachedQueryView {
-                        state: CachedQueryState::Loading,
-                        generation: 0,
-                        resolved: None,
-                        max_limit: None,
-                        referenced: false,
-                    },
-                );
-            }
+            self.state_view.cached_queries.insert(
+                pq.fingerprint,
+                CachedQueryView {
+                    state: CachedQueryState::Loading,
+                    generation: 0,
+                    resolved: None,
+                    max_limit: None,
+                    referenced: false,
+                },
+            );
 
             let (subsumption_tx, _subsumption_rx) = oneshot::channel();
             self.query_tx
@@ -434,18 +429,16 @@ impl QueryCache {
             CachedQueryState::Pending(1)
         };
 
-        if let Ok(mut view) = self.state_view.write() {
-            view.cached_queries.insert(
-                fingerprint,
-                CachedQueryView {
-                    state: initial_state,
-                    generation: 0,
-                    resolved: None,
-                    max_limit: None,
-                    referenced: false,
-                },
-            );
-        }
+        self.state_view.cached_queries.insert(
+            fingerprint,
+            CachedQueryView {
+                state: initial_state,
+                generation: 0,
+                resolved: None,
+                max_limit: None,
+                referenced: false,
+            },
+        );
 
         if immediate_admit {
             trace!("send to writer {fingerprint}");

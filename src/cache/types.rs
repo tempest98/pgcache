@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
@@ -203,11 +204,12 @@ impl Cache {
 /// Written by the writer thread, read by the CDC processor.
 pub type ActiveRelations = Arc<ArcSwap<HashSet<u32>>>;
 
-/// Lightweight read-only view of cache state for the coordinator.
-/// Updated by the writer thread after each mutation.
+/// Shared cache state for coordinator lookups and writer updates.
+/// Uses DashMap for per-shard locking — reads to one shard don't block
+/// writes to another, eliminating the global RwLock bottleneck.
 #[derive(Debug, Default)]
 pub struct CacheStateView {
-    pub cached_queries: HashMap<u64, CachedQueryView>,
+    pub cached_queries: DashMap<u64, CachedQueryView>,
 }
 
 /// Lightweight view of a cached query for coordinator lookups.

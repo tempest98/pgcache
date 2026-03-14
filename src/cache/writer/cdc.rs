@@ -306,9 +306,7 @@ impl CacheWriter {
         self.cache.generations.remove(&query.generation);
 
         // Remove from state view
-        if let Ok(mut view) = self.state_view.write() {
-            view.cached_queries.remove(&fingerprint);
-        }
+        self.state_view.cached_queries.remove(&fingerprint);
 
         // Remove update queries
         for oid in &query.relation_oids {
@@ -379,9 +377,7 @@ impl CacheWriter {
         }
 
         // Update state view to Invalidated
-        if let Ok(mut view) = self.state_view.write()
-            && let Some(entry) = view.cached_queries.get_mut(&fingerprint)
-        {
+        if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint) {
             entry.state = CachedQueryState::Invalidated;
             entry.referenced = false;
         }

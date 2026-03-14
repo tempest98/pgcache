@@ -630,9 +630,7 @@ impl CacheWriter {
             }
 
             // Remove from state view
-            if let Ok(mut view) = self.state_view.write() {
-                view.cached_queries.remove(&fingerprint);
-            }
+            self.state_view.cached_queries.remove(&fingerprint);
 
             self.relations_dirty = true;
             debug!("cleaned up failed query {fingerprint}");
