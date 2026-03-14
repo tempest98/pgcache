@@ -529,10 +529,7 @@ impl CdcProcessor {
     /// Check if there are any cached queries for a specific table by relation OID.
     /// Reads the shared active relations set maintained by the writer — no messaging needed.
     fn is_relation_active(&self, relation_oid: u32) -> bool {
-        self.active_relations
-            .read()
-            .map(|set| set.contains(&relation_oid))
-            .unwrap_or(false)
+        self.active_relations.load().contains(&relation_oid)
     }
 }
 

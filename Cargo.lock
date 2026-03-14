@@ -2022,6 +2022,7 @@ dependencies = [
 name = "pgcache"
 version = "0.4.4"
 dependencies = [
+ "arc-swap",
  "async-stream",
  "bytes",
  "console-subscriber",

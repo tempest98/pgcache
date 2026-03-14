@@ -294,25 +294,19 @@ impl CacheWriter {
             .flat_map(|q| q.relation_oids.iter().copied())
             .collect();
 
-        if let Ok(mut set) = self.active_relations.write() {
-            if *set == oids {
-                return false;
-            }
-            *set = oids;
-            return true;
+        let current = self.active_relations.load();
+        if **current == oids {
+            return false;
         }
-        false
+        self.active_relations.store(Arc::new(oids));
+        true
     }
 
     /// Synchronize the origin publication's table list with active relations.
     /// Compares `publication_oids` (current publication state) with the shared
     /// active relations set and issues ALTER PUBLICATION as needed.
     pub(super) async fn publication_update(&mut self) -> CacheResult<()> {
-        let new_oids: HashSet<u32> = self
-            .active_relations
-            .read()
-            .map(|set| set.clone())
-            .unwrap_or_default();
+        let new_oids: HashSet<u32> = (**self.active_relations.load()).clone();
 
         if new_oids == self.publication_oids {
             return Ok(());

@@ -2,6 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
+
 use tokio::{
     runtime::Builder,
     sync::{
@@ -229,7 +231,7 @@ pub fn cache_run(
 
         // Shared set of active relation OIDs (writer writes, CDC reads)
         let active_relations: ActiveRelations =
-            Arc::new(RwLock::new(std::collections::HashSet::new()));
+            Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
 
         // Spawn writer thread (owns Cache, serializes all mutations)
         // Two channels: one for query registration, one for CDC commands
