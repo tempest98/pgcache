@@ -7,6 +7,8 @@ use std::{
     time::Instant,
 };
 
+use ecow::EcoString;
+
 use crate::catalog::FunctionVolatility;
 
 use rootcause::Report;
@@ -23,7 +25,7 @@ use tokio_util::{
     bytes::{Buf, BufMut, BytesMut},
     codec::FramedRead,
 };
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     cache::{
@@ -268,6 +270,12 @@ pub(super) struct ConnectionState {
 
     /// Extended query protocol pipeline state
     extended: ExtendedPending,
+
+    /// Configured origin database name for client database validation
+    origin_database: EcoString,
+
+    /// Caching disabled for this connection (e.g., client targets a different database)
+    cache_disabled: bool,
 }
 
 /// Buffered extended protocol messages, accumulated until Sync/Flush.
@@ -413,6 +421,7 @@ impl ConnectionState {
     fn new(
         client_socket_source: ClientSocketSource,
         func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+        origin_database: EcoString,
     ) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
@@ -430,6 +439,8 @@ impl ConnectionState {
             telemetry: QueryTelemetry::new(),
             func_volatility,
             extended: ExtendedPending::new(),
+            origin_database,
+            cache_disabled: false,
         }
     }
 }
@@ -446,7 +457,7 @@ impl ConnectionState {
                 metrics::counter!(names::PROTOCOL_SIMPLE_QUERIES).increment(1);
                 self.telemetry.query_receive();
 
-                if !self.in_transaction {
+                if !self.in_transaction && !self.cache_disabled {
                     self.proxy_mode = match handle_query(
                         &msg.data,
                         &mut self.fingerprint_cache,
@@ -513,6 +524,19 @@ impl ConnectionState {
             }
             PgFrontendMessageType::Startup => {
                 self.session_user = startup_message_parameter(&msg.data, "user").map(String::from);
+
+                // The cache is connected to a specific database and cannot serve queries
+                // for other databases.
+                if let Some(client_db) = startup_message_parameter(&msg.data, "database")
+                    && client_db != self.origin_database.as_str()
+                {
+                    warn!(
+                        "client database '{}' does not match cache database '{}', caching disabled for this connection",
+                        client_db, self.origin_database
+                    );
+                    self.cache_disabled = true;
+                }
+
                 self.origin_write_buf.push_back(msg.data);
             }
             PgFrontendMessageType::SslRequest => {
@@ -857,7 +881,7 @@ impl ConnectionState {
     /// Attempt to create a cache message from the extended buffer at Sync time.
     /// Returns None if caching is not possible.
     fn buffer_try_cache(&self, buffer: &ExtendedBuffer) -> Option<CacheMessage> {
-        if self.in_transaction {
+        if self.in_transaction || self.cache_disabled {
             return None;
         }
         if self.proxy_status != ProxyStatus::Normal {
@@ -1291,6 +1315,7 @@ async fn handle_connection(
     server_name: &str,
     cache_sender: CacheSender,
     func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+    origin_database: EcoString,
 ) -> ConnectionResult<()> {
     // Track active connections - guard ensures decrement on any exit path
     metrics::gauge!(names::CONNECTIONS_ACTIVE).increment(1.0);
@@ -1313,7 +1338,7 @@ async fn handle_connection(
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
 
     // Initialize connection state with socket source
-    let mut state = ConnectionState::new(client_socket_source, func_volatility);
+    let mut state = ConnectionState::new(client_socket_source, func_volatility, origin_database);
 
     tokio::pin!(origin_framed_read);
     tokio::pin!(client_framed_read);
@@ -1443,9 +1468,10 @@ pub fn connection_run(
         .map_into_report::<ConnectionError>()
         .attach_loc("creating connection runtime")?;
 
-    // Extract TLS settings for the connection loop
+    // Extract settings for the connection loop
     let ssl_mode = settings.origin.ssl_mode;
     let server_name = settings.origin.host.clone();
+    let origin_database = EcoString::from(settings.origin.database.as_str());
 
     debug!("handle connection start");
     rt.block_on(async {
@@ -1467,6 +1493,7 @@ pub fn connection_run(
                     let cache_sender = cache_sender.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let func_volatility = Arc::clone(&func_volatility);
+                    let origin_database = origin_database.clone();
                     spawn_local(async move {
                         debug!("task spawn");
 
@@ -1496,6 +1523,7 @@ pub fn connection_run(
                             &server_name,
                             cache_sender,
                             func_volatility,
+                            origin_database,
                         )
                         .await;
 
