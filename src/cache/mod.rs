@@ -30,10 +30,8 @@ mod writer;
 pub use messages::{
     CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
 };
-pub use status::{
-    CacheStatusData, CdcStatusData, QueryStatusData, StatusRequest, StatusResponse,
-};
 pub use runtime::cache_run;
+pub use status::{CacheStatusData, CdcStatusData, QueryStatusData, StatusRequest, StatusResponse};
 pub use types::{
     Cache, CachedQuery, CachedQueryState, CachedQueryView, PinnedQuery, SubqueryKind,
     UpdateQueries, UpdateQuery, UpdateQuerySource,
@@ -75,7 +73,7 @@ error_set! {
 
 
     TableError := {
-        #[display("Oid: {oid:?} Name {name:?}")]
+        #[display("Unknown Table: oid: {oid:?} name {name:?}")]
         UnknownTable {
             oid: Option<u32>,
             name: Option<String>,
