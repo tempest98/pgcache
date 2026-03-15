@@ -540,6 +540,7 @@ fn tuple_data_parse(columns: &[TupleData]) -> Vec<Option<String>> {
         .map(|col| match col {
             TupleData::Null | TupleData::UnchangedToast => None,
             TupleData::Text(data) => Some(String::from_utf8_lossy(data).into_owned()),
+            TupleData::Binary(_) => unreachable!("pgcache uses text-format replication"),
         })
         .collect()
 }
