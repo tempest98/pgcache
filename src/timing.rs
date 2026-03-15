@@ -58,8 +58,12 @@ pub struct QueryDurations {
     pub dispatch_ns: Option<u64>,
     /// Time spent in cache lookup
     pub lookup_ns: Option<u64>,
-    /// Time spent routing to cache hit or miss
-    pub routing_ns: Option<u64>,
+    /// Time waiting in the worker channel queue (lookup_complete → worker_received)
+    pub queue_wait_ns: Option<u64>,
+    /// Time waiting for a cache database connection from the pool (worker_received → conn_acquired)
+    pub conn_wait_ns: Option<u64>,
+    /// Time from connection acquired to worker task start (conn_acquired → worker_start)
+    pub spawn_wait_ns: Option<u64>,
     /// Time spent executing query in cache worker
     pub worker_execution_ns: Option<u64>,
     /// Time spent writing response to client
@@ -89,6 +93,12 @@ pub struct QueryTiming {
     /// When cache lookup completed (found Ready, Loading, or Miss)
     pub lookup_complete_at: Option<Instant>,
 
+    /// When the worker thread received the message from the channel (cache hit path)
+    pub worker_received_at: Option<Instant>,
+
+    /// When a cache database connection was acquired from the pool (cache hit path)
+    pub conn_acquired_at: Option<Instant>,
+
     /// When the cache worker started processing (cache hit path)
     pub worker_start_at: Option<Instant>,
 
@@ -117,6 +127,8 @@ impl QueryTiming {
             parsed_at: None,
             dispatched_at: None,
             lookup_complete_at: None,
+            worker_received_at: None,
+            conn_acquired_at: None,
             worker_start_at: None,
             query_done_at: None,
             response_written_at: None,
@@ -140,9 +152,17 @@ impl QueryTiming {
                 self.dispatched_at
                     .map(|d| l.duration_since(d).as_nanos() as u64)
             }),
-            routing_ns: self.worker_start_at.and_then(|l| {
+            queue_wait_ns: self.worker_received_at.and_then(|r| {
                 self.lookup_complete_at
-                    .map(|d| l.duration_since(d).as_nanos() as u64)
+                    .map(|l| r.duration_since(l).as_nanos() as u64)
+            }),
+            conn_wait_ns: self.conn_acquired_at.and_then(|c| {
+                self.worker_received_at
+                    .map(|r| c.duration_since(r).as_nanos() as u64)
+            }),
+            spawn_wait_ns: self.worker_start_at.and_then(|w| {
+                self.conn_acquired_at
+                    .map(|c| w.duration_since(c).as_nanos() as u64)
             }),
             worker_execution_ns: self.query_done_at.and_then(|e| {
                 self.worker_start_at
@@ -177,8 +197,17 @@ pub fn timing_record(timing: &QueryTiming) {
     if let Some(ns) = durations.lookup_ns {
         metrics::histogram!(names::QUERY_STAGE_LOOKUP_SECONDS).record(ns as f64 / 1_000_000_000.0);
     }
-    if let Some(ns) = durations.routing_ns {
-        metrics::histogram!(names::QUERY_STAGE_ROUTING_SECONDS).record(ns as f64 / 1_000_000_000.0);
+    if let Some(ns) = durations.queue_wait_ns {
+        metrics::histogram!(names::QUERY_STAGE_QUEUE_WAIT_SECONDS)
+            .record(ns as f64 / 1_000_000_000.0);
+    }
+    if let Some(ns) = durations.conn_wait_ns {
+        metrics::histogram!(names::QUERY_STAGE_CONN_WAIT_SECONDS)
+            .record(ns as f64 / 1_000_000_000.0);
+    }
+    if let Some(ns) = durations.spawn_wait_ns {
+        metrics::histogram!(names::QUERY_STAGE_SPAWN_WAIT_SECONDS)
+            .record(ns as f64 / 1_000_000_000.0);
     }
     if let Some(ns) = durations.worker_execution_ns {
         metrics::histogram!(names::QUERY_STAGE_WORKER_EXEC_SECONDS)
@@ -202,7 +231,9 @@ pub fn timing_record(timing: &QueryTiming) {
             parse_us = durations.parse_ns.map(|n| n / 1000),
             dispatch_us = durations.dispatch_ns.map(|n| n / 1000),
             lookup_us = durations.lookup_ns.map(|n| n / 1000),
-            routing_us = durations.routing_ns.map(|n| n / 1000),
+            queue_wait_us = durations.queue_wait_ns.map(|n| n / 1000),
+            conn_wait_us = durations.conn_wait_ns.map(|n| n / 1000),
+            spawn_wait_us = durations.spawn_wait_ns.map(|n| n / 1000),
             worker_us = durations.worker_execution_ns.map(|n| n / 1000),
             write_us = durations.response_write_ns.map(|n| n / 1000),
             "query timing breakdown"

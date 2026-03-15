@@ -362,9 +362,8 @@ fn worker_run(
         LocalSet::new()
             .run_until(async move {
                 loop {
-                    // Block for at least one request (track wait time)
-                    let wait_start = Instant::now();
-                    let msg = tokio::select! {
+                    // Block for at least one request
+                    let mut msg = tokio::select! {
                         _ = cancel.cancelled() => {
                             debug!("cache worker shutdown signal received");
                             break;
@@ -374,21 +373,18 @@ fn worker_run(
                             msg
                         }
                     };
-                    metrics::histogram!(names::CACHE_WORKER_WAIT_SECONDS)
-                        .record(wait_start.elapsed().as_secs_f64());
+                    msg.timing.worker_received_at = Some(Instant::now());
 
-                    // Wait for an available connection (track wait time only when blocking)
+                    // Wait for an available connection
                     let conn = if let Ok(conn) = conn_rx.try_recv() {
                         conn
                     } else {
-                        let conn_wait_start = Instant::now();
                         let Some(conn) = conn_rx.recv().await else {
                             return Err(CacheError::NoConnection.into());
                         };
-                        metrics::histogram!(names::CACHE_WORKER_CONN_WAIT_SECONDS)
-                            .record(conn_wait_start.elapsed().as_secs_f64());
                         conn
                     };
+                    msg.timing.conn_acquired_at = Some(Instant::now());
 
                     // Spawn task with both the request and connection
                     let return_tx = conn_tx.clone();

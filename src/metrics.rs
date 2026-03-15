@@ -123,15 +123,15 @@ pub mod names {
     pub const QUERY_STAGE_PARSE_SECONDS: &str = "pgcache.query.stage.parse_seconds";
     pub const QUERY_STAGE_DISPATCH_SECONDS: &str = "pgcache.query.stage.dispatch_seconds";
     pub const QUERY_STAGE_LOOKUP_SECONDS: &str = "pgcache.query.stage.lookup_seconds";
-    pub const QUERY_STAGE_ROUTING_SECONDS: &str = "pgcache.query.stage.routing_seconds";
+    pub const QUERY_STAGE_QUEUE_WAIT_SECONDS: &str = "pgcache.query.stage.queue_wait_seconds";
+    pub const QUERY_STAGE_CONN_WAIT_SECONDS: &str = "pgcache.query.stage.conn_wait_seconds";
+    pub const QUERY_STAGE_SPAWN_WAIT_SECONDS: &str = "pgcache.query.stage.spawn_wait_seconds";
     pub const QUERY_STAGE_WORKER_EXEC_SECONDS: &str = "pgcache.query.stage.worker_exec_seconds";
     pub const QUERY_STAGE_RESPONSE_WRITE_SECONDS: &str =
         "pgcache.query.stage.response_write_seconds";
     pub const QUERY_STAGE_TOTAL_SECONDS: &str = "pgcache.query.stage.total_seconds";
 
-    // Worker wait time histograms
-    pub const CACHE_WORKER_WAIT_SECONDS: &str = "pgcache.cache.worker_wait_seconds";
-    pub const CACHE_WORKER_CONN_WAIT_SECONDS: &str = "pgcache.cache.worker_conn_wait_seconds";
+
 }
 
 /// Install the global Prometheus metrics recorder.
