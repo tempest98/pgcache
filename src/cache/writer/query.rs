@@ -408,7 +408,7 @@ impl CacheWriter {
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.cached_since_ns =
                 NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
-            m.population_count += 1;
+            m.subsumption_count += 1;
         }
 
         metrics::counter!(names::CACHE_SUBSUMPTIONS).increment(1);
