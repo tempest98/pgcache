@@ -660,12 +660,13 @@ impl CacheWriter {
 
             // Look up per-query metrics (shared read access)
             let metrics = self.state_view.metrics.get(&q.fingerprint);
+            let now_ns = self.state_view.started_at.elapsed().as_nanos() as u64;
             let (
                 hit_count,
                 miss_count,
-                last_hit_at_ms,
-                registered_at_ms,
-                cached_since_ms,
+                idle_duration_ms,
+                registered_duration_ms,
+                cached_duration_ms,
                 invalidation_count,
                 readmission_count,
                 eviction_count,
@@ -694,9 +695,12 @@ impl CacheWriter {
                     (
                         m.hit_count,
                         m.miss_count,
-                        m.last_hit_at_ns.map(|ns| ns.get() / 1_000_000),
-                        m.registered_at_ns.map(|ns| ns.get() / 1_000_000),
-                        m.cached_since_ns.map(|ns| ns.get() / 1_000_000),
+                        m.last_hit_at_ns
+                            .map(|ns| now_ns.saturating_sub(ns.get()) / 1_000_000),
+                        m.registered_at_ns
+                            .map(|ns| now_ns.saturating_sub(ns.get()) / 1_000_000),
+                        m.cached_since_ns
+                            .map(|ns| now_ns.saturating_sub(ns.get()) / 1_000_000),
                         m.invalidation_count,
                         m.readmission_count,
                         m.eviction_count,
@@ -721,9 +725,9 @@ impl CacheWriter {
                 pinned: q.pinned,
                 hit_count,
                 miss_count,
-                last_hit_at_ms,
-                registered_at_ms,
-                cached_since_ms,
+                idle_duration_ms,
+                registered_duration_ms,
+                cached_duration_ms,
                 invalidation_count,
                 readmission_count,
                 eviction_count,

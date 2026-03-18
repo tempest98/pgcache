@@ -46,12 +46,12 @@ pub struct QueryStatusData {
     // Per-query operational metrics
     pub hit_count: u64,
     pub miss_count: u64,
-    /// Milliseconds since process start (None = no hits yet)
-    pub last_hit_at_ms: Option<u64>,
-    /// Milliseconds since process start when query was first seen
-    pub registered_at_ms: Option<u64>,
-    /// Milliseconds since process start when query last became Ready (None = not currently cached)
-    pub cached_since_ms: Option<u64>,
+    /// Milliseconds since last cache hit (None = no hits yet)
+    pub idle_duration_ms: Option<u64>,
+    /// Milliseconds since query was first seen by the cache
+    pub registered_duration_ms: Option<u64>,
+    /// Milliseconds since query last became Ready (None = not currently cached)
+    pub cached_duration_ms: Option<u64>,
     pub invalidation_count: u64,
     pub readmission_count: u64,
     pub eviction_count: u64,
