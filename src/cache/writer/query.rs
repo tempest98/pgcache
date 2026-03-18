@@ -20,7 +20,9 @@ use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, SubsumptionResult},
     query::CacheableQuery,
-    types::{CachedQuery, CachedQueryState, SharedResolved, UpdateQueries, UpdateQuery},
+    types::{
+        CachedQuery, CachedQueryState, QueryMetrics, SharedResolved, UpdateQueries, UpdateQuery,
+    },
 };
 use super::{CacheWriter, PopulationWork};
 
@@ -511,6 +513,10 @@ impl CacheWriter {
             started_at,
             pinned,
         );
+        self.state_view
+            .metrics
+            .entry(fingerprint)
+            .or_insert_with(QueryMetrics::new);
 
         if relations_changed {
             self.publication_update().await?;

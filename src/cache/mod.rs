@@ -31,7 +31,9 @@ pub use messages::{
     CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
 };
 pub use runtime::cache_run;
-pub use status::{CacheStatusData, CdcStatusData, QueryStatusData, StatusRequest, StatusResponse};
+pub use status::{
+    CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
+};
 pub use types::{
     Cache, CachedQuery, CachedQueryState, CachedQueryView, PinnedQuery, SubqueryKind,
     UpdateQueries, UpdateQuery, UpdateQuerySource,

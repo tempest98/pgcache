@@ -1,9 +1,11 @@
 use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use hdrhistogram::Histogram;
 
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
@@ -204,12 +206,90 @@ impl Cache {
 /// Written by the writer thread, read by the CDC processor.
 pub type ActiveRelations = Arc<ArcSwap<HashSet<u32>>>;
 
+/// Per-query operational metrics.
+///
+/// All writes go through `DashMap::get_mut()`, which holds an exclusive shard lock
+/// for the duration of access. This means plain `u64` fields and the `Histogram`
+/// need no additional synchronization — the shard lock provides mutual exclusion.
+///
+/// Only two threads write: coordinator (hit/miss/subsumption counts) and
+/// writer (all other fields including histogram recording from worker channel).
+pub struct QueryMetrics {
+    pub hit_count: u64,
+    pub miss_count: u64,
+    /// Nanoseconds since `CacheStateView.started_at`
+    pub last_hit_at_ns: Option<NonZeroU64>,
+    /// Nanoseconds since `CacheStateView.started_at` when query became Ready
+    pub cached_since_ns: Option<NonZeroU64>,
+    pub invalidation_count: u64,
+    pub readmission_count: u64,
+    pub eviction_count: u64,
+    pub subsumption_count: u64,
+    pub population_count: u64,
+    pub last_population_duration_us: Option<NonZeroU64>,
+    pub total_bytes_served: u64,
+    /// Physical rows cached (sum across all branch tables)
+    pub row_count: u64,
+    /// Cache-hit latency distribution (1us–60s, 2 significant figures)
+    pub cache_hit_latency: Histogram<u64>,
+}
+
+impl QueryMetrics {
+    pub fn new() -> Self {
+        Self {
+            hit_count: 0,
+            miss_count: 0,
+            last_hit_at_ns: None,
+            cached_since_ns: None,
+            invalidation_count: 0,
+            readmission_count: 0,
+            eviction_count: 0,
+            subsumption_count: 0,
+            population_count: 0,
+            last_population_duration_us: None,
+            total_bytes_served: 0,
+            row_count: 0,
+            #[allow(clippy::unwrap_used)]
+            cache_hit_latency: Histogram::new_with_bounds(1, 60_000_000, 2).unwrap(),
+        }
+    }
+}
+
+/// Metrics sent from worker thread to writer thread after each cache hit.
+#[allow(dead_code)] // Fields used in Phase 3
+pub struct WorkerMetrics {
+    pub fingerprint: u64,
+    pub latency_us: u64,
+    pub bytes_served: u64,
+}
+
 /// Shared cache state for coordinator lookups and writer updates.
 /// Uses DashMap for per-shard locking — reads to one shard don't block
 /// writes to another, eliminating the global RwLock bottleneck.
-#[derive(Debug, Default)]
 pub struct CacheStateView {
     pub cached_queries: DashMap<u64, CachedQueryView>,
+    pub metrics: DashMap<u64, QueryMetrics>,
+    pub started_at: Instant,
+}
+
+impl std::fmt::Debug for CacheStateView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheStateView")
+            .field("cached_queries", &self.cached_queries)
+            .field("metrics_len", &self.metrics.len())
+            .field("started_at", &self.started_at)
+            .finish()
+    }
+}
+
+impl CacheStateView {
+    pub fn new() -> Self {
+        Self {
+            cached_queries: DashMap::new(),
+            metrics: DashMap::new(),
+            started_at: Instant::now(),
+        }
+    }
 }
 
 /// Lightweight view of a cached query for coordinator lookups.

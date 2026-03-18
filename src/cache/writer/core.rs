@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
 
 use crate::cache::status::{
-    CacheStatusData, CdcStatusData, QueryStatusData, StatusRequest, StatusResponse,
+    CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::metrics::names;
@@ -591,6 +591,12 @@ impl CacheWriter {
                 CachedQueryState::Pending(_) | CachedQueryState::Invalidated
             ) || entry.generation >= cleanup_threshold
         });
+
+        // Remove metrics for fingerprints no longer in either map
+        self.state_view.metrics.retain(|fp, _| {
+            self.cache.cached_queries.contains_key1(fp)
+                || self.state_view.cached_queries.contains_key(fp)
+        });
     }
 
     /// Promote generation-0 entries to `generation_counter + 1` so they become
@@ -651,6 +657,57 @@ impl CacheWriter {
                 .map(|entry| format!("{:?}", entry.value().state))
                 .unwrap_or_else(|| "Unknown".to_owned());
 
+            // Look up per-query metrics (shared read access)
+            let metrics = self.state_view.metrics.get(&q.fingerprint);
+            let (
+                hit_count,
+                miss_count,
+                last_hit_at_ms,
+                cached_since_ms,
+                invalidation_count,
+                readmission_count,
+                eviction_count,
+                subsumption_count,
+                population_count,
+                last_population_duration_ms,
+                total_bytes_served,
+                row_count,
+                cache_hit_latency,
+            ) = match &metrics {
+                Some(m) => {
+                    let latency_stats = if !m.cache_hit_latency.is_empty() {
+                        Some(LatencyStats {
+                            count: m.cache_hit_latency.len(),
+                            mean_us: m.cache_hit_latency.mean(),
+                            p50_us: m.cache_hit_latency.value_at_quantile(0.5),
+                            p95_us: m.cache_hit_latency.value_at_quantile(0.95),
+                            p99_us: m.cache_hit_latency.value_at_quantile(0.99),
+                            min_us: m.cache_hit_latency.min(),
+                            max_us: m.cache_hit_latency.max(),
+                        })
+                    } else {
+                        None
+                    };
+
+                    (
+                        m.hit_count,
+                        m.miss_count,
+                        m.last_hit_at_ns.map(|ns| ns.get() / 1_000_000),
+                        m.cached_since_ns.map(|ns| ns.get() / 1_000_000),
+                        m.invalidation_count,
+                        m.readmission_count,
+                        m.eviction_count,
+                        m.subsumption_count,
+                        m.population_count,
+                        m.last_population_duration_us.map(|us| us.get() / 1_000),
+                        m.total_bytes_served,
+                        m.row_count,
+                        latency_stats,
+                    )
+                }
+                None => (0, 0, None, None, 0, 0, 0, 0, 0, None, 0, 0, None),
+            };
+
             queries.push(QueryStatusData {
                 fingerprint: q.fingerprint,
                 sql_preview,
@@ -659,6 +716,19 @@ impl CacheWriter {
                 cached_bytes: q.cached_bytes,
                 max_limit: q.max_limit,
                 pinned: q.pinned,
+                hit_count,
+                miss_count,
+                last_hit_at_ms,
+                cached_since_ms,
+                invalidation_count,
+                readmission_count,
+                eviction_count,
+                subsumption_count,
+                population_count,
+                last_population_duration_ms,
+                total_bytes_served,
+                row_count,
+                cache_hit_latency,
             });
 
             yield_now().await;

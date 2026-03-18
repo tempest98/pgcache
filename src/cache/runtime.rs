@@ -22,7 +22,7 @@ use crate::{
         cdc::CdcProcessor,
         messages::{CacheReply, CdcCommand, ProxyMessage},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
-        types::{ActiveRelations, CacheStateView},
+        types::{ActiveRelations, CacheStateView, WorkerMetrics},
         worker::handle_cached_query,
         writer::writer_run,
     },
@@ -227,7 +227,7 @@ pub fn cache_run(
             .map_into_report::<CacheError>()?;
 
         // Create shared state view for coordinator to read cache state
-        let state_view = Arc::new(CacheStateView::default());
+        let state_view = Arc::new(CacheStateView::new());
 
         // Shared set of active relation OIDs (writer writes, CDC reads)
         let active_relations: ActiveRelations =
@@ -237,6 +237,7 @@ pub fn cache_run(
         // Two channels: one for query registration, one for CDC commands
         let (query_tx, query_rx) = unbounded_channel();
         let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
+        let (worker_metrics_tx, worker_metrics_rx) = unbounded_channel::<WorkerMetrics>();
         let state_view_writer = Arc::clone(&state_view);
         let active_relations_writer = Arc::clone(&active_relations);
         let settings_writer = settings.clone();
@@ -262,7 +263,9 @@ pub fn cache_run(
         let cancel_worker = cancel.child_token();
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
-            .spawn_scoped(scope, || worker_run(settings, worker_rx, cancel_worker))
+            .spawn_scoped(scope, || {
+                worker_run(settings, worker_rx, worker_metrics_tx, cancel_worker)
+            })
             .map_into_report::<CacheError>()
             .attach_loc("spawning worker thread")?;
 
@@ -298,6 +301,7 @@ pub fn cache_run(
             LocalSet::new()
                 .run_until(async move {
                     let mut cache_rx = cache_rx;
+                    let mut worker_metrics_rx = worker_metrics_rx;
                     loop {
                         // Block until at least one message arrives
                         tokio::select! {
@@ -327,6 +331,12 @@ pub fn cache_run(
                                     }
                                 }
                             }
+                            // Record worker metrics (cache-hit latency, bytes served)
+                            msg = worker_metrics_rx.recv() => {
+                                if let Some(wm) = msg {
+                                    worker_metrics_record(&state_view, wm);
+                                }
+                            }
                         }
 
                         metrics::gauge!(names::CACHE_PROXY_MESSAGE_QUEUE)
@@ -341,10 +351,16 @@ pub fn cache_run(
     })
 }
 
+/// Record worker-reported metrics (cache-hit latency, bytes served).
+fn worker_metrics_record(_state_view: &CacheStateView, _wm: WorkerMetrics) {
+    // Stub — individual metric recording added in later phases
+}
+
 /// Worker runtime - executes cached queries against the database
 fn worker_run(
     settings: &Settings,
     mut worker_rx: UnboundedReceiver<WorkerRequest>,
+    _worker_metrics_tx: UnboundedSender<WorkerMetrics>,
     cancel: CancellationToken,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()

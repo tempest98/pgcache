@@ -43,4 +43,33 @@ pub struct QueryStatusData {
     pub cached_bytes: usize,
     pub max_limit: Option<u64>,
     pub pinned: bool,
+    // Per-query operational metrics
+    pub hit_count: u64,
+    pub miss_count: u64,
+    /// Milliseconds since process start (None = no hits yet)
+    pub last_hit_at_ms: Option<u64>,
+    /// Milliseconds since process start when query became Ready (None = not cached)
+    pub cached_since_ms: Option<u64>,
+    pub invalidation_count: u64,
+    pub readmission_count: u64,
+    pub eviction_count: u64,
+    pub subsumption_count: u64,
+    pub population_count: u64,
+    /// Milliseconds (None = not set)
+    pub last_population_duration_ms: Option<u64>,
+    pub total_bytes_served: u64,
+    pub row_count: u64,
+    pub cache_hit_latency: Option<LatencyStats>,
+}
+
+/// Summary statistics from the cache-hit latency histogram.
+#[derive(Debug, Serialize)]
+pub struct LatencyStats {
+    pub count: u64,
+    pub mean_us: f64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub min_us: u64,
+    pub max_us: u64,
 }

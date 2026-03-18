@@ -11,13 +11,15 @@ use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprin
 use crate::settings::{CachePolicy, Settings};
 use crate::timing::QueryTiming;
 
+use std::num::NonZeroU64;
+
 use super::{
     CacheError, CacheResult,
     messages::{
         AdmitAction, CacheReply, PipelineContext, PipelineDescribe, QueryCommand, SubsumptionResult,
     },
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
-    types::{CacheStateView, CachedQueryState, CachedQueryView, SharedResolved},
+    types::{CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, SharedResolved},
 };
 use crate::proxy::ClientSocket;
 
@@ -190,6 +192,7 @@ impl QueryCache {
                 max_limit,
                 ..
             }) if limit_is_sufficient(*max_limit, rows_needed) => {
+                self.metrics_hit_record(fingerprint);
                 self.clock_reference_set(&fingerprint);
                 self.worker_request_send(msg, Arc::clone(resolved), *generation)
             }
@@ -201,6 +204,7 @@ impl QueryCache {
                 ..
             }) => {
                 trace!("limit bump {fingerprint} cached={max_limit:?} needed={rows_needed:?}");
+                self.metrics_miss_record(fingerprint);
                 // Set Loading immediately to prevent duplicate LimitBump commands from racing
                 self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
                 reply_forward(msg.reply_tx, msg.pipeline, msg.data)?;
@@ -219,6 +223,7 @@ impl QueryCache {
                 ..
             }) => {
                 trace!("cache loading {fingerprint}");
+                self.metrics_miss_record(fingerprint);
                 reply_forward(msg.reply_tx, msg.pipeline, msg.data)
             }
 
@@ -257,6 +262,22 @@ impl QueryCache {
                 trace!("cache miss {fingerprint}");
                 self.query_first_miss_handle(fingerprint, msg).await
             }
+        }
+    }
+
+    /// Record a cache hit in per-query metrics.
+    fn metrics_hit_record(&self, fingerprint: u64) {
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.hit_count += 1;
+            m.last_hit_at_ns =
+                NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+        }
+    }
+
+    /// Record a cache miss in per-query metrics.
+    fn metrics_miss_record(&self, fingerprint: u64) {
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.miss_count += 1;
         }
     }
 
@@ -343,6 +364,10 @@ impl QueryCache {
                     referenced: false,
                 },
             );
+            self.state_view
+                .metrics
+                .entry(pq.fingerprint)
+                .or_insert_with(QueryMetrics::new);
 
             let (subsumption_tx, _subsumption_rx) = oneshot::channel();
             self.query_tx
@@ -406,8 +431,12 @@ impl QueryCache {
                 generation,
                 resolved,
                 ..
-            }) => self.worker_request_send(msg, resolved, generation),
+            }) => {
+                self.metrics_hit_record(fingerprint);
+                self.worker_request_send(msg, resolved, generation)
+            }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
+                self.metrics_miss_record(fingerprint);
                 reply_forward(msg.reply_tx, msg.pipeline, msg.data)
             }
         }
@@ -439,6 +468,10 @@ impl QueryCache {
                 referenced: false,
             },
         );
+        self.state_view
+            .metrics
+            .entry(fingerprint)
+            .or_insert_with(QueryMetrics::new);
 
         if immediate_admit {
             trace!("send to writer {fingerprint}");
