@@ -211,8 +211,9 @@ impl CacheWriter {
             QueryCommand::Ready {
                 fingerprint,
                 cached_bytes,
+                row_count,
             } => {
-                self.query_ready_mark(fingerprint, cached_bytes);
+                self.query_ready_mark(fingerprint, cached_bytes, row_count);
                 self.cache.current_size = self.cache_size_load().await?;
                 self.eviction_run().await?;
             }
@@ -663,6 +664,7 @@ impl CacheWriter {
                 hit_count,
                 miss_count,
                 last_hit_at_ms,
+                registered_at_ms,
                 cached_since_ms,
                 invalidation_count,
                 readmission_count,
@@ -671,7 +673,7 @@ impl CacheWriter {
                 population_count,
                 last_population_duration_ms,
                 total_bytes_served,
-                row_count,
+                population_row_count,
                 cache_hit_latency,
             ) = match &metrics {
                 Some(m) => {
@@ -693,6 +695,7 @@ impl CacheWriter {
                         m.hit_count,
                         m.miss_count,
                         m.last_hit_at_ns.map(|ns| ns.get() / 1_000_000),
+                        m.registered_at_ns.map(|ns| ns.get() / 1_000_000),
                         m.cached_since_ns.map(|ns| ns.get() / 1_000_000),
                         m.invalidation_count,
                         m.readmission_count,
@@ -701,11 +704,11 @@ impl CacheWriter {
                         m.population_count,
                         m.last_population_duration_us.map(|us| us.get() / 1_000),
                         m.total_bytes_served,
-                        m.row_count,
+                        m.population_row_count,
                         latency_stats,
                     )
                 }
-                None => (0, 0, None, None, 0, 0, 0, 0, 0, None, 0, 0, None),
+                None => (0, 0, None, None, None, 0, 0, 0, 0, 0, None, 0, 0, None),
             };
 
             queries.push(QueryStatusData {
@@ -719,6 +722,7 @@ impl CacheWriter {
                 hit_count,
                 miss_count,
                 last_hit_at_ms,
+                registered_at_ms,
                 cached_since_ms,
                 invalidation_count,
                 readmission_count,
@@ -727,7 +731,7 @@ impl CacheWriter {
                 population_count,
                 last_population_duration_ms,
                 total_bytes_served,
-                row_count,
+                population_row_count,
                 cache_hit_latency,
             });
 

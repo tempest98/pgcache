@@ -300,6 +300,7 @@ impl CacheWriter {
         debug!("evicting query {fingerprint}");
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.eviction_count += 1;
+            m.cached_since_ns = None;
         }
         self.relations_dirty = true;
 
@@ -370,6 +371,7 @@ impl CacheWriter {
         debug!("cdc invalidating query {fingerprint}");
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.invalidation_count += 1;
+            m.cached_since_ns = None;
         }
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();

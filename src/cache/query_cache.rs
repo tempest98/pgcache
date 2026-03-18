@@ -367,10 +367,11 @@ impl QueryCache {
                     referenced: false,
                 },
             );
+            let now = NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
             self.state_view
                 .metrics
                 .entry(pq.fingerprint)
-                .or_insert_with(QueryMetrics::new);
+                .or_insert_with(|| QueryMetrics::new(now));
 
             let (subsumption_tx, _subsumption_rx) = oneshot::channel();
             self.query_tx
@@ -471,10 +472,11 @@ impl QueryCache {
                 referenced: false,
             },
         );
+        let now = NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
         self.state_view
             .metrics
             .entry(fingerprint)
-            .or_insert_with(QueryMetrics::new);
+            .or_insert_with(|| QueryMetrics::new(now));
 
         if immediate_admit {
             trace!("send to writer {fingerprint}");

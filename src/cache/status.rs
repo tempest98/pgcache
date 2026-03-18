@@ -48,7 +48,9 @@ pub struct QueryStatusData {
     pub miss_count: u64,
     /// Milliseconds since process start (None = no hits yet)
     pub last_hit_at_ms: Option<u64>,
-    /// Milliseconds since process start when query became Ready (None = not cached)
+    /// Milliseconds since process start when query was first seen
+    pub registered_at_ms: Option<u64>,
+    /// Milliseconds since process start when query last became Ready (None = not currently cached)
     pub cached_since_ms: Option<u64>,
     pub invalidation_count: u64,
     pub readmission_count: u64,
@@ -58,7 +60,7 @@ pub struct QueryStatusData {
     /// Milliseconds (None = not set)
     pub last_population_duration_ms: Option<u64>,
     pub total_bytes_served: u64,
-    pub row_count: u64,
+    pub population_row_count: u64,
     pub cache_hit_latency: Option<LatencyStats>,
 }
 

@@ -203,10 +203,12 @@ impl std::fmt::Debug for QueryCommand {
             Self::Ready {
                 fingerprint,
                 cached_bytes,
+                row_count,
             } => f
                 .debug_struct("Ready")
                 .field("fingerprint", fingerprint)
                 .field("cached_bytes", cached_bytes)
+                .field("row_count", row_count)
                 .finish(),
             Self::Failed { fingerprint } => f
                 .debug_struct("Failed")
@@ -257,6 +259,7 @@ pub enum QueryCommand {
     Ready {
         fingerprint: u64,
         cached_bytes: usize,
+        row_count: u64,
     },
 
     /// Query population failed

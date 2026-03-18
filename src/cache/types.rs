@@ -219,7 +219,9 @@ pub struct QueryMetrics {
     pub miss_count: u64,
     /// Nanoseconds since `CacheStateView.started_at`
     pub last_hit_at_ns: Option<NonZeroU64>,
-    /// Nanoseconds since `CacheStateView.started_at` when query became Ready
+    /// Nanoseconds since `CacheStateView.started_at` when query was first seen. Set once, never cleared.
+    pub registered_at_ns: Option<NonZeroU64>,
+    /// Nanoseconds since `CacheStateView.started_at` when query last became Ready. Cleared on invalidation/eviction.
     pub cached_since_ns: Option<NonZeroU64>,
     pub invalidation_count: u64,
     pub readmission_count: u64,
@@ -228,18 +230,19 @@ pub struct QueryMetrics {
     pub population_count: u64,
     pub last_population_duration_us: Option<NonZeroU64>,
     pub total_bytes_served: u64,
-    /// Physical rows cached (sum across all branch tables)
-    pub row_count: u64,
+    /// Physical rows inserted during last population (sum across all branch tables)
+    pub population_row_count: u64,
     /// Cache-hit latency distribution (1us–60s, 2 significant figures)
     pub cache_hit_latency: Histogram<u64>,
 }
 
 impl QueryMetrics {
-    pub fn new() -> Self {
+    pub fn new(registered_at_ns: Option<NonZeroU64>) -> Self {
         Self {
             hit_count: 0,
             miss_count: 0,
             last_hit_at_ns: None,
+            registered_at_ns,
             cached_since_ns: None,
             invalidation_count: 0,
             readmission_count: 0,
@@ -248,7 +251,7 @@ impl QueryMetrics {
             population_count: 0,
             last_population_duration_us: None,
             total_bytes_served: 0,
-            row_count: 0,
+            population_row_count: 0,
             #[allow(clippy::unwrap_used)]
             cache_hit_latency: Histogram::new_with_bounds(1, 60_000_000, 2).unwrap(),
         }

@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -403,6 +404,13 @@ impl CacheWriter {
             q.registration_started_at = None;
         }
 
+        // Record per-query metrics for subsumption
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.cached_since_ns =
+                NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+            m.population_count += 1;
+        }
+
         metrics::counter!(names::CACHE_SUBSUMPTIONS).increment(1);
         metrics::histogram!(names::CACHE_SUBSUMPTION_LATENCY_SECONDS)
             .record(subsume_start.elapsed().as_secs_f64());
@@ -513,10 +521,11 @@ impl CacheWriter {
             started_at,
             pinned,
         );
+        let now = NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
         self.state_view
             .metrics
             .entry(fingerprint)
-            .or_insert_with(QueryMetrics::new);
+            .or_insert_with(|| QueryMetrics::new(now));
 
         if relations_changed {
             self.publication_update().await?;
@@ -586,7 +595,7 @@ impl CacheWriter {
 
     /// Mark a query as ready after successful population.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub fn query_ready_mark(&mut self, fingerprint: u64, cached_bytes: usize) {
+    pub fn query_ready_mark(&mut self, fingerprint: u64, cached_bytes: usize, row_count: u64) {
         trace!("query_ready_mark {fingerprint}");
         let update_info = if let Some(mut query) = self.cache.cached_queries.get1_mut(&fingerprint)
         {
@@ -604,10 +613,21 @@ impl CacheWriter {
 
         if let Some((generation, resolved, max_limit, started_at)) = update_info {
             // Record registration latency metric
-            if let Some(started) = started_at {
-                let latency = started.elapsed();
+            let population_duration_us = started_at.map(|s| {
+                let latency = s.elapsed();
                 metrics::histogram!(names::QUERY_REGISTRATION_LATENCY_SECONDS)
                     .record(latency.as_secs_f64());
+                latency.as_micros() as u64
+            });
+
+            // Record per-query population metrics
+            if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+                m.population_count += 1;
+                m.population_row_count = row_count;
+                m.cached_since_ns =
+                    NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+                m.last_population_duration_us =
+                    population_duration_us.and_then(NonZeroU64::new);
             }
 
             // Update shared state view
@@ -618,7 +638,7 @@ impl CacheWriter {
                 &resolved,
                 max_limit,
             );
-            trace!("cached query ready, cached_bytes={cached_bytes} {fingerprint}");
+            trace!("cached query ready, cached_bytes={cached_bytes} rows={row_count} {fingerprint}");
         }
     }
 

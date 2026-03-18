@@ -50,11 +50,12 @@ pub async fn population_worker(
         .await;
 
         match result {
-            Ok(cached_bytes) => {
+            Ok((cached_bytes, row_count)) => {
                 if query_tx
                     .send(QueryCommand::Ready {
                         fingerprint: work.fingerprint,
                         cached_bytes,
+                        row_count,
                     })
                     .is_err()
                 {
@@ -96,7 +97,7 @@ async fn population_task(
     max_limit: Option<u64>,
     db_origin: Rc<Client>,
     db_cache: &Client,
-) -> CacheResult<usize> {
+) -> CacheResult<(usize, u64)> {
     // Set generation for tracking triggers
     let set_generation_sql = format!("SET mem.query_generation = {generation}");
     db_cache
@@ -105,6 +106,7 @@ async fn population_task(
         .map_into_report::<CacheError>()?;
 
     let mut total_bytes: usize = 0;
+    let mut total_rows: u64 = 0;
     let task_start = Instant::now();
 
     // Process each SELECT branch independently
@@ -123,15 +125,16 @@ async fn population_task(
                 })?;
 
             let stream_start = Instant::now();
-            let bytes =
+            let (bytes, rows) =
                 population_stream(&db_origin, db_cache, table, table_node, branch, max_limit)
                     .await?;
             let stream_elapsed = stream_start.elapsed();
 
             total_bytes += bytes;
+            total_rows += rows;
 
             trace!(
-                "population table {}.{} elapsed={:?} bytes={bytes}",
+                "population table {}.{} elapsed={:?} bytes={bytes} rows={rows}",
                 table.schema, table.name, stream_elapsed
             );
         }
@@ -146,10 +149,10 @@ async fn population_task(
         .map_into_report::<CacheError>()?;
 
     trace!(
-        "population complete for query {fingerprint}, total_time={:?} bytes={total_bytes}",
+        "population complete for query {fingerprint}, total_time={:?} bytes={total_bytes} rows={total_rows}",
         task_elapsed
     );
-    Ok(total_bytes)
+    Ok((total_bytes, total_rows))
 }
 
 /// Pre-computed parts of the batched INSERT...ON CONFLICT statement.
@@ -251,6 +254,7 @@ fn row_to_tuple(
 /// Streams rows from origin via SimpleQueryStream, batching INSERT...ON CONFLICT
 /// statements in groups of POPULATION_INSERT_BATCH_SIZE rows. This avoids materializing
 /// the entire result set in memory.
+/// Returns `(cached_bytes, row_count)`.
 async fn population_stream(
     db_origin: &Client,
     db_cache: &Client,
@@ -258,7 +262,7 @@ async fn population_stream(
     table_node: &ResolvedTableNode,
     branch: &ResolvedSelectNode,
     max_limit: Option<u64>,
-) -> CacheResult<usize> {
+) -> CacheResult<(usize, u64)> {
     // Build the SELECT query
     let select_columns = table.resolved_select_columns(table_node.alias.as_deref());
     let new_ast = resolved_select_node_replace(branch, select_columns);
@@ -281,15 +285,16 @@ async fn population_stream(
         Some(Ok(SimpleQueryMessage::RowDescription(cols))) => cols,
         Some(Ok(_)) => return Err(CacheError::InvalidMessage.into()),
         Some(Err(e)) => {
-            let report: CacheResult<usize> = Err(CacheError::from(e).into());
+            let report: CacheResult<(usize, u64)> = Err(CacheError::from(e).into());
             return report.attach(buf);
         }
-        None => return Ok(0),
+        None => return Ok((0, 0)),
     };
 
     let insert = insert_statement_build(table, &row_description);
 
     let mut cached_bytes: usize = 0;
+    let mut row_count: u64 = 0;
     let mut value_tuples: Vec<String> = Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
     let mut values_buf: Vec<String> = Vec::with_capacity(insert.num_columns);
     let mut tuple_buf = String::new();
@@ -301,6 +306,7 @@ async fn population_stream(
                     row_to_tuple(&row, &insert, &mut values_buf, &mut tuple_buf)
                 {
                     cached_bytes += bytes;
+                    row_count += 1;
                     value_tuples.push(tuple);
 
                     if value_tuples.len() >= POPULATION_INSERT_BATCH_SIZE {
@@ -325,7 +331,7 @@ async fn population_stream(
         population_batch_flush(db_cache, &insert.prefix, &insert.suffix, &mut value_tuples).await?;
     }
 
-    Ok(cached_bytes)
+    Ok((cached_bytes, row_count))
 }
 
 /// Flush a batch of value tuples as a single multi-row INSERT statement.
