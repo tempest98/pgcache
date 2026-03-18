@@ -69,23 +69,24 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Returns the number of DataRow bytes served to the client on success.
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn handle_cached_query(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
-) -> CacheResult<()> {
+) -> CacheResult<usize> {
     debug!("message query generation {}", msg.generation);
 
-    let rv = if msg.result_formats.first().is_none_or(|&f| f == 0) {
-        handle_cached_query_text(conn, return_tx, msg).await
+    let bytes_served = if msg.result_formats.first().is_none_or(|&f| f == 0) {
+        handle_cached_query_text(conn, return_tx, msg).await?
     } else {
-        handle_cached_query_binary(conn, return_tx, msg).await
+        handle_cached_query_binary(conn, return_tx, msg).await?
     };
 
     debug!("cache hit");
-    rv
+    Ok(bytes_served)
 }
 
 /// Response state machine for the text (simple query) path.
@@ -109,7 +110,7 @@ async fn handle_cached_query_text(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
-) -> CacheResult<()> {
+) -> CacheResult<usize> {
     let mut guard = ConnectionGuard::new(conn, return_tx);
     let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
@@ -172,6 +173,7 @@ async fn handle_cached_query_text(
     }
 
     let mut state = TextResponseState::SetComplete;
+    let mut bytes_served: usize = 0;
 
     loop {
         tokio::select! {
@@ -213,6 +215,7 @@ async fn handle_cached_query_text(
                     }
                     (TextResponseState::DataRows, PgBackendMessageType::DataRows) => {
                         trace!("net: cache→client DataRow ({} bytes)", frame.data.len());
+                        bytes_served += frame.data.len();
                         write_buf.extend_from_slice(&frame.data);
                     }
                     (TextResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
@@ -285,7 +288,7 @@ async fn handle_cached_query_text(
     #[cfg(feature = "hotpath")]
     drop(_m);
 
-    Ok(())
+    Ok(bytes_served)
 }
 
 /// Response state machine for the binary (pipelined extended query) path.
@@ -316,7 +319,7 @@ async fn handle_cached_query_binary(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
-) -> CacheResult<()> {
+) -> CacheResult<usize> {
     let mut guard = ConnectionGuard::new(conn, return_tx);
     let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
@@ -366,6 +369,7 @@ async fn handle_cached_query_binary(
     }
 
     let mut state = BinaryResponseState::SetComplete;
+    let mut bytes_served: usize = 0;
 
     loop {
         tokio::select! {
@@ -409,6 +413,7 @@ async fn handle_cached_query_binary(
                     }
                     (BinaryResponseState::DataRows, PgBackendMessageType::DataRows) => {
                         trace!("net: cache→client DataRow (binary, {} bytes)", frame.data.len());
+                        bytes_served += frame.data.len();
                         write_buf.extend_from_slice(&frame.data);
                     }
                     (BinaryResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
@@ -477,5 +482,5 @@ async fn handle_cached_query_binary(
 
     msg.timing.response_written_at = Some(Instant::now());
 
-    Ok(())
+    Ok(bytes_served)
 }

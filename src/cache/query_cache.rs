@@ -47,6 +47,7 @@ pub struct QueryRequest {
 /// Request sent to cache worker for executing cached queries.
 /// Contains the resolved AST with schema-qualified table names.
 pub struct WorkerRequest {
+    pub fingerprint: u64,
     pub query_type: QueryType,
     pub data: BytesMut,
     pub resolved: SharedResolved,
@@ -194,7 +195,7 @@ impl QueryCache {
             }) if limit_is_sufficient(*max_limit, rows_needed) => {
                 self.metrics_hit_record(fingerprint);
                 self.clock_reference_set(&fingerprint);
-                self.worker_request_send(msg, Arc::clone(resolved), *generation)
+                self.worker_request_send(fingerprint, msg, Arc::clone(resolved), *generation)
             }
 
             // Cache hit: Ready but insufficient rows — forward and request limit bump
@@ -300,6 +301,7 @@ impl QueryCache {
     /// Build and send a WorkerRequest for serving a query from cache.
     fn worker_request_send(
         &self,
+        fingerprint: u64,
         msg: QueryRequest,
         resolved: SharedResolved,
         generation: u64,
@@ -328,6 +330,7 @@ impl QueryCache {
 
         self.worker_tx
             .send(WorkerRequest {
+                fingerprint,
                 query_type: msg.query_type,
                 data: msg.data,
                 resolved,
@@ -433,7 +436,7 @@ impl QueryCache {
                 ..
             }) => {
                 self.metrics_hit_record(fingerprint);
-                self.worker_request_send(msg, resolved, generation)
+                self.worker_request_send(fingerprint, msg, resolved, generation)
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);

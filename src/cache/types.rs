@@ -255,8 +255,7 @@ impl QueryMetrics {
     }
 }
 
-/// Metrics sent from worker thread to writer thread after each cache hit.
-#[allow(dead_code)] // Fields used in Phase 3
+/// Metrics sent from worker to coordinator after each cache hit.
 pub struct WorkerMetrics {
     pub fingerprint: u64,
     pub latency_us: u64,

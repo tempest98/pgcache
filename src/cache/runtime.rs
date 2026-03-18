@@ -71,6 +71,7 @@ async fn handle_worker_request(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     mut msg: WorkerRequest,
+    worker_metrics_tx: UnboundedSender<WorkerMetrics>,
 ) {
     debug!("cache worker task spawn");
 
@@ -78,7 +79,19 @@ async fn handle_worker_request(
     msg.timing.worker_start_at = Some(Instant::now());
 
     let reply = match handle_cached_query(conn, return_tx, &mut msg).await {
-        Ok(_) => CacheReply::Complete(Some(msg.timing)),
+        Ok(bytes_served) => {
+            let latency_us = msg
+                .timing
+                .worker_start_at
+                .map(|s| s.elapsed().as_micros() as u64)
+                .unwrap_or(0);
+            let _ = worker_metrics_tx.send(WorkerMetrics {
+                fingerprint: msg.fingerprint,
+                latency_us,
+                bytes_served: bytes_served as u64,
+            });
+            CacheReply::Complete(Some(msg.timing))
+        }
         Err(e) => {
             error!("handle_cached_query failed: {e}");
             // Forward bytes include the full pipeline (Execute+Sync etc.); fall back to raw data
@@ -352,15 +365,18 @@ pub fn cache_run(
 }
 
 /// Record worker-reported metrics (cache-hit latency, bytes served).
-fn worker_metrics_record(_state_view: &CacheStateView, _wm: WorkerMetrics) {
-    // Stub — individual metric recording added in later phases
+fn worker_metrics_record(state_view: &CacheStateView, wm: WorkerMetrics) {
+    if let Some(mut m) = state_view.metrics.get_mut(&wm.fingerprint) {
+        m.total_bytes_served += wm.bytes_served;
+        m.cache_hit_latency.saturating_record(wm.latency_us);
+    }
 }
 
 /// Worker runtime - executes cached queries against the database
 fn worker_run(
     settings: &Settings,
     mut worker_rx: UnboundedReceiver<WorkerRequest>,
-    _worker_metrics_tx: UnboundedSender<WorkerMetrics>,
+    worker_metrics_tx: UnboundedSender<WorkerMetrics>,
     cancel: CancellationToken,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
@@ -404,8 +420,9 @@ fn worker_run(
 
                     // Spawn task with both the request and connection
                     let return_tx = conn_tx.clone();
+                    let metrics_tx = worker_metrics_tx.clone();
                     spawn_local(async move {
-                        handle_worker_request(conn, return_tx, msg).await;
+                        handle_worker_request(conn, return_tx, msg, metrics_tx).await;
                     });
 
                     metrics::gauge!(names::CACHE_WORKER_QUEUE).set(worker_rx.len() as f64);
