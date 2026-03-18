@@ -22,6 +22,10 @@ pub struct CacheStatusData {
     pub generation: u64,
     pub tables_tracked: usize,
     pub policy: String,
+    pub queries_registered: usize,
+    pub uptime_ms: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
 }
 
 /// CDC / logical replication state.

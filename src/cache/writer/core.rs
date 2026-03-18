@@ -626,12 +626,22 @@ impl CacheWriter {
     async fn status_respond(&self, req: StatusRequest) {
         let cache = &self.cache;
 
+        let (mut total_hits, mut total_misses) = (0u64, 0u64);
+        for entry in self.state_view.metrics.iter() {
+            total_hits += entry.hit_count;
+            total_misses += entry.miss_count;
+        }
+
         let cache_status = CacheStatusData {
             size_bytes: cache.current_size,
             size_limit_bytes: cache.cache_size,
             generation: cache.generation_counter,
             tables_tracked: cache.tables.len(),
             policy: format!("{:?}", cache.cache_policy),
+            queries_registered: cache.cached_queries.len(),
+            uptime_ms: self.state_view.started_at.elapsed().as_millis() as u64,
+            cache_hits: total_hits,
+            cache_misses: total_misses,
         };
 
         let mut queries: Vec<QueryStatusData> = Vec::with_capacity(cache.cached_queries.len());
