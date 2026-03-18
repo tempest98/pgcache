@@ -298,6 +298,9 @@ impl CacheWriter {
         };
 
         debug!("evicting query {fingerprint}");
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.eviction_count += 1;
+        }
         self.relations_dirty = true;
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
@@ -365,6 +368,9 @@ impl CacheWriter {
 
         let generation = query.generation;
         debug!("cdc invalidating query {fingerprint}");
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.invalidation_count += 1;
+        }
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
 

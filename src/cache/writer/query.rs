@@ -543,6 +543,9 @@ impl CacheWriter {
     ) -> CacheResult<()> {
         debug!("readmitting query {fingerprint}");
         metrics::counter!(names::CACHE_READMISSIONS).increment(1);
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.readmission_count += 1;
+        }
 
         // Assign new generation
         self.cache.generation_counter += 1;
