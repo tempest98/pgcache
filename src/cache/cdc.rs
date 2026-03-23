@@ -83,6 +83,11 @@ impl CdcProcessor {
         })
     }
 
+    /// Returns the last LSN acknowledged to PostgreSQL.
+    pub fn last_flushed_lsn(&self) -> u64 {
+        self.last_flushed_lsn
+    }
+
     /// Starts the CDC replication stream and processes incoming messages.
     /// Uses tokio::select! for concurrent message processing and periodic keep-alives.
     /// Returns Ok(()) on graceful shutdown via cancellation token.
@@ -168,9 +173,13 @@ impl CdcProcessor {
     }
 
     /// Marks the current LSN as fully applied after successful processing.
+    /// Only advances forward — keep-alive acknowledgments may have already moved
+    /// past this position when the decoder read ahead of buffered transaction output.
     fn mark_lsn_applied(&mut self) {
         let received = self.last_received_lsn;
-        self.last_applied_lsn = received;
+        if received > self.last_applied_lsn {
+            self.last_applied_lsn = received;
+        }
     }
 
     /// Send a standby status update if at least 5 seconds have elapsed since the last one.
@@ -233,13 +242,18 @@ impl CdcProcessor {
     }
 
     /// Handles incoming keep-alive messages and sends appropriate responses.
-    /// Uses graceful error handling - logs warnings but continues processing.
+    ///
+    /// The keep-alive's `wal_end` is the logical decoder's `sentPtr` — the position of
+    /// the last WAL record read by the decoder. This may be ahead of data sent to us
+    /// (in-progress transactions are buffered in PostgreSQL's ReorderBuffer), but it is
+    /// safe to acknowledge: on reconnect, PostgreSQL re-decodes from `confirmed_flush`
+    /// and replays any buffered transactions. Advancing here keeps our LSN tracking
+    /// accurate for reconnect decisions and allows the server to release retained WAL.
     async fn handle_keep_alive(
         &mut self,
         keep_alive: &PrimaryKeepAliveBody,
         stream: std::pin::Pin<&mut LogicalReplicationStream>,
     ) -> Result<(), Error> {
-        // Check if PostgreSQL requested a reply
         let reply_requested = keep_alive.reply() == 1;
         let wal_end = keep_alive.wal_end();
 
@@ -248,10 +262,16 @@ impl CdcProcessor {
             wal_end, reply_requested
         );
 
+        // Advance our position to the decoder's read cursor. All WAL up to this point
+        // has been processed by the logical decoder — any pending output is buffered
+        // server-side and will be re-decoded on reconnect.
+        if wal_end > self.last_applied_lsn {
+            self.last_received_lsn = wal_end;
+            self.last_applied_lsn = wal_end;
+        }
+
         if reply_requested {
             debug!("PostgreSQL requested immediate keep-alive response");
-            // Send immediate standby status update response
-            // Note: send_standby_status_update already handles errors gracefully
             self.send_standby_status_update(stream, false).await?;
         }
 
@@ -278,8 +298,8 @@ impl CdcProcessor {
                     LogicalReplicationMessage::Update(body) => self.process_update(&body).await,
                     LogicalReplicationMessage::Delete(body) => self.process_delete(&body).await,
                     LogicalReplicationMessage::Truncate(body) => self.process_truncate(&body).await,
-                    _ => {
-                        println!("Unhandled replication message type");
+                    LogicalReplicationMessage::Message(_) | _ => {
+                        debug!("unhandled replication message type");
                         Ok(())
                     }
                 };

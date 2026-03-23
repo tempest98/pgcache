@@ -1,4 +1,5 @@
 use error_set::error_set;
+use postgres_types::PgLsn;
 use rootcause::Report;
 use std::io;
 use tokio_postgres::config::ReplicationMode;
@@ -125,6 +126,36 @@ pub async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> {
 
     debug!("Replication cleanup complete");
     Ok(())
+}
+
+/// Query the replication slot's confirmed flush LSN.
+///
+/// Returns `Some(lsn)` if the slot exists, `None` if the slot has been dropped.
+/// A never-consumed slot may have a NULL confirmed_flush_lsn, which is returned as 0.
+pub async fn slot_confirmed_lsn(settings: &Settings) -> PgCdcResult<Option<u64>> {
+    let slot_name = &settings.cdc.slot_name;
+
+    let client = connect(&settings.origin, "slot LSN check")
+        .await
+        .map_into_report::<PgCdcError>()
+        .attach_loc("connecting to check slot LSN")?;
+
+    let row = client
+        .query_opt(
+            "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .map_into_report::<PgCdcError>()
+        .attach_loc("querying confirmed_flush_lsn")?;
+
+    match row {
+        Some(row) => {
+            let lsn: Option<PgLsn> = row.get(0);
+            Ok(Some(lsn.map(u64::from).unwrap_or(0)))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Connect to a PostgreSQL database in logical replication mode.

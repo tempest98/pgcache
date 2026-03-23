@@ -1,33 +1,32 @@
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
 use tokio::{
     runtime::Builder,
-    sync::{
-        mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel},
-        oneshot,
+    sync::mpsc::{
+        Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
     },
     task::{LocalSet, spawn_local},
 };
 use tokio_postgres::{Config, NoTls};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{
     cache::{
         CacheError, CacheResult, MapIntoReport, ReportExt, StatusRequest,
         cdc::CdcProcessor,
-        messages::{CacheReply, CdcCommand, ProxyMessage},
+        messages::{CacheReply, CdcCommand, CdcSignal, ProxyMessage},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
         types::{ActiveRelations, CacheStateView, WorkerMetrics},
         worker::handle_cached_query,
         writer::writer_run,
     },
     metrics::names,
-    pg::cache_connection::CacheConnection,
+    pg::{cache_connection::CacheConnection, cdc::slot_confirmed_lsn},
     settings::Settings,
 };
 
@@ -282,16 +281,20 @@ pub fn cache_run(
             .map_into_report::<CacheError>()
             .attach_loc("spawning worker thread")?;
 
-        // Spawn CDC thread -- sends CdcCommand directly to writer
-        let (cdc_exit_tx, mut cdc_exit_rx) = oneshot::channel::<()>();
+        // Spawn CDC thread -- sends CdcCommand directly to writer, signals coordinator
+        let (cdc_signal_tx, mut cdc_signal_rx) = unbounded_channel::<CdcSignal>();
         let active_relations_cdc = Arc::clone(&active_relations);
         let cancel_cdc = cancel.child_token();
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
             .spawn_scoped(scope, move || {
-                // cdc_exit_tx drops when this closure returns, signaling the runtime
-                let _cdc_exit = cdc_exit_tx;
-                cdc_run(settings, cdc_cmd_tx, active_relations_cdc, cancel_cdc)
+                cdc_run(
+                    settings,
+                    cdc_cmd_tx,
+                    active_relations_cdc,
+                    cancel_cdc,
+                    cdc_signal_tx,
+                )
             })
             .map_into_report::<CacheError>()
             .attach_loc("spawning CDC thread")?;
@@ -315,6 +318,7 @@ pub fn cache_run(
                 .run_until(async move {
                     let mut cache_rx = cache_rx;
                     let mut worker_metrics_rx = worker_metrics_rx;
+                    let mut cdc_connected = true;
                     loop {
                         // Block until at least one message arrives
                         tokio::select! {
@@ -326,17 +330,39 @@ pub fn cache_run(
                                 error!("writer thread exited unexpectedly");
                                 return Err(CacheError::WriterFailure.into());
                             }
-                            _ = &mut cdc_exit_rx => {
-                                error!("CDC thread exited unexpectedly");
-                                return Err(CacheError::CdcFailure.into());
+                            signal = cdc_signal_rx.recv() => {
+                                match signal {
+                                    Some(CdcSignal::Disconnected { last_flushed_lsn }) => {
+                                        warn!("CDC disconnected (last_flushed_lsn: {last_flushed_lsn}), forwarding queries to origin");
+                                        cdc_connected = false;
+                                    }
+                                    Some(CdcSignal::Reconnected) => {
+                                        debug!("CDC reconnected, resuming cache dispatch");
+                                        cdc_connected = true;
+                                    }
+                                    Some(CdcSignal::Fatal) | None => {
+                                        error!("CDC fatal error or thread exited");
+                                        return Err(CacheError::CdcFailure.into());
+                                    }
+                                }
                             }
                             msg = cache_rx.recv() => {
                                 match msg {
                                     Some(proxy_msg) => {
-                                        let mut qcache = qcache.clone();
-                                        spawn_local(async move {
-                                            handle_proxy_message(&mut qcache, proxy_msg).await;
-                                        });
+                                        if cdc_connected {
+                                            let mut qcache = qcache.clone();
+                                            spawn_local(async move {
+                                                handle_proxy_message(&mut qcache, proxy_msg).await;
+                                            });
+                                        } else {
+                                            // CDC is down; forward to origin to avoid serving stale data
+                                            let forward_buf = if let Some(pipeline) = proxy_msg.pipeline {
+                                                pipeline.buffered_bytes
+                                            } else {
+                                                proxy_msg.message.into_data()
+                                            };
+                                            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(forward_buf));
+                                        }
                                     }
                                     None => {
                                         debug!("proxy channel closed");
@@ -434,13 +460,23 @@ fn worker_run(
     })
 }
 
+/// Initial backoff for CDC reconnection attempts.
+const CDC_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+/// Maximum backoff for CDC reconnection attempts.
+const CDC_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
 /// CDC runtime - processes change data capture events.
-/// The CDC processor should run indefinitely, so any exit is considered a failure.
+///
+/// On stream error, attempts to reconnect by verifying the replication slot's
+/// confirmed_flush_lsn matches our last acknowledged position. If the LSN matches,
+/// the stream is resumed without cache invalidation. If the slot is gone or the
+/// LSN diverges, signals Fatal so the proxy can perform a full restart.
 fn cdc_run(
     settings: &Settings,
     cdc_tx: UnboundedSender<CdcCommand>,
     active_relations: ActiveRelations,
     cancel: CancellationToken,
+    signal_tx: UnboundedSender<CdcSignal>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -449,19 +485,103 @@ fn cdc_run(
 
     debug!("cdc loop");
     rt.block_on(async {
-        let mut cdc = CdcProcessor::new(settings, cdc_tx, active_relations)
-            .await
-            .attach_loc("initializing CDC processor")?;
+        let mut cdc =
+            CdcProcessor::new(settings, cdc_tx.clone(), Arc::clone(&active_relations))
+                .await
+                .attach_loc("initializing CDC processor")?;
 
-        match cdc.run(cancel).await {
-            Ok(()) => {
-                debug!("cdc.run() exited");
+        loop {
+            let stream_result = cdc.run(cancel.clone()).await;
+
+            // Cancel-initiated shutdown — exit cleanly
+            if cancel.is_cancelled() {
+                debug!("CDC shutdown complete");
+                return Ok(());
             }
-            Err(e) => {
-                error!("cdc.run() failed: {e}");
+
+            // Stream ended or errored while not cancelled — treat as disconnect
+            let saved_lsn = cdc.last_flushed_lsn();
+            match &stream_result {
+                Ok(()) => warn!(
+                    "CDC stream ended unexpectedly (last_flushed_lsn: {saved_lsn})"
+                ),
+                Err(e) => {
+                    warn!("CDC stream error (last_flushed_lsn: {saved_lsn}): {e}")
+                }
+            }
+
+            // Signal coordinator to forward all queries to origin
+            if signal_tx
+                .send(CdcSignal::Disconnected {
+                    last_flushed_lsn: saved_lsn,
+                })
+                .is_err()
+            {
+                return Err(CacheError::CdcFailure.into());
+            }
+
+            // Reconnect loop with exponential backoff
+            let mut backoff = CDC_INITIAL_BACKOFF;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!("CDC cancelled during reconnect");
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+
+                // Verify the slot hasn't been advanced past our last acknowledged position.
+                // confirmed <= saved is safe: the slot is retaining WAL from an equal or
+                // earlier position, so we'll receive everything from saved_lsn forward.
+                // confirmed > saved means the slot was externally advanced — events may
+                // have been skipped.
+                match slot_confirmed_lsn(settings).await {
+                    Ok(Some(confirmed_lsn)) => {
+                        if confirmed_lsn > saved_lsn {
+                            error!(
+                                "slot advanced past our position: saved={saved_lsn}, confirmed={confirmed_lsn}"
+                            );
+                            let _ = signal_tx.send(CdcSignal::Fatal);
+                            return Err(CacheError::CdcFailure.into());
+                        }
+                        debug!("slot LSN verified: confirmed={confirmed_lsn}, saved={saved_lsn}");
+                    }
+                    Ok(None) => {
+                        error!("replication slot no longer exists");
+                        let _ = signal_tx.send(CdcSignal::Fatal);
+                        return Err(CacheError::CdcFailure.into());
+                    }
+                    Err(e) => {
+                        error!("slot LSN check failed: {e}");
+                        backoff = (backoff * 2).min(CDC_MAX_BACKOFF);
+                        continue;
+                    }
+                }
+
+                // LSN matches — attempt to re-establish the replication connection
+                match CdcProcessor::new(
+                    settings,
+                    cdc_tx.clone(),
+                    Arc::clone(&active_relations),
+                )
+                .await
+                {
+                    Ok(new_cdc) => {
+                        cdc = new_cdc;
+                        debug!("CDC reconnected");
+                        if signal_tx.send(CdcSignal::Reconnected).is_err() {
+                            return Err(CacheError::CdcFailure.into());
+                        }
+                        break; // Back to outer loop to run the stream
+                    }
+                    Err(e) => {
+                        error!("CDC reconnect failed: {e}");
+                        backoff = (backoff * 2).min(CDC_MAX_BACKOFF);
+                        continue;
+                    }
+                }
             }
         }
-
-        Err(CacheError::CdcFailure.into())
     })
 }

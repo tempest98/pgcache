@@ -306,3 +306,15 @@ pub enum CdcCommand {
     /// CDC Truncate operation
     Truncate { relation_oids: Vec<u32> },
 }
+
+/// Signals from the CDC thread to the coordinator about replication connection health.
+pub enum CdcSignal {
+    /// CDC lost its replication connection. Queries should be forwarded to origin
+    /// until the connection is restored.
+    Disconnected { last_flushed_lsn: u64 },
+    /// CDC reconnected and verified no events were missed (LSN match).
+    Reconnected,
+    /// Unrecoverable failure: replication slot gone or LSN mismatch.
+    /// Coordinator should exit so the proxy can perform a full restart.
+    Fatal,
+}
