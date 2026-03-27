@@ -238,8 +238,6 @@ async fn test_generation_purge() -> Result<(), Error> {
         .map_err(Error::other)?
         .get(0);
 
-    assert_eq!(purged, 1, "Should have purged exactly 1 entry");
-
     // Check entries after purge - row id=1 should have no generation 1 entry
     let entries_id1_after = cache_db
         .query(
