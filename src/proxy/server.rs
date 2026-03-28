@@ -476,6 +476,7 @@ pub fn proxy_run(
                                 "accept error: {e}"
                             ))))
                         })?;
+                        let _ = socket.set_nodelay(true);
                         metrics::counter!(names::CONNECTIONS_TOTAL).increment(1);
                         debug!("socket accepted");
 

@@ -182,6 +182,7 @@ impl std::fmt::Debug for ClientSocketSource {
 fn fd_to_tcp_stream(fd: OwnedFd) -> io::Result<TcpStream> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd.into_raw_fd()) };
     std_stream.set_nonblocking(true)?;
+    std_stream.set_nodelay(true)?;
     TcpStream::from_std(std_stream)
 }
 

@@ -1270,6 +1270,7 @@ async fn origin_connect(
 ) -> ConnectionResult<OriginStream> {
     for addr in addrs {
         if let Ok(stream) = TcpStream::connect(addr).await {
+            let _ = stream.set_nodelay(true);
             return match ssl_mode {
                 SslMode::Disable => Ok(TlsStream::plain(stream)),
                 SslMode::Require | SslMode::VerifyFull => {

@@ -30,6 +30,7 @@ impl CacheConnection {
         let stream = TcpStream::connect(&addr)
             .await
             .map_into_report::<CacheError>()?;
+        let _ = stream.set_nodelay(true);
 
         let mut conn = Self {
             stream,
