@@ -235,6 +235,9 @@ struct SettingsToml {
     /// expanded to `SELECT * FROM {table}` and merged with `pinned_queries`.
     #[serde(default)]
     pinned_tables: Option<Vec<String>>,
+    /// Enable anonymous telemetry (default: true). Set to false to disable.
+    #[serde(default)]
+    telemetry: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +272,9 @@ pub struct Settings {
     /// Queries to pin in cache at startup. Pinned queries are pre-registered,
     /// protected from eviction, and auto-readmitted after CDC invalidation.
     pub pinned_queries: Option<Vec<String>>,
+    /// Enable anonymous telemetry (default: true).
+    /// Disable via CLI --telemetry_off, TOML telemetry = false, or env PGCACHE_TELEMETRY=off.
+    pub telemetry: bool,
 }
 
 /// Parse the next CLI argument as a string.
@@ -390,6 +396,7 @@ struct CliArgs {
     allowed_tables: Option<String>,
     pinned_queries: Option<String>,
     pinned_tables: Option<String>,
+    telemetry_off: bool,
 }
 
 fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
@@ -442,6 +449,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
             Long("allowed_tables") => args.allowed_tables = Some(arg_string(&mut parser)?),
             Long("pinned_queries") => args.pinned_queries = Some(arg_string(&mut parser)?),
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
+            Long("telemetry_off") => args.telemetry_off = true,
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -452,6 +460,20 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
     }
 
     Ok((args, config))
+}
+
+/// Resolve telemetry enabled state from CLI > TOML > env var > default (true).
+fn telemetry_resolve(cli_off: bool, toml_value: Option<bool>) -> bool {
+    if cli_off {
+        return false;
+    }
+    if let Some(v) = toml_value {
+        return v;
+    }
+    if let Ok(v) = std::env::var("PGCACHE_TELEMETRY") {
+        return !matches!(v.to_lowercase().as_str(), "off" | "false" | "0");
+    }
+    true
 }
 
 fn settings_build(args: CliArgs, config: Option<SettingsToml>) -> ConfigResult<Settings> {
@@ -540,6 +562,7 @@ fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> Confi
             pinned_queries_parse(args.pinned_queries).or(config.pinned_queries.take()),
             csv_parse(args.pinned_tables).or(config.pinned_tables.take()),
         ),
+        telemetry: telemetry_resolve(args.telemetry_off, config.telemetry),
     })
 }
 
@@ -599,6 +622,7 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
             pinned_queries_parse(args.pinned_queries),
             csv_parse(args.pinned_tables),
         ),
+        telemetry: telemetry_resolve(args.telemetry_off, None),
     })
 }
 
@@ -626,7 +650,8 @@ impl Settings {
             [--allowed_tables TABLE1,TABLE2,...] (restrict caching to these tables) \n \
             [--pinned_queries QUERY1;QUERY2;...] (pin queries in cache at startup, semicolon-separated) \n \
             [--pinned_tables TABLE1,TABLE2,...] (pin SELECT * FROM table for each table) \n \
-            [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug)"
+            [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug) \n \
+            [--telemetry_off] (disable anonymous telemetry)"
         );
         std::process::exit(1);
     }
@@ -1173,6 +1198,7 @@ socket = "127.0.0.1:5434"
             allowed_tables: None,
             pinned_queries: None,
             pinned_tables: None,
+            telemetry: None,
         }
     }
 

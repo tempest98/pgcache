@@ -7,6 +7,7 @@ pub mod query;
 pub mod result;
 pub mod settings;
 pub mod stream_utils;
+pub mod telemetry;
 pub mod timing;
 pub mod tls;
 pub mod tracing_utils;

@@ -621,10 +621,19 @@ impl ConnectionState {
 
         match msg.message_type {
             PgBackendMessageType::ParameterStatus => {
-                // Check for search_path parameter (PG 18+ sends this during startup)
-                if let Some(("search_path", value)) = parameter_status_parse(&msg.data) {
-                    debug!("received search_path from ParameterStatus: {}", value);
-                    self.search_path_state = SearchPathState::Resolved(SearchPath::parse(value));
+                if let Some((name, value)) = parameter_status_parse(&msg.data) {
+                    match name {
+                        "search_path" => {
+                            // PG 18+ sends this during startup
+                            debug!("received search_path from ParameterStatus: {}", value);
+                            self.search_path_state =
+                                SearchPathState::Resolved(SearchPath::parse(value));
+                        }
+                        "server_version" => {
+                            crate::telemetry::pg_version_set(value.to_owned());
+                        }
+                        _ => {}
+                    }
                 }
             }
             PgBackendMessageType::ParameterDescription => {

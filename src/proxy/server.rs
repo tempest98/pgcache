@@ -147,6 +147,7 @@ use crate::{
     },
     query::ast::{query_expr_convert, query_expr_fingerprint},
     settings::Settings,
+    telemetry,
     tls,
 };
 
@@ -429,6 +430,9 @@ pub fn proxy_run(
             shared_proxy_status.clone(),
         );
 
+        // Clone metrics handle for telemetry before admin server takes ownership
+        let telemetry_metrics = metrics_handle.clone();
+
         // Spawn admin HTTP server now that the status channel is available
         if let Some(ref m) = settings.metrics {
             admin_server_spawn(
@@ -441,6 +445,15 @@ pub fn proxy_run(
             .map_into_report::<ConnectionError>()
             .attach_loc("spawning admin server")?;
         }
+
+        // Spawn telemetry background thread
+        telemetry::telemetry_spawn(
+            settings.telemetry,
+            cancel.child_token(),
+            telemetry_metrics,
+        )
+        .map_into_report::<ConnectionError>()
+        .attach_loc("spawning telemetry thread")?;
 
         let resources = WorkerResources {
             cache_sender,
@@ -564,6 +577,7 @@ mod tests {
             admission_threshold: 2,
             allowed_tables: None,
             pinned_queries,
+            telemetry: false,
         }
     }
 
