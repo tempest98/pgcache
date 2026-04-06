@@ -19,7 +19,7 @@ use tokio_postgres::{Client, Row, SimpleQueryMessage, ToStatement};
 
 pub use assertions::{assert_row_at, assert_row_fields, extract_row};
 pub use context::TestContext;
-pub use http::http_get;
+pub use http::{http_get, http_post, http_put};
 pub use metrics::{
     MetricsSnapshot, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_subsume_hit,
     metrics_delta, metrics_http_get,

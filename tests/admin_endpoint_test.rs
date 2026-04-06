@@ -110,26 +110,64 @@ async fn test_status_shows_cached_queries() -> Result<(), Error> {
     // Verify per-query metrics fields are present
     assert!(q.get("hit_count").is_some(), "missing hit_count");
     assert!(q.get("miss_count").is_some(), "missing miss_count");
-    assert!(q.get("invalidation_count").is_some(), "missing invalidation_count");
-    assert!(q.get("readmission_count").is_some(), "missing readmission_count");
+    assert!(
+        q.get("invalidation_count").is_some(),
+        "missing invalidation_count"
+    );
+    assert!(
+        q.get("readmission_count").is_some(),
+        "missing readmission_count"
+    );
     assert!(q.get("eviction_count").is_some(), "missing eviction_count");
-    assert!(q.get("subsumption_count").is_some(), "missing subsumption_count");
-    assert!(q.get("population_count").is_some(), "missing population_count");
-    assert!(q.get("total_bytes_served").is_some(), "missing total_bytes_served");
-    assert!(q.get("population_row_count").is_some(), "missing population_row_count");
+    assert!(
+        q.get("subsumption_count").is_some(),
+        "missing subsumption_count"
+    );
+    assert!(
+        q.get("population_count").is_some(),
+        "missing population_count"
+    );
+    assert!(
+        q.get("total_bytes_served").is_some(),
+        "missing total_bytes_served"
+    );
+    assert!(
+        q.get("population_row_count").is_some(),
+        "missing population_row_count"
+    );
 
     // After one miss + population, expect miss_count=1, population_count=1
     assert_eq!(q["miss_count"].as_u64(), Some(1), "expected 1 miss");
-    assert_eq!(q["population_count"].as_u64(), Some(1), "expected 1 population");
-    assert_eq!(q["hit_count"].as_u64(), Some(0), "expected 0 hits before cache hit");
+    assert_eq!(
+        q["population_count"].as_u64(),
+        Some(1),
+        "expected 1 population"
+    );
+    assert_eq!(
+        q["hit_count"].as_u64(),
+        Some(0),
+        "expected 0 hits before cache hit"
+    );
 
     // Duration fields should be present after population
-    assert!(q.get("registered_duration_ms").is_some(), "missing registered_duration_ms");
-    assert!(q.get("cached_duration_ms").is_some(), "missing cached_duration_ms");
-    assert!(q.get("last_population_duration_ms").is_some(), "missing last_population_duration_ms");
+    assert!(
+        q.get("registered_duration_ms").is_some(),
+        "missing registered_duration_ms"
+    );
+    assert!(
+        q.get("cached_duration_ms").is_some(),
+        "missing cached_duration_ms"
+    );
+    assert!(
+        q.get("last_population_duration_ms").is_some(),
+        "missing last_population_duration_ms"
+    );
 
     // idle_duration_ms should be null (no hits yet)
-    assert!(q["idle_duration_ms"].is_null(), "idle_duration_ms should be null before any hit");
+    assert!(
+        q["idle_duration_ms"].is_null(),
+        "idle_duration_ms should be null before any hit"
+    );
 
     // Cache hit — serve from cache
     ctx.simple_query("SELECT id, name FROM status_test WHERE id = 1")
@@ -141,9 +179,19 @@ async fn test_status_shows_cached_queries() -> Result<(), Error> {
         .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
     let q = &json["queries"].as_array().unwrap()[0];
 
-    assert_eq!(q["hit_count"].as_u64(), Some(1), "expected 1 hit after cache hit");
-    assert!(q["idle_duration_ms"].is_number(), "idle_duration_ms should be set after hit");
-    assert!(q["total_bytes_served"].as_u64().unwrap() > 0, "expected bytes served after hit");
+    assert_eq!(
+        q["hit_count"].as_u64(),
+        Some(1),
+        "expected 1 hit after cache hit"
+    );
+    assert!(
+        q["idle_duration_ms"].is_number(),
+        "idle_duration_ms should be set after hit"
+    );
+    assert!(
+        q["total_bytes_served"].as_u64().unwrap() > 0,
+        "expected bytes served after hit"
+    );
 
     Ok(())
 }
@@ -189,10 +237,7 @@ async fn test_status_cache_fields() -> Result<(), Error> {
         cache.get("queries_registered").is_some(),
         "missing cache.queries_registered"
     );
-    assert!(
-        cache.get("uptime_ms").is_some(),
-        "missing cache.uptime_ms"
-    );
+    assert!(cache.get("uptime_ms").is_some(), "missing cache.uptime_ms");
     assert!(
         cache.get("cache_hits").is_some(),
         "missing cache.cache_hits"

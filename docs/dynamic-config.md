@@ -2,12 +2,54 @@
 
 ## Context
 
-pgcache config is fully static today — parsed once from TOML + CLI at startup, passed as `&Settings` throughout. The goal is to make a subset of config adjustable at runtime via the HTTP admin API, with the TOML file always as source of truth. This enables IaC tools (Terraform, Ansible) to manage pgcache configuration without restarts.
+pgcache config is fully static today — parsed once from TOML + CLI + env vars at startup, passed as `&Settings` throughout. The goal is to make a subset of config adjustable at runtime via the HTTP admin API, with the TOML file always as source of truth. This enables IaC tools (Terraform, Ansible) to manage pgcache configuration without restarts.
 
 The API model:
 - `GET /config` — read current effective config (enables Terraform plan/diff)
 - `PUT /config` — write partial config to TOML file + reload (single atomic call for IaC)
 - `POST /config/reload` — re-read TOML file and apply dynamic changes (for file-based IaC)
+
+## Current State
+
+### Admin Server (`src/metrics.rs`)
+
+The admin HTTP server already exists, running on a dedicated thread with its own single-threaded tokio runtime. It currently serves:
+
+- `GET /metrics` — Prometheus metrics
+- `GET /healthz` — liveness probe
+- `GET /readyz` — readiness probe (checks `SharedProxyStatus`)
+- `GET /status` — queries cache writer via `StatusSender` channel, returns JSON
+
+The `/config` endpoints will be added alongside these existing routes.
+
+### Settings (`src/settings.rs`)
+
+Settings are parsed from three sources (CLI overrides TOML overrides defaults). The full list of fields on `Settings`:
+
+**Connection / infrastructure (static):**
+- `origin` — origin database connection
+- `replication` — replication connection (cascades from origin if not set)
+- `cache` — cache database connection
+- `cdc` — CDC replication slot/publication settings
+- `listen` — proxy listen address
+- `metrics` — Prometheus endpoint address
+- `num_workers` — proxy worker thread count
+- `tls_cert`, `tls_key` — TLS certificate/key paths
+
+**Cache behavior (candidates for dynamic):**
+- `cache_size: Option<usize>` — maximum cache size in bytes
+- `cache_policy: CachePolicy` — `Fifo` or `Clock` (default: Clock)
+- `admission_threshold: u32` — query count before cache admission (default: 2, clock only)
+- `allowed_tables: Option<Vec<String>>` — restrict caching to named tables
+- `log_level: Option<String>` — tracing EnvFilter syntax
+
+**Startup-only (static, not candidates for dynamic):**
+- `pinned_queries: Option<Vec<String>>` — queries to pin in cache at startup
+- `telemetry: bool` — anonymous telemetry (default: true)
+
+### Dependencies
+
+`arc-swap = "1.8.2"` is already in `Cargo.toml`, currently used for `ActiveRelations` (`Arc<ArcSwap<HashSet<u32>>>`). Will be reused for `DynamicConfig`.
 
 ## Dynamic vs Static Fields
 
@@ -23,9 +65,12 @@ The API model:
 - `cdc` (replication slot/publication)
 - `listen`, `metrics` (bound sockets)
 - `num_workers` (thread count)
-- `tls_cert`, `tls_key`
+- `tls_cert`, `tls_key` (TLS config)
+- `pinned_queries` / `pinned_tables` (startup-only registration)
+- `telemetry` (collector initialized once at startup)
 
-**Deferred — pinned_queries**: More of a command than a config knob (requires SQL parsing, origin validation, cache registration). Better as a separate `/queries/pin` endpoint in a future phase.
+**Not exposed via config API:**
+- `pinned_queries` — these are startup-only. Pinned queries require SQL parsing, origin schema validation, and cache registration. Runtime pinning would be better served by a separate `POST /queries/pin` endpoint in a future phase.
 
 ## Key Design Decisions
 
@@ -34,7 +79,7 @@ The API model:
 Dynamic fields are read on every query dispatch (hot path). `arc_swap::ArcSwap<DynamicConfig>` gives:
 - Lock-free reads via `.load()` (~1 atomic load, no CAS)
 - Rare atomic swaps on config update via `.store()`
-- Already the standard crate for this pattern in Rust
+- Already a dependency (used for `ActiveRelations` in `cache/types.rs`)
 
 Both `QueryCache` (coordinator, per-worker clone) and `CacheWriter` (writer thread) hold a `ConfigHandle` wrapping `Arc<ArcSwap<DynamicConfig>>`. On each query dispatch or eviction check, they load the current config.
 
@@ -94,7 +139,7 @@ Recommendation: parse on update, store both raw and parsed in DynamicConfig.
 **File: `src/settings.rs`**
 
 - Add `config_path: Option<PathBuf>` to `Settings`
-- In `cli_args_parse()`, when `--config` is parsed (line ~404), store the path
+- In `cli_args_parse()`, when `--config` is parsed, store the path
 - Thread it through `settings_build()` into the final `Settings`
 
 ### Phase 3: Plumb ConfigHandle into cache subsystem
@@ -112,18 +157,22 @@ Recommendation: parse on update, store both raw and parsed in DynamicConfig.
 
 **File: `src/cache/types.rs`**
 
-- Replace `cache_size`, `cache_policy`, `admission_threshold` in `Cache` with `config: ConfigHandle`
+- Replace `cache_policy`, `admission_threshold` in `Cache` with `config: ConfigHandle`
 - `Cache::new()` takes `ConfigHandle` instead of reading from `&Settings`
 
 **File: `src/cache/writer/core.rs`**
 
 - `eviction_run()`: load config from handle for `cache_size`, `cache_policy`
 
+**File: `src/cache/writer/cdc.rs`**
+
+- CDC invalidation checks `cache_policy` (line ~357) — read from ConfigHandle
+
 ### Phase 4: HTTP Admin API endpoints
 
 **File: `src/metrics.rs`** (extend existing admin server)
 
-Add ConfigHandle to `admin_server_run()` parameters and route new endpoints:
+Add `ConfigHandle` to `admin_server_spawn()` / `admin_server_run()` parameters. Add routes alongside existing `/metrics`, `/healthz`, `/readyz`, `/status`:
 
 ```
 GET  /config        → config_get_handle()
@@ -193,17 +242,16 @@ pub struct DynamicConfigPatch {
 ## New Dependencies
 
 ```toml
-arc-swap = "1"       # Lock-free atomic pointer swap
 toml_edit = "0.22"   # Format-preserving TOML editing
 ```
 
-`serde::Serialize` derive needed on: `DynamicConfig`, `CachePolicy`, `SslMode` (for GET /config response).
+`arc-swap` is already a dependency. `serde::Serialize` derive needed on: `DynamicConfig`, `CachePolicy`, `SslMode` (for GET /config response).
 
 ## Files Modified (summary)
 
 | File | Changes |
 |------|---------|
-| `Cargo.toml` | Add arc-swap, toml_edit |
+| `Cargo.toml` | Add toml_edit |
 | `src/config.rs` (new) | DynamicConfig, ConfigHandle, TOML r/w, patch type |
 | `src/lib.rs` | Add `pub mod config;` |
 | `src/settings.rs` | Add config_path field, Serialize on CachePolicy |
@@ -214,6 +262,7 @@ toml_edit = "0.22"   # Format-preserving TOML editing
 | `src/cache/types.rs` | Cache uses ConfigHandle instead of owned fields |
 | `src/cache/query_cache.rs` | QueryCache uses ConfigHandle instead of owned fields |
 | `src/cache/writer/core.rs` | Eviction reads from ConfigHandle |
+| `src/cache/writer/cdc.rs` | CDC policy check reads from ConfigHandle |
 
 ## Verification
 
@@ -227,4 +276,4 @@ toml_edit = "0.22"   # Format-preserving TOML editing
 
 1. **Auth on admin API?** Production deployments will want it. Could be a follow-up phase — start with bind-address-only security (listen on localhost/internal network).
 2. **Config versioning?** A generation counter on GET /config could help IaC tools detect concurrent changes. Low cost to add.
-3. **Pinned queries**: Separate `/queries/pin` endpoint or part of config? Leaning toward separate endpoint given the validation complexity.
+3. **Runtime query pinning**: `pinned_queries` is currently startup-only (parsed, validated against origin schema, registered in cache). A future `POST /queries/pin` endpoint could support runtime pinning, but the validation complexity (SQL parsing, schema check, cache registration) warrants a separate design.

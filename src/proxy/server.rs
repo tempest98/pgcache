@@ -147,8 +147,7 @@ use crate::{
     },
     query::ast::{query_expr_convert, query_expr_fingerprint},
     settings::Settings,
-    telemetry,
-    tls,
+    telemetry, tls,
 };
 
 use super::cache_sender::CacheSenderInner;
@@ -441,19 +440,16 @@ pub fn proxy_run(
                 cancel.child_token(),
                 shared_proxy_status,
                 status_sender,
+                settings.dynamic.clone(),
             )
             .map_into_report::<ConnectionError>()
             .attach_loc("spawning admin server")?;
         }
 
         // Spawn telemetry background thread
-        telemetry::telemetry_spawn(
-            settings.telemetry,
-            cancel.child_token(),
-            telemetry_metrics,
-        )
-        .map_into_report::<ConnectionError>()
-        .attach_loc("spawning telemetry thread")?;
+        telemetry::telemetry_spawn(settings.telemetry, cancel.child_token(), telemetry_metrics)
+            .map_into_report::<ConnectionError>()
+            .attach_loc("spawning telemetry thread")?;
 
         let resources = WorkerResources {
             cache_sender,
@@ -542,7 +538,7 @@ mod tests {
 
     use crate::catalog::FunctionVolatility;
     use crate::settings::{
-        CachePolicy, CdcSettings, ListenSettings, PgSettings, Settings, SslMode,
+        CdcSettings, DynamicConfigHandle, ListenSettings, PgSettings, Settings, SslMode,
     };
 
     use super::pinned_queries_validate;
@@ -568,14 +564,10 @@ mod tests {
                 socket: "127.0.0.1:5432".parse().expect("valid socket"),
             },
             num_workers: 1,
-            cache_size: None,
             tls_cert: None,
             tls_key: None,
             metrics: None,
-            log_level: None,
-            cache_policy: CachePolicy::Clock,
-            admission_threshold: 2,
-            allowed_tables: None,
+            dynamic: DynamicConfigHandle::test_default(),
             pinned_queries,
             telemetry: false,
         }

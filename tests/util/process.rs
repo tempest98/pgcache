@@ -166,6 +166,8 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
 }
 
 /// Spawn a pgcache process with the given extra CLI arguments.
+/// Copies the default config to a temp file so each process gets its own copy
+/// (prevents concurrent tests from corrupting the shared config via PUT /config).
 fn pgcache_spawn(
     dbs: &TempDBs,
     listen_port: u16,
@@ -175,9 +177,13 @@ fn pgcache_spawn(
     let listen_socket = format!("127.0.0.1:{}", listen_port);
     let metrics_socket = format!("127.0.0.1:{}", metrics_port);
 
+    let config_path = std::env::temp_dir().join(format!("pgcache_test_{listen_port}.toml"));
+    std::fs::copy("tests/data/default_config.toml", &config_path)
+        .expect("copy default config to temp file");
+
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pgcache"));
     cmd.arg("--config")
-        .arg("tests/data/default_config.toml")
+        .arg(&config_path)
         .arg("--origin_host")
         .arg("127.0.0.1")
         .arg("--origin_port")

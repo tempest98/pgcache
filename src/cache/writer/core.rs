@@ -412,7 +412,7 @@ impl CacheWriter {
         }
 
         metrics::gauge!(names::CACHE_SIZE_BYTES).set(self.cache.current_size as f64);
-        if let Some(limit) = self.cache.cache_size {
+        if let Some(limit) = self.cache.dynamic.load().cache_size {
             metrics::gauge!(names::CACHE_SIZE_LIMIT_BYTES).set(limit as f64);
         }
         metrics::gauge!(names::CACHE_GENERATION).set(self.cache.generation_counter as f64);
@@ -441,11 +441,8 @@ impl CacheWriter {
         let mut bumps = 0;
         let mut pinned_skips = 0;
 
-        while self
-            .cache
-            .cache_size
-            .is_some_and(|s| self.cache.current_size > s)
-        {
+        let cfg = self.cache.dynamic.load();
+        while cfg.cache_size.is_some_and(|s| self.cache.current_size > s) {
             let Some(&min_gen) = self.cache.generations.first() else {
                 break;
             };
@@ -469,7 +466,7 @@ impl CacheWriter {
             }
 
             // CLOCK second-chance: referenced queries get bumped (bounded by MAX_BUMPS)
-            if self.cache.cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS {
+            if cfg.cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS {
                 let referenced = self
                     .state_view
                     .cached_queries
@@ -632,12 +629,13 @@ impl CacheWriter {
             total_misses += entry.miss_count;
         }
 
+        let dynamic = cache.dynamic.load();
         let cache_status = CacheStatusData {
             size_bytes: cache.current_size,
-            size_limit_bytes: cache.cache_size,
+            size_limit_bytes: dynamic.cache_size,
             generation: cache.generation_counter,
             tables_tracked: cache.tables.len(),
-            policy: format!("{:?}", cache.cache_policy),
+            policy: format!("{:?}", dynamic.cache_policy),
             queries_registered: cache.cached_queries.len(),
             uptime_ms: self.state_view.started_at.elapsed().as_millis() as u64,
             cache_hits: total_hits,

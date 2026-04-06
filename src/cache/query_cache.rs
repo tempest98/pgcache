@@ -8,7 +8,7 @@ use tracing::{error, info, instrument, trace};
 use crate::metrics::names;
 
 use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprint};
-use crate::settings::{CachePolicy, Settings};
+use crate::settings::{Allowlist, CachePolicy, DynamicConfig, DynamicConfigHandle, Settings};
 use crate::timing::QueryTiming;
 
 use std::num::NonZeroU64;
@@ -77,39 +77,13 @@ pub struct WorkerRequest {
     pub forward_bytes: Option<BytesMut>,
 }
 
-/// Parsed allowlist entry: (optional schema, table name), both lowercased.
-type AllowlistEntry = (Option<String>, String);
-
-/// Parsed and ready-to-match allowlist. None = all tables cacheable.
-type Allowlist = Option<Vec<AllowlistEntry>>;
-
-/// Parse an allowlist entry string into (optional schema, table name).
-/// Supports "table" and "schema.table" forms.
-fn allowlist_entry_parse(entry: &str) -> AllowlistEntry {
-    let entry = entry.trim();
-    match entry.rsplit_once('.') {
-        Some((schema, table)) => (Some(schema.to_lowercase()), table.to_lowercase()),
-        None => (None, entry.to_lowercase()),
-    }
-}
-
-/// Parse config strings into a ready-to-match allowlist.
-fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
-    tables
-        .as_ref()
-        .filter(|v| !v.is_empty())
-        .map(|entries| entries.iter().map(|e| allowlist_entry_parse(e)).collect())
-}
-
 /// Query cache coordinator - routes queries and delegates writes to the writer thread.
 #[derive(Debug, Clone)]
 pub struct QueryCache {
     query_tx: UnboundedSender<QueryCommand>,
     worker_tx: UnboundedSender<WorkerRequest>,
     state_view: Arc<CacheStateView>,
-    cache_policy: CachePolicy,
-    admission_threshold: u32,
-    allowed_tables: Allowlist,
+    dynamic: DynamicConfigHandle,
 }
 
 impl QueryCache {
@@ -119,16 +93,15 @@ impl QueryCache {
         worker_tx: UnboundedSender<WorkerRequest>,
         state_view: Arc<CacheStateView>,
     ) -> CacheResult<Self> {
-        let allowed_tables = allowlist_parse(&settings.allowed_tables);
-        match &allowed_tables {
-            Some(entries) => {
-                let names: Vec<&str> = settings
+        let cfg = settings.dynamic.load();
+        match &cfg.allowed_tables_parsed {
+            Some(_entries) => {
+                let names: Vec<&str> = cfg
                     .allowed_tables
                     .as_ref()
                     .map(|v| v.iter().map(String::as_str).collect())
                     .unwrap_or_default();
                 info!("table allowlist enabled: {names:?}");
-                let _ = entries; // silence unused warning
             }
             None => info!("table allowlist disabled, all tables cacheable"),
         }
@@ -137,16 +110,14 @@ impl QueryCache {
             query_tx,
             worker_tx,
             state_view,
-            cache_policy: settings.cache_policy,
-            admission_threshold: settings.admission_threshold,
-            allowed_tables,
+            dynamic: settings.dynamic.clone(),
         })
     }
 
     /// Check whether all tables in the query are in the allowlist.
     /// Returns true if no allowlist is configured (all tables allowed).
-    fn query_allowlist_check(&self, query: &QueryExpr) -> bool {
-        let Some(entries) = &self.allowed_tables else {
+    fn query_allowlist_check(allowlist: &Allowlist, query: &QueryExpr) -> bool {
+        let Some(entries) = allowlist else {
             return true;
         };
         query.nodes::<TableNode>().all(|t| {
@@ -165,7 +136,8 @@ impl QueryCache {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, msg: QueryRequest) -> CacheResult<()> {
-        if !self.query_allowlist_check(&msg.cacheable_query.query) {
+        let cfg = self.dynamic.load();
+        if !Self::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
             metrics::counter!(names::QUERIES_ALLOWLIST_SKIPPED).increment(1);
             return reply_forward(msg.reply_tx, msg.pipeline, msg.data);
         }
@@ -194,7 +166,7 @@ impl QueryCache {
                 ..
             }) if limit_is_sufficient(*max_limit, rows_needed) => {
                 self.metrics_hit_record(fingerprint);
-                self.clock_reference_set(&fingerprint);
+                self.clock_reference_set(cfg.cache_policy, &fingerprint);
                 self.worker_request_send(fingerprint, msg, Arc::clone(resolved), *generation)
             }
 
@@ -236,7 +208,7 @@ impl QueryCache {
                 let new_count = hit_count + 1;
                 trace!("pending {fingerprint} count={new_count}");
 
-                if new_count >= self.admission_threshold {
+                if new_count >= cfg.admission_threshold {
                     self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
                     self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
                         .await
@@ -261,7 +233,7 @@ impl QueryCache {
             // Cache miss — hold request, check subsumption
             None => {
                 trace!("cache miss {fingerprint}");
-                self.query_first_miss_handle(fingerprint, msg).await
+                self.query_first_miss_handle(fingerprint, msg, &cfg).await
             }
         }
     }
@@ -283,8 +255,8 @@ impl QueryCache {
     }
 
     /// Set the CLOCK reference bit for eviction tracking.
-    fn clock_reference_set(&self, fingerprint: &u64) {
-        if self.cache_policy == CachePolicy::Clock
+    fn clock_reference_set(&self, cache_policy: CachePolicy, fingerprint: &u64) {
+        if cache_policy == CachePolicy::Clock
             && let Some(mut entry) = self.state_view.cached_queries.get_mut(fingerprint)
         {
             entry.referenced = true;
@@ -452,9 +424,9 @@ impl QueryCache {
         &self,
         fingerprint: u64,
         msg: QueryRequest,
+        cfg: &DynamicConfig,
     ) -> CacheResult<()> {
-        let immediate_admit =
-            self.cache_policy == CachePolicy::Fifo || self.admission_threshold <= 1;
+        let immediate_admit = cfg.cache_policy == CachePolicy::Fifo || cfg.admission_threshold <= 1;
 
         let initial_state = if immediate_admit {
             CachedQueryState::Loading

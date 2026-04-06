@@ -4,8 +4,8 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
-use pgcache_lib::proxy::SharedProxyStatus;
 use pgcache_lib::metrics::metrics_recorder_install;
+use pgcache_lib::proxy::SharedProxyStatus;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
 use rootcause::Report;
@@ -16,7 +16,7 @@ use pgcache_lib::tracing_utils::SimpeFormatter;
 use tokio::io;
 use tracing::info;
 #[cfg(not(feature = "console"))]
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -50,17 +50,35 @@ fn main() -> Result<(), Report> {
     {
         // Log level precedence: CLI arg > config file > RUST_LOG env var > default (info)
         let filter = settings
+            .dynamic
+            .load()
             .log_level
             .as_deref()
             .map(EnvFilter::new)
             .or_else(|| EnvFilter::try_from_default_env().ok())
             .unwrap_or_else(|| EnvFilter::new("info"));
 
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .event_format(SimpeFormatter)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)?;
+        let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(tracing_subscriber::fmt::layer().event_format(SimpeFormatter))
+            .init();
+
+        let reload_handle_for_current = reload_handle.clone();
+        settings
+            .dynamic
+            .log_reload_handle_set(pgcache_lib::settings::LogReloadHandle {
+                reload: Box::new(move |level: &str| {
+                    reload_handle
+                        .reload(EnvFilter::new(level))
+                        .map_err(|e| e.to_string())
+                }),
+                current: Box::new(move || {
+                    reload_handle_for_current
+                        .with_current(|filter| filter.to_string())
+                        .ok()
+                }),
+            });
     }
 
     let sigint = Arc::new(AtomicBool::new(false));
@@ -91,10 +109,7 @@ fn main() -> Result<(), Report> {
         let res = proxy_handle
             .join()
             .unwrap_or_else(|_panic| {
-                Err(
-                    ConnectionError::IoError(io::Error::other("proxy thread panicked"))
-                        .into(),
-                )
+                Err(ConnectionError::IoError(io::Error::other("proxy thread panicked")).into())
             })
             .map_err(|e| e.into_dynamic());
 

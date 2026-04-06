@@ -80,6 +80,7 @@ ecow = "0.2.6"
 strum = "0.28.0"
 strum_macros = "0.28.0"
 toml = "1.0.6"
+toml_edit = "0.22.24"
 hdrhistogram = "7.5.4"
 ordered-float = "5.1.0"
 hotpath = { version = "0.14.0", optional = true }

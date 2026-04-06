@@ -13,7 +13,7 @@ use crate::{
     cache::query::CacheableQuery,
     catalog::TableMetadata,
     query::{ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr},
-    settings::{CachePolicy, Settings},
+    settings::{DynamicConfigHandle, Settings},
 };
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
@@ -164,16 +164,11 @@ pub struct Cache {
     pub generation_counter: u64,
     /// Generations of active cached queries (for efficient min-tracking)
     pub generations: BTreeSet<u64>,
-    /// Target size of cached data, if the current size is larger then
-    /// queries will be invalidated to decrease cached data
-    pub cache_size: Option<usize>,
     /// Size of currently cached data, updated after loading queries or purging data
     /// Actual size can drift from this value because of CDC traffic
     pub current_size: usize,
-    /// Cache eviction policy
-    pub cache_policy: CachePolicy,
-    /// Number of times a query must be seen before admission (clock policy only)
-    pub admission_threshold: u32,
+    /// Dynamic config handle for runtime-adjustable cache settings
+    pub dynamic: DynamicConfigHandle,
 }
 
 impl Cache {
@@ -184,10 +179,8 @@ impl Cache {
             cached_queries: BiHashMap::new(),
             generation_counter: 0,
             generations: BTreeSet::new(),
-            cache_size: settings.cache_size,
             current_size: 0,
-            cache_policy: settings.cache_policy,
-            admission_threshold: settings.admission_threshold,
+            dynamic: settings.dynamic.clone(),
         }
     }
 

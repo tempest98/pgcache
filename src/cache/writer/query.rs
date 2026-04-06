@@ -626,8 +626,7 @@ impl CacheWriter {
                 m.population_row_count = row_count;
                 m.cached_since_ns =
                     NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
-                m.last_population_duration_us =
-                    population_duration_us.and_then(NonZeroU64::new);
+                m.last_population_duration_us = population_duration_us.and_then(NonZeroU64::new);
             }
 
             // Update shared state view
@@ -638,7 +637,9 @@ impl CacheWriter {
                 &resolved,
                 max_limit,
             );
-            trace!("cached query ready, cached_bytes={cached_bytes} rows={row_count} {fingerprint}");
+            trace!(
+                "cached query ready, cached_bytes={cached_bytes} rows={row_count} {fingerprint}"
+            );
         }
     }
 

@@ -39,7 +39,9 @@ async fn test_select_star_column_order() -> Result<(), Error> {
     )
     .await?;
 
-    let expected_columns = ["id", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+    let expected_columns = [
+        "id", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
+    ];
 
     // First query — cache miss, served from origin
     let m = ctx.metrics().await?;

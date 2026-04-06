@@ -397,17 +397,20 @@ mod tests {
         column_names: &[&str],
     ) -> TableMetadata {
         let columns =
-            ColumnStore::new(column_names.iter().enumerate().map(|(i, col_name)| {
-                ColumnMetadata {
-                    name: (*col_name).into(),
-                    position: (i + 1) as i16,
-                    type_oid: 25,
-                    data_type: Type::TEXT,
-                    type_name: "text".into(),
-                    cache_type_name: "text".into(),
-                    is_primary_key: i == 0,
-                }
-            }));
+            ColumnStore::new(
+                column_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col_name)| ColumnMetadata {
+                        name: (*col_name).into(),
+                        position: (i + 1) as i16,
+                        type_oid: 25,
+                        data_type: Type::TEXT,
+                        type_name: "text".into(),
+                        cache_type_name: "text".into(),
+                        is_primary_key: i == 0,
+                    }),
+            );
         TableMetadata {
             relation_oid,
             name: name.into(),

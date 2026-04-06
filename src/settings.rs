@@ -1,11 +1,20 @@
 use std::{
-    error::Error, fmt, fs::read_to_string, io, net::SocketAddr, path::PathBuf, str::FromStr,
+    error::Error,
+    fmt, fs,
+    fs::read_to_string,
+    io,
+    net::SocketAddr,
+    path::Path,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex},
 };
 
+use arc_swap::ArcSwap;
 use error_set::error_set;
 use lexopt::prelude::*;
 use rootcause::Report;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::result::MapIntoReport;
 
@@ -72,7 +81,7 @@ impl fmt::Display for ParseSslModeError {
 impl Error for ParseSslModeError {}
 
 /// Cache eviction policy
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CachePolicy {
     /// FIFO eviction: oldest-registered query evicted first, no admission gating
@@ -110,6 +119,362 @@ impl FromStr for CachePolicy {
     }
 }
 
+/// Parsed allowlist entry: (optional schema, table name), both lowercased.
+pub type AllowlistEntry = (Option<String>, String);
+
+/// Parsed and ready-to-match allowlist. None = all tables cacheable.
+pub type Allowlist = Option<Vec<AllowlistEntry>>;
+
+/// Parse an allowlist entry string into (optional schema, table name).
+/// Supports "table" and "schema.table" forms.
+pub fn allowlist_entry_parse(entry: &str) -> AllowlistEntry {
+    let entry = entry.trim();
+    match entry.rsplit_once('.') {
+        Some((schema, table)) => (Some(schema.to_lowercase()), table.to_lowercase()),
+        None => (None, entry.to_lowercase()),
+    }
+}
+
+/// Parse config strings into a ready-to-match allowlist.
+pub fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
+    tables
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|entries| entries.iter().map(|e| allowlist_entry_parse(e)).collect())
+}
+
+/// Runtime-adjustable configuration fields.
+/// Stored behind ArcSwap for lock-free reads on the hot path.
+#[derive(Debug, Clone, Serialize)]
+pub struct DynamicConfig {
+    pub cache_size: Option<usize>,
+    pub cache_policy: CachePolicy,
+    pub admission_threshold: u32,
+    pub allowed_tables: Option<Vec<String>>,
+    #[serde(skip)]
+    pub allowed_tables_parsed: Allowlist,
+    pub log_level: Option<String>,
+}
+
+const DEFAULT_ADMISSION_THRESHOLD: u32 = 2;
+
+impl DynamicConfig {
+    pub fn new(
+        cache_size: Option<usize>,
+        cache_policy: Option<CachePolicy>,
+        admission_threshold: Option<u32>,
+        allowed_tables: Option<Vec<String>>,
+        log_level: Option<String>,
+    ) -> Self {
+        Self {
+            cache_size,
+            cache_policy: cache_policy.unwrap_or_default(),
+            admission_threshold: admission_threshold.unwrap_or(DEFAULT_ADMISSION_THRESHOLD),
+            allowed_tables_parsed: allowlist_parse(&allowed_tables),
+            allowed_tables,
+            log_level,
+        }
+    }
+}
+
+/// Type-erased handle for reloading the tracing log filter at runtime.
+type LogReloadFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+type LogCurrentFn = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+pub struct LogReloadHandle {
+    pub reload: LogReloadFn,
+    pub current: LogCurrentFn,
+}
+
+/// Snapshot of static config fields captured at startup.
+/// Used to detect when the TOML file has been edited and a restart is needed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticConfigSnapshot {
+    pub origin: PgSettings,
+    pub cache: PgSettings,
+    pub listen: ListenSettings,
+    pub num_workers: usize,
+    pub cdc: CdcSettings,
+}
+
+impl StaticConfigSnapshot {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            origin: settings.origin.clone(),
+            cache: settings.cache.clone(),
+            listen: settings.listen.clone(),
+            num_workers: settings.num_workers,
+            cdc: settings.cdc.clone(),
+        }
+    }
+
+    fn from_toml(config: &SettingsToml) -> Self {
+        Self {
+            origin: config.origin.clone(),
+            cache: config.cache.clone(),
+            listen: config.listen.clone(),
+            num_workers: config.num_workers,
+            cdc: config.cdc.clone(),
+        }
+    }
+}
+
+/// Shared handle for reading/updating dynamic config. Cloneable, lock-free reads.
+pub struct DynamicConfigHandle {
+    inner: Arc<ArcSwap<DynamicConfig>>,
+    config_path: Option<PathBuf>,
+    log_reload: Arc<Mutex<Option<LogReloadHandle>>>,
+    static_snapshot: Option<StaticConfigSnapshot>,
+}
+
+impl Clone for DynamicConfigHandle {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            config_path: self.config_path.clone(),
+            log_reload: Arc::clone(&self.log_reload),
+            static_snapshot: self.static_snapshot.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for DynamicConfigHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynamicConfigHandle")
+            .field("config", &*self.inner.load())
+            .field("config_path", &self.config_path)
+            .finish()
+    }
+}
+
+impl DynamicConfigHandle {
+    fn new(
+        config: DynamicConfig,
+        config_path: Option<PathBuf>,
+        static_snapshot: Option<StaticConfigSnapshot>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(config)),
+            config_path,
+            log_reload: Arc::new(Mutex::new(None)),
+            static_snapshot,
+        }
+    }
+
+    /// Lock-free read of current dynamic config. Hot path.
+    pub fn load(&self) -> arc_swap::Guard<Arc<DynamicConfig>> {
+        self.inner.load()
+    }
+
+    /// Path to the TOML config file, if one was provided at startup.
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
+    /// Check if the TOML config file has static fields that differ from the running config.
+    /// Returns true if a restart is needed to apply the changes.
+    pub fn restart_required(&self) -> bool {
+        let (Some(path), Some(snapshot)) = (self.config_path.as_deref(), &self.static_snapshot)
+        else {
+            return false;
+        };
+        let Ok(content) = read_to_string(path) else {
+            return false;
+        };
+        let Ok(config) = toml::from_str::<SettingsToml>(&content) else {
+            return false;
+        };
+        let file_snapshot = StaticConfigSnapshot::from_toml(&config);
+        *snapshot != file_snapshot
+    }
+
+    /// Query the effective log level from the tracing subscriber.
+    /// Returns None if no reload handle is set (e.g., console-subscriber mode).
+    pub fn effective_log_level(&self) -> Option<String> {
+        if let Ok(guard) = self.log_reload.lock()
+            && let Some(ref handle) = *guard
+        {
+            (handle.current)()
+        } else {
+            None
+        }
+    }
+
+    /// Set the log reload handle. Called once at startup after tracing is initialized.
+    pub fn log_reload_handle_set(&self, handle: LogReloadHandle) {
+        if let Ok(mut guard) = self.log_reload.lock() {
+            *guard = Some(handle);
+        }
+    }
+
+    /// If log_level changed, reload the tracing filter.
+    fn log_level_reload(&self, new_level: Option<&str>) {
+        if let Ok(guard) = self.log_reload.lock()
+            && let Some(ref handle) = *guard
+            && let Err(e) = (handle.reload)(new_level.unwrap_or("info"))
+        {
+            tracing::error!("log level reload failed: {e}");
+        }
+    }
+
+    /// Swap in a new dynamic config. Called on config update via admin API.
+    /// Reloads log level if it changed.
+    pub fn update(&self, new: DynamicConfig) {
+        let old = self.inner.load();
+        let log_changed = old.log_level != new.log_level;
+        let new_log_level = new.log_level.clone();
+        self.inner.store(Arc::new(new));
+        if log_changed {
+            self.log_level_reload(new_log_level.as_deref());
+        }
+    }
+
+    /// Create a handle with default dynamic config and no config file. For tests.
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self::new(DynamicConfig::new(None, None, None, None, None), None, None)
+    }
+}
+
+/// Partial update for dynamic config fields via PUT /config.
+/// None = don't change, Some(None) = unset to default, Some(Some(v)) = set to v.
+///
+/// For nullable fields (cache_size, allowed_tables, log_level), JSON `null`
+/// means "unset" (Some(None)), absent means "don't change" (None).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DynamicConfigPatch {
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub cache_size: Option<Option<usize>>,
+    #[serde(default)]
+    pub cache_policy: Option<CachePolicy>,
+    #[serde(default)]
+    pub admission_threshold: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub allowed_tables: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub log_level: Option<Option<String>>,
+}
+
+/// Deserialize a double-Option: absent → None, null → Some(None), value → Some(Some(v)).
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+impl DynamicConfigPatch {
+    /// Merge this patch into an existing config, producing a new DynamicConfig.
+    pub fn apply(&self, current: &DynamicConfig) -> DynamicConfig {
+        let allowlist_changed = self.allowed_tables.is_some();
+        let allowed_tables = match &self.allowed_tables {
+            Some(v) => v.clone(),
+            None => current.allowed_tables.clone(),
+        };
+        DynamicConfig {
+            cache_size: match self.cache_size {
+                Some(v) => v,
+                None => current.cache_size,
+            },
+            cache_policy: self.cache_policy.unwrap_or(current.cache_policy),
+            admission_threshold: self
+                .admission_threshold
+                .unwrap_or(current.admission_threshold),
+            allowed_tables_parsed: if allowlist_changed {
+                allowlist_parse(&allowed_tables)
+            } else {
+                current.allowed_tables_parsed.clone()
+            },
+            allowed_tables,
+            log_level: match &self.log_level {
+                Some(v) => v.clone(),
+                None => current.log_level.clone(),
+            },
+        }
+    }
+}
+
+/// Extract dynamic config fields from a parsed TOML config file.
+fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {
+    DynamicConfig::new(
+        config.cache_size,
+        config.cache_policy,
+        config.admission_threshold,
+        config.allowed_tables.clone(),
+        config.log_level.clone(),
+    )
+}
+
+/// Read a TOML config file and extract the dynamic config fields.
+pub fn config_file_dynamic_extract(path: &Path) -> ConfigResult<DynamicConfig> {
+    let content = read_to_string(path).map_into_report::<ConfigError>()?;
+    let config: SettingsToml = toml::from_str(&content).map_into_report::<ConfigError>()?;
+    Ok(dynamic_config_from_toml(&config))
+}
+
+/// Apply a patch to the TOML config file, preserving formatting and comments.
+/// Returns the new effective dynamic config after the update.
+#[allow(clippy::indexing_slicing)] // toml_edit doc[key] creates keys, does not panic
+pub fn config_file_dynamic_update(
+    path: &Path,
+    patch: &DynamicConfigPatch,
+) -> ConfigResult<()> {
+    let content = read_to_string(path).map_into_report::<ConfigError>()?;
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e: toml_edit::TomlError| ConfigError::TomlError(Box::new(e)))
+        .map_into_report::<ConfigError>()?;
+
+    if let Some(v) = &patch.cache_size {
+        match v {
+            Some(size) => doc["cache_size"] = toml_edit::value(*size as i64),
+            None => {
+                doc.remove("cache_size");
+            }
+        }
+    }
+
+    if let Some(policy) = &patch.cache_policy {
+        let s = match policy {
+            CachePolicy::Fifo => "fifo",
+            CachePolicy::Clock => "clock",
+        };
+        doc["cache_policy"] = toml_edit::value(s);
+    }
+
+    if let Some(threshold) = &patch.admission_threshold {
+        doc["admission_threshold"] = toml_edit::value(*threshold as i64);
+    }
+
+    if let Some(v) = &patch.allowed_tables {
+        match v {
+            Some(tables) => {
+                let mut arr = toml_edit::Array::new();
+                for t in tables {
+                    arr.push(t.as_str());
+                }
+                doc["allowed_tables"] = toml_edit::value(arr);
+            }
+            None => {
+                doc.remove("allowed_tables");
+            }
+        }
+    }
+
+    if let Some(v) = &patch.log_level {
+        match v {
+            Some(level) => doc["log_level"] = toml_edit::value(level.as_str()),
+            None => {
+                doc.remove("log_level");
+            }
+        }
+    }
+
+    fs::write(path, doc.to_string()).map_into_report::<ConfigError>()?;
+    Ok(())
+}
+
 impl FromStr for SslMode {
     type Err = ParseSslModeError;
 
@@ -124,7 +489,7 @@ impl FromStr for SslMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PgSettings {
     pub host: String,
     pub port: u16,
@@ -183,13 +548,13 @@ pub fn replication_settings_resolve(
     cli_overrides.merge_with(&base)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CdcSettings {
     pub publication_name: String,
     pub slot_name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ListenSettings {
     pub socket: SocketAddr,
 }
@@ -250,25 +615,15 @@ pub struct Settings {
     pub cdc: CdcSettings,
     pub listen: ListenSettings,
     pub num_workers: usize,
-    pub cache_size: Option<usize>,
     /// TLS certificate file path (PEM format) for client connections
     pub tls_cert: Option<PathBuf>,
     /// TLS private key file path (PEM format) for client connections
     pub tls_key: Option<PathBuf>,
     /// Prometheus metrics endpoint configuration
     pub metrics: Option<MetricsSettings>,
-    /// Log level filter (supports tracing EnvFilter syntax)
-    /// Examples: "debug", "info", "pgcache_lib::cache=debug,info"
-    pub log_level: Option<String>,
-    /// Cache eviction policy: fifo or clock (default: clock)
-    pub cache_policy: CachePolicy,
-    /// Number of times a query must be seen before admission to cache (default: 2)
-    /// Only used with clock policy; fifo always admits immediately.
-    pub admission_threshold: u32,
-    /// Only cache queries referencing these tables.
-    /// Supports both unqualified ("orders") and schema-qualified ("audit.orders") names.
-    /// If omitted or empty, all tables are cacheable (current behavior).
-    pub allowed_tables: Option<Vec<String>>,
+    /// Runtime-adjustable configuration (cache_size, cache_policy, etc.)
+    /// Backed by ArcSwap for lock-free reads on the hot path.
+    pub dynamic: DynamicConfigHandle,
     /// Queries to pin in cache at startup. Pinned queries are pre-registered,
     /// protected from eviction, and auto-readmitted after CDC invalidation.
     pub pinned_queries: Option<Vec<String>>,
@@ -399,17 +754,19 @@ struct CliArgs {
     telemetry_off: bool,
 }
 
-fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
+fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathBuf>)> {
     let mut args = CliArgs::default();
     let mut config = None;
+    let mut config_path = None;
     let mut parser = lexopt::Parser::from_env();
 
     while let Some(arg) = parser.next().map_into_report::<ConfigError>()? {
         match arg {
             Short('c') | Long("config") => {
                 let path = arg_string(&mut parser)?;
-                let file = read_to_string(path).map_into_report::<ConfigError>()?;
+                let file = read_to_string(&path).map_into_report::<ConfigError>()?;
                 config = Some(toml::from_str(&file).map_into_report::<ConfigError>()?);
+                config_path = Some(PathBuf::from(path));
             }
             Long("origin_host") => args.origin_host = Some(arg_string(&mut parser)?),
             Long("origin_port") => args.origin_port = Some(arg_parse(&mut parser)?),
@@ -459,7 +816,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>)> {
         }
     }
 
-    Ok((args, config))
+    Ok((args, config, config_path))
 }
 
 /// Resolve telemetry enabled state from CLI > TOML > env var > default (true).
@@ -476,9 +833,13 @@ fn telemetry_resolve(cli_off: bool, toml_value: Option<bool>) -> bool {
     true
 }
 
-fn settings_build(args: CliArgs, config: Option<SettingsToml>) -> ConfigResult<Settings> {
+fn settings_build(
+    args: CliArgs,
+    config: Option<SettingsToml>,
+    config_path: Option<PathBuf>,
+) -> ConfigResult<Settings> {
     let mut settings = if let Some(mut config) = config {
-        settings_build_with_config(args, &mut config)?
+        settings_build_with_config(args, &mut config, config_path)?
     } else {
         settings_build_cli_only(args)?
     };
@@ -487,11 +848,18 @@ fn settings_build(args: CliArgs, config: Option<SettingsToml>) -> ConfigResult<S
     settings.cdc.publication_name = settings.cdc.publication_name.to_ascii_lowercase();
     settings.cdc.slot_name = settings.cdc.slot_name.to_ascii_lowercase();
 
+    // Capture static config snapshot for restart-required detection
+    settings.dynamic.static_snapshot = Some(StaticConfigSnapshot::from_settings(&settings));
+
     Ok(settings)
 }
 
 /// Build settings by merging CLI args over a TOML config file.
-fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> ConfigResult<Settings> {
+fn settings_build_with_config(
+    args: CliArgs,
+    config: &mut SettingsToml,
+    config_path: Option<PathBuf>,
+) -> ConfigResult<Settings> {
     let origin_overrides = PgSettingsPartial {
         host: args.origin_host,
         port: args.origin_port,
@@ -525,6 +893,14 @@ fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> Confi
     };
     let cache = cache_overrides.merge_with(&config.cache);
 
+    let dynamic = DynamicConfig::new(
+        args.cache_size.or(config.cache_size),
+        args.cache_policy.or(config.cache_policy),
+        args.admission_threshold.or(config.admission_threshold),
+        csv_parse(args.allowed_tables).or(config.allowed_tables.take()),
+        args.log_level.or_else(|| config.log_level.clone()),
+    );
+
     Ok(Settings {
         origin,
         replication,
@@ -541,23 +917,13 @@ fn settings_build_with_config(args: CliArgs, config: &mut SettingsToml) -> Confi
             socket: args.listen_socket.unwrap_or(config.listen.socket),
         },
         num_workers: args.num_workers.unwrap_or(config.num_workers),
-        cache_size: args.cache_size.or(config.cache_size),
         tls_cert: args.tls_cert.or_else(|| config.tls_cert.clone()),
         tls_key: args.tls_key.or_else(|| config.tls_key.clone()),
         metrics: args
             .metrics_socket
             .map(|socket| MetricsSettings { socket })
             .or_else(|| config.metrics.clone()),
-        log_level: args.log_level.or_else(|| config.log_level.clone()),
-        cache_policy: args
-            .cache_policy
-            .or(config.cache_policy)
-            .unwrap_or_default(),
-        admission_threshold: args
-            .admission_threshold
-            .or(config.admission_threshold)
-            .unwrap_or(2),
-        allowed_tables: csv_parse(args.allowed_tables).or(config.allowed_tables.take()),
+        dynamic: DynamicConfigHandle::new(dynamic, config_path, None),
         pinned_queries: pinned_tables_expand_and_merge(
             pinned_queries_parse(args.pinned_queries).or(config.pinned_queries.take()),
             csv_parse(args.pinned_tables).or(config.pinned_tables.take()),
@@ -610,14 +976,20 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
             socket: require(args.listen_socket, "listen_socket")?,
         },
         num_workers: require(args.num_workers, "num_workers")?,
-        cache_size: args.cache_size,
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
         metrics: args.metrics_socket.map(|socket| MetricsSettings { socket }),
-        log_level: args.log_level,
-        cache_policy: args.cache_policy.unwrap_or_default(),
-        admission_threshold: args.admission_threshold.unwrap_or(2),
-        allowed_tables: csv_parse(args.allowed_tables),
+        dynamic: DynamicConfigHandle::new(
+            DynamicConfig::new(
+                args.cache_size,
+                args.cache_policy,
+                args.admission_threshold,
+                csv_parse(args.allowed_tables),
+                args.log_level,
+            ),
+            None, // no config file in CLI-only mode
+            None, // snapshot set in settings_build
+        ),
         pinned_queries: pinned_tables_expand_and_merge(
             pinned_queries_parse(args.pinned_queries),
             csv_parse(args.pinned_tables),
@@ -628,8 +1000,8 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
 
 impl Settings {
     pub fn from_args() -> ConfigResult<Settings> {
-        let (args, config) = cli_args_parse()?;
-        settings_build(args, config)
+        let (args, config, config_path) = cli_args_parse()?;
+        settings_build(args, config, config_path)
     }
 
     fn print_usage_and_exit(name: &str) -> ! {
@@ -1207,7 +1579,7 @@ socket = "127.0.0.1:5434"
         let config = base_toml_config();
         let args = CliArgs::default();
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         assert_eq!(settings.replication.host, "origin.example.com");
         assert_eq!(settings.replication.port, 5432);
@@ -1228,7 +1600,7 @@ socket = "127.0.0.1:5434"
         });
         let args = CliArgs::default();
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         assert_eq!(settings.replication.host, "replica.example.com");
         assert_eq!(settings.replication.port, 5432);
@@ -1248,7 +1620,7 @@ socket = "127.0.0.1:5434"
             ..Default::default()
         };
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         assert_eq!(settings.replication.host, "cli-replica.example.com");
         assert_eq!(settings.replication.port, 6432);
@@ -1274,7 +1646,7 @@ socket = "127.0.0.1:5434"
             ..Default::default()
         };
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         // CLI host wins over TOML host
         assert_eq!(settings.replication.host, "cli-replica.example.com");
@@ -1292,7 +1664,7 @@ socket = "127.0.0.1:5434"
             ..Default::default()
         };
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         // Origin was overridden by CLI
         assert_eq!(settings.origin.host, "cli-origin.example.com");
@@ -1307,7 +1679,7 @@ socket = "127.0.0.1:5434"
         config.cdc.slot_name = "MY_SLOT".to_owned();
         let args = CliArgs::default();
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         assert_eq!(settings.cdc.publication_name, "my_pub");
         assert_eq!(settings.cdc.slot_name, "my_slot");
@@ -1339,7 +1711,7 @@ socket = "127.0.0.1:5434"
     fn settings_build_cli_only_replication_defaults_to_origin() {
         let args = base_cli_args();
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         assert_eq!(settings.replication.host, "origin.example.com");
         assert_eq!(settings.replication.port, 5432);
@@ -1359,7 +1731,7 @@ socket = "127.0.0.1:5434"
             ..base_cli_args()
         };
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         assert_eq!(settings.replication.host, "replica.example.com");
         // Remaining fields inherited from origin
@@ -1384,7 +1756,7 @@ socket = "127.0.0.1:5434"
             ..base_cli_args()
         };
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         assert_eq!(settings.replication.host, "replica.example.com");
         assert_eq!(settings.replication.port, 6432);
@@ -1402,7 +1774,7 @@ socket = "127.0.0.1:5434"
         let mut args = base_cli_args();
         args.origin_host = None;
 
-        let err = settings_build(args, None).expect_err("missing origin_host");
+        let err = settings_build(args, None, None).expect_err("missing origin_host");
         assert!(err.to_string().contains("origin_host"));
     }
 
@@ -1410,11 +1782,12 @@ socket = "127.0.0.1:5434"
     fn settings_build_cli_only_defaults() {
         let args = base_cli_args();
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         assert_eq!(settings.origin.ssl_mode, SslMode::Disable);
-        assert_eq!(settings.cache_policy, CachePolicy::Clock);
-        assert_eq!(settings.admission_threshold, 2);
+        let dynamic = settings.dynamic.load();
+        assert_eq!(dynamic.cache_policy, CachePolicy::Clock);
+        assert_eq!(dynamic.admission_threshold, 2);
         assert_eq!(settings.cache.ssl_mode, SslMode::Disable);
         assert_eq!(settings.cache.password, None);
     }
@@ -1427,7 +1800,7 @@ socket = "127.0.0.1:5434"
             ..base_cli_args()
         };
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         assert_eq!(settings.cdc.publication_name, "my_pub");
         assert_eq!(settings.cdc.slot_name, "my_slot");
@@ -1438,7 +1811,7 @@ socket = "127.0.0.1:5434"
     #[test]
     fn settings_build_pinned_queries_default_none() {
         let args = base_cli_args();
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
         assert!(settings.pinned_queries.is_none());
     }
 
@@ -1451,7 +1824,7 @@ socket = "127.0.0.1:5434"
         ]);
         let args = CliArgs::default();
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 2);
@@ -1466,7 +1839,7 @@ socket = "127.0.0.1:5434"
             ..base_cli_args()
         };
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 2);
@@ -1483,7 +1856,7 @@ socket = "127.0.0.1:5434"
             ..CliArgs::default()
         };
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 1);
@@ -1536,7 +1909,7 @@ socket = "127.0.0.1:5434"
         config.pinned_tables = Some(vec!["settings".to_owned(), "products".to_owned()]);
         let args = CliArgs::default();
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 2);
@@ -1551,7 +1924,7 @@ socket = "127.0.0.1:5434"
         config.pinned_tables = Some(vec!["settings".to_owned()]);
         let args = CliArgs::default();
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 2);
@@ -1566,7 +1939,7 @@ socket = "127.0.0.1:5434"
             ..base_cli_args()
         };
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 2);
@@ -1580,7 +1953,7 @@ socket = "127.0.0.1:5434"
         config.pinned_tables = Some(vec!["analytics.events".to_owned()]);
         let args = CliArgs::default();
 
-        let settings = settings_build(args, Some(config)).expect("build settings");
+        let settings = settings_build(args, Some(config), None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 1);
@@ -1595,7 +1968,7 @@ socket = "127.0.0.1:5434"
             ..base_cli_args()
         };
 
-        let settings = settings_build(args, None).expect("build settings");
+        let settings = settings_build(args, None, None).expect("build settings");
 
         let pinned = settings.pinned_queries.expect("pinned queries set");
         assert_eq!(pinned.len(), 2);
@@ -1636,5 +2009,151 @@ socket = "127.0.0.1:5434"
         assert_eq!(tables.len(), 2);
         assert_eq!(tables[0], "settings");
         assert_eq!(tables[1], "products");
+    }
+
+    // ==================== DynamicConfigPatch Tests ====================
+
+    fn base_dynamic_config() -> DynamicConfig {
+        DynamicConfig::new(
+            Some(1_000_000),
+            Some(CachePolicy::Clock),
+            Some(2),
+            Some(vec!["public.users".to_owned()]),
+            Some("info".to_owned()),
+        )
+    }
+
+    #[test]
+    fn config_patch_apply_empty_preserves_current() {
+        let current = base_dynamic_config();
+        let patch = DynamicConfigPatch {
+            cache_size: None,
+            cache_policy: None,
+            admission_threshold: None,
+            allowed_tables: None,
+            log_level: None,
+        };
+        let result = patch.apply(&current);
+        assert_eq!(result.cache_size, Some(1_000_000));
+        assert_eq!(result.cache_policy, CachePolicy::Clock);
+        assert_eq!(result.admission_threshold, 2);
+        assert_eq!(result.allowed_tables, Some(vec!["public.users".to_owned()]));
+        assert_eq!(result.log_level, Some("info".to_owned()));
+    }
+
+    #[test]
+    fn config_patch_apply_set_values() {
+        let current = base_dynamic_config();
+        let patch = DynamicConfigPatch {
+            cache_size: Some(Some(2_000_000)),
+            cache_policy: Some(CachePolicy::Fifo),
+            admission_threshold: Some(5),
+            allowed_tables: Some(Some(vec!["orders".to_owned()])),
+            log_level: Some(Some("debug".to_owned())),
+        };
+        let result = patch.apply(&current);
+        assert_eq!(result.cache_size, Some(2_000_000));
+        assert_eq!(result.cache_policy, CachePolicy::Fifo);
+        assert_eq!(result.admission_threshold, 5);
+        assert_eq!(result.allowed_tables, Some(vec!["orders".to_owned()]));
+        assert_eq!(result.log_level, Some("debug".to_owned()));
+    }
+
+    #[test]
+    fn config_patch_apply_unset_optional_fields() {
+        let current = base_dynamic_config();
+        let patch = DynamicConfigPatch {
+            cache_size: Some(None),
+            cache_policy: None,
+            admission_threshold: None,
+            allowed_tables: Some(None),
+            log_level: Some(None),
+        };
+        let result = patch.apply(&current);
+        assert_eq!(result.cache_size, None);
+        assert_eq!(result.allowed_tables, None);
+        assert!(result.allowed_tables_parsed.is_none());
+        assert_eq!(result.log_level, None);
+    }
+
+    #[test]
+    fn config_patch_json_deserialize() {
+        let json = r#"{"cache_size": 500, "admission_threshold": 3}"#;
+        let patch: DynamicConfigPatch = serde_json::from_str(json).expect("parse JSON");
+        assert_eq!(patch.cache_size, Some(Some(500)));
+        assert_eq!(patch.admission_threshold, Some(3));
+        assert!(patch.cache_policy.is_none());
+        assert!(patch.allowed_tables.is_none());
+        assert!(patch.log_level.is_none());
+    }
+
+    #[test]
+    fn config_patch_json_null_unsets() {
+        let json = r#"{"cache_size": null, "log_level": null}"#;
+        let patch: DynamicConfigPatch = serde_json::from_str(json).expect("parse JSON");
+        assert_eq!(patch.cache_size, Some(None));
+        assert_eq!(patch.log_level, Some(None));
+    }
+
+    #[test]
+    fn config_file_toml_round_trip() {
+        let toml_content = r#"# Main config
+num_workers = 4
+cache_size = 1000000
+cache_policy = "clock"
+admission_threshold = 2
+log_level = "info"
+allowed_tables = ["public.users"]
+
+[origin]
+host = "localhost"
+port = 5432
+user = "test"
+database = "testdb"
+
+[cache]
+host = "localhost"
+port = 5433
+user = "test"
+database = "cachedb"
+
+[cdc]
+publication_name = "pub"
+slot_name = "slot"
+
+[listen]
+socket = "127.0.0.1:6432"
+"#;
+
+        let dir = std::env::temp_dir().join("pgcache_test_config");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test_round_trip.toml");
+        fs::write(&path, toml_content).expect("write test TOML");
+
+        // Apply a patch
+        let patch = DynamicConfigPatch {
+            cache_size: Some(Some(2_000_000)),
+            cache_policy: Some(CachePolicy::Fifo),
+            admission_threshold: None,
+            allowed_tables: None,
+            log_level: Some(None),
+        };
+        config_file_dynamic_update(&path, &patch).expect("update TOML");
+
+        // Re-read to verify the changes
+        let result = config_file_dynamic_extract(&path).expect("extract after update");
+        assert_eq!(result.cache_size, Some(2_000_000));
+        assert_eq!(result.cache_policy, CachePolicy::Fifo);
+        assert_eq!(result.admission_threshold, 2); // unchanged
+        assert!(result.log_level.is_none()); // unset
+        assert_eq!(result.allowed_tables, Some(vec!["public.users".to_owned()]));
+
+        let updated = fs::read_to_string(&path).expect("read updated TOML");
+        assert!(updated.contains("# Main config"));
+        assert!(updated.contains("cache_size = 2000000"));
+        assert!(updated.contains(r#"cache_policy = "fifo""#));
+        assert!(!updated.contains("log_level")); // removed
+
+        let _ = fs::remove_file(&path);
     }
 }

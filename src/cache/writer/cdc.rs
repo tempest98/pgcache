@@ -322,9 +322,10 @@ impl CacheWriter {
         // Purge generations based on new threshold
         let new_threshold = self.cache.generation_purge_threshold();
         if new_threshold > prev_generation_threshold {
+            let cache_size = self.cache.dynamic.load().cache_size;
             let mut current_size = self.cache_size_load().await?;
 
-            if self.cache.cache_size.is_some_and(|s| current_size > s) {
+            if cache_size.is_some_and(|s| current_size > s) {
                 self.generation_purge(new_threshold).await?;
                 current_size = self.cache_size_load().await?;
             }
@@ -354,7 +355,9 @@ impl CacheWriter {
             return Ok(());
         }
 
-        if self.cache.cache_policy == CachePolicy::Fifo {
+        let cfg = self.cache.dynamic.load();
+
+        if cfg.cache_policy == CachePolicy::Fifo {
             return self.cache_query_evict(fingerprint).await;
         }
 
@@ -395,7 +398,7 @@ impl CacheWriter {
         if new_threshold > prev_generation_threshold {
             let mut current_size = self.cache_size_load().await?;
 
-            if self.cache.cache_size.is_some_and(|s| current_size > s) {
+            if cfg.cache_size.is_some_and(|s| current_size > s) {
                 self.generation_purge(new_threshold).await?;
                 current_size = self.cache_size_load().await?;
             }

@@ -4,5 +4,5 @@ mod population;
 mod query;
 mod table;
 
-pub use self::core::{CacheWriter, writer_run};
 pub(super) use self::core::PopulationWork;
+pub use self::core::{CacheWriter, writer_run};
