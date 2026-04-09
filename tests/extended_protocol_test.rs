@@ -134,15 +134,18 @@ async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
     assert_eq!(rows[0].get::<_, i32>("value"), 100);
     let m = assert_cache_hit(&mut ctx, m).await?;
 
-    // Different parameters — cache miss
-    ctx.query(&stmt, &[&"foo", &150]).await?;
+    // Different data parameter — cache miss (different fingerprint)
+    ctx.query(&stmt, &[&"bar", &100]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     wait_cache_load().await;
 
     // Same parameters — cache hit
-    let rows = ctx.query(&stmt, &[&"foo", &150]).await?;
-    assert_eq!(rows.len(), 0);
+    let rows = ctx.query(&stmt, &[&"bar", &100]).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("id"), 2);
+    assert_eq!(rows[0].get::<_, &str>("data"), "bar");
+    assert_eq!(rows[0].get::<_, i32>("value"), 200);
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())

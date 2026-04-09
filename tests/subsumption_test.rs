@@ -153,10 +153,10 @@ async fn test_subsumption_different_table_not_subsumed() -> Result<(), Error> {
     Ok(())
 }
 
-/// Test that cached queries with inequality constraints do NOT subsume.
-/// Cached WHERE value > 50 does NOT cover WHERE value > 100.
+/// Test that a narrower inequality IS subsumed by a wider one.
+/// Cached WHERE value > 50 covers WHERE value > 100.
 #[tokio::test]
-async fn test_subsumption_inequality_not_subsumed() -> Result<(), Error> {
+async fn test_subsumption_inequality_subsumed() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
     ctx.query(
@@ -178,10 +178,12 @@ async fn test_subsumption_inequality_not_subsumed() -> Result<(), Error> {
 
     wait_cache_load().await;
 
-    // Narrower inequality — not subsumed (v1 rejects non-equality cached constraints)
-    ctx.simple_query("SELECT * FROM test_sub_ineq WHERE value > 100")
+    // Narrower inequality — subsumed (value > 100 implies value > 50)
+    let rows = ctx
+        .simple_query("SELECT * FROM test_sub_ineq WHERE value > 100")
         .await?;
-    let _m = assert_not_subsumed(&mut ctx, m).await?;
+    let _m = assert_subsume_hit(&mut ctx, m).await?;
+    assert_eq!(rows.len(), 3); // 1 row + RowDescription + CommandComplete
 
     Ok(())
 }
