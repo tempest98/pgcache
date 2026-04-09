@@ -105,6 +105,35 @@ impl AsyncWrite for ClientSocket {
             }
         }
     }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            ClientSocket::Plain(tcp) => Pin::new(tcp).poll_write_vectored(cx, bufs),
+            ClientSocket::Tls {
+                tcp,
+                tls_state,
+                pending,
+            } => {
+                // TLS cannot vectored-write; write first non-empty slice
+                let buf = bufs
+                    .iter()
+                    .find(|b| !b.is_empty())
+                    .map_or(&[][..], |b| b);
+                tls_poll_write(Pin::new(tcp), tls_state, cx, buf, pending)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            ClientSocket::Plain(tcp) => tcp.is_write_vectored(),
+            ClientSocket::Tls { .. } => false,
+        }
+    }
 }
 
 impl std::fmt::Debug for ClientSocket {

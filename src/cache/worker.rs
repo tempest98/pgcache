@@ -3,7 +3,7 @@ use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
 use tokio_stream::StreamExt;
-use tokio_util::bytes::BytesMut;
+use tokio_util::bytes::{Buf, Bytes};
 use tokio_util::codec::FramedRead;
 use tracing::{debug, error, instrument, trace};
 
@@ -11,16 +11,15 @@ use crate::cache::messages::PipelineDescribe;
 use crate::pg::cache_connection::CacheConnection;
 use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
-    bind_complete_encode, parse_complete_encode, ready_for_query_encode,
+    BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
 };
 use crate::query::ast::Deparse;
 
 use super::{
     CacheError, CacheResult,
     query_cache::{QueryType, WorkerRequest},
+    write_queue::WriteQueue,
 };
-
-const BUFFER_SIZE_THRESHOLD: usize = 64 * 1024;
 
 /// Guard that ensures a connection is returned to the pool.
 ///
@@ -159,17 +158,17 @@ async fn handle_cached_query_text(
     let has_parse = msg.has_parse;
     let has_bind = msg.has_bind;
     let pipeline_describe = msg.pipeline_describe;
-    let parameter_description = msg.parameter_description.take();
+    let mut parameter_description = msg.parameter_description.take();
     let client_socket = &mut msg.client_socket;
 
-    let mut write_buf = BytesMut::with_capacity(BUFFER_SIZE_THRESHOLD);
+    let mut write_queue = WriteQueue::new();
 
     // Prepend ParseComplete / BindComplete for messages the proxy buffered
     if has_parse {
-        parse_complete_encode(&mut write_buf);
+        write_queue.push(Bytes::from_static(PARSE_COMPLETE_MSG));
     }
     if has_bind {
-        bind_complete_encode(&mut write_buf);
+        write_queue.push(Bytes::from_static(BIND_COMPLETE_MSG));
     }
 
     let mut state = TextResponseState::SetComplete;
@@ -197,17 +196,17 @@ async fn handle_cached_query_text(
                     (TextResponseState::RowDescription, PgBackendMessageType::RowDescription) => {
                         if query_type == QueryType::Simple {
                             trace!("net: cache→client RowDescription ({} bytes, simple)", frame.data.len());
-                            write_buf.extend_from_slice(&frame.data);
+                            write_queue.push(frame.data);
                         } else if pipeline_describe != PipelineDescribe::None {
                             // Describe was in pipeline — include Describe response
                             if pipeline_describe == PipelineDescribe::Statement
-                            && let Some(param_desc) = &parameter_description
+                                && let Some(param_desc) = parameter_description.take()
                             {
                                 trace!("net: cache→client ParameterDescription ({} bytes, pipeline)", param_desc.len());
-                                write_buf.extend_from_slice(param_desc);
+                                write_queue.push(param_desc);
                             }
                             trace!("net: cache→client RowDescription ({} bytes, pipeline)", frame.data.len());
-                            write_buf.extend_from_slice(&frame.data);
+                            write_queue.push(frame.data);
                         } else {
                             trace!("net: cache skip RowDescription ({} bytes, extended — no Describe in pipeline)", frame.data.len());
                         }
@@ -216,11 +215,11 @@ async fn handle_cached_query_text(
                     (TextResponseState::DataRows, PgBackendMessageType::DataRows) => {
                         trace!("net: cache→client DataRow ({} bytes)", frame.data.len());
                         bytes_served += frame.data.len();
-                        write_buf.extend_from_slice(&frame.data);
+                        write_queue.push(frame.data);
                     }
                     (TextResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
                         trace!("net: cache→client CommandComplete ({} bytes)", frame.data.len());
-                        write_buf.extend_from_slice(&frame.data);
+                        write_queue.push(frame.data);
                         msg.timing.query_done_at = Some(Instant::now());
                     }
                     (_, PgBackendMessageType::ReadyForQuery) => {
@@ -233,7 +232,7 @@ async fn handle_cached_query_text(
                 drop(_match);
 
             }
-            result = client_socket.write_buf(&mut write_buf), if !write_buf.is_empty() =>
+            result = client_socket.write_buf(&mut write_queue), if !write_queue.is_empty() =>
             {
                 match result {
                     Ok(cnt) => {
@@ -265,17 +264,17 @@ async fn handle_cached_query_text(
     // Append ReadyForQuery for simple queries (always) and extended queries with Sync
     if query_type == QueryType::Simple || has_sync {
         trace!("net: cache→client ReadyForQuery");
-        ready_for_query_encode(&mut write_buf);
+        write_queue.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
     }
 
     // Final flush
-    if !write_buf.is_empty() {
+    if !write_queue.is_empty() {
         trace!(
             "net: cache→client final flush (text, {} bytes remaining)",
-            write_buf.len()
+            write_queue.remaining()
         );
         client_socket
-            .write_all_buf(&mut write_buf)
+            .write_all_buf(&mut write_queue)
             .await
             .map_err(|_| {
                 error!("no client");
@@ -355,17 +354,17 @@ async fn handle_cached_query_binary(
     let has_parse = msg.has_parse;
     let has_bind = msg.has_bind;
     let pipeline_describe = msg.pipeline_describe;
-    let parameter_description = msg.parameter_description.take();
+    let mut parameter_description = msg.parameter_description.take();
     let client_socket = &mut msg.client_socket;
 
-    let mut write_buf = BytesMut::with_capacity(BUFFER_SIZE_THRESHOLD);
+    let mut write_queue = WriteQueue::new();
 
     // Prepend ParseComplete / BindComplete for messages the proxy buffered
     if has_parse {
-        parse_complete_encode(&mut write_buf);
+        write_queue.push(Bytes::from_static(PARSE_COMPLETE_MSG));
     }
     if has_bind {
-        bind_complete_encode(&mut write_buf);
+        write_queue.push(Bytes::from_static(BIND_COMPLETE_MSG));
     }
 
     let mut state = BinaryResponseState::SetComplete;
@@ -402,23 +401,23 @@ async fn handle_cached_query_binary(
                     (BinaryResponseState::DescribeRow, PgBackendMessageType::RowDescription) => {
                         // Include Describe response from cache DB in client response
                         if pipeline_describe == PipelineDescribe::Statement
-                            && let Some(param_desc) = &parameter_description
+                            && let Some(param_desc) = parameter_description.take()
                         {
                             trace!("net: cache→client ParameterDescription (binary, {} bytes)", param_desc.len());
-                            write_buf.extend_from_slice(param_desc);
+                            write_queue.push(param_desc);
                         }
                         trace!("net: cache→client RowDescription (binary, {} bytes)", frame.data.len());
-                        write_buf.extend_from_slice(&frame.data);
+                        write_queue.push(frame.data);
                         state = BinaryResponseState::DataRows;
                     }
                     (BinaryResponseState::DataRows, PgBackendMessageType::DataRows) => {
                         trace!("net: cache→client DataRow (binary, {} bytes)", frame.data.len());
                         bytes_served += frame.data.len();
-                        write_buf.extend_from_slice(&frame.data);
+                        write_queue.push(frame.data);
                     }
                     (BinaryResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
                         trace!("net: cache→client CommandComplete (binary, {} bytes)", frame.data.len());
-                        write_buf.extend_from_slice(&frame.data);
+                        write_queue.push(frame.data);
                         msg.timing.query_done_at = Some(Instant::now());
                     }
                     (_, PgBackendMessageType::ReadyForQuery)
@@ -430,7 +429,7 @@ async fn handle_cached_query_binary(
                     _ => {}
                 }
             }
-            result = client_socket.write_buf(&mut write_buf), if !write_buf.is_empty() =>
+            result = client_socket.write_buf(&mut write_queue), if !write_queue.is_empty() =>
             {
                 match result {
                     Ok(cnt) => {
@@ -462,17 +461,17 @@ async fn handle_cached_query_binary(
     // Append ReadyForQuery for extended queries with Sync
     if has_sync {
         trace!("net: cache→client ReadyForQuery (binary pipeline)");
-        ready_for_query_encode(&mut write_buf);
+        write_queue.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
     }
 
     // Final flush
-    if !write_buf.is_empty() {
+    if !write_queue.is_empty() {
         trace!(
             "net: cache→client final flush (binary, {} bytes remaining)",
-            write_buf.len()
+            write_queue.remaining()
         );
         client_socket
-            .write_all_buf(&mut write_buf)
+            .write_all_buf(&mut write_queue)
             .await
             .map_err(|_| {
                 error!("no client");

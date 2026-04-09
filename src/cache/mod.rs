@@ -24,6 +24,7 @@ mod runtime;
 pub(crate) mod status;
 mod types;
 mod worker;
+mod write_queue;
 mod writer;
 
 // Re-export public types

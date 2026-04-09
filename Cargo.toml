@@ -34,6 +34,9 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = true
+strip = false
+lto = false
+split-debuginfo = "unpacked"
 
 [features]
 console = ["dep:console-subscriber"]

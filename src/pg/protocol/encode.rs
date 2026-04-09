@@ -58,6 +58,11 @@ pub fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
     buf.put_u8(0);
 }
 
+/// Fixed protocol messages as static byte slices — no heap allocation.
+pub const PARSE_COMPLETE_MSG: &[u8] = &[b'1', 0, 0, 0, 4];
+pub const BIND_COMPLETE_MSG: &[u8] = &[b'2', 0, 0, 0, 4];
+pub const READY_FOR_QUERY_IDLE_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
+
 #[instrument(skip_all)]
 pub fn ready_for_query_encode(buf: &mut BytesMut) {
     buf.put_u8(READY_FOR_QUERY_TAG);
