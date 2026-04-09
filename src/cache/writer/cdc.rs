@@ -10,7 +10,8 @@ use tracing::{debug, error, instrument, trace};
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
 
-use crate::query::constraints::QueryConstraints;
+use crate::query::ast::BinaryOp;
+use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::where_value_compare_string;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
@@ -496,15 +497,26 @@ impl CacheWriter {
             return true;
         };
 
-        for (column_name, op, constraint_value) in constraints {
-            if let Some(column_meta) = table_metadata.columns.get(column_name.as_str()) {
+        for constraint in constraints {
+            let column_name = match constraint {
+                TableConstraint::Comparison(col, ..) | TableConstraint::AnyOf(col, ..) => {
+                    col.as_str()
+                }
+            };
+
+            if let Some(column_meta) = table_metadata.columns.get(column_name) {
                 let position = column_meta.position as usize - 1;
                 if let Some(row_value) = row_data.get(position) {
                     let matches = match row_value {
-                        Some(row_str) => where_value_compare_string(constraint_value, row_str, *op),
-                        // NULL: comparison operators never match NULL values
-                        // (only IS NULL / IS NOT NULL can test for NULL, and those
-                        // are UnaryOps not extracted as constraints)
+                        Some(row_str) => match constraint {
+                            TableConstraint::Comparison(_, op, val) => {
+                                where_value_compare_string(val, row_str, *op)
+                            }
+                            TableConstraint::AnyOf(_, values) => values
+                                .iter()
+                                .any(|v| where_value_compare_string(v, row_str, BinaryOp::Equal)),
+                        },
+                        // NULL never matches comparison operators
                         None => false,
                     };
                     if !matches {

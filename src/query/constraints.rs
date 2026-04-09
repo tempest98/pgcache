@@ -8,12 +8,30 @@ use crate::query::resolved::{
     ResolvedColumnNode, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
 };
 
-/// A constraint comparing a column to a constant value with a comparison operator
+/// A column constraint extracted from WHERE/JOIN conditions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ColumnConstraint {
-    pub column: ResolvedColumnNode,
-    pub op: BinaryOp,
-    pub value: LiteralValue,
+pub enum ColumnConstraint {
+    /// Single comparison: column op value
+    Comparison {
+        column: ResolvedColumnNode,
+        op: BinaryOp,
+        value: LiteralValue,
+    },
+    /// Set membership: column IN (v1, v2, ...)
+    /// Values are sorted for deterministic Hash/Eq.
+    InSet {
+        column: ResolvedColumnNode,
+        values: Vec<LiteralValue>,
+    },
+}
+
+impl ColumnConstraint {
+    pub fn column(&self) -> &ResolvedColumnNode {
+        match self {
+            ColumnConstraint::Comparison { column, .. }
+            | ColumnConstraint::InSet { column, .. } => column,
+        }
+    }
 }
 
 /// An equivalence between two columns
@@ -31,6 +49,16 @@ impl ColumnEquivalence {
     }
 }
 
+/// A constraint clause organized for per-table CDC matching and subsumption.
+/// All clauses within a table's Vec are AND-connected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableConstraint {
+    /// Single comparison: column op value
+    Comparison(EcoString, BinaryOp, LiteralValue),
+    /// At least one must match (IN semantics): column = v1 OR column = v2 OR ...
+    AnyOf(EcoString, Vec<LiteralValue>),
+}
+
 /// Analysis results for a query showing all constant constraints
 #[derive(Debug, Clone, Default)]
 pub struct QueryConstraints {
@@ -41,7 +69,7 @@ pub struct QueryConstraints {
     pub equivalences: HashSet<ColumnEquivalence>,
 
     /// Constraints organized by table for quick lookup
-    pub table_constraints: HashMap<EcoString, Vec<(EcoString, BinaryOp, LiteralValue)>>,
+    pub table_constraints: HashMap<EcoString, Vec<TableConstraint>>,
 }
 
 impl QueryConstraints {
@@ -85,6 +113,8 @@ enum ColumnRange {
     Empty,
     /// Exactly one value: column = v
     Equal(LiteralValue),
+    /// Finite set of allowed values: column IN (v1, v2, ...)
+    InSet(HashSet<LiteralValue>),
     /// Bounded interval with possible exclusions
     Range {
         lower: Option<RangeBound>,
@@ -160,8 +190,104 @@ fn value_satisfies_upper(value: &LiteralValue, bound: &RangeBound) -> Option<boo
 }
 
 /// Build a ColumnRange from all constraints on a single column.
-fn column_range_build(constraints: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
+fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRange {
     if constraints.is_empty() {
+        return ColumnRange::Unconstrained;
+    }
+
+    // Separate comparisons from in-sets
+    let mut comparisons: Vec<(BinaryOp, &LiteralValue)> = Vec::new();
+    let mut in_set: Option<&[LiteralValue]> = None;
+
+    for tc in constraints {
+        match tc {
+            TableConstraint::Comparison(_, op, value) => {
+                comparisons.push((*op, value));
+            }
+            TableConstraint::AnyOf(_, values) => {
+                // Multiple AnyOf on same column: intersect sets
+                in_set = Some(match in_set {
+                    None => values.as_slice(),
+                    Some(_existing) => {
+                        // Rare case — for now treat as Unknown
+                        return ColumnRange::Unknown;
+                    }
+                });
+            }
+        }
+    }
+
+    // If we have an in-set, integrate with any comparisons
+    if let Some(set_values) = in_set {
+        return in_set_range_build(set_values, &comparisons);
+    }
+
+    // No in-set — pure comparison logic
+    comparison_range_build(&comparisons)
+}
+
+/// Build a ColumnRange from an IN-set, optionally intersected with comparisons.
+fn in_set_range_build(
+    set_values: &[LiteralValue],
+    comparisons: &[(BinaryOp, &LiteralValue)],
+) -> ColumnRange {
+    if set_values.is_empty() {
+        return ColumnRange::Empty;
+    }
+
+    // Any incomparable value in the set makes it unknowable
+    if set_values.iter().any(literal_value_is_incomparable) {
+        return ColumnRange::Unknown;
+    }
+
+    // If no comparisons, return the set directly
+    if comparisons.is_empty() {
+        return ColumnRange::InSet(set_values.iter().cloned().collect());
+    }
+
+    // Build a temporary range from comparisons and filter the set
+    let filter_range = comparison_range_build(comparisons);
+
+    match filter_range {
+        ColumnRange::Unknown => ColumnRange::Unknown,
+        ColumnRange::Empty => ColumnRange::Empty,
+        ColumnRange::Unconstrained => ColumnRange::InSet(set_values.iter().cloned().collect()),
+        ColumnRange::Equal(v) => {
+            if set_values.contains(&v) {
+                ColumnRange::Equal(v)
+            } else {
+                ColumnRange::Empty
+            }
+        }
+        ColumnRange::InSet(_) => unreachable!("comparison_range_build never produces InSet"),
+        ColumnRange::Range {
+            ref lower,
+            ref upper,
+            ref not_equal,
+        } => {
+            let mut iter = set_values
+                .iter()
+                .filter(|v| range_contains_value(lower, upper, not_equal, v))
+                .cloned();
+            match iter.next() {
+                None => ColumnRange::Empty,
+                Some(first) => match iter.next() {
+                    None => ColumnRange::Equal(first),
+                    Some(second) => {
+                        let mut set: HashSet<LiteralValue> =
+                            HashSet::from_iter([first, second]);
+                        set.extend(iter);
+                        ColumnRange::InSet(set)
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// Build a ColumnRange from comparison-only constraints (no in-sets).
+fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRange {
+    if comparisons.is_empty() {
         return ColumnRange::Unconstrained;
     }
 
@@ -170,7 +296,7 @@ fn column_range_build(constraints: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
     let mut upper: Option<RangeBound> = None;
     let mut not_equal: Vec<LiteralValue> = Vec::new();
 
-    for (op, value) in constraints {
+    for &(op, value) in comparisons {
         if literal_value_is_incomparable(value) {
             return ColumnRange::Unknown;
         }
@@ -186,7 +312,7 @@ fn column_range_build(constraints: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
             BinaryOp::GreaterThan | BinaryOp::GreaterThanOrEqual => {
                 let candidate = RangeBound {
                     value: value.clone(),
-                    inclusive: *op == BinaryOp::GreaterThanOrEqual,
+                    inclusive: op == BinaryOp::GreaterThanOrEqual,
                 };
                 lower = Some(match lower {
                     None => candidate,
@@ -199,7 +325,7 @@ fn column_range_build(constraints: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
             BinaryOp::LessThan | BinaryOp::LessThanOrEqual => {
                 let candidate = RangeBound {
                     value: value.clone(),
-                    inclusive: *op == BinaryOp::LessThanOrEqual,
+                    inclusive: op == BinaryOp::LessThanOrEqual,
                 };
                 upper = Some(match upper {
                     None => candidate,
@@ -245,10 +371,14 @@ fn column_range_build(constraints: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
         match literal_value_order(&lb.value, &ub.value) {
             Some(Ordering::Greater) => return ColumnRange::Empty,
             Some(Ordering::Equal) => {
-                // lower = upper: only valid if both inclusive (point), otherwise empty
                 if !lb.inclusive || !ub.inclusive {
                     return ColumnRange::Empty;
                 }
+                // Both inclusive at same value: degenerate range → single point
+                if not_equal.contains(&lb.value) {
+                    return ColumnRange::Empty;
+                }
+                return ColumnRange::Equal(lb.value.clone());
             }
             Some(Ordering::Less) => {} // valid range
             None => return ColumnRange::Unknown,
@@ -376,8 +506,31 @@ fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> bool {
         // Equal vs Equal
         (ColumnRange::Equal(a), ColumnRange::Equal(b)) => *a == *b,
 
-        // Equal cached, Range new: cached has one value, new wants a range
-        (ColumnRange::Equal(_), ColumnRange::Range { .. }) => false,
+        // Equal cached can't subsume anything broader
+        (ColumnRange::Equal(_), ColumnRange::Range { .. } | ColumnRange::InSet(_)) => false,
+
+        // InSet cached, InSet new: subset check
+        (ColumnRange::InSet(cached_set), ColumnRange::InSet(new_set)) => {
+            new_set.is_subset(cached_set)
+        }
+
+        // InSet cached, Equal new: point in set
+        (ColumnRange::InSet(set), ColumnRange::Equal(v)) => set.contains(v),
+
+        // InSet cached, Range new: set is finite, range may be infinite — not subsumed
+        (ColumnRange::InSet(_), ColumnRange::Range { .. }) => false,
+
+        // Range cached, InSet new: check all values in the set are within range
+        (
+            ColumnRange::Range {
+                lower,
+                upper,
+                not_equal,
+            },
+            ColumnRange::InSet(set),
+        ) => set
+            .iter()
+            .all(|v| range_contains_value(lower, upper, not_equal, v)),
 
         // Range cached, Equal new: check point within interval
         (
@@ -407,14 +560,16 @@ fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> bool {
 
 /// Group table constraints by column name for per-column range building.
 fn constraints_group_by_column<'a>(
-    constraints: &'a [(EcoString, BinaryOp, LiteralValue)],
-) -> HashMap<&'a str, Vec<(BinaryOp, LiteralValue)>> {
-    let mut grouped: HashMap<&'a str, Vec<(BinaryOp, LiteralValue)>> = HashMap::new();
-    for (col, op, val) in constraints {
-        grouped
-            .entry(col.as_str())
-            .or_default()
-            .push((*op, val.clone()));
+    constraints: &'a [TableConstraint],
+) -> HashMap<&'a str, Vec<&'a TableConstraint>> {
+    let mut grouped: HashMap<&'a str, Vec<&'a TableConstraint>> = HashMap::new();
+    for tc in constraints {
+        let col = match tc {
+            TableConstraint::Comparison(col, _, _) | TableConstraint::AnyOf(col, _) => {
+                col.as_str()
+            }
+        };
+        grouped.entry(col).or_default().push(tc);
     }
     grouped
 }
@@ -432,7 +587,7 @@ fn analyze_constraint_expr(
             match (&*binary.lexpr, &*binary.rexpr) {
                 // column op literal
                 (ResolvedWhereExpr::Column(col), ResolvedWhereExpr::Value(val)) => {
-                    constraints.insert(ColumnConstraint {
+                    constraints.insert(ColumnConstraint::Comparison {
                         column: col.clone(),
                         op: binary.op,
                         value: val.clone(),
@@ -441,7 +596,7 @@ fn analyze_constraint_expr(
                 // literal op column → column op_flip literal
                 (ResolvedWhereExpr::Value(val), ResolvedWhereExpr::Column(col)) => {
                     if let Some(flipped) = binary.op.op_flip() {
-                        constraints.insert(ColumnConstraint {
+                        constraints.insert(ColumnConstraint::Comparison {
                             column: col.clone(),
                             op: flipped,
                             value: val.clone(),
@@ -474,7 +629,17 @@ fn analyze_constraint_expr(
             between_constraints_extract(&multi.op, &multi.exprs, constraints);
         }
 
-        // Everything else: OR, NOT BETWEEN, IN, subqueries, etc. — cannot extract constraints
+        // IN: extract as set membership constraint
+        ResolvedWhereExpr::Multi(multi) if multi.op == MultiOp::In => {
+            in_constraints_extract(&multi.exprs, constraints);
+        }
+
+        // NOT IN: extract as individual NotEqual constraints
+        ResolvedWhereExpr::Multi(multi) if multi.op == MultiOp::NotIn => {
+            not_in_constraints_extract(&multi.exprs, constraints);
+        }
+
+        // Everything else: OR, NOT BETWEEN, subqueries, etc. — cannot extract constraints
         ResolvedWhereExpr::Value(_)
         | ResolvedWhereExpr::Column(_)
         | ResolvedWhereExpr::Unary(_)
@@ -514,16 +679,75 @@ fn between_constraints_extract(
         (low, high)
     };
 
-    constraints.insert(ColumnConstraint {
+    constraints.insert(ColumnConstraint::Comparison {
         column: col.clone(),
         op: BinaryOp::GreaterThanOrEqual,
         value: low.clone(),
     });
-    constraints.insert(ColumnConstraint {
+    constraints.insert(ColumnConstraint::Comparison {
         column: col.clone(),
         op: BinaryOp::LessThanOrEqual,
         value: high.clone(),
     });
+}
+
+/// Extract an IN constraint from `column IN (v1, v2, ...)`.
+/// exprs layout: [subject, val1, val2, ..., valN]
+fn in_constraints_extract(
+    exprs: &[ResolvedWhereExpr],
+    constraints: &mut HashSet<ColumnConstraint>,
+) {
+    let Some(ResolvedWhereExpr::Column(col)) = exprs.first() else {
+        return;
+    };
+    let values = exprs.get(1..).unwrap_or_default();
+
+    // All values must be literals, no Parameters or Nulls
+    let mut literal_values: Vec<LiteralValue> = Vec::with_capacity(values.len());
+    for expr in values {
+        let ResolvedWhereExpr::Value(v) = expr else {
+            return;
+        };
+        if literal_value_is_incomparable(v) {
+            return;
+        }
+        literal_values.push(v.clone());
+    }
+
+    // Sort for deterministic Hash on ColumnConstraint::InSet
+    literal_values.sort_by(|a, b| literal_value_order(a, b).unwrap_or(Ordering::Equal));
+    literal_values.dedup();
+
+    constraints.insert(ColumnConstraint::InSet {
+        column: col.clone(),
+        values: literal_values,
+    });
+}
+
+/// Extract NOT IN as individual NotEqual constraints.
+/// `NOT IN (1, 2, 3)` = `!= 1 AND != 2 AND != 3`
+fn not_in_constraints_extract(
+    exprs: &[ResolvedWhereExpr],
+    constraints: &mut HashSet<ColumnConstraint>,
+) {
+    let Some(ResolvedWhereExpr::Column(col)) = exprs.first() else {
+        return;
+    };
+    let values = exprs.get(1..).unwrap_or_default();
+
+    for expr in values {
+        let ResolvedWhereExpr::Value(v) = expr else {
+            return;
+        };
+        if literal_value_is_incomparable(v) {
+            return;
+        }
+        constraints.insert(ColumnConstraint::Comparison {
+            column: col.clone(),
+            op: BinaryOp::NotEqual,
+            value: v.clone(),
+        });
+    }
 }
 
 /// Compare two literal values for ordering. Returns None if the values
@@ -591,19 +815,27 @@ fn propagate_constraints(
         for equiv in equivalences {
             // Collect constraints on either side and propagate to the other
             for constraint in &constraints {
-                if constraint.column == equiv.left {
-                    new_constraints.push(ColumnConstraint {
-                        column: equiv.right.clone(),
-                        op: constraint.op,
-                        value: constraint.value.clone(),
-                    });
-                } else if constraint.column == equiv.right {
-                    new_constraints.push(ColumnConstraint {
-                        column: equiv.left.clone(),
-                        op: constraint.op,
-                        value: constraint.value.clone(),
-                    });
-                }
+                let other = if *constraint.column() == equiv.left {
+                    &equiv.right
+                } else if *constraint.column() == equiv.right {
+                    &equiv.left
+                } else {
+                    continue;
+                };
+                let propagated = match constraint {
+                    ColumnConstraint::Comparison { op, value, .. } => {
+                        ColumnConstraint::Comparison {
+                            column: other.clone(),
+                            op: *op,
+                            value: value.clone(),
+                        }
+                    }
+                    ColumnConstraint::InSet { values, .. } => ColumnConstraint::InSet {
+                        column: other.clone(),
+                        values: values.clone(),
+                    },
+                };
+                new_constraints.push(propagated);
             }
         }
 
@@ -643,10 +875,12 @@ pub fn table_constraints_subsumed(
             let new_by_col = constraints_group_by_column(new_cs);
 
             cached_by_col.iter().all(|(col, cached_col_cs)| {
-                let cached_range = column_range_build(cached_col_cs);
+                let cached_range = column_range_build(cached_col_cs.as_slice());
                 let new_range = new_by_col
                     .get(col)
-                    .map_or(ColumnRange::Unconstrained, |cs| column_range_build(cs));
+                    .map_or(ColumnRange::Unconstrained, |cs| {
+                        column_range_build(cs.as_slice())
+                    });
                 column_range_subsumes(&cached_range, &new_range)
             })
         }
@@ -666,17 +900,20 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
     let column_constraints = propagate_constraints(constraints, &equivalences);
 
     // Step 3: Organize by table for quick lookup
-    let mut table_constraints: HashMap<EcoString, Vec<(EcoString, BinaryOp, LiteralValue)>> =
-        HashMap::new();
+    let mut table_constraints: HashMap<EcoString, Vec<TableConstraint>> = HashMap::new();
     for constraint in &column_constraints {
+        let tc = match constraint {
+            ColumnConstraint::Comparison {
+                column, op, value, ..
+            } => TableConstraint::Comparison(column.column.clone(), *op, value.clone()),
+            ColumnConstraint::InSet {
+                column, values, ..
+            } => TableConstraint::AnyOf(column.column.clone(), values.clone()),
+        };
         table_constraints
-            .entry(constraint.column.table.clone())
+            .entry(constraint.column().table.clone())
             .or_default()
-            .push((
-                constraint.column.column.clone(),
-                constraint.op,
-                constraint.value.clone(),
-            ));
+            .push(tc);
     }
 
     QueryConstraints {
@@ -752,8 +989,26 @@ mod tests {
         value: LiteralValue,
     ) -> bool {
         constraints.table_constraints.get(table).is_some_and(|cs| {
-            cs.iter()
-                .any(|(c, o, v)| c == column && *o == op && *v == value)
+            cs.iter().any(|tc| match tc {
+                TableConstraint::Comparison(c, o, v) => c == column && *o == op && *v == value,
+                TableConstraint::AnyOf(..) => false,
+            })
+        })
+    }
+
+    fn has_in_constraint(
+        constraints: &QueryConstraints,
+        table: &str,
+        column: &str,
+        values: &[LiteralValue],
+    ) -> bool {
+        constraints.table_constraints.get(table).is_some_and(|cs| {
+            cs.iter().any(|tc| match tc {
+                TableConstraint::AnyOf(c, vs) => {
+                    c == column && values.iter().all(|v| vs.contains(v)) && vs.len() == values.len()
+                }
+                TableConstraint::Comparison(..) => false,
+            })
         })
     }
 
@@ -1822,21 +2077,31 @@ mod tests {
 
     // ========== ColumnRange unit tests ==========
 
+    /// Helper: build a ColumnRange from comparison tuples (convenience for tests)
+    fn range_from_comparisons(comparisons: &[(BinaryOp, LiteralValue)]) -> ColumnRange {
+        let tcs: Vec<TableConstraint> = comparisons
+            .iter()
+            .map(|(op, val)| TableConstraint::Comparison("col".into(), *op, val.clone()))
+            .collect();
+        let refs: Vec<&TableConstraint> = tcs.iter().collect();
+        column_range_build(&refs)
+    }
+
     #[test]
     fn test_column_range_build_unconstrained() {
-        let range = column_range_build(&[]);
+        let range = range_from_comparisons(&[]);
         assert!(matches!(range, ColumnRange::Unconstrained));
     }
 
     #[test]
     fn test_column_range_build_equal() {
-        let range = column_range_build(&[(BinaryOp::Equal, LiteralValue::Integer(5))]);
+        let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Integer(5))]);
         assert!(matches!(range, ColumnRange::Equal(LiteralValue::Integer(5))));
     }
 
     #[test]
     fn test_column_range_build_contradictory_equals() {
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::Equal, LiteralValue::Integer(5)),
             (BinaryOp::Equal, LiteralValue::Integer(3)),
         ]);
@@ -1845,7 +2110,7 @@ mod tests {
 
     #[test]
     fn test_column_range_build_equal_with_contradictory_bound() {
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::Equal, LiteralValue::Integer(5)),
             (BinaryOp::GreaterThan, LiteralValue::Integer(10)),
         ]);
@@ -1854,7 +2119,7 @@ mod tests {
 
     #[test]
     fn test_column_range_build_equal_with_consistent_bound() {
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::Equal, LiteralValue::Integer(5)),
             (BinaryOp::GreaterThan, LiteralValue::Integer(3)),
         ]);
@@ -1863,7 +2128,7 @@ mod tests {
 
     #[test]
     fn test_column_range_build_equal_with_not_equal_contradiction() {
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::Equal, LiteralValue::Integer(5)),
             (BinaryOp::NotEqual, LiteralValue::Integer(5)),
         ]);
@@ -1872,8 +2137,7 @@ mod tests {
 
     #[test]
     fn test_column_range_build_bounds_contradictory() {
-        // lower > upper
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::GreaterThan, LiteralValue::Integer(10)),
             (BinaryOp::LessThan, LiteralValue::Integer(5)),
         ]);
@@ -1882,8 +2146,7 @@ mod tests {
 
     #[test]
     fn test_column_range_build_bounds_equal_exclusive() {
-        // > 5 AND < 5 — empty
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::GreaterThan, LiteralValue::Integer(5)),
             (BinaryOp::LessThan, LiteralValue::Integer(5)),
         ]);
@@ -1892,17 +2155,17 @@ mod tests {
 
     #[test]
     fn test_column_range_build_bounds_equal_inclusive() {
-        // >= 5 AND <= 5 — valid point range
-        let range = column_range_build(&[
+        // >= 5 AND <= 5 → collapses to Equal(5)
+        let range = range_from_comparisons(&[
             (BinaryOp::GreaterThanOrEqual, LiteralValue::Integer(5)),
             (BinaryOp::LessThanOrEqual, LiteralValue::Integer(5)),
         ]);
-        assert!(matches!(range, ColumnRange::Range { .. }));
+        assert!(matches!(range, ColumnRange::Equal(LiteralValue::Integer(5))));
     }
 
     #[test]
     fn test_column_range_build_parameter_unknown() {
-        let range = column_range_build(&[(
+        let range = range_from_comparisons(&[(
             BinaryOp::Equal,
             LiteralValue::Parameter("$1".to_owned()),
         )]);
@@ -1911,14 +2174,13 @@ mod tests {
 
     #[test]
     fn test_column_range_build_null_unknown() {
-        let range = column_range_build(&[(BinaryOp::Equal, LiteralValue::Null)]);
+        let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Null)]);
         assert!(matches!(range, ColumnRange::Unknown));
     }
 
     #[test]
     fn test_column_range_build_lower_tightening() {
-        // > 3 AND > 7 → tightens to > 7
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::GreaterThan, LiteralValue::Integer(3)),
             (BinaryOp::GreaterThan, LiteralValue::Integer(7)),
         ]);
@@ -1937,8 +2199,7 @@ mod tests {
 
     #[test]
     fn test_column_range_build_upper_tightening() {
-        // < 10 AND < 5 → tightens to < 5
-        let range = column_range_build(&[
+        let range = range_from_comparisons(&[
             (BinaryOp::LessThan, LiteralValue::Integer(10)),
             (BinaryOp::LessThan, LiteralValue::Integer(5)),
         ]);
@@ -1952,6 +2213,318 @@ mod tests {
                 assert!(!ub.inclusive);
             }
             _ => panic!("expected Range with upper bound"),
+        }
+    }
+
+    // ========== IN extraction tests ==========
+
+    #[test]
+    fn test_in_extraction() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users WHERE id IN (1, 2, 3)";
+        let resolved = resolve_sql(sql, &tables);
+        let constraints = analyze_query_constraints(&resolved);
+
+        assert!(has_in_constraint(
+            &constraints,
+            "users",
+            "id",
+            &[
+                LiteralValue::Integer(1),
+                LiteralValue::Integer(2),
+                LiteralValue::Integer(3),
+            ],
+        ));
+    }
+
+    #[test]
+    fn test_in_with_and() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users WHERE id IN (1, 2) AND name = 'alice'";
+        let resolved = resolve_sql(sql, &tables);
+        let constraints = analyze_query_constraints(&resolved);
+
+        assert!(has_in_constraint(
+            &constraints,
+            "users",
+            "id",
+            &[LiteralValue::Integer(1), LiteralValue::Integer(2)],
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "users",
+            "name",
+            BinaryOp::Equal,
+            LiteralValue::String("alice".to_owned()),
+        ));
+    }
+
+    #[test]
+    fn test_in_with_parameter_skipped() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users WHERE id IN (1, $1)";
+        let resolved = resolve_sql(sql, &tables);
+        let constraints = analyze_query_constraints(&resolved);
+
+        // Parameter in IN list → entire IN skipped
+        assert!(constraints.table_constraints.is_empty());
+    }
+
+    #[test]
+    fn test_not_in_extraction() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT * FROM users WHERE id NOT IN (1, 2, 3)";
+        let resolved = resolve_sql(sql, &tables);
+        let constraints = analyze_query_constraints(&resolved);
+
+        // NOT IN → individual NotEqual constraints
+        assert!(has_constraint(
+            &constraints,
+            "users",
+            "id",
+            BinaryOp::NotEqual,
+            LiteralValue::Integer(1),
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "users",
+            "id",
+            BinaryOp::NotEqual,
+            LiteralValue::Integer(2),
+        ));
+        assert!(has_constraint(
+            &constraints,
+            "users",
+            "id",
+            BinaryOp::NotEqual,
+            LiteralValue::Integer(3),
+        ));
+    }
+
+    #[test]
+    fn test_in_propagation_through_join() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("a", 1001));
+        tables.insert_overwrite(test_table_metadata("b", 1002));
+
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.id IN (1, 2)";
+        let resolved = resolve_sql(sql, &tables);
+        let constraints = analyze_query_constraints(&resolved);
+
+        // Should propagate: a.id IN (1, 2) → b.id IN (1, 2)
+        assert!(has_in_constraint(
+            &constraints,
+            "a",
+            "id",
+            &[LiteralValue::Integer(1), LiteralValue::Integer(2)],
+        ));
+        assert!(has_in_constraint(
+            &constraints,
+            "b",
+            "id",
+            &[LiteralValue::Integer(1), LiteralValue::Integer(2)],
+        ));
+    }
+
+    // ========== IN subsumption tests ==========
+
+    #[test]
+    fn test_subsumption_in_subset() {
+        // IN (1,2,3) subsumed by IN (1,2) — subset
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 2, 3)",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 2)",
+            &tables,
+        ));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_in_point() {
+        // IN (1,2,3) subsumed by = 2 — point in set
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 2, 3)",
+            &tables,
+        ));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 2", &tables));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_in_not_subset() {
+        // IN (1,2,3) NOT subsumed by IN (1,4) — 4 not in set
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 2, 3)",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 4)",
+            &tables,
+        ));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_range_subsumes_in() {
+        // id > 0 subsumed by IN (1,2,3) — all values > 0
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 0", &tables));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 2, 3)",
+            &tables,
+        ));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_in_not_subsumes_range() {
+        // IN (1,2,3) NOT subsumed by id > 0 — set is finite, range is infinite
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 2, 3)",
+            &tables,
+        ));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 0", &tables));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_unconstrained_subsumes_in() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id IN (1, 2, 3)",
+            &tables,
+        ));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    // ========== IN + range intersection in column_range_build ==========
+
+    #[test]
+    fn test_in_set_with_range_filter() {
+        // IN (1,2,3,4,5) AND id > 3 → InSet({4, 5})
+        let tcs = vec![
+            TableConstraint::AnyOf(
+                "id".into(),
+                vec![
+                    LiteralValue::Integer(1),
+                    LiteralValue::Integer(2),
+                    LiteralValue::Integer(3),
+                    LiteralValue::Integer(4),
+                    LiteralValue::Integer(5),
+                ],
+            ),
+            TableConstraint::Comparison("id".into(), BinaryOp::GreaterThan, LiteralValue::Integer(3)),
+        ];
+        let refs: Vec<&TableConstraint> = tcs.iter().collect();
+        let range = column_range_build(&refs);
+        match range {
+            ColumnRange::InSet(set) => {
+                assert_eq!(set.len(), 2);
+                assert!(set.contains(&LiteralValue::Integer(4)));
+                assert!(set.contains(&LiteralValue::Integer(5)));
+            }
+            _ => panic!("expected InSet, got {range:?}"),
+        }
+    }
+
+    #[test]
+    fn test_in_set_with_equality_match() {
+        // IN (1,2,3) AND id = 2 → Equal(2)
+        let tcs = vec![
+            TableConstraint::AnyOf(
+                "id".into(),
+                vec![
+                    LiteralValue::Integer(1),
+                    LiteralValue::Integer(2),
+                    LiteralValue::Integer(3),
+                ],
+            ),
+            TableConstraint::Comparison("id".into(), BinaryOp::Equal, LiteralValue::Integer(2)),
+        ];
+        let refs: Vec<&TableConstraint> = tcs.iter().collect();
+        let range = column_range_build(&refs);
+        assert!(matches!(range, ColumnRange::Equal(LiteralValue::Integer(2))));
+    }
+
+    #[test]
+    fn test_in_set_with_equality_mismatch() {
+        // IN (1,2,3) AND id = 5 → Empty
+        let tcs = vec![
+            TableConstraint::AnyOf(
+                "id".into(),
+                vec![
+                    LiteralValue::Integer(1),
+                    LiteralValue::Integer(2),
+                    LiteralValue::Integer(3),
+                ],
+            ),
+            TableConstraint::Comparison("id".into(), BinaryOp::Equal, LiteralValue::Integer(5)),
+        ];
+        let refs: Vec<&TableConstraint> = tcs.iter().collect();
+        let range = column_range_build(&refs);
+        assert!(matches!(range, ColumnRange::Empty));
+    }
+
+    #[test]
+    fn test_in_set_with_not_equal() {
+        // IN (1,2,3) AND id != 2 → InSet({1, 3})
+        let tcs = vec![
+            TableConstraint::AnyOf(
+                "id".into(),
+                vec![
+                    LiteralValue::Integer(1),
+                    LiteralValue::Integer(2),
+                    LiteralValue::Integer(3),
+                ],
+            ),
+            TableConstraint::Comparison("id".into(), BinaryOp::NotEqual, LiteralValue::Integer(2)),
+        ];
+        let refs: Vec<&TableConstraint> = tcs.iter().collect();
+        let range = column_range_build(&refs);
+        match range {
+            ColumnRange::InSet(set) => {
+                assert_eq!(set.len(), 2);
+                assert!(set.contains(&LiteralValue::Integer(1)));
+                assert!(set.contains(&LiteralValue::Integer(3)));
+            }
+            _ => panic!("expected InSet, got {range:?}"),
         }
     }
 }
