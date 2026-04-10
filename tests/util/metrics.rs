@@ -21,6 +21,7 @@ pub struct MetricsSnapshot {
     pub cache_subsumptions: u64,
     pub cache_invalidations: u64,
     pub cache_readmissions: u64,
+    pub cache_coalesce_served: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -63,6 +64,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_subsumptions = 0u64;
     let mut cache_invalidations = 0u64;
     let mut cache_readmissions = 0u64;
+    let mut cache_coalesce_served = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -89,6 +91,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_subsumptions" => cache_subsumptions = value,
                 "pgcache_cache_invalidations" => cache_invalidations = value,
                 "pgcache_cache_readmissions" => cache_readmissions = value,
+                "pgcache_cache_coalesce_served" => cache_coalesce_served = value,
                 _ => {}
             }
         }
@@ -122,6 +125,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_subsumptions,
         cache_invalidations,
         cache_readmissions,
+        cache_coalesce_served,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -144,6 +148,7 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_subsumptions: after.cache_subsumptions - before.cache_subsumptions,
         cache_invalidations: after.cache_invalidations - before.cache_invalidations,
         cache_readmissions: after.cache_readmissions - before.cache_readmissions,
+        cache_coalesce_served: after.cache_coalesce_served - before.cache_coalesce_served,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

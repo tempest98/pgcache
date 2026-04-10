@@ -24,8 +24,21 @@ pub enum SubsumptionResult {
     NotSubsumed,
 }
 
+/// Notifications from writer to coordinator for coalescing queue drain.
+pub enum WriterNotify {
+    /// Population completed — query is Ready.
+    Ready {
+        fingerprint: u64,
+        generation: u64,
+        resolved: SharedResolved,
+        max_limit: Option<u64>,
+    },
+    /// Population failed.
+    Failed { fingerprint: u64 },
+}
+
 /// Whether the pipeline includes a Describe and which type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PipelineDescribe {
     /// No Describe in the pipeline
     None,

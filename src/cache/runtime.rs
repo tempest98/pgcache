@@ -19,10 +19,10 @@ use crate::{
     cache::{
         CacheError, CacheResult, MapIntoReport, ReportExt, StatusRequest,
         cdc::CdcProcessor,
-        messages::{CacheReply, CdcCommand, CdcSignal, ProxyMessage},
+        messages::{CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
         types::{ActiveRelations, CacheStateView, WorkerMetrics},
-        worker::handle_cached_query,
+        worker::{CoalescedOutcome, handle_cached_query},
         writer::writer_run,
     },
     metrics::names,
@@ -65,7 +65,8 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
     }
 }
 
-/// Handles a worker request by executing the query and sending the reply
+/// Handles a worker request by executing the query and sending the reply.
+/// Sends replies for both the primary client and any coalesced clients.
 async fn handle_worker_request(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
@@ -74,11 +75,10 @@ async fn handle_worker_request(
 ) {
     debug!("cache worker task spawn");
 
-    // Record worker start time
     msg.timing.worker_start_at = Some(Instant::now());
 
     let reply = match handle_cached_query(conn, return_tx, &mut msg).await {
-        Ok(bytes_served) => {
+        Ok((bytes_served, coalesced_outcomes)) => {
             let latency_us = msg
                 .timing
                 .worker_start_at
@@ -89,11 +89,24 @@ async fn handle_worker_request(
                 latency_us,
                 bytes_served: bytes_served as u64,
             });
+
+            // Send replies to coalesced clients
+            for outcome in coalesced_outcomes {
+                match outcome {
+                    CoalescedOutcome::Complete(client) => {
+                        let _ = client.reply_tx.send(CacheReply::Complete(Some(client.timing)));
+                    }
+                    CoalescedOutcome::Failed(client) => {
+                        let _ = client.reply_tx.send(CacheReply::Error(client.data));
+                    }
+                }
+            }
+
             CacheReply::Complete(Some(msg.timing))
         }
         Err(e) => {
             error!("handle_cached_query failed: {e}");
-            // Forward bytes include the full pipeline (Execute+Sync etc.); fall back to raw data
+            // Coalesced clients already received Error replies inside the worker
             let error_buf = msg
                 .forward_bytes
                 .take()
@@ -250,6 +263,7 @@ pub fn cache_run(
         let (query_tx, query_rx) = unbounded_channel();
         let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
         let (worker_metrics_tx, worker_metrics_rx) = unbounded_channel::<WorkerMetrics>();
+        let (notify_tx, mut notify_rx) = unbounded_channel::<WriterNotify>();
         let state_view_writer = Arc::clone(&state_view);
         let active_relations_writer = Arc::clone(&active_relations);
         let settings_writer = settings.clone();
@@ -263,6 +277,7 @@ pub fn cache_run(
                     cdc_cmd_rx,
                     state_view_writer,
                     active_relations_writer,
+                    notify_tx,
                     cancel_writer,
                     status_rx,
                 )
@@ -374,6 +389,21 @@ pub fn cache_run(
                             msg = worker_metrics_rx.recv() => {
                                 if let Some(wm) = msg {
                                     worker_metrics_record(&state_view, wm);
+                                }
+                            }
+                            // Drain coalesced waiters when writer signals Ready/Failed
+                            notify = notify_rx.recv() => {
+                                match notify {
+                                    Some(WriterNotify::Ready { fingerprint, generation, resolved, max_limit }) => {
+                                        qcache.waiting_drain_ready(fingerprint, generation, resolved, max_limit);
+                                    }
+                                    Some(WriterNotify::Failed { fingerprint }) => {
+                                        qcache.waiting_drain_failed(fingerprint);
+                                    }
+                                    None => {
+                                        error!("writer notify channel closed");
+                                        return Err(CacheError::WriterFailure.into());
+                                    }
                                 }
                             }
                         }

@@ -2108,7 +2108,7 @@ impl TryFrom<SortByDir> for OrderDirection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LimitClause {
     pub count: Option<LiteralValue>,
     pub offset: Option<LiteralValue>,

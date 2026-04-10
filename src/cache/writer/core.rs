@@ -22,7 +22,7 @@ use crate::settings::{CachePolicy, Settings};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{CdcCommand, QueryCommand},
+    messages::{CdcCommand, QueryCommand, WriterNotify},
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
     },
@@ -73,6 +73,8 @@ pub struct CacheWriter {
     pub(super) relations_dirty: bool,
     /// Writer's own command channel for sending deferred commands (e.g., pinned readmit from CDC).
     pub(super) query_tx: UnboundedSender<QueryCommand>,
+    /// Notifications to coordinator for coalescing queue drain.
+    pub(super) notify_tx: UnboundedSender<WriterNotify>,
 }
 
 impl CacheWriter {
@@ -81,6 +83,7 @@ impl CacheWriter {
         state_view: Arc<CacheStateView>,
         active_relations: ActiveRelations,
         query_tx: UnboundedSender<QueryCommand>,
+        notify_tx: UnboundedSender<WriterNotify>,
     ) -> CacheResult<Self> {
         let (cache_client, cache_connection) = Config::new()
             .host(&settings.cache.host)
@@ -176,6 +179,7 @@ impl CacheWriter {
             publication_oids: HashSet::new(),
             relations_dirty: false,
             query_tx,
+            notify_tx,
         })
     }
 
@@ -780,12 +784,14 @@ impl CacheWriter {
 }
 
 /// Main writer runtime - processes query and CDC commands with LocalSet for spawned tasks.
+#[allow(clippy::too_many_arguments)]
 pub fn writer_run(
     settings: &Settings,
     mut query_rx: UnboundedReceiver<QueryCommand>,
     mut cdc_rx: UnboundedReceiver<CdcCommand>,
     state_view: Arc<CacheStateView>,
     active_relations: ActiveRelations,
+    notify_tx: UnboundedSender<WriterNotify>,
     cancel: CancellationToken,
     mut status_rx: Receiver<StatusRequest>,
 ) -> CacheResult<()> {
@@ -803,7 +809,8 @@ pub fn writer_run(
             .run_until(async move {
                 // Create writer inside LocalSet so spawn_local works for population workers
                 let mut writer =
-                    CacheWriter::new(settings, state_view, active_relations, query_tx).await?;
+                    CacheWriter::new(settings, state_view, active_relations, query_tx, notify_tx)
+                        .await?;
 
                 loop {
                     tokio::select! {

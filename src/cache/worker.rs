@@ -1,13 +1,15 @@
 use std::time::Instant;
 
 use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::Sender;
+use tokio::task::{JoinHandle, spawn_local};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, Bytes};
 use tokio_util::codec::FramedRead;
 use tracing::{debug, error, instrument, trace};
 
-use crate::cache::messages::PipelineDescribe;
+use crate::cache::messages::{CacheReply, PipelineDescribe};
 use crate::pg::cache_connection::CacheConnection;
 use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
@@ -17,9 +19,100 @@ use crate::query::ast::Deparse;
 
 use super::{
     CacheError, CacheResult,
-    query_cache::{QueryType, WorkerRequest},
+    query_cache::{CoalescedClient, QueryType, WorkerRequest},
     write_queue::WriteQueue,
 };
+
+/// Outcome of a coalesced client's write task.
+pub enum CoalescedOutcome {
+    /// All bytes were delivered successfully.
+    Complete(CoalescedClient),
+    /// Write failed or broadcast lagged — byte stream is corrupted.
+    Failed(CoalescedClient),
+}
+
+/// Broadcast state for coalesced request handling.
+struct BroadcastState {
+    tx: broadcast::Sender<Bytes>,
+    tasks: Vec<JoinHandle<Result<CoalescedClient, CoalescedClient>>>,
+}
+
+/// Push bytes to the primary WriteQueue and broadcast to coalesced clients.
+fn push_and_broadcast(
+    write_queue: &mut WriteQueue,
+    broadcast: &Option<BroadcastState>,
+    data: impl Into<Bytes>,
+) {
+    if let Some(bc) = broadcast {
+        let bytes: Bytes = data.into();
+        let _ = bc.tx.send(bytes.clone());
+        write_queue.push(bytes);
+    } else {
+        write_queue.push(data);
+    }
+}
+
+/// Create broadcast channel and spawn per-client write tasks.
+/// Returns None if there are no coalesced clients.
+fn broadcast_setup(msg: &mut WorkerRequest) -> Option<BroadcastState> {
+    if msg.coalesced.is_empty() {
+        return None;
+    }
+
+    let (tx, _) = broadcast::channel::<Bytes>(64);
+
+    let tasks = msg
+        .coalesced
+        .drain(..)
+        .map(|mut client| {
+            let mut rx = tx.subscribe();
+            spawn_local(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(chunk) => {
+                            if client.client_socket.write_all(&chunk).await.is_err() {
+                                return Err(client);
+                            }
+                        }
+                        Err(RecvError::Closed) => return Ok(client),
+                        Err(RecvError::Lagged(_)) => return Err(client),
+                    }
+                }
+            })
+        })
+        .collect();
+
+    Some(BroadcastState { tx, tasks })
+}
+
+/// Drop the broadcast sender, join all tasks, and collect outcomes.
+async fn broadcast_join(bc: BroadcastState) -> Vec<CoalescedOutcome> {
+    drop(bc.tx);
+
+    let mut outcomes = Vec::with_capacity(bc.tasks.len());
+    for task in bc.tasks {
+        match task.await {
+            Ok(Ok(client)) => outcomes.push(CoalescedOutcome::Complete(client)),
+            Ok(Err(client)) => outcomes.push(CoalescedOutcome::Failed(client)),
+            Err(_) => {} // JoinError — task panicked
+        }
+    }
+    outcomes
+}
+
+/// Drop the broadcast sender, join all tasks, and send Error replies.
+/// Used when the primary path fails after broadcast was created.
+async fn broadcast_error_reply(bc: BroadcastState) {
+    drop(bc.tx);
+
+    for task in bc.tasks {
+        let client = match task.await {
+            Ok(Ok(c)) | Ok(Err(c)) => c,
+            Err(_) => continue,
+        };
+        let _ = client.reply_tx.send(CacheReply::Error(client.data));
+    }
+}
 
 /// Guard that ensures a connection is returned to the pool.
 ///
@@ -68,24 +161,24 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// Returns the number of DataRow bytes served to the client on success.
+/// Returns the number of DataRow bytes served and coalesced client outcomes on success.
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn handle_cached_query(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
-) -> CacheResult<usize> {
+) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
     debug!("message query generation {}", msg.generation);
 
-    let bytes_served = if msg.result_formats.first().is_none_or(|&f| f == 0) {
+    let (bytes_served, outcomes) = if msg.result_formats.first().is_none_or(|&f| f == 0) {
         handle_cached_query_text(conn, return_tx, msg).await?
     } else {
         handle_cached_query_binary(conn, return_tx, msg).await?
     };
 
     debug!("cache hit");
-    Ok(bytes_served)
+    Ok((bytes_served, outcomes))
 }
 
 /// Response state machine for the text (simple query) path.
@@ -109,7 +202,7 @@ async fn handle_cached_query_text(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
-) -> CacheResult<usize> {
+) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
     let mut guard = ConnectionGuard::new(conn, return_tx);
     let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
@@ -119,7 +212,6 @@ async fn handle_cached_query_text(
 
     let mut sql = String::new();
     msg.resolved.deparse(&mut sql);
-    // Append incoming query's LIMIT/OFFSET (the stored resolved query has no LIMIT)
     if let Some(limit) = &msg.limit {
         limit.deparse(&mut sql);
     }
@@ -140,6 +232,9 @@ async fn handle_cached_query_text(
 
     #[cfg(feature = "hotpath")]
     drop(_m);
+
+    // Create broadcast for coalesced clients (after query is sent, before streaming)
+    let mut broadcast = broadcast_setup(msg);
 
     // Stream results to client
     #[cfg(feature = "hotpath")]
@@ -165,10 +260,10 @@ async fn handle_cached_query_text(
 
     // Prepend ParseComplete / BindComplete for messages the proxy buffered
     if has_parse {
-        write_queue.push(Bytes::from_static(PARSE_COMPLETE_MSG));
+        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(PARSE_COMPLETE_MSG));
     }
     if has_bind {
-        write_queue.push(Bytes::from_static(BIND_COMPLETE_MSG));
+        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(BIND_COMPLETE_MSG));
     }
 
     let mut state = TextResponseState::SetComplete;
@@ -181,6 +276,9 @@ async fn handle_cached_query_text(
                     Some(Ok(frame)) => frame,
                     Some(Err(_)) | None => {
                         guard.poisoned = true;
+                        if let Some(bc) = broadcast.take() {
+                            broadcast_error_reply(bc).await;
+                        }
                         return Err(CacheError::InvalidMessage.into());
                     }
                 };
@@ -190,23 +288,21 @@ async fn handle_cached_query_text(
 
                 match (state, frame.message_type) {
                     (TextResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {
-                        // SET response — skip, advance state
                         state = TextResponseState::RowDescription;
                     }
                     (TextResponseState::RowDescription, PgBackendMessageType::RowDescription) => {
                         if query_type == QueryType::Simple {
                             trace!("net: cache→client RowDescription ({} bytes, simple)", frame.data.len());
-                            write_queue.push(frame.data);
+                            push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         } else if pipeline_describe != PipelineDescribe::None {
-                            // Describe was in pipeline — include Describe response
                             if pipeline_describe == PipelineDescribe::Statement
                                 && let Some(param_desc) = parameter_description.take()
                             {
                                 trace!("net: cache→client ParameterDescription ({} bytes, pipeline)", param_desc.len());
-                                write_queue.push(param_desc);
+                                push_and_broadcast(&mut write_queue, &broadcast, param_desc);
                             }
                             trace!("net: cache→client RowDescription ({} bytes, pipeline)", frame.data.len());
-                            write_queue.push(frame.data);
+                            push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         } else {
                             trace!("net: cache skip RowDescription ({} bytes, extended — no Describe in pipeline)", frame.data.len());
                         }
@@ -215,11 +311,11 @@ async fn handle_cached_query_text(
                     (TextResponseState::DataRows, PgBackendMessageType::DataRows) => {
                         trace!("net: cache→client DataRow ({} bytes)", frame.data.len());
                         bytes_served += frame.data.len();
-                        write_queue.push(frame.data);
+                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                     }
                     (TextResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
                         trace!("net: cache→client CommandComplete ({} bytes)", frame.data.len());
-                        write_queue.push(frame.data);
+                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         msg.timing.query_done_at = Some(Instant::now());
                     }
                     (_, PgBackendMessageType::ReadyForQuery) => {
@@ -241,6 +337,9 @@ async fn handle_cached_query_text(
                     Err(_) => {
                         guard.poisoned = true;
                         error!("no client");
+                        if let Some(bc) = broadcast.take() {
+                            broadcast_error_reply(bc).await;
+                        }
                         return Err(CacheError::Write.into());
                     }
                 }
@@ -259,27 +358,35 @@ async fn handle_cached_query_text(
         read_buf: parts.read_buf,
         codec: parts.codec,
     });
-    guard.release().await?;
+    if let Err(e) = guard.release().await {
+        if let Some(bc) = broadcast.take() {
+            broadcast_error_reply(bc).await;
+        }
+        return Err(e);
+    }
 
     // Append ReadyForQuery for simple queries (always) and extended queries with Sync
     if query_type == QueryType::Simple || has_sync {
         trace!("net: cache→client ReadyForQuery");
-        write_queue.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
     }
 
-    // Final flush
+    // Tear down broadcast and collect coalesced outcomes
+    let outcomes = match broadcast.take() {
+        Some(bc) => broadcast_join(bc).await,
+        None => vec![],
+    };
+
+    // Final flush to primary client
     if !write_queue.is_empty() {
         trace!(
             "net: cache→client final flush (text, {} bytes remaining)",
             write_queue.remaining()
         );
-        client_socket
-            .write_all_buf(&mut write_queue)
-            .await
-            .map_err(|_| {
-                error!("no client");
-                CacheError::Write
-            })?;
+        if let Err(e) = client_socket.write_all_buf(&mut write_queue).await {
+            error!("no client: {e}");
+            return Err(CacheError::Write.into());
+        }
     }
 
     msg.timing.response_written_at = Some(Instant::now());
@@ -287,7 +394,7 @@ async fn handle_cached_query_text(
     #[cfg(feature = "hotpath")]
     drop(_m);
 
-    Ok(bytes_served)
+    Ok((bytes_served, outcomes))
 }
 
 /// Response state machine for the binary (pipelined extended query) path.
@@ -318,28 +425,28 @@ async fn handle_cached_query_binary(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
-) -> CacheResult<usize> {
+) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
     let mut guard = ConnectionGuard::new(conn, return_tx);
     let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
     // Generate SQL query from resolved AST
     let mut sql = String::new();
     msg.resolved.deparse(&mut sql);
-    // Append incoming query's LIMIT/OFFSET (the stored resolved query has no LIMIT)
     if let Some(limit) = &msg.limit {
         limit.deparse(&mut sql);
     }
     let set_sql = format!("SET mem.query_generation = {}", msg.generation);
 
-    // Include Describe('P') in cache DB pipeline when the client's pipeline has a Describe
     let include_describe = msg.pipeline_describe != PipelineDescribe::None;
 
-    // Send pipelined: SET (simple query) + Parse/Bind/[Describe('P')]/Execute/Sync (extended query)
     conn.pipelined_binary_query_send(&set_sql, &sql, include_describe)
         .await
         .inspect_err(|_| {
             guard.poisoned = true;
         })?;
+
+    // Create broadcast for coalesced clients (after query is sent, before streaming)
+    let mut broadcast = broadcast_setup(msg);
 
     // Stream results to client
     let CacheConnection {
@@ -359,12 +466,11 @@ async fn handle_cached_query_binary(
 
     let mut write_queue = WriteQueue::new();
 
-    // Prepend ParseComplete / BindComplete for messages the proxy buffered
     if has_parse {
-        write_queue.push(Bytes::from_static(PARSE_COMPLETE_MSG));
+        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(PARSE_COMPLETE_MSG));
     }
     if has_bind {
-        write_queue.push(Bytes::from_static(BIND_COMPLETE_MSG));
+        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(BIND_COMPLETE_MSG));
     }
 
     let mut state = BinaryResponseState::SetComplete;
@@ -377,6 +483,9 @@ async fn handle_cached_query_binary(
                     Some(Ok(frame)) => frame,
                     Some(Err(_)) | None => {
                         guard.poisoned = true;
+                        if let Some(bc) = broadcast.take() {
+                            broadcast_error_reply(bc).await;
+                        }
                         return Err(CacheError::InvalidMessage.into());
                     }
                 };
@@ -399,25 +508,24 @@ async fn handle_cached_query_binary(
                         };
                     }
                     (BinaryResponseState::DescribeRow, PgBackendMessageType::RowDescription) => {
-                        // Include Describe response from cache DB in client response
                         if pipeline_describe == PipelineDescribe::Statement
                             && let Some(param_desc) = parameter_description.take()
                         {
                             trace!("net: cache→client ParameterDescription (binary, {} bytes)", param_desc.len());
-                            write_queue.push(param_desc);
+                            push_and_broadcast(&mut write_queue, &broadcast, param_desc);
                         }
                         trace!("net: cache→client RowDescription (binary, {} bytes)", frame.data.len());
-                        write_queue.push(frame.data);
+                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         state = BinaryResponseState::DataRows;
                     }
                     (BinaryResponseState::DataRows, PgBackendMessageType::DataRows) => {
                         trace!("net: cache→client DataRow (binary, {} bytes)", frame.data.len());
                         bytes_served += frame.data.len();
-                        write_queue.push(frame.data);
+                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                     }
                     (BinaryResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
                         trace!("net: cache→client CommandComplete (binary, {} bytes)", frame.data.len());
-                        write_queue.push(frame.data);
+                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         msg.timing.query_done_at = Some(Instant::now());
                     }
                     (_, PgBackendMessageType::ReadyForQuery)
@@ -438,6 +546,9 @@ async fn handle_cached_query_binary(
                     Err(_) => {
                         guard.poisoned = true;
                         error!("no client");
+                        if let Some(bc) = broadcast.take() {
+                            broadcast_error_reply(bc).await;
+                        }
                         return Err(CacheError::Write.into());
                     }
                 }
@@ -456,30 +567,35 @@ async fn handle_cached_query_binary(
         read_buf: parts.read_buf,
         codec: parts.codec,
     });
-    guard.release().await?;
-
-    // Append ReadyForQuery for extended queries with Sync
-    if has_sync {
-        trace!("net: cache→client ReadyForQuery (binary pipeline)");
-        write_queue.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+    if let Err(e) = guard.release().await {
+        if let Some(bc) = broadcast.take() {
+            broadcast_error_reply(bc).await;
+        }
+        return Err(e);
     }
 
-    // Final flush
+    if has_sync {
+        trace!("net: cache→client ReadyForQuery (binary pipeline)");
+        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+    }
+
+    let outcomes = match broadcast.take() {
+        Some(bc) => broadcast_join(bc).await,
+        None => vec![],
+    };
+
     if !write_queue.is_empty() {
         trace!(
             "net: cache→client final flush (binary, {} bytes remaining)",
             write_queue.remaining()
         );
-        client_socket
-            .write_all_buf(&mut write_queue)
-            .await
-            .map_err(|_| {
-                error!("no client");
-                CacheError::Write
-            })?;
+        if let Err(e) = client_socket.write_all_buf(&mut write_queue).await {
+            error!("no client: {e}");
+            return Err(CacheError::Write.into());
+        }
     }
 
     msg.timing.response_written_at = Some(Instant::now());
 
-    Ok(bytes_served)
+    Ok((bytes_served, outcomes))
 }

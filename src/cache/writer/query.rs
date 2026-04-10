@@ -19,7 +19,7 @@ use crate::query::update::query_table_update_queries;
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{AdmitAction, SubsumptionResult},
+    messages::{AdmitAction, SubsumptionResult, WriterNotify},
     query::CacheableQuery,
     types::{
         CachedQuery, CachedQueryState, QueryMetrics, SharedResolved, UpdateQueries, UpdateQuery,
@@ -637,6 +637,14 @@ impl CacheWriter {
                 &resolved,
                 max_limit,
             );
+            // Notify coordinator to drain coalesced waiters
+            let _ = self.notify_tx.send(WriterNotify::Ready {
+                fingerprint,
+                generation,
+                resolved,
+                max_limit,
+            });
+
             trace!(
                 "cached query ready, cached_bytes={cached_bytes} rows={row_count} {fingerprint}"
             );
@@ -661,6 +669,9 @@ impl CacheWriter {
 
             // Remove from state view
             self.state_view.cached_queries.remove(&fingerprint);
+
+            // Notify coordinator to drain coalesced waiters (forward to origin)
+            let _ = self.notify_tx.send(WriterNotify::Failed { fingerprint });
 
             self.relations_dirty = true;
             debug!("cleaned up failed query {fingerprint}");

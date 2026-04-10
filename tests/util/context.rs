@@ -1,7 +1,7 @@
 use std::io::Error;
 
 use postgres_types::ToSql;
-use tokio_postgres::{Client, Row, SimpleQueryMessage, Statement, ToStatement};
+use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, Statement, ToStatement};
 
 use super::metrics::MetricsSnapshot;
 use super::process::{
@@ -128,6 +128,26 @@ impl TestContext {
             pgcache,
             dbs,
         })
+    }
+
+    /// Create an additional client connection through the pgcache proxy.
+    pub async fn proxy_client_connect(&self) -> Result<Client, Error> {
+        let (client, connection) = Config::new()
+            .host("localhost")
+            .port(self.cache_port)
+            .user("postgres")
+            .dbname("origin_test")
+            .connect(NoTls)
+            .await
+            .map_err(Error::other)?;
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("proxy connection error: {e}");
+            }
+        });
+
+        Ok(client)
     }
 
     /// Execute query through pgcache proxy

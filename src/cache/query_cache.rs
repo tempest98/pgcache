@@ -1,3 +1,7 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -6,12 +10,10 @@ use tokio_util::bytes::BytesMut;
 use tracing::{error, info, instrument, trace};
 
 use crate::metrics::names;
-
+use crate::proxy::ClientSocket;
 use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprint};
 use crate::settings::{Allowlist, CachePolicy, DynamicConfig, DynamicConfigHandle, Settings};
 use crate::timing::QueryTiming;
-
-use std::num::NonZeroU64;
 
 use super::{
     CacheError, CacheResult,
@@ -21,13 +23,38 @@ use super::{
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     types::{CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, SharedResolved},
 };
-use crate::proxy::ClientSocket;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueryType {
     Simple,
     Extended,
 }
+
+/// Key for grouping coalesced requests. Requests in the same group
+/// produce identical wire protocol bytes and can share a single worker execution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CoalesceKey {
+    query_type: QueryType,
+    has_sync: bool,
+    has_parse: bool,
+    has_bind: bool,
+    pipeline_describe: PipelineDescribe,
+    result_formats: Vec<i16>,
+    limit: Option<LimitClause>,
+}
+
+/// A client waiting to receive coalesced response bytes from a shared worker execution.
+pub struct CoalescedClient {
+    pub client_socket: ClientSocket,
+    pub reply_tx: oneshot::Sender<CacheReply>,
+    pub timing: QueryTiming,
+    /// Pre-computed origin fallback bytes (pipeline.buffered_bytes or raw data).
+    pub data: BytesMut,
+}
+
+/// Outer key: fingerprint (O(1) drain on Ready/Failed).
+/// Inner key: CoalesceKey grouping requests that share identical response bytes.
+type WaitingQueue = HashMap<u64, HashMap<CoalesceKey, Vec<QueryRequest>>>;
 
 pub struct QueryRequest {
     pub query_type: QueryType,
@@ -75,15 +102,19 @@ pub struct WorkerRequest {
     pub parameter_description: Option<BytesMut>,
     /// Buffered bytes for origin fallback on worker error.
     pub forward_bytes: Option<BytesMut>,
+    /// Additional clients to receive the same response bytes.
+    /// Empty for non-coalesced requests.
+    pub coalesced: Vec<CoalescedClient>,
 }
 
 /// Query cache coordinator - routes queries and delegates writes to the writer thread.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct QueryCache {
     query_tx: UnboundedSender<QueryCommand>,
     worker_tx: UnboundedSender<WorkerRequest>,
     state_view: Arc<CacheStateView>,
     dynamic: DynamicConfigHandle,
+    waiting: Rc<RefCell<WaitingQueue>>,
 }
 
 impl QueryCache {
@@ -111,6 +142,7 @@ impl QueryCache {
             worker_tx,
             state_view,
             dynamic: settings.dynamic.clone(),
+            waiting: Rc::new(RefCell::new(HashMap::new())),
         })
     }
 
@@ -190,14 +222,23 @@ impl QueryCache {
                 Ok(())
             }
 
-            // Loading — forward to origin, don't re-register
+            // Loading — coalesce: queue request for later dispatch from cache
             Some(CachedQueryView {
                 state: CachedQueryState::Loading,
                 ..
             }) => {
-                trace!("cache loading {fingerprint}");
+                trace!("cache loading, coalesce {fingerprint}");
                 self.metrics_miss_record(fingerprint);
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data)
+                let key = Self::coalesce_key_from_request(&msg);
+                self.waiting
+                    .borrow_mut()
+                    .entry(fingerprint)
+                    .or_default()
+                    .entry(key)
+                    .or_default()
+                    .push(msg);
+                metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
+                Ok(())
             }
 
             // Pending — hold request, check subsumption, increment hit count, admit if threshold reached
@@ -278,6 +319,18 @@ impl QueryCache {
         resolved: SharedResolved,
         generation: u64,
     ) -> CacheResult<()> {
+        self.worker_request_send_with(fingerprint, msg, resolved, generation, vec![])
+    }
+
+    /// Build and send a WorkerRequest with coalesced clients attached.
+    fn worker_request_send_with(
+        &self,
+        fingerprint: u64,
+        msg: QueryRequest,
+        resolved: SharedResolved,
+        generation: u64,
+        coalesced: Vec<CoalescedClient>,
+    ) -> CacheResult<()> {
         let mut timing = msg.timing;
         timing.lookup_complete_at = Some(Instant::now());
 
@@ -318,11 +371,118 @@ impl QueryCache {
                 pipeline_describe,
                 parameter_description,
                 forward_bytes,
+                coalesced,
             })
             .map_err(|e| {
                 error!("worker send {e}");
                 CacheError::WorkerSend.into()
             })
+    }
+
+    /// Build a CoalesceKey from a QueryRequest's pipeline context.
+    fn coalesce_key_from_request(msg: &QueryRequest) -> CoalesceKey {
+        let (has_sync, has_parse, has_bind, pipeline_describe) = match &msg.pipeline {
+            Some(p) => (true, p.has_parse, p.has_bind, p.describe),
+            None => (false, false, false, PipelineDescribe::None),
+        };
+        CoalesceKey {
+            query_type: msg.query_type,
+            has_sync,
+            has_parse,
+            has_bind,
+            pipeline_describe,
+            result_formats: msg.result_formats.clone(),
+            limit: msg.cacheable_query.query.limit.clone(),
+        }
+    }
+
+    /// Total number of requests waiting across all coalescing groups.
+    fn waiting_count(&self) -> usize {
+        self.waiting
+            .borrow()
+            .values()
+            .flat_map(|groups| groups.values())
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Drain all coalesced waiters for a fingerprint that became Ready.
+    /// Each coalescing group dispatches a single worker request that broadcasts
+    /// response bytes to all clients in the group.
+    pub fn waiting_drain_ready(
+        &self,
+        fingerprint: u64,
+        generation: u64,
+        resolved: SharedResolved,
+        max_limit: Option<u64>,
+    ) {
+        let Some(groups) = self.waiting.borrow_mut().remove(&fingerprint) else {
+            return;
+        };
+
+        let mut served = 0u64;
+        for (_key, mut waiters) in groups {
+            let primary = waiters.remove(0);
+
+            // Check whether the cached rows cover this group's LIMIT
+            let primary_needed = limit_rows_needed(&primary.cacheable_query.query.limit);
+            if !limit_is_sufficient(max_limit, primary_needed) {
+                let _ = reply_forward(primary.reply_tx, primary.pipeline, primary.data);
+                for msg in waiters {
+                    let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data);
+                }
+                continue;
+            }
+
+            served += waiters.len() as u64;
+
+            let coalesced: Vec<CoalescedClient> = waiters
+                .into_iter()
+                .map(|msg| {
+                    let fallback = match msg.pipeline {
+                        Some(pipeline) => pipeline.buffered_bytes,
+                        None => msg.data,
+                    };
+                    CoalescedClient {
+                        client_socket: msg.client_socket,
+                        reply_tx: msg.reply_tx,
+                        timing: msg.timing,
+                        data: fallback,
+                    }
+                })
+                .collect();
+
+            if let Err(e) = self.worker_request_send_with(
+                fingerprint,
+                primary,
+                Arc::clone(&resolved),
+                generation,
+                coalesced,
+            ) {
+                error!("coalesce serve failed: {e}");
+            }
+        }
+
+        if served > 0 {
+            metrics::counter!(names::CACHE_COALESCE_SERVED).increment(served);
+        }
+        metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
+    }
+
+    /// Drain all coalesced waiters for a fingerprint that failed.
+    /// Falls back to forwarding each waiter to origin.
+    pub fn waiting_drain_failed(&self, fingerprint: u64) {
+        let Some(groups) = self.waiting.borrow_mut().remove(&fingerprint) else {
+            return;
+        };
+
+        for (_key, waiters) in groups {
+            for msg in waiters {
+                let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data);
+            }
+        }
+
+        metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
     }
 
     /// Register pinned queries at startup by sending Register commands with `pinned: true`.

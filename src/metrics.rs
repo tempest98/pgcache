@@ -118,6 +118,10 @@ pub mod names {
     pub const CACHE_GENERATION: &str = "pgcache.cache.generation";
     pub const CACHE_TABLES_TRACKED: &str = "pgcache.cache.tables_tracked";
 
+    // Request coalescing metrics
+    pub const CACHE_COALESCE_WAITING: &str = "pgcache.cache.coalesce_waiting";
+    pub const CACHE_COALESCE_SERVED: &str = "pgcache.cache.coalesce_served";
+
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
     pub const PROTOCOL_EXTENDED_QUERIES: &str = "pgcache.protocol.extended_queries";
