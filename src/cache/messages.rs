@@ -239,6 +239,10 @@ impl std::fmt::Debug for QueryCommand {
                 .debug_struct("Readmit")
                 .field("fingerprint", fingerprint)
                 .finish(),
+            Self::MvBuild { fingerprint } => f
+                .debug_struct("MvBuild")
+                .field("fingerprint", fingerprint)
+                .finish(),
         }
     }
 }
@@ -289,6 +293,14 @@ pub enum QueryCommand {
     /// Readmit a pinned query after CDC invalidation.
     /// Deferred via the writer's internal channel to avoid inline population during CDC processing.
     Readmit { fingerprint: u64 },
+
+    /// Build (or rebuild) the materialized result for a cached query. Sent by
+    /// the coordinator when it observes `mv_state == Pending { .. }` on a cache
+    /// hit and transitions to `Scheduled { .. }`. The writer's handler branches
+    /// on `has_table` to choose between `CREATE TABLE AS` (first build, may
+    /// run the Measure size gate) and `BEGIN; TRUNCATE; INSERT; COMMIT`
+    /// (rebuild; gate is sticky).
+    MvBuild { fingerprint: u64 },
 }
 
 /// Commands for CDC mutations and relation tracking, sent to the writer thread

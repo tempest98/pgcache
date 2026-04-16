@@ -22,6 +22,11 @@ pub struct MetricsSnapshot {
     pub cache_invalidations: u64,
     pub cache_readmissions: u64,
     pub cache_coalesce_served: u64,
+    pub cache_mv_hits: u64,
+    pub cache_mv_fallthrough: u64,
+    pub cache_mv_rebuilds: u64,
+    pub cache_mv_skipped_rebuilds: u64,
+    pub cache_mv_dirty_truncates: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -65,6 +70,11 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_invalidations = 0u64;
     let mut cache_readmissions = 0u64;
     let mut cache_coalesce_served = 0u64;
+    let mut cache_mv_hits = 0u64;
+    let mut cache_mv_fallthrough = 0u64;
+    let mut cache_mv_rebuilds = 0u64;
+    let mut cache_mv_skipped_rebuilds = 0u64;
+    let mut cache_mv_dirty_truncates = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -92,6 +102,11 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_invalidations" => cache_invalidations = value,
                 "pgcache_cache_readmissions" => cache_readmissions = value,
                 "pgcache_cache_coalesce_served" => cache_coalesce_served = value,
+                "pgcache_cache_mv_hits" => cache_mv_hits = value,
+                "pgcache_cache_mv_fallthrough" => cache_mv_fallthrough = value,
+                "pgcache_cache_mv_rebuilds" => cache_mv_rebuilds = value,
+                "pgcache_cache_mv_skipped_rebuilds" => cache_mv_skipped_rebuilds = value,
+                "pgcache_cache_mv_dirty_truncates" => cache_mv_dirty_truncates = value,
                 _ => {}
             }
         }
@@ -126,6 +141,11 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_invalidations,
         cache_readmissions,
         cache_coalesce_served,
+        cache_mv_hits,
+        cache_mv_fallthrough,
+        cache_mv_rebuilds,
+        cache_mv_skipped_rebuilds,
+        cache_mv_dirty_truncates,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -149,6 +169,13 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_invalidations: after.cache_invalidations - before.cache_invalidations,
         cache_readmissions: after.cache_readmissions - before.cache_readmissions,
         cache_coalesce_served: after.cache_coalesce_served - before.cache_coalesce_served,
+        cache_mv_hits: after.cache_mv_hits - before.cache_mv_hits,
+        cache_mv_fallthrough: after.cache_mv_fallthrough - before.cache_mv_fallthrough,
+        cache_mv_rebuilds: after.cache_mv_rebuilds - before.cache_mv_rebuilds,
+        cache_mv_skipped_rebuilds: after.cache_mv_skipped_rebuilds
+            - before.cache_mv_skipped_rebuilds,
+        cache_mv_dirty_truncates: after.cache_mv_dirty_truncates
+            - before.cache_mv_dirty_truncates,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

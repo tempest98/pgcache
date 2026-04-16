@@ -29,7 +29,7 @@ fn main() -> Result<(), Report> {
 
     #[cfg(feature = "hotpath")]
     let _guard = hotpath::HotpathGuardBuilder::new("pgcache")
-        .percentiles(&[50, 95, 99])
+        .percentiles(&[50.0, 95.0, 99.0])
         .format(hotpath::Format::Table)
         .build();
 

@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashSet;
 
 use ecow::EcoString;
 use error_set::error_set;
@@ -751,6 +752,34 @@ impl ResolvedColumnExpr {
         current.chain(children)
     }
 
+    /// True when the expression tree contains a `Function` call whose name
+    /// appears in `agg_fns`. Walks through CASE branches and arithmetic operands,
+    /// but does not descend into scalar subqueries (an aggregate nested inside a
+    /// subquery doesn't make the outer expression aggregating).
+    pub fn has_aggregate(&self, agg_fns: &HashSet<String>) -> bool {
+        match self {
+            ResolvedColumnExpr::Function { name, args, .. } => {
+                agg_fns.contains(name.as_str())
+                    || args.iter().any(|a| a.has_aggregate(agg_fns))
+            }
+            ResolvedColumnExpr::Case(case) => {
+                case.arg.as_ref().is_some_and(|a| a.has_aggregate(agg_fns))
+                    || case.whens.iter().any(|w| w.result.has_aggregate(agg_fns))
+                    || case
+                        .default
+                        .as_ref()
+                        .is_some_and(|d| d.has_aggregate(agg_fns))
+            }
+            ResolvedColumnExpr::Arithmetic(arith) => {
+                arith.left.has_aggregate(agg_fns) || arith.right.has_aggregate(agg_fns)
+            }
+            ResolvedColumnExpr::Column(_)
+            | ResolvedColumnExpr::Identifier(_)
+            | ResolvedColumnExpr::Literal(_)
+            | ResolvedColumnExpr::Subquery(_, _) => false,
+        }
+    }
+
     /// Compute the maximum subquery nesting depth in this column expression.
     fn subquery_depth(&self) -> usize {
         match self {
@@ -966,6 +995,26 @@ impl ResolvedSelectColumn {
         let children = self.expr.nodes();
         current.chain(children)
     }
+
+    /// The column's output name — its alias if present, otherwise inferred
+    /// from the expression (the column name for `Column` / `Identifier`).
+    /// Returns `None` for unaliased function, literal, case, arithmetic, or
+    /// subquery expressions, which have no stable output name (PG reports
+    /// `?column?`).
+    pub fn output_name(&self) -> Option<&EcoString> {
+        if let Some(alias) = &self.alias {
+            return Some(alias);
+        }
+        match &self.expr {
+            ResolvedColumnExpr::Column(c) => Some(&c.column),
+            ResolvedColumnExpr::Identifier(name) => Some(name),
+            ResolvedColumnExpr::Function { .. }
+            | ResolvedColumnExpr::Literal(_)
+            | ResolvedColumnExpr::Case(_)
+            | ResolvedColumnExpr::Arithmetic(_)
+            | ResolvedColumnExpr::Subquery(_, _) => None,
+        }
+    }
 }
 
 impl Deparse for ResolvedSelectColumn {
@@ -1033,6 +1082,20 @@ impl ResolvedSelectColumns {
                 col.expr.subquery_nodes_collect(branches);
             }
         }
+    }
+
+    /// Find the 1-based position of a SELECT column whose expression is
+    /// structurally equal to `expr`. Used to emit positional ORDER BY
+    /// (`ORDER BY N`) when serving from an MV table — the MV's columns are
+    /// named by the original SELECT-list scope, so source-qualified refs
+    /// (`public.orders.status`, `count(orders.id)`) aren't valid against the
+    /// MV; positional ORDER BY sidesteps the naming entirely.
+    pub fn columns_position_of(&self, expr: &ResolvedColumnExpr) -> Option<usize> {
+        let cols = match self {
+            ResolvedSelectColumns::Columns(cols) => cols,
+            ResolvedSelectColumns::None => return None,
+        };
+        cols.iter().position(|c| c.expr == *expr).map(|i| i + 1)
     }
 }
 

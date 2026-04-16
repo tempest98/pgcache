@@ -91,6 +91,23 @@ pub mod names {
     pub const CACHE_SUBSUMPTIONS: &str = "pgcache.cache.subsumptions";
     pub const CACHE_SUBSUMPTION_LATENCY_SECONDS: &str = "pgcache.cache.subsumption_latency_seconds";
 
+    // Materialized result metrics
+    /// Requests served directly from the MV table (fast path).
+    pub const CACHE_MV_HITS: &str = "pgcache.cache.mv_hits";
+    /// Cache hits where mv_state != Fresh — fell through to source-row eval.
+    pub const CACHE_MV_FALLTHROUGH: &str = "pgcache.cache.mv_fallthrough";
+    /// Rebuilds committed by the writer (Dirty → Fresh transitions).
+    pub const CACHE_MV_REBUILDS: &str = "pgcache.cache.mv_rebuilds";
+    /// Rebuild messages the writer dropped because source-row state was not Ready
+    /// at the time of processing (transitioned back to Dirty).
+    pub const CACHE_MV_SKIPPED_REBUILDS: &str = "pgcache.cache.mv_skipped_rebuilds";
+    /// Dirty MV tables truncated by the eviction pre-sweep.
+    pub const CACHE_MV_DIRTY_TRUNCATES: &str = "pgcache.cache.mv_dirty_truncates";
+    /// Histogram of MV build durations (seconds). Labeled by `kind={first_pop,rebuild}`
+    /// so operators can correlate with replication slot lag to decide whether
+    /// off-thread builds (Option B) are needed.
+    pub const CACHE_MV_BUILD_DURATION_SECONDS: &str = "pgcache.cache.mv_build_duration_seconds";
+
     // Cache state metrics (admission/eviction policy)
     pub const CACHE_QUERIES_PENDING: &str = "pgcache.cache.queries_pending";
     pub const CACHE_QUERIES_INVALIDATED: &str = "pgcache.cache.queries_invalidated";

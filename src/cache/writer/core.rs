@@ -23,6 +23,7 @@ use crate::settings::{CachePolicy, Settings};
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcCommand, QueryCommand, WriterNotify},
+    mv::{MvState, ShapeGate, mv_state_initial},
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
     },
@@ -218,6 +219,10 @@ impl CacheWriter {
                 row_count,
             } => {
                 self.query_ready_mark(fingerprint, cached_bytes, row_count);
+                // Pinned queries bypass the coordinator-driven "first hit triggers
+                // MV build" flow so they stay warm across restarts and readmits.
+                // See mv_pinned_bootstrap.
+                self.mv_pinned_bootstrap(fingerprint);
                 self.cache.current_size = self.cache_size_load().await?;
                 self.eviction_run().await?;
             }
@@ -237,6 +242,12 @@ impl CacheWriter {
                 trace!("command readmit {fingerprint}");
                 if let Err(e) = self.query_readmit(fingerprint, Instant::now()).await {
                     error!("pinned readmit failed: {e} {fingerprint}");
+                }
+            }
+            QueryCommand::MvBuild { fingerprint } => {
+                trace!("command mv build {fingerprint}");
+                if let Err(e) = self.mv_build(fingerprint).await {
+                    error!("mv build failed: {e} {fingerprint}");
                 }
             }
         }
@@ -370,6 +381,18 @@ impl CacheWriter {
 
     // Helper methods
 
+    /// Set the shape-gate classification and derive the initial MvState for a
+    /// cached query. Called once per fresh registration (not on readmit / limit
+    /// bump, since classification is sticky). The state_view entry is expected
+    /// to exist — it is inserted by the coordinator before dispatching
+    /// `QueryCommand::Register`.
+    pub(super) fn mv_state_set(&self, fingerprint: u64, shape_gate: ShapeGate) {
+        if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
+            view.shape_gate = shape_gate;
+            view.mv_state = mv_state_initial(shape_gate);
+        }
+    }
+
     pub(super) fn state_view_update(
         &self,
         fingerprint: u64,
@@ -378,16 +401,29 @@ impl CacheWriter {
         resolved: &SharedResolved,
         max_limit: Option<u64>,
     ) {
-        self.state_view.cached_queries.insert(
-            fingerprint,
-            CachedQueryView {
+        // Preserve shape_gate and mv_state across state transitions — the writer
+        // mutates those via dedicated helpers (registration classifier, mv_dirty_mark,
+        // rebuild, etc). For a first insert (no existing entry), default to Skip/Skipped
+        // until classification runs.
+        self.state_view
+            .cached_queries
+            .entry(fingerprint)
+            .and_modify(|v| {
+                v.state = state;
+                v.generation = generation;
+                v.resolved = Some(Arc::clone(resolved));
+                v.max_limit = max_limit;
+                v.referenced = false;
+            })
+            .or_insert_with(|| CachedQueryView {
                 state,
                 generation,
                 resolved: Some(Arc::clone(resolved)),
                 max_limit,
                 referenced: false,
-            },
-        );
+                shape_gate: ShapeGate::Skip,
+                mv_state: MvState::Skipped,
+            });
     }
 
     /// Update cache state gauges with current values.
@@ -446,6 +482,15 @@ impl CacheWriter {
         let mut pinned_skips = 0;
 
         let cfg = self.cache.dynamic.load();
+
+        // Pre-sweep: reclaim bytes held by Dirty MVs before considering live
+        // entries for eviction. If this alone brings current_size under the
+        // limit, the loop below exits immediately without evicting anything.
+        if cfg.cache_size.is_some_and(|s| self.cache.current_size > s) {
+            self.mv_dirty_sweep().await?;
+            self.cache.current_size = self.cache_size_load().await?;
+        }
+
         while cfg.cache_size.is_some_and(|s| self.cache.current_size > s) {
             let Some(&min_gen) = self.cache.generations.first() else {
                 break;

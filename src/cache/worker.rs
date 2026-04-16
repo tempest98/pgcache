@@ -19,6 +19,7 @@ use crate::query::ast::Deparse;
 
 use super::{
     CacheError, CacheResult,
+    mv::mv_serve_sql,
     query_cache::{CoalescedClient, QueryType, WorkerRequest},
     write_queue::WriteQueue,
 };
@@ -210,12 +211,20 @@ async fn handle_cached_query_text(
     #[cfg(feature = "hotpath")]
     let _m = hotpath::functions::MeasurementGuardSync::new("hcqt:deparse", false, false);
 
-    let mut sql = String::new();
-    msg.resolved.deparse(&mut sql);
-    if let Some(limit) = &msg.limit {
-        limit.deparse(&mut sql);
-    }
-    let combined_sql = format!("SET mem.query_generation = {}; {};", msg.generation, &sql);
+    let combined_sql = if msg.mv_source {
+        // MV fast path: SELECT * FROM pgcache_mv.q_<fp> [ORDER BY] [LIMIT].
+        // No generation SET — MV tables are not pgcache_pgrx-tracked.
+        let mut sql = mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref());
+        sql.push(';');
+        sql
+    } else {
+        let mut sql = String::new();
+        msg.resolved.deparse(&mut sql);
+        if let Some(limit) = &msg.limit {
+            limit.deparse(&mut sql);
+        }
+        format!("SET mem.query_generation = {}; {};", msg.generation, &sql)
+    };
 
     #[cfg(feature = "hotpath")]
     drop(_m);
@@ -266,7 +275,13 @@ async fn handle_cached_query_text(
         push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(BIND_COMPLETE_MSG));
     }
 
-    let mut state = TextResponseState::SetComplete;
+    // MV path: no SET statement was sent, so skip the SetComplete waiting state
+    // and start directly at RowDescription.
+    let mut state = if msg.mv_source {
+        TextResponseState::RowDescription
+    } else {
+        TextResponseState::SetComplete
+    };
     let mut bytes_served: usize = 0;
 
     loop {
@@ -429,21 +444,29 @@ async fn handle_cached_query_binary(
     let mut guard = ConnectionGuard::new(conn, return_tx);
     let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
-    // Generate SQL query from resolved AST
-    let mut sql = String::new();
-    msg.resolved.deparse(&mut sql);
-    if let Some(limit) = &msg.limit {
-        limit.deparse(&mut sql);
-    }
-    let set_sql = format!("SET mem.query_generation = {}", msg.generation);
-
     let include_describe = msg.pipeline_describe != PipelineDescribe::None;
 
-    conn.pipelined_binary_query_send(&set_sql, &sql, include_describe)
-        .await
-        .inspect_err(|_| {
-            guard.poisoned = true;
-        })?;
+    if msg.mv_source {
+        // MV fast path: extended query only, no SET prefix.
+        let sql = mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref());
+        conn.extended_binary_query_send(&sql, include_describe)
+            .await
+            .inspect_err(|_| {
+                guard.poisoned = true;
+            })?;
+    } else {
+        let mut sql = String::new();
+        msg.resolved.deparse(&mut sql);
+        if let Some(limit) = &msg.limit {
+            limit.deparse(&mut sql);
+        }
+        let set_sql = format!("SET mem.query_generation = {}", msg.generation);
+        conn.pipelined_binary_query_send(&set_sql, &sql, include_describe)
+            .await
+            .inspect_err(|_| {
+                guard.poisoned = true;
+            })?;
+    }
 
     // Create broadcast for coalesced clients (after query is sent, before streaming)
     let mut broadcast = broadcast_setup(msg);
@@ -473,7 +496,13 @@ async fn handle_cached_query_binary(
         push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(BIND_COMPLETE_MSG));
     }
 
-    let mut state = BinaryResponseState::SetComplete;
+    // MV path: no SET statement was sent, so skip SetComplete/SetReady and
+    // start directly at ParseComplete (first message from the extended query).
+    let mut state = if msg.mv_source {
+        BinaryResponseState::ParseComplete
+    } else {
+        BinaryResponseState::SetComplete
+    };
     let mut bytes_served: usize = 0;
 
     loop {

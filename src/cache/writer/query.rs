@@ -21,6 +21,7 @@ use crate::query::update::query_table_update_queries;
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, SubsumptionResult, WriterNotify},
+    mv::{ShapeGate, shape_classify},
     query::CacheableQuery,
     types::{
         CachedQuery, CachedQueryState, QueryMetrics, SharedResolved, UpdateEvalStrategy,
@@ -68,6 +69,12 @@ struct QueryResolution {
     relation_oids: Vec<u32>,
     base_query: QueryExpr,
     max_limit: Option<u64>,
+    /// MV shape gate. Also gates `max_limit`: reducer shapes force
+    /// `max_limit = None` so source-row population isn't truncated in a way
+    /// that would break re-evaluation (aggregates, GROUP BY, DISTINCT,
+    /// windows all depend on the full input row set to produce correct
+    /// result rows).
+    shape_gate: ShapeGate,
 }
 
 /// Clone the query, strip LIMIT, and compute max_limit for population.
@@ -85,6 +92,24 @@ fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
 }
 
 impl CacheWriter {
+    /// Classify a resolved query's shape for MV eligibility. Runs decorrelation
+    /// first so the classification matches what first-population / rebuild will
+    /// actually see (correlated subqueries get rewritten to JOIN + DISTINCT,
+    /// which affects classification). Falls back to the original resolved form
+    /// if decorrelation fails.
+    ///
+    /// NOTE: `population_work_build` and `update_queries_register` also decorrelate
+    /// the same resolved query. Factoring these three callers onto a single
+    /// decorrelation pass is a worthwhile follow-up but out of scope for v1.
+    fn shape_gate_classify(&self, resolved: &SharedResolved) -> ShapeGate {
+        let decorrelated = query_expr_decorrelate(resolved, &self.aggregate_functions).ok();
+        let query: &ResolvedQueryExpr = match &decorrelated {
+            Some(d) if d.transformed => &d.resolved,
+            _ => resolved,
+        };
+        shape_classify(query, &self.aggregate_functions)
+    }
+
     /// Build population work for a query, handling decorrelation and branch extraction.
     ///
     /// Decorrelates the resolved AST so correlated subqueries are merged into JOINs,
@@ -290,7 +315,7 @@ impl CacheWriter {
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
     ) -> CacheResult<QueryResolution> {
-        let (base_query, max_limit) = base_query_prepare(&cacheable_query.query);
+        let (base_query, user_max_limit) = base_query_prepare(&cacheable_query.query);
 
         self.cache_tables_ensure(&base_query, search_path).await?;
 
@@ -301,6 +326,22 @@ impl CacheWriter {
                 .map(predicate_pushdown_apply)?,
         );
 
+        // Classify the shape once here; `query_register` and MV setup both reuse
+        // the result via `QueryResolution.shape_gate` to avoid re-running
+        // decorrelation + classification.
+        let shape_gate = self.shape_gate_classify(&resolved);
+
+        // Reducer shapes transform row cardinality — applying the user's
+        // LIMIT to source-row population truncates the input and breaks
+        // re-evaluation (e.g. `SELECT count(*) FROM t LIMIT 3` cached with 3
+        // source rows returns 3, not the real count). Force unbounded
+        // population for those shapes.
+        let max_limit = if shape_gate.is_reducer() {
+            None
+        } else {
+            user_max_limit
+        };
+
         let relation_oids =
             self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;
 
@@ -309,6 +350,7 @@ impl CacheWriter {
             relation_oids,
             base_query,
             max_limit,
+            shape_gate,
         })
     }
 
@@ -487,6 +529,11 @@ impl CacheWriter {
         let resolution = self
             .query_resolve(fingerprint, cacheable_query, search_path)
             .await?;
+
+        // Classify shape for MV eligibility. Sticky — readmit and limit-bump
+        // paths preserve the result via state_view_update. Classification
+        // was done in `query_resolve`; reuse it here.
+        self.mv_state_set(fingerprint, resolution.shape_gate);
 
         // Phase 2: Subsumption check
         let subsumed = self.subsumption_check(&resolution);
@@ -729,6 +776,11 @@ impl CacheWriter {
             trace!("limit bump: query {fingerprint} not found, skipping");
             return Ok(());
         };
+
+        // A larger max_limit means the existing MV (sized for the old max_limit)
+        // is short of rows. Flip Fresh → Dirty before any other mutation so
+        // coordinators fall through while the new population runs.
+        self.mv_dirty_mark(fingerprint);
 
         // Collect data needed before mutating
         let resolved = Arc::clone(&cached_query.resolved);

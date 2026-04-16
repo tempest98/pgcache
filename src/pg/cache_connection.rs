@@ -145,6 +145,20 @@ impl CacheConnection {
             .await
             .map_into_report::<CacheError>()
     }
+
+    /// Extended-only variant of `pipelined_binary_query_send` for MV reads that
+    /// don't need the generation SET (MV tables are not `pgcache_pgrx`-tracked).
+    pub async fn extended_binary_query_send(
+        &mut self,
+        select_sql: &str,
+        include_describe: bool,
+    ) -> CacheResult<()> {
+        let ext_msg = extended_query_binary_build(select_sql, include_describe);
+        self.stream
+            .write_all(&ext_msg)
+            .await
+            .map_into_report::<CacheError>()
+    }
 }
 
 /// Build a PG startup message (protocol v3.0).

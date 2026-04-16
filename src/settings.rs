@@ -154,9 +154,14 @@ pub struct DynamicConfig {
     #[serde(skip)]
     pub allowed_tables_parsed: Allowlist,
     pub log_level: Option<String>,
+    /// Materialized-view size gate: a Measure-classified query is materialized
+    /// iff `result_rows × mv_size_ratio ≤ source_rows` at first population.
+    /// Sticky: retuning affects future first-population decisions only.
+    pub mv_size_ratio: u32,
 }
 
 const DEFAULT_ADMISSION_THRESHOLD: u32 = 2;
+const DEFAULT_MV_SIZE_RATIO: u32 = 10;
 
 impl DynamicConfig {
     pub fn new(
@@ -165,6 +170,7 @@ impl DynamicConfig {
         admission_threshold: Option<u32>,
         allowed_tables: Option<Vec<String>>,
         log_level: Option<String>,
+        mv_size_ratio: Option<u32>,
     ) -> Self {
         Self {
             cache_size,
@@ -173,6 +179,7 @@ impl DynamicConfig {
             allowed_tables_parsed: allowlist_parse(&allowed_tables),
             allowed_tables,
             log_level,
+            mv_size_ratio: mv_size_ratio.unwrap_or(DEFAULT_MV_SIZE_RATIO),
         }
     }
 }
@@ -332,7 +339,11 @@ impl DynamicConfigHandle {
     /// Create a handle with default dynamic config and no config file. For tests.
     #[cfg(test)]
     pub fn test_default() -> Self {
-        Self::new(DynamicConfig::new(None, None, None, None, None), None, None)
+        Self::new(
+            DynamicConfig::new(None, None, None, None, None, None),
+            None,
+            None,
+        )
     }
 }
 
@@ -353,6 +364,8 @@ pub struct DynamicConfigPatch {
     pub allowed_tables: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub log_level: Option<Option<String>>,
+    #[serde(default)]
+    pub mv_size_ratio: Option<u32>,
 }
 
 /// Deserialize a double-Option: absent → None, null → Some(None), value → Some(Some(v)).
@@ -391,6 +404,7 @@ impl DynamicConfigPatch {
                 Some(v) => v.clone(),
                 None => current.log_level.clone(),
             },
+            mv_size_ratio: self.mv_size_ratio.unwrap_or(current.mv_size_ratio),
         }
     }
 }
@@ -403,6 +417,7 @@ fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {
         config.admission_threshold,
         config.allowed_tables.clone(),
         config.log_level.clone(),
+        config.mv_size_ratio,
     )
 }
 
@@ -442,6 +457,10 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
 
     if let Some(threshold) = &patch.admission_threshold {
         doc["admission_threshold"] = toml_edit::value(*threshold as i64);
+    }
+
+    if let Some(ratio) = &patch.mv_size_ratio {
+        doc["mv_size_ratio"] = toml_edit::value(*ratio as i64);
     }
 
     if let Some(v) = &patch.allowed_tables {
@@ -584,6 +603,11 @@ struct SettingsToml {
     cache_policy: Option<CachePolicy>,
     #[serde(default)]
     admission_threshold: Option<u32>,
+    /// Materialized-view size gate: a Measure query is materialized iff
+    /// `result_rows × mv_size_ratio ≤ source_rows` at first population.
+    /// Defaults to 10.
+    #[serde(default)]
+    mv_size_ratio: Option<u32>,
     /// Only cache queries referencing these tables.
     /// Supports both unqualified ("orders") and schema-qualified ("audit.orders") names.
     /// If omitted or empty, all tables are cacheable.
@@ -745,6 +769,7 @@ struct CliArgs {
     log_level: Option<String>,
     cache_policy: Option<CachePolicy>,
     admission_threshold: Option<u32>,
+    mv_size_ratio: Option<u32>,
     allowed_tables: Option<String>,
     pinned_queries: Option<String>,
     pinned_tables: Option<String>,
@@ -800,6 +825,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("log_level") => args.log_level = Some(arg_string(&mut parser)?),
             Long("cache_policy") => args.cache_policy = Some(arg_enum(&mut parser)?),
             Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
+            Long("mv_size_ratio") => args.mv_size_ratio = Some(arg_parse(&mut parser)?),
             Long("allowed_tables") => args.allowed_tables = Some(arg_string(&mut parser)?),
             Long("pinned_queries") => args.pinned_queries = Some(arg_string(&mut parser)?),
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
@@ -828,6 +854,23 @@ fn telemetry_resolve(cli_off: bool, toml_value: Option<bool>) -> bool {
         return !matches!(v.to_lowercase().as_str(), "off" | "false" | "0");
     }
     true
+}
+
+/// Resolve mv_size_ratio from CLI > TOML > env var.
+/// Returns None to fall through to `DEFAULT_MV_SIZE_RATIO` in `DynamicConfig::new`.
+fn mv_size_ratio_resolve(cli: Option<u32>, toml_value: Option<u32>) -> Option<u32> {
+    if let Some(v) = cli {
+        return Some(v);
+    }
+    if let Some(v) = toml_value {
+        return Some(v);
+    }
+    if let Ok(v) = std::env::var("PGCACHE_MV_SIZE_RATIO")
+        && let Ok(parsed) = v.parse::<u32>()
+    {
+        return Some(parsed);
+    }
+    None
 }
 
 fn settings_build(
@@ -896,6 +939,7 @@ fn settings_build_with_config(
         args.admission_threshold.or(config.admission_threshold),
         csv_parse(args.allowed_tables).or(config.allowed_tables.take()),
         args.log_level.or_else(|| config.log_level.clone()),
+        mv_size_ratio_resolve(args.mv_size_ratio, config.mv_size_ratio),
     );
 
     Ok(Settings {
@@ -983,6 +1027,7 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
                 args.admission_threshold,
                 csv_parse(args.allowed_tables),
                 args.log_level,
+                mv_size_ratio_resolve(args.mv_size_ratio, None),
             ),
             None, // no config file in CLI-only mode
             None, // snapshot set in settings_build
@@ -1014,6 +1059,7 @@ impl Settings {
             [--cache_size BYTES] \n \
             [--cache_policy fifo|clock] (default: clock) \n \
             [--admission_threshold N] (default: 2, clock policy only) \n \
+            [--mv_size_ratio N] (default: 10, materialized view size gate) \n \
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
             [--metrics_socket IP_AND_PORT] \n \
             [--allowed_tables TABLE1,TABLE2,...] (restrict caching to these tables) \n \
@@ -1564,6 +1610,7 @@ socket = "127.0.0.1:5434"
             log_level: None,
             cache_policy: None,
             admission_threshold: None,
+            mv_size_ratio: None,
             allowed_tables: None,
             pinned_queries: None,
             pinned_tables: None,
@@ -2017,6 +2064,7 @@ socket = "127.0.0.1:5434"
             Some(2),
             Some(vec!["public.users".to_owned()]),
             Some("info".to_owned()),
+            None,
         )
     }
 
@@ -2029,6 +2077,7 @@ socket = "127.0.0.1:5434"
             admission_threshold: None,
             allowed_tables: None,
             log_level: None,
+            mv_size_ratio: None,
         };
         let result = patch.apply(&current);
         assert_eq!(result.cache_size, Some(1_000_000));
@@ -2036,6 +2085,7 @@ socket = "127.0.0.1:5434"
         assert_eq!(result.admission_threshold, 2);
         assert_eq!(result.allowed_tables, Some(vec!["public.users".to_owned()]));
         assert_eq!(result.log_level, Some("info".to_owned()));
+        assert_eq!(result.mv_size_ratio, DEFAULT_MV_SIZE_RATIO);
     }
 
     #[test]
@@ -2047,6 +2097,7 @@ socket = "127.0.0.1:5434"
             admission_threshold: Some(5),
             allowed_tables: Some(Some(vec!["orders".to_owned()])),
             log_level: Some(Some("debug".to_owned())),
+            mv_size_ratio: Some(25),
         };
         let result = patch.apply(&current);
         assert_eq!(result.cache_size, Some(2_000_000));
@@ -2054,6 +2105,7 @@ socket = "127.0.0.1:5434"
         assert_eq!(result.admission_threshold, 5);
         assert_eq!(result.allowed_tables, Some(vec!["orders".to_owned()]));
         assert_eq!(result.log_level, Some("debug".to_owned()));
+        assert_eq!(result.mv_size_ratio, 25);
     }
 
     #[test]
@@ -2065,6 +2117,7 @@ socket = "127.0.0.1:5434"
             admission_threshold: None,
             allowed_tables: Some(None),
             log_level: Some(None),
+            mv_size_ratio: None,
         };
         let result = patch.apply(&current);
         assert_eq!(result.cache_size, None);
@@ -2134,6 +2187,7 @@ socket = "127.0.0.1:6432"
             admission_threshold: None,
             allowed_tables: None,
             log_level: Some(None),
+            mv_size_ratio: None,
         };
         config_file_dynamic_update(&path, &patch).expect("update TOML");
 

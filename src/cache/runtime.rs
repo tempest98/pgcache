@@ -229,6 +229,15 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
             .map_into_report::<CacheError>()
             .attach_loc("creating pgcache_pgrx extension")?;
 
+        // Dedicated schema for materialized query results. Tables here are named
+        // pgcache_mv.q_<fingerprint> and are managed by the MV subsystem (population,
+        // rebuild, eviction). Not pgrx-tracked — consistency is managed via MvState.
+        cache_client
+            .execute("CREATE SCHEMA IF NOT EXISTS pgcache_mv", &[])
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("creating pgcache_mv schema")?;
+
         Ok(())
     })
 }

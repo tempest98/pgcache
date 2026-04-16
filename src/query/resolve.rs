@@ -209,23 +209,9 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
             .iter()
             .enumerate()
             .filter_map(|(i, col)| {
-                // Determine the column name: alias if present, otherwise
-                // infer from the expression
-                let name = if let Some(alias) = &col.alias {
-                    alias.clone()
-                } else {
-                    match &col.expr {
-                        ResolvedColumnExpr::Column(c) => c.column.clone(),
-                        ResolvedColumnExpr::Identifier(ident) => ident.clone(),
-                        // Functions, literals, etc. — without an alias we
-                        // can't determine a stable column name
-                        ResolvedColumnExpr::Function { .. }
-                        | ResolvedColumnExpr::Literal(_)
-                        | ResolvedColumnExpr::Case(_)
-                        | ResolvedColumnExpr::Arithmetic(_)
-                        | ResolvedColumnExpr::Subquery(..) => return None,
-                    }
-                };
+                // Functions, literals, etc. without an alias have no stable
+                // output name — skip them.
+                let name = col.output_name()?.clone();
 
                 // Use column metadata from the source column if available,
                 // otherwise create a synthetic entry with TEXT type

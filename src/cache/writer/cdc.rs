@@ -20,6 +20,7 @@ use crate::settings::CachePolicy;
 use crate::query::evaluate::where_expr_evaluate;
 
 use super::super::messages::QueryCommand;
+use super::super::mv::MvState;
 use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
@@ -314,6 +315,19 @@ impl CacheWriter {
         // Remove generation from tracking
         self.cache.generations.remove(&query.generation);
 
+        // Drop the MV table (if any) before removing the state_view entry so we
+        // can read the mv_state. Errors are logged but don't abort the eviction.
+        let mv_state = self
+            .state_view
+            .cached_queries
+            .get(&fingerprint)
+            .map(|v| v.mv_state);
+        if let Some(mv_state) = mv_state
+            && let Err(e) = self.mv_drop(fingerprint, mv_state).await
+        {
+            error!("mv drop on eviction failed for {fingerprint}: {e}");
+        }
+
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
 
@@ -392,10 +406,16 @@ impl CacheWriter {
             query.invalidated = true;
         }
 
-        // Update state view to Invalidated
+        // Update state view to Invalidated. Fold the MV dirty transition into
+        // the same get_mut block so coordinators observe both transitions
+        // atomically — a reader that sees state=Invalidated never sees the MV
+        // in a stale-Fresh state.
         if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint) {
             entry.state = CachedQueryState::Invalidated;
             entry.referenced = false;
+            if entry.mv_state == MvState::Fresh {
+                entry.mv_state = MvState::Pending { has_table: true };
+            }
         }
 
         // Purge stale rows if generation threshold moved
@@ -790,6 +810,11 @@ impl CacheWriter {
             );
             metrics::counter!(names::CACHE_CDC_LOCAL_EVAL_HITS).increment(1);
 
+            // Mark the MV dirty BEFORE the source-row mutation commits, so
+            // any coordinator observing the updated source row also observes
+            // mv_state != Fresh and falls through to source-row eval.
+            self.mv_dirty_mark(update_query.fingerprint);
+
             let sql = self.cache_upsert_unconditional_sql(table_metadata, row_data);
             let conn = self.cache_pool.first().ok_or(CacheError::Other)?;
             conn.execute(sql.as_str(), &[])
@@ -849,6 +874,11 @@ impl CacheWriter {
                 match result {
                     Ok(1) => {
                         trace!("update_queries pg-eval matched fingerprint {fingerprint}");
+                        // PG-eval commits concurrently — we can't dirty-mark
+                        // before commit here. The window between commit and
+                        // this flip is microseconds and matches the "reads
+                        // that overlap an invalidation" case in the design doc.
+                        self.mv_dirty_mark(fingerprint);
                         batch_matched = true;
                     }
                     Ok(n) if n > 1 => {

@@ -18,6 +18,7 @@ pub use crate::result::{MapIntoReport, ReportExt};
 // Module declarations
 mod cdc;
 pub(crate) mod messages;
+pub(crate) mod mv;
 pub(crate) mod query;
 mod query_cache;
 mod runtime;
@@ -31,6 +32,7 @@ mod writer;
 pub use messages::{
     CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
 };
+pub use mv::{MvState, ShapeGate, mv_serve_sql, mv_state_initial, mv_table_name, shape_classify};
 pub use runtime::cache_run;
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,

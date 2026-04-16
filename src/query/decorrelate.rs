@@ -672,40 +672,6 @@ fn subquery_not_in_all_decorrelate(
     })
 }
 
-/// Check whether a `ResolvedColumnExpr` contains any aggregate function call.
-///
-/// Walks the expression tree looking for `Function { name, .. }` nodes whose name
-/// appears in the aggregate function set.
-fn column_expr_has_aggregate(expr: &ResolvedColumnExpr, agg_fns: &HashSet<String>) -> bool {
-    match expr {
-        ResolvedColumnExpr::Function { name, args, .. } => {
-            agg_fns.contains(name.as_str())
-                || args.iter().any(|a| column_expr_has_aggregate(a, agg_fns))
-        }
-        ResolvedColumnExpr::Case(case) => {
-            case.arg
-                .as_ref()
-                .is_some_and(|a| column_expr_has_aggregate(a, agg_fns))
-                || case
-                    .whens
-                    .iter()
-                    .any(|w| column_expr_has_aggregate(&w.result, agg_fns))
-                || case
-                    .default
-                    .as_ref()
-                    .is_some_and(|d| column_expr_has_aggregate(d, agg_fns))
-        }
-        ResolvedColumnExpr::Arithmetic(arith) => {
-            column_expr_has_aggregate(&arith.left, agg_fns)
-                || column_expr_has_aggregate(&arith.right, agg_fns)
-        }
-        ResolvedColumnExpr::Column(_)
-        | ResolvedColumnExpr::Identifier(_)
-        | ResolvedColumnExpr::Literal(_)
-        | ResolvedColumnExpr::Subquery(_, _) => false,
-    }
-}
-
 /// Validate and clean an inner query for scalar subquery decorrelation.
 ///
 /// Requirements:
@@ -748,7 +714,7 @@ fn scalar_inner_prepare(
         })
     })?;
 
-    let has_aggregate = column_expr_has_aggregate(scalar_expr, agg_fns);
+    let has_aggregate = scalar_expr.has_aggregate(agg_fns);
 
     // Reject non-aggregate with LIMIT (can't safely strip LIMIT without aggregate dedup)
     if !has_aggregate && inner_query.limit.is_some() {
@@ -829,7 +795,7 @@ fn subquery_scalar_decorrelate(
         }
     };
 
-    let has_aggregate = column_expr_has_aggregate(scalar_expr, state.aggregate_functions);
+    let has_aggregate = scalar_expr.has_aggregate(state.aggregate_functions);
 
     // Generate aliases
     let derived_alias = state.next_derived_alias();
