@@ -274,8 +274,7 @@ fn in_set_range_build(
                 Some(first) => match iter.next() {
                     None => ColumnRange::Equal(first),
                     Some(second) => {
-                        let mut set: HashSet<LiteralValue> =
-                            HashSet::from_iter([first, second]);
+                        let mut set: HashSet<LiteralValue> = HashSet::from_iter([first, second]);
                         set.extend(iter);
                         ColumnRange::InSet(set)
                     }
@@ -565,9 +564,7 @@ fn constraints_group_by_column<'a>(
     let mut grouped: HashMap<&'a str, Vec<&'a TableConstraint>> = HashMap::new();
     for tc in constraints {
         let col = match tc {
-            TableConstraint::Comparison(col, _, _) | TableConstraint::AnyOf(col, _) => {
-                col.as_str()
-            }
+            TableConstraint::Comparison(col, _, _) | TableConstraint::AnyOf(col, _) => col.as_str(),
         };
         grouped.entry(col).or_default().push(tc);
     }
@@ -906,9 +903,9 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
             ColumnConstraint::Comparison {
                 column, op, value, ..
             } => TableConstraint::Comparison(column.column.clone(), *op, value.clone()),
-            ColumnConstraint::InSet {
-                column, values, ..
-            } => TableConstraint::AnyOf(column.column.clone(), values.clone()),
+            ColumnConstraint::InSet { column, values, .. } => {
+                TableConstraint::AnyOf(column.column.clone(), values.clone())
+            }
         };
         table_constraints
             .entry(constraint.column().table.clone())
@@ -1913,10 +1910,8 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let cached = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 5",
-            &tables,
-        ));
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
         let new =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 3", &tables));
 
@@ -1929,10 +1924,8 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let cached = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 5",
-            &tables,
-        ));
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
         let new =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 5", &tables));
 
@@ -1945,10 +1938,8 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let cached = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 5",
-            &tables,
-        ));
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
         let new =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 10", &tables));
 
@@ -1961,10 +1952,8 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let cached = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 5",
-            &tables,
-        ));
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
         let new =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 3", &tables));
 
@@ -1977,14 +1966,10 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let cached = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 5",
-            &tables,
-        ));
-        let new = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 5",
-            &tables,
-        ));
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
 
         assert!(table_constraints_subsumed(&new, &cached, "users"));
     }
@@ -1995,14 +1980,10 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let cached = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 5",
-            &tables,
-        ));
-        let new = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id != 3",
-            &tables,
-        ));
+        let cached =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 3", &tables));
 
         assert!(!table_constraints_subsumed(&new, &cached, "users"));
     }
@@ -2096,7 +2077,10 @@ mod tests {
     #[test]
     fn test_column_range_build_equal() {
         let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Integer(5))]);
-        assert!(matches!(range, ColumnRange::Equal(LiteralValue::Integer(5))));
+        assert!(matches!(
+            range,
+            ColumnRange::Equal(LiteralValue::Integer(5))
+        ));
     }
 
     #[test]
@@ -2123,7 +2107,10 @@ mod tests {
             (BinaryOp::Equal, LiteralValue::Integer(5)),
             (BinaryOp::GreaterThan, LiteralValue::Integer(3)),
         ]);
-        assert!(matches!(range, ColumnRange::Equal(LiteralValue::Integer(5))));
+        assert!(matches!(
+            range,
+            ColumnRange::Equal(LiteralValue::Integer(5))
+        ));
     }
 
     #[test]
@@ -2160,15 +2147,16 @@ mod tests {
             (BinaryOp::GreaterThanOrEqual, LiteralValue::Integer(5)),
             (BinaryOp::LessThanOrEqual, LiteralValue::Integer(5)),
         ]);
-        assert!(matches!(range, ColumnRange::Equal(LiteralValue::Integer(5))));
+        assert!(matches!(
+            range,
+            ColumnRange::Equal(LiteralValue::Integer(5))
+        ));
     }
 
     #[test]
     fn test_column_range_build_parameter_unknown() {
-        let range = range_from_comparisons(&[(
-            BinaryOp::Equal,
-            LiteralValue::Parameter("$1".to_owned()),
-        )]);
+        let range =
+            range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Parameter("$1".to_owned()))]);
         assert!(matches!(range, ColumnRange::Unknown));
     }
 
@@ -2450,7 +2438,11 @@ mod tests {
                     LiteralValue::Integer(5),
                 ],
             ),
-            TableConstraint::Comparison("id".into(), BinaryOp::GreaterThan, LiteralValue::Integer(3)),
+            TableConstraint::Comparison(
+                "id".into(),
+                BinaryOp::GreaterThan,
+                LiteralValue::Integer(3),
+            ),
         ];
         let refs: Vec<&TableConstraint> = tcs.iter().collect();
         let range = column_range_build(&refs);
@@ -2480,7 +2472,10 @@ mod tests {
         ];
         let refs: Vec<&TableConstraint> = tcs.iter().collect();
         let range = column_range_build(&refs);
-        assert!(matches!(range, ColumnRange::Equal(LiteralValue::Integer(2))));
+        assert!(matches!(
+            range,
+            ColumnRange::Equal(LiteralValue::Integer(2))
+        ));
     }
 
     #[test]

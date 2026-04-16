@@ -257,12 +257,8 @@ async fn admin_server_run(
                         }
                         ("/status", _) => status_handle(status_tx).await,
                         ("/config", &Method::GET) => config_get_handle(&dynamic).await,
-                        ("/config", &Method::PUT) => {
-                            config_put_handle(request, &dynamic).await
-                        }
-                        ("/config/reload", &Method::POST) => {
-                            config_reload_handle(&dynamic).await
-                        }
+                        ("/config", &Method::PUT) => config_put_handle(request, &dynamic).await,
+                        ("/config/reload", &Method::POST) => config_reload_handle(&dynamic).await,
                         _ => Response::builder()
                             .status(404)
                             .body(Full::new(Bytes::from("Not Found"))),

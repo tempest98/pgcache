@@ -107,12 +107,8 @@ async fn test_config_put_partial_preserves_other_fields() -> Result<(), Error> {
     let initial_policy = initial["dynamic"]["cache_policy"].as_str().unwrap();
 
     // Update only admission_threshold
-    let (status, body) = http_put(
-        ctx.metrics_port,
-        "/config",
-        r#"{"admission_threshold": 5}"#,
-    )
-    .await?;
+    let (status, body) =
+        http_put(ctx.metrics_port, "/config", r#"{"admission_threshold": 5}"#).await?;
     assert_eq!(status, 200, "body: {body}");
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(Error::other)?;
@@ -147,12 +143,8 @@ async fn test_config_put_null_unsets_field() -> Result<(), Error> {
     assert!(json["dynamic"]["allowed_tables"].is_array());
 
     // Unset with null
-    let (status, body) = http_put(
-        ctx.metrics_port,
-        "/config",
-        r#"{"allowed_tables": null}"#,
-    )
-    .await?;
+    let (status, body) =
+        http_put(ctx.metrics_port, "/config", r#"{"allowed_tables": null}"#).await?;
     assert_eq!(status, 200, "body: {body}");
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(Error::other)?;
@@ -274,12 +266,7 @@ async fn test_config_log_level_change() -> Result<(), Error> {
     assert_eq!(initial_effective, "info", "expected initial level 'info'");
 
     // Change log level to debug
-    let (status, body) = http_put(
-        ctx.metrics_port,
-        "/config",
-        r#"{"log_level": "debug"}"#,
-    )
-    .await?;
+    let (status, body) = http_put(ctx.metrics_port, "/config", r#"{"log_level": "debug"}"#).await?;
     assert_eq!(status, 200, "PUT failed: {body}");
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(Error::other)?;
@@ -312,12 +299,7 @@ async fn test_config_log_level_change() -> Result<(), Error> {
     );
 
     // Unset log_level (reverts to default "info")
-    let (status, body) = http_put(
-        ctx.metrics_port,
-        "/config",
-        r#"{"log_level": null}"#,
-    )
-    .await?;
+    let (status, body) = http_put(ctx.metrics_port, "/config", r#"{"log_level": null}"#).await?;
     assert_eq!(status, 200, "PUT failed: {body}");
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(Error::other)?;

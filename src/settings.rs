@@ -416,10 +416,7 @@ pub fn config_file_dynamic_extract(path: &Path) -> ConfigResult<DynamicConfig> {
 /// Apply a patch to the TOML config file, preserving formatting and comments.
 /// Returns the new effective dynamic config after the update.
 #[allow(clippy::indexing_slicing)] // toml_edit doc[key] creates keys, does not panic
-pub fn config_file_dynamic_update(
-    path: &Path,
-    patch: &DynamicConfigPatch,
-) -> ConfigResult<()> {
+pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> ConfigResult<()> {
     let content = read_to_string(path).map_into_report::<ConfigError>()?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()

@@ -119,10 +119,7 @@ impl AsyncWrite for ClientSocket {
                 pending,
             } => {
                 // TLS cannot vectored-write; write first non-empty slice
-                let buf = bufs
-                    .iter()
-                    .find(|b| !b.is_empty())
-                    .map_or(&[][..], |b| b);
+                let buf = bufs.iter().find(|b| !b.is_empty()).map_or(&[][..], |b| b);
                 tls_poll_write(Pin::new(tcp), tls_state, cx, buf, pending)
             }
         }
