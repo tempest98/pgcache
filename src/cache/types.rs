@@ -100,6 +100,22 @@ pub enum SubqueryKind {
     Scalar,
 }
 
+/// Strategy for evaluating an update query's WHERE clause during CDC handling.
+///
+/// Determined once at registration time based on the shape of the resolved query.
+/// `LocalEval` rows skip per-query PG round-trips; `PgEval` rows fall through to
+/// the `INSERT ... WHERE EXISTS` dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateEvalStrategy {
+    /// WHERE clause is fully representable by the Rust evaluator and can be
+    /// decided against a single CDC row without touching the cache DB.
+    LocalEval,
+    /// WHERE clause shape is not representable by the Rust evaluator (subqueries,
+    /// GROUP BY/HAVING, unsupported expressions, multi-table, or non-FromClause
+    /// source). CDC must use the per-query `INSERT ... WHERE EXISTS` path.
+    PgEval,
+}
+
 /// Whether an update query was derived from a direct table or a subquery table
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UpdateQuerySource {
@@ -135,6 +151,8 @@ pub struct UpdateQuery {
     /// Whether the parent cached query has a LIMIT (max_limit.is_some()).
     /// Used by CDC to determine if DELETE should trigger invalidation.
     pub has_limit: bool,
+    /// Eval strategy for this query's WHERE clause during CDC row matching.
+    pub eval_strategy: UpdateEvalStrategy,
 }
 
 /// Collection of update queries for a specific relation

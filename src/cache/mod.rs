@@ -37,7 +37,7 @@ pub use status::{
 };
 pub use types::{
     Cache, CachedQuery, CachedQueryState, CachedQueryView, PinnedQuery, SubqueryKind,
-    UpdateQueries, UpdateQuery, UpdateQuerySource,
+    UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource,
 };
 
 error_set! {

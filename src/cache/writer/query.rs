@@ -11,6 +11,7 @@ use crate::metrics::names;
 use crate::query::ast::{Deparse, QueryBody, QueryExpr, TableNode};
 use crate::query::constraints::{analyze_query_constraints, table_constraints_subsumed};
 use crate::query::decorrelate::query_expr_decorrelate;
+use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::resolved::{
     ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
 };
@@ -22,10 +23,44 @@ use super::super::{
     messages::{AdmitAction, SubsumptionResult, WriterNotify},
     query::CacheableQuery,
     types::{
-        CachedQuery, CachedQueryState, QueryMetrics, SharedResolved, UpdateQueries, UpdateQuery,
+        CachedQuery, CachedQueryState, QueryMetrics, SharedResolved, UpdateEvalStrategy,
+        UpdateQueries, UpdateQuery, UpdateQuerySource,
     },
 };
 use super::{CacheWriter, PopulationWork};
+
+/// Decide whether CDC can evaluate this update query's WHERE in Rust.
+///
+/// Conservative classifier: rejects anything the Rust evaluator can't decide
+/// from a single CDC row. GROUP BY / HAVING are rejected because row-level
+/// matching doesn't capture post-aggregation filtering. Non-FromClause sources
+/// are rejected because their CDC semantics (subquery membership, outer join
+/// null-padding cascade) aren't expressible as a row-level predicate.
+fn update_eval_strategy_classify(
+    resolved: &ResolvedQueryExpr,
+    source: UpdateQuerySource,
+) -> UpdateEvalStrategy {
+    if source != UpdateQuerySource::FromClause {
+        return UpdateEvalStrategy::PgEval;
+    }
+    let Some(select) = resolved.as_select() else {
+        return UpdateEvalStrategy::PgEval;
+    };
+    if !select.is_single_table() {
+        return UpdateEvalStrategy::PgEval;
+    }
+    if !select.group_by.is_empty() || select.having.is_some() {
+        return UpdateEvalStrategy::PgEval;
+    }
+    let Some(where_expr) = &select.where_clause else {
+        return UpdateEvalStrategy::LocalEval;
+    };
+    if resolved_where_expr_supported(where_expr) {
+        UpdateEvalStrategy::LocalEval
+    } else {
+        UpdateEvalStrategy::PgEval
+    }
+}
 
 /// Intermediate result from resolving a query before subsumption check or population.
 struct QueryResolution {
@@ -195,6 +230,7 @@ impl CacheWriter {
                 .map(analyze_query_constraints)
                 .unwrap_or_default();
             let complexity = update_resolved.complexity();
+            let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
@@ -202,6 +238,7 @@ impl CacheWriter {
                 source,
                 constraints,
                 has_limit,
+                eval_strategy,
             };
 
             self.update_query_register(relation_oid, update_query);
@@ -774,5 +811,139 @@ impl CacheWriter {
         self.cache.tables.insert_overwrite(table_metadata);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+
+    use std::collections::HashMap;
+
+    use iddqd::BiHashMap;
+    use tokio_postgres::types::Type;
+
+    use crate::cache::query::CacheableQuery;
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::query::ast::query_expr_convert;
+    use crate::query::resolved::query_expr_resolve;
+
+    fn make_table(name: &str, oid: u32, columns: &[&str]) -> TableMetadata {
+        let cols = ColumnStore::new(columns.iter().enumerate().map(|(i, c)| {
+            let is_pk = i == 0;
+            ColumnMetadata {
+                name: (*c).into(),
+                position: (i + 1) as i16,
+                type_oid: if is_pk { 23 } else { 25 },
+                data_type: if is_pk { Type::INT4 } else { Type::TEXT },
+                type_name: if is_pk { "int4" } else { "text" }.into(),
+                cache_type_name: if is_pk { "int4" } else { "text" }.into(),
+                is_primary_key: is_pk,
+            }
+        }));
+        TableMetadata {
+            relation_oid: oid,
+            name: name.into(),
+            schema: "public".into(),
+            primary_key_columns: vec![columns[0].to_owned()],
+            columns: cols,
+            indexes: Vec::new(),
+        }
+    }
+
+    fn resolve(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
+        let ast = pg_query::parse(sql).expect("parse");
+        let query_expr = query_expr_convert(&ast).expect("convert");
+        let cacheable = CacheableQuery::try_new(&query_expr, &HashMap::new()).expect("cacheable");
+        query_expr_resolve(&cacheable.query, tables, &["public"]).expect("resolve")
+    }
+
+    fn classify_single_table(sql: &str) -> UpdateEvalStrategy {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status", "age"]));
+        let resolved = resolve(sql, &tables);
+        update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause)
+    }
+
+    #[test]
+    fn simple_equality_is_local_eval() {
+        assert_eq!(
+            classify_single_table("SELECT * FROM t WHERE id = 5"),
+            UpdateEvalStrategy::LocalEval
+        );
+    }
+
+    #[test]
+    fn no_where_is_local_eval() {
+        assert_eq!(
+            classify_single_table("SELECT * FROM t"),
+            UpdateEvalStrategy::LocalEval
+        );
+    }
+
+    #[test]
+    fn and_or_with_comparisons_is_local_eval() {
+        assert_eq!(
+            classify_single_table("SELECT * FROM t WHERE (id = 1 OR id = 2) AND name IS NOT NULL"),
+            UpdateEvalStrategy::LocalEval
+        );
+    }
+
+    #[test]
+    fn in_list_is_pg_eval() {
+        // IN is a Multi op — not yet evaluable in Rust
+        assert_eq!(
+            classify_single_table("SELECT * FROM t WHERE id IN (1, 2, 3)"),
+            UpdateEvalStrategy::PgEval
+        );
+    }
+
+    #[test]
+    fn like_is_pg_eval() {
+        assert_eq!(
+            classify_single_table("SELECT * FROM t WHERE name LIKE 'j%'"),
+            UpdateEvalStrategy::PgEval
+        );
+    }
+
+    #[test]
+    fn group_by_is_pg_eval() {
+        assert_eq!(
+            classify_single_table("SELECT status, count(*) FROM t GROUP BY status"),
+            UpdateEvalStrategy::PgEval
+        );
+    }
+
+    #[test]
+    fn multi_table_is_pg_eval() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(make_table("a", 1, &["id", "bid"]));
+        tables.insert_overwrite(make_table("b", 2, &["id", "name"]));
+        let resolved = resolve("SELECT * FROM a JOIN b ON a.bid = b.id", &tables);
+        assert_eq!(
+            update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause),
+            UpdateEvalStrategy::PgEval
+        );
+    }
+
+    #[test]
+    fn non_fromclause_source_is_pg_eval() {
+        use crate::cache::SubqueryKind;
+        let resolved = resolve("SELECT * FROM t WHERE id = 5", &{
+            let mut tables = BiHashMap::new();
+            tables.insert_overwrite(make_table("t", 1, &["id", "name"]));
+            tables
+        });
+        // Same query, but classified as a subquery-sourced update query
+        assert_eq!(
+            update_eval_strategy_classify(
+                &resolved,
+                UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
+            ),
+            UpdateEvalStrategy::PgEval
+        );
     }
 }

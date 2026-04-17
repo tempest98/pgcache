@@ -228,6 +228,36 @@ pub fn where_value_compare_string(
     }
 }
 
+/// Returns true iff `where_expr_evaluate` can decide this expression against a
+/// single CDC row. Must stay in lockstep with the evaluator: any shape the
+/// evaluator falls through on (returning false unconditionally) is unsupported.
+///
+/// Used at update-query registration to classify the CDC fast path eligibility;
+/// see `UpdateEvalStrategy`.
+pub fn resolved_where_expr_supported(expr: &ResolvedWhereExpr) -> bool {
+    match expr {
+        ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => true,
+        ResolvedWhereExpr::Binary(binary) => match binary.op {
+            BinaryOp::And | BinaryOp::Or => {
+                resolved_where_expr_supported(&binary.lexpr)
+                    && resolved_where_expr_supported(&binary.rexpr)
+            }
+            BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual => is_simple_comparison(binary),
+            BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => false,
+        },
+        ResolvedWhereExpr::Unary(unary) => resolved_where_expr_supported(&unary.expr),
+        ResolvedWhereExpr::Multi(_)
+        | ResolvedWhereExpr::Array(_)
+        | ResolvedWhereExpr::Function { .. }
+        | ResolvedWhereExpr::Subquery { .. } => false,
+    }
+}
+
 /// Check if a binary expression is a simple comparison (column op value).
 pub fn is_simple_comparison(binary_expr: &ResolvedBinaryExpr) -> bool {
     matches!(
@@ -244,8 +274,11 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
-    use crate::query::resolved::ResolvedUnaryExpr;
+    use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, SubLinkType, UnaryOp};
+    use crate::query::resolved::{
+        ResolvedMultiExpr, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectNode,
+        ResolvedUnaryExpr,
+    };
     use ecow::EcoString;
     use ordered_float::NotNan;
     use tokio_postgres::types::Type;
@@ -1249,6 +1282,142 @@ mod tests {
             Some("true".to_owned()),
         ];
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    // ------------------------------------------------------------------
+    // resolved_where_expr_supported
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn supported_bare_equality() {
+        let table = test_table_metadata();
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            col_expr(&table, "id"),
+            val_expr(LiteralValue::Integer(5)),
+        );
+        assert!(resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn supported_nested_and_or() {
+        let table = test_table_metadata();
+        let expr = binary_expr(
+            BinaryOp::And,
+            binary_expr(
+                BinaryOp::Or,
+                binary_expr(
+                    BinaryOp::Equal,
+                    col_expr(&table, "id"),
+                    val_expr(LiteralValue::Integer(1)),
+                ),
+                binary_expr(
+                    BinaryOp::Equal,
+                    col_expr(&table, "id"),
+                    val_expr(LiteralValue::Integer(2)),
+                ),
+            ),
+            unary_expr(UnaryOp::IsNotNull, col_expr(&table, "name")),
+        );
+        assert!(resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn supported_is_null_and_is_true() {
+        let table = test_table_metadata();
+        assert!(resolved_where_expr_supported(&unary_expr(
+            UnaryOp::IsNull,
+            col_expr(&table, "active"),
+        )));
+        assert!(resolved_where_expr_supported(&unary_expr(
+            UnaryOp::IsTrue,
+            col_expr(&table, "active"),
+        )));
+    }
+
+    #[test]
+    fn unsupported_like() {
+        let table = test_table_metadata();
+        let expr = binary_expr(
+            BinaryOp::Like,
+            col_expr(&table, "name"),
+            val_expr(LiteralValue::String("j%".to_owned())),
+        );
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn unsupported_column_to_column_comparison() {
+        // The evaluator only handles Column op Value / Value op Column.
+        // Column op Column falls through to false; classifier must mark unsupported.
+        let table = test_table_metadata();
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            col_expr(&table, "id"),
+            col_expr(&table, "id"),
+        );
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn unsupported_multi_in() {
+        let table = test_table_metadata();
+        let expr = ResolvedWhereExpr::Multi(ResolvedMultiExpr {
+            op: MultiOp::In,
+            exprs: vec![
+                col_expr(&table, "id"),
+                val_expr(LiteralValue::Integer(1)),
+                val_expr(LiteralValue::Integer(2)),
+            ],
+        });
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn unsupported_function() {
+        let expr = ResolvedWhereExpr::Function {
+            name: EcoString::from("upper"),
+            args: vec![],
+            agg_star: false,
+        };
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn unsupported_subquery() {
+        let select_node: Box<ResolvedSelectNode> = Box::default();
+        let query = Box::new(ResolvedQueryExpr {
+            body: ResolvedQueryBody::Select(select_node),
+            order_by: vec![],
+            limit: None,
+        });
+        let expr = ResolvedWhereExpr::Subquery {
+            query,
+            sublink_type: SubLinkType::Exists,
+            test_expr: None,
+            outer_refs: vec![],
+        };
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn unsupported_and_short_circuits_on_unsupported_child() {
+        // An otherwise-supported AND becomes unsupported if either child is unsupported
+        let table = test_table_metadata();
+        let expr = binary_expr(
+            BinaryOp::And,
+            binary_expr(
+                BinaryOp::Equal,
+                col_expr(&table, "id"),
+                val_expr(LiteralValue::Integer(1)),
+            ),
+            binary_expr(
+                BinaryOp::Like,
+                col_expr(&table, "name"),
+                val_expr(LiteralValue::String("j%".to_owned())),
+            ),
+        );
+        assert!(!resolved_where_expr_supported(&expr));
     }
 
     #[test]

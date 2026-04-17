@@ -17,8 +17,12 @@ use crate::query::transform::resolved_select_node_table_replace_with_values;
 
 use crate::settings::CachePolicy;
 
+use crate::query::evaluate::where_expr_evaluate;
+
 use super::super::messages::QueryCommand;
-use super::super::types::{CachedQueryState, SubqueryKind, UpdateQuery, UpdateQuerySource};
+use super::super::types::{
+    CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
+};
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::CacheWriter;
 
@@ -730,10 +734,15 @@ impl CacheWriter {
         Ok(fp_list)
     }
 
-    /// Execute update queries concurrently with lazy SQL building.
-    /// Builds SQL only for each batch just before execution, avoiding
-    /// unnecessary work when a match is found early.
-    /// Returns true if any statement modified exactly 1 row.
+    /// Decide whether a CDC row belongs in cache and, if so, upsert it.
+    ///
+    /// Two-phase dispatch:
+    /// 1. LocalEval queries are evaluated in Rust. First match short-circuits
+    ///    with a single unconditional upsert.
+    /// 2. If no LocalEval query matches, PgEval queries run via the original
+    ///    concurrent `INSERT ... WHERE EXISTS` batch path.
+    ///
+    /// Returns true if any query matched (row upserted).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn update_queries_execute_concurrent(
         &self,
@@ -765,11 +774,48 @@ impl CacheWriter {
             return Ok(false);
         }
 
+        // Phase 1: Rust evaluation for LocalEval queries. Complexity-sorted
+        // iteration gives us the same try-simplest-first property.
+        for update_query in &update_queries.queries {
+            if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
+                continue;
+            }
+            if !update_query_matches_locally(update_query, table_metadata, row_data) {
+                continue;
+            }
+
+            trace!(
+                "update_queries local-eval matched fingerprint {}",
+                update_query.fingerprint
+            );
+            metrics::counter!(names::CACHE_CDC_LOCAL_EVAL_HITS).increment(1);
+
+            let sql = self.cache_upsert_unconditional_sql(table_metadata, row_data);
+            let conn = self.cache_pool.first().ok_or(CacheError::Other)?;
+            conn.execute(sql.as_str(), &[])
+                .await
+                .map_into_report::<CacheError>()?;
+            return Ok(true);
+        }
+
+        // Phase 2: fall back to PG-side WHERE EXISTS for PgEval queries.
+        let pg_eval_queries: Vec<&UpdateQuery> = update_queries
+            .queries
+            .iter()
+            .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
+            .collect();
+
+        if pg_eval_queries.is_empty() {
+            trace!(
+                "update_queries_execute_concurrent done [{total_queries}] - local-eval no match, no pg queries"
+            );
+            return Ok(false);
+        }
+
         let pool_size = self.cache_pool.len();
-        let mut query_iter = update_queries.queries.iter().enumerate();
+        let mut query_iter = pg_eval_queries.iter().copied().enumerate();
         let mut total_executed = 0;
 
-        // Process in batches
         loop {
             let mut futures = FuturesUnordered::new();
             for (idx, update_query) in query_iter.by_ref().take(pool_size) {
@@ -795,7 +841,6 @@ impl CacheWriter {
                 break;
             }
 
-            // Collect results from this batch
             let mut batch_matched = false;
             let mut batch_error: Option<CacheError> = None;
 
@@ -803,7 +848,7 @@ impl CacheWriter {
                 total_executed += 1;
                 match result {
                     Ok(1) => {
-                        trace!("update_queries matched fingerprint {fingerprint}");
+                        trace!("update_queries pg-eval matched fingerprint {fingerprint}");
                         batch_matched = true;
                     }
                     Ok(n) if n > 1 => {
@@ -817,22 +862,23 @@ impl CacheWriter {
                 }
             }
 
-            // Check for errors
             if let Some(err) = batch_error {
                 return Err(err.into());
             }
 
-            // If we found a match in this batch, we're done
             if batch_matched {
                 trace!(
-                    "update_queries_execute_concurrent done [{total_executed}/{total_queries}] - matched"
+                    "update_queries_execute_concurrent done [{total_executed}/{}] - pg-eval matched",
+                    pg_eval_queries.len()
                 );
+                metrics::counter!(names::CACHE_CDC_PG_EVAL_HITS).increment(1);
                 return Ok(true);
             }
         }
 
         trace!(
-            "update_queries_execute_concurrent done [{total_executed}/{total_queries}] - no match"
+            "update_queries_execute_concurrent done [{total_executed}/{}] - no match",
+            pg_eval_queries.len()
         );
         Ok(false)
     }
@@ -917,6 +963,74 @@ impl CacheWriter {
         Ok(sql)
     }
 
+    /// Build an unconditional UPSERT for the row — `INSERT ... ON CONFLICT DO UPDATE`
+    /// with no WHERE predicate. Used by the LocalEval fast path once the Rust
+    /// evaluator has already decided the row belongs in cache.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(super) fn cache_upsert_unconditional_sql(
+        &self,
+        table_metadata: &crate::catalog::TableMetadata,
+        row_data: &[Option<String>],
+    ) -> String {
+        let mut column_names = Vec::with_capacity(table_metadata.columns.len());
+        let mut values = Vec::with_capacity(table_metadata.columns.len());
+
+        for column_meta in &table_metadata.columns {
+            let position = column_meta.position as usize - 1;
+            if let Some(row_value) = row_data.get(position) {
+                let value = row_value
+                    .as_deref()
+                    .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
+                column_names.push(column_meta.name.as_str());
+                values.push(value);
+            }
+        }
+
+        let schema = &table_metadata.schema;
+        let table = &table_metadata.name;
+
+        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+        let _ = write!(sql, "INSERT INTO {schema}.{table} (");
+        for (i, col) in column_names.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(col);
+        }
+        sql.push_str(") VALUES (");
+        for (i, val) in values.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(val);
+        }
+        sql.push_str(") ON CONFLICT (");
+        for (i, pk) in table_metadata.primary_key_columns.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(pk);
+        }
+        sql.push_str(") DO UPDATE SET ");
+        let mut first_update = true;
+        for col in &column_names {
+            if table_metadata
+                .primary_key_columns
+                .iter()
+                .any(|pk| pk.as_str() == *col)
+            {
+                continue;
+            }
+            if !first_update {
+                sql.push_str(", ");
+            }
+            let _ = write!(sql, "{col} = EXCLUDED.{col}");
+            first_update = false;
+        }
+
+        sql
+    }
+
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn cache_delete_sql(
@@ -954,6 +1068,26 @@ impl CacheWriter {
         }
 
         Ok(sql)
+    }
+}
+
+/// Evaluate a LocalEval update query's WHERE against the CDC row.
+///
+/// Must only be called when `update_query.eval_strategy == LocalEval` — the
+/// classifier has already ensured the query is single-table, FromClause, with
+/// no GROUP BY / HAVING and a supported WHERE shape. A WHERE of `None` means
+/// the query loads every row, so the match is unconditional.
+fn update_query_matches_locally(
+    update_query: &UpdateQuery,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<String>],
+) -> bool {
+    let Some(select) = update_query.resolved.as_select() else {
+        return false;
+    };
+    match &select.where_clause {
+        None => true,
+        Some(expr) => where_expr_evaluate(expr, row_data, table_metadata.name.as_str()),
     }
 }
 
