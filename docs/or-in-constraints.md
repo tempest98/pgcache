@@ -1,22 +1,30 @@
-# OR and IN Constraint Extraction for CDC Invalidation
+# CNF-Based Constraint Extraction
+
+## Status
+
+IN and NOT IN extraction are implemented. OR extraction is **not** — `BinaryOp::Or` falls into the catch-all "cannot extract" arm in `analyze_constraint_expr`, and `test_no_propagation_with_or` asserts that `WHERE id = 1 OR id = 2` currently yields zero constraints.
+
+Rather than adding OR as a one-off case, this doc proposes refactoring constraint extraction around a general CNF (conjunctive normal form) representation. OR, IN, NOT IN, BETWEEN, and compound disjunctions all become instances of the same structure.
 
 ## Context
 
-The constraint system in `constraints.rs` extracts column constraints from WHERE clauses to optimize CDC invalidation. After the inequality constraints work, it handles AND-connected comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) and BETWEEN. However, OR expressions and IN lists are silently ignored.
+`analyze_constraint_expr` in `src/query/constraints.rs` extracts column constraints from WHERE clauses for CDC invalidation filtering. Today it handles AND, comparisons, BETWEEN, IN, and NOT IN. OR is ignored.
 
-This means queries like `WHERE status IN ('active', 'pending')` or `WHERE id = 1 OR id = 2` produce no constraints, causing unnecessary invalidation for every CDC event.
+The current `TableConstraint` enum is expressive enough for IN (same-column equality set) but not for general OR:
 
-**Goal**: Extract disjunctive constraints from OR expressions and IN lists, enabling CDC filtering for these common patterns.
+```rust
+pub enum TableConstraint {
+    Comparison(EcoString, BinaryOp, LiteralValue),
+    AnyOf(EcoString, Vec<LiteralValue>),  // single-column, equality-only
+}
+```
 
-## Current State
+Patterns that don't fit this shape:
+- Same-table, different-column OR: `id = 1 OR name = 'alice'`
+- OR with inequalities: `id > 5 OR id < 2`
+- Compound OR branches: `(id = 1 AND name = 'x') OR (id = 2 AND name = 'y')`
 
-The extraction function `analyze_constraint_expr` handles:
-- Comparison operators (`column op value`) → `ColumnConstraint`
-- AND → recurse both sides
-- BETWEEN / BETWEEN SYMMETRIC → two inequality constraints
-- Everything else (OR, IN, subqueries, etc.) → ignored
-
-All extracted constraints are AND-connected in a flat `HashSet<ColumnConstraint>`. The CDC matching in `row_constraints_match` requires ALL constraints to match.
+Each would otherwise need its own structural extension. CNF subsumes all of them.
 
 ## Key Design Constraint: Cross-Table OR
 
@@ -29,202 +37,180 @@ WHERE o.status = 'urgent' OR c.vip = true
 
 A CDC event on `orders` with `status = 'normal'` — the local branch fails, but the row could still be in the result set if the joined customer has `vip = true`. We can't evaluate the remote branch from a single table's CDC event.
 
-**Rule**: An OR is only extractable when ALL branches reference the **same table**. If any branch references a different table (or is opaque), the entire OR is skipped.
+**Rule**: A CNF clause is assignable to a table only when all of its literals reference the same table. Multi-table clauses are dropped — the other AND-connected clauses are still usable.
 
-## Changes
+## CNF as the Canonical Form
 
-### 1. Add `ConstraintClause` enum — `src/query/constraints.rs`
+CNF is conjunction of disjunctions: `(L1 ∨ L2) ∧ (L3 ∨ L4 ∨ L5) ∧ ...`. Under CNF:
+
+- Plain comparison `id = 1` → one 1-literal clause `[id=1]`
+- AND chain `id = 1 AND name = 'x'` → two 1-literal clauses `[id=1]`, `[name='x']`
+- `IN (1,2,3)` → one 3-literal clause `[id=1, id=2, id=3]`
+- `NOT IN (1,2,3)` → three 1-literal clauses `[id!=1]`, `[id!=2]`, `[id!=3]`
+- BETWEEN → two 1-literal clauses (`[>=low]`, `[<=high]`)
+- Simple OR `id = 1 OR id = 2` → one 2-literal clause `[id=1, id=2]`
+- Cross-column OR `id = 1 OR name = 'x'` → one 2-literal clause `[id=1, name='x']`
+- Inequality OR `id > 5 OR id < 2` → one 2-literal clause `[id>5, id<2]`
+- Compound `(a ∧ b) ∨ c` → two clauses `[a, c]`, `[b, c]` (distribute OR over AND)
+
+**Evaluation** (CDC row match): row matches iff every clause has at least one satisfied literal. One loop, no special cases.
+
+**Why classical CNF over Tseytin**: Tseytin avoids exponential blowup in CNF size by introducing auxiliary variables. But Tseytin's aux variables are placeholders for subexpressions — they're not column-level literals we can evaluate against a CDC row. Our matching model (concrete row values, direct literal evaluation) needs real literals in every clause; aux-variable clauses would force tree-walk evaluation, giving up CNF's benefits. Tseytin fits SAT-solver consumers, not row-predicate evaluators.
+
+The classical distribution cost is bounded at extraction time (see budget below).
+
+## Three-Valued Logic Safety
+
+SQL's WHERE clause evaluates predicates under Kleene 3VL and filters to rows where the predicate is TRUE (UNKNOWN counts as rejection). CNF conversion is safe under 3VL because the core identities hold in Kleene logic:
+
+- Distributivity: `A ∨ (B ∧ C) ≡ (A ∨ B) ∧ (A ∨ C)`
+- De Morgan: `¬(A ∧ B) ≡ ¬A ∨ ¬B`, `¬(A ∨ B) ≡ ¬A ∧ ¬B`
+
+These don't depend on the law of excluded middle, which is the identity that fails in 3VL. CNF-converted WHERE clauses produce the same filtered row set as the original.
+
+NULL literals in comparisons (which always evaluate to UNKNOWN) are already excluded at extraction time by the existing code — we only admit non-NULL `LiteralValue` into literals. CNF doesn't change this.
+
+## Types
+
+Keep `column_constraints` and `equivalences` as they are. Replace `TableConstraint` with a CNF clause type:
 
 ```rust
-/// A clause in the constraint formula. All clauses are AND-connected.
+/// A CNF literal: column op value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Literal {
+    pub column: EcoString,
+    pub op: BinaryOp,
+    pub value: LiteralValue,
+}
+
+/// A CNF clause — disjunction of literals. Interpreted as OR.
+/// Single-literal clauses are the common case (plain comparisons).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ConstraintClause {
-    /// A single comparison (column op value)
-    Single(ColumnConstraint),
-    /// A disjunction — at least one must match (OR / IN semantics)
-    AnyOf(Vec<ColumnConstraint>),
+pub struct Clause(pub Vec<Literal>);
+
+pub struct QueryConstraints {
+    pub column_constraints: HashSet<ColumnConstraint>,       // unchanged
+    pub equivalences: HashSet<ColumnEquivalence>,            // unchanged
+    pub table_constraints: HashMap<EcoString, Vec<Clause>>,  // CNF per table
 }
 ```
 
-### 2. Add `TableConstraint` enum — `src/query/constraints.rs`
+`column_constraints` stays as a separate flat set of single-column facts, for use by equivalence propagation and other machinery that reasons about individual comparisons. Once CNF is well-understood, unifying the two can be revisited.
 
-The table-level representation used by CDC matching:
+## CNF Conversion
+
+One recursive function over the resolved WHERE AST, with an opacity-aware result type:
 
 ```rust
-/// A constraint clause organized for per-table CDC matching
-#[derive(Debug, Clone, PartialEq)]
-pub enum TableConstraint {
-    /// A single comparison
-    Comparison(String, BinaryOp, LiteralValue),
-    /// At least one must match
-    AnyOf(Vec<(String, BinaryOp, LiteralValue)>),
+enum CnfResult {
+    /// Successfully extracted — may be empty (no extractable clauses).
+    Clauses(Vec<Clause>),
+    /// Subtree contains a predicate we can't reason about.
+    /// Propagates upward through OR; absorbed by AND.
+    Opaque,
+}
+
+fn expr_to_cnf(expr: &ResolvedWhereExpr, budget: &mut usize) -> CnfResult
+```
+
+Rules:
+
+| Input | Output |
+|---|---|
+| Literal `col op value` | `Clauses([[literal]])` |
+| BETWEEN | `Clauses([[>= low], [<= high]])` |
+| IN | `Clauses([[col=v1, col=v2, ...]])` — one clause |
+| NOT IN | `Clauses([[col!=v1], [col!=v2], ...])` — AND of 1-literal clauses |
+| AND(L, R) | Union of clauses; `Opaque` conjunct contributes nothing |
+| OR(L, R) | Cartesian product — for each `(cl_l, cl_r)` pair, concat into one clause. Any `Opaque` branch forces `Opaque`. |
+| Anything else (function call, subquery, opaque operator) | `Opaque` |
+
+**Asymmetric handling of `Opaque` in AND vs OR is required for correctness:**
+- Opaque conjunct in AND: the unknown subtree might be TRUE — dropping it gives us a weaker predicate, which means over-invalidation. Safe.
+- Opaque branch in OR: the unknown branch might be TRUE — dropping it would incorrectly narrow the predicate and cause us to filter out rows that actually match. Must bail the entire OR.
+
+**Budget**: the cartesian product in OR can expand exponentially. A running clause-count budget (e.g., 32 or 64 total clauses) bounds extraction cost. When OR would exceed the budget, return `Opaque` for that subtree — the AND context absorbs it safely. Real-world SQL rarely has the shape (wide AND-under-OR) that triggers blowup; when it does, bailing to "no constraints" is a correct, predictable fallback (degrades to today's "invalidate on any CDC event" behavior for that subtree).
+
+## Per-Table Clause Assignment
+
+After CNF, assign each clause to a table. Build CNF over `ResolvedColumnNode` (which carries table info), then strip to `EcoString` column names at assignment time:
+
+```rust
+fn clauses_by_table(
+    clauses: Vec<ResolvedClause>,
+) -> HashMap<EcoString, Vec<Clause>> {
+    let mut by_table = HashMap::new();
+    for clause in clauses {
+        let tables: HashSet<_> = clause.literals.iter().map(|l| &l.column.table).collect();
+        if tables.len() == 1 {
+            let table = tables.into_iter().next().unwrap().clone();
+            by_table.entry(table).or_default().push(clause.to_table_clause());
+        }
+        // multi-table clause: drop (can't use for per-table CDC filter)
+    }
+    by_table
 }
 ```
 
-### 3. Change `QueryConstraints` fields — `src/query/constraints.rs`
+Single-literal clauses (the common case, from AND of simple comparisons) always go to their one table.
 
-- `column_constraints`: `HashSet<ColumnConstraint>` → `Vec<ConstraintClause>`
-  - Now holds both simple constraints and disjunctive clauses
-  - All clauses are AND-connected at the top level
-  - `Vec` because `ConstraintClause::AnyOf` doesn't have a useful `Hash`
-- `table_constraints`: `HashMap<String, Vec<(String, BinaryOp, LiteralValue)>>` → `HashMap<String, Vec<TableConstraint>>`
+## Impact on Existing Code
 
-### 4. Change `analyze_constraint_expr` signature — `src/query/constraints.rs`
+| Call site | Change |
+|---|---|
+| `analyze_constraint_expr` | Replaced by `expr_to_cnf`. Equivalence / `column_constraints` collection stays as a separate pass over the AST. |
+| `in_constraints_extract`, `not_in_constraints_extract`, `between_constraints_extract` | Absorbed into CNF rules. Deleted. |
+| `analyze_query_constraints` | Runs CNF + per-table assignment to populate `table_constraints`. |
+| `propagate_constraints` | Propagate single-column clauses (all literals share a column with an equivalence → clone clause with the equivalent column). Multi-column clauses don't propagate. Matches current `AnyOf` behavior. |
+| `row_constraints_match` in `src/cache/writer/cdc.rs` | One loop: every clause must have ≥1 matching literal. Collapses the current `Comparison` / `AnyOf` dispatch. |
+| `table_constraints_subsumed` + `column_range_build` | Detect multi-column clauses in cached constraints → fail subsumption conservatively for v1. Single-column and equality-set clauses continue through the existing `ColumnRange` path. |
 
-Change first parameter from `&mut HashSet<ColumnConstraint>` to `&mut Vec<ConstraintClause>`. The function now returns clauses rather than flat constraints.
+## Test Changes
 
-Existing extraction logic stays the same but wraps results in `ConstraintClause::Single`.
+Existing equality / inequality / IN / NOT IN / BETWEEN tests continue to pass — their CNF output is identical in shape to the current output.
 
-### 5. Add OR handling to `analyze_constraint_expr` — `src/query/constraints.rs`
+Invert `test_no_propagation_with_or` (currently asserts 0 constraints for `id = 1 OR id = 2`; should assert 1 clause with 2 literals).
 
-New match arm for `BinaryOp::Or`:
-
-```
-ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::Or => {
-    or_constraints_extract(expr, clauses);
-    // Note: equivalences inside OR branches are NOT collected —
-    // they're conditional on the branch being active
-}
-```
-
-### 6. Add `or_constraints_extract` — `src/query/constraints.rs`
-
-Extracts an `AnyOf` clause from an OR expression:
-
-1. Flatten the OR tree: walk right-recursive `OR(a, OR(b, OR(c, d)))` into a list of branches `[a, b, c, d]`
-2. For each branch, recursively extract constraints (into a separate `Vec<ConstraintClause>`, ignoring equivalences)
-3. If any branch produces zero constraints → entire OR is opaque, return without adding a clause
-4. If any branch produces multiple clauses (AND of constraints) → skip (compound branches not supported in first cut)
-5. Each branch should produce exactly one clause. Unwrap `Single` constraints and collect; flatten nested `AnyOf` constraints
-6. Check that all collected constraints reference the same table → if not, skip (cross-table OR)
-7. Add `ConstraintClause::AnyOf(collected)` to the clauses
-
-Flattening nested OR handles chains like `id = 1 OR id = 2 OR id = 3` which the parser produces as right-recursive trees.
-
-### 7. Add IN handling to `analyze_constraint_expr` — `src/query/constraints.rs`
-
-New match arm for `MultiOp::In`:
-
-```
-ResolvedWhereExpr::Multi(multi) if multi.op == MultiOp::In => {
-    in_constraints_extract(&multi.exprs, clauses);
-}
-```
-
-Extract from `exprs`: if `exprs[0]` is `Column` and all remaining are `Value`, produce `AnyOf` of equality constraints. Otherwise skip.
-
-### 8. Add NOT IN handling to `analyze_constraint_expr` — `src/query/constraints.rs`
-
-New match arm for `MultiOp::NotIn`:
-
-`NOT IN (1, 2, 3)` is semantically `col != 1 AND col != 2 AND col != 3`. Extract as individual `Single(ColumnConstraint { op: NotEqual, ... })` clauses — these are AND-connected, fitting the existing model. No new representation needed.
-
-If `exprs[0]` is `Column` and all remaining are `Value`, produce one `Single` clause per value with `BinaryOp::NotEqual`. Otherwise skip.
-
-### 9. Update `between_constraints_extract` — `src/query/constraints.rs`
-
-Change parameter from `&mut HashSet<ColumnConstraint>` to `&mut Vec<ConstraintClause>`. Wrap the two constraints in `ConstraintClause::Single`.
-
-### 10. Update `collect_from_table_source` and `collect_query_constraints` — `src/query/constraints.rs`
-
-Change parameter/return types from `HashSet<ColumnConstraint>` to `Vec<ConstraintClause>`.
-
-### 11. Update `propagate_constraints` — `src/query/constraints.rs`
-
-Input and output change to `Vec<ConstraintClause>`. Propagation rules:
-
-- `Single` constraints: propagate through equivalences as today (if column has an equivalence, clone with the equivalent column)
-- `AnyOf` constraints: propagate only when ALL constraints in the AnyOf reference the **same column** AND that column has an equivalence. Clone the entire AnyOf with the equivalent column. If constraints reference different columns, do not propagate (conservative).
-
-Dedup: after propagation, remove duplicate clauses. For `Single`, compare the inner `ColumnConstraint`. For `AnyOf`, compare the full constraint list (order-independent — sort before comparing, or use a set-based check).
-
-### 12. Update `analyze_query_constraints` — `src/query/constraints.rs`
-
-Build `table_constraints` from `Vec<ConstraintClause>`:
-
-- `Single(c)` → `TableConstraint::Comparison(column, op, value)` keyed by `c.column.table`
-- `AnyOf(cs)` → `TableConstraint::AnyOf([(column, op, value), ...])` keyed by the shared table (all constraints guaranteed same table by extraction)
-
-### 13. Update `row_constraints_match` — `src/cache/writer/cdc.rs`
-
-Iterate `Vec<TableConstraint>`. All must match (AND semantics):
-
-- `Comparison(col, op, val)`: same as current — check single constraint
-- `AnyOf(alternatives)`: check each alternative, return true if **any** matches. If **none** match, return false (row doesn't satisfy this clause)
-
-Extract the single-constraint matching logic into a helper `row_constraint_matches_value` to reuse between `Comparison` and `AnyOf` branches.
-
-### 14. Update `has_table_constraints` checks — `src/cache/writer/cdc.rs`
-
-The `.contains_key()` checks on `table_constraints` continue to work unchanged since the HashMap key (table name) is the same.
-
-### 15. Update existing tests — `src/query/constraints.rs`
-
-All `column_constraints.len()` assertions change to count clauses (each `Single` is one clause). For existing tests with only equality/inequality constraints, the count stays the same — each constraint is a `Single` clause.
-
-The `has_constraint` helper needs updating to search within both `Single` and `AnyOf` variants of `TableConstraint`.
-
-### 16. Add new tests — `src/query/constraints.rs`
-
-**IN tests:**
-- `WHERE id IN (1, 2, 3)` → 1 AnyOf clause with 3 equality constraints
-- `WHERE id IN (1, 2) AND name = 'alice'` → 1 AnyOf + 1 Single
-- `WHERE id IN (SELECT ...)` → 0 constraints (subquery IN, not literal IN)
-- IN propagation through JOIN: `a JOIN b ON a.id = b.id WHERE a.id IN (1, 2)` → both tables get AnyOf
-
-**NOT IN tests:**
-- `WHERE id NOT IN (1, 2, 3)` → 3 Single NotEqual constraints
-- NOT IN propagation through JOIN
-
-**OR tests:**
-- `WHERE id = 1 OR id = 2` → 1 AnyOf clause
-- `WHERE id = 1 OR id = 2 OR id = 3` → 1 AnyOf with 3 constraints (flattened)
-- `WHERE id > 5 OR id < 2` → 1 AnyOf with 2 inequality constraints
-- `WHERE (id = 1 OR id = 2) AND name = 'alice'` → 1 AnyOf + 1 Single
-- Cross-table OR: `WHERE a.id = 1 OR b.id = 2` → 0 constraints (skipped)
-- OR with opaque branch: `WHERE id = 1 OR func(id)` → 0 constraints
-- OR with compound branch: `WHERE (id = 1 AND name = 'x') OR id = 2` → 0 constraints (compound branch, deferred)
-- Same-table different-column OR: `WHERE id = 1 OR name = 'alice'` → 1 AnyOf with 2 constraints
-- OR propagation through JOIN (same column): `a JOIN b ON a.id = b.id WHERE a.id = 1 OR a.id = 2` → both tables get AnyOf
+New tests:
+- **Simple OR**: `id = 1 OR id = 2` → 1 clause `[id=1, id=2]`
+- **Flattened chain**: `id = 1 OR id = 2 OR id = 3` → 1 clause with 3 literals
+- **Cross-column same-table**: `id = 1 OR name = 'alice'` → 1 clause with 2 literals
+- **Inequality OR**: `id > 5 OR id < 2` → 1 clause
+- **OR + AND**: `(id = 1 OR id = 2) AND name = 'alice'` → 2 clauses
+- **Compound**: `(id = 1 AND name = 'x') OR id = 2` → 2 clauses `[id=1, id=2]`, `[name='x', id=2]`
+- **Nested compound**: `(a AND b) OR (c AND d)` → 4 clauses
+- **Cross-table OR**: `a.id = 1 OR b.id = 2` → 0 constraints (multi-table clause dropped)
+- **Opaque branch**: `id = 1 OR func(id)` → 0 constraints (OR with opaque branch)
+- **Budget exhaustion**: construct a pathological WHERE that would exceed the budget; verify extraction returns no constraints for that subtree while other AND conjuncts still produce clauses
+- **Propagation through JOIN**: `a JOIN b ON a.id = b.id WHERE a.id = 1 OR a.id = 2` → both tables receive the same-column 2-literal clause
 
 ## Files Modified
 
 | File | Nature of change |
 |------|-----------------|
-| `src/query/constraints.rs` | New types (`ConstraintClause`, `TableConstraint`), OR/IN/NOT IN extraction, propagation updates, tests |
-| `src/cache/writer/cdc.rs` | `row_constraints_match` handles `TableConstraint` enum |
+| `src/query/constraints.rs` | New `Literal` / `Clause` types, CNF converter `expr_to_cnf`, per-table assignment, updated `propagate_constraints`, updated tests |
+| `src/cache/writer/cdc.rs` | `row_constraints_match` rewritten as "every clause has ≥1 matching literal" |
 
-## Design Notes
+## Suggested Phasing
 
-### Why not full CNF conversion?
+**Phase 1 — Structural refactor only.** Introduce `Literal` and `Clause`. Rewrite `row_constraints_match`, `propagate_constraints`, `table_constraints_subsumed`, and `column_range_build` to consume `Vec<Clause>`. Keep extraction behavior identical: every current case produces 1-literal clauses or same-column multi-literal clauses. All existing tests pass unchanged.
 
-General CNF conversion of `(A AND B) OR C` into `(A OR C) AND (B OR C)` can cause exponential blowout. We avoid this by limiting OR extraction to branches that produce a single constraint each. Compound branches like `(id = 1 AND name = 'x') OR id = 2` are skipped. This covers the most common patterns (IN lists, simple OR of comparisons) without complexity.
+**Phase 2 — Replace extraction with CNF conversion.** Swap `analyze_constraint_expr` for `expr_to_cnf` + per-table assignment. Existing tests still pass (IN, NOT IN, BETWEEN, AND chains produce identical CNF output). Add the OR test suite. Invert `test_no_propagation_with_or`.
 
-### AnyOf dedup during propagation
+**Phase 3 — Subsumption for same-column multi-literal clauses.** Route them through `ColumnRange::InSet` (already exists). Multi-column clauses remain conservatively not-subsumable.
 
-After propagation, the same AnyOf could be added multiple times (via different equivalence chains). For `Single` constraints, the existing approach works. For `AnyOf`, dedup requires comparing the full constraint list. Since constraint counts are small, a sort-and-compare approach is sufficient.
+**Phase 4 (optional) — Polish.** Clause dedup, tautology simplification, De Morgan pushdown for `NOT`.
 
-### Equivalences inside OR branches
+Splitting phase 1 and phase 2 keeps each diff small and reviewable in isolation — phase 1 is pure mechanical refactor with no behavior change, phase 2 is where OR extraction turns on.
 
-Equivalences found inside OR branches (e.g., `WHERE (a.id = b.id AND a.id = 1) OR a.id = 2`) are NOT collected. They're conditional on the branch being active and can't be used for unconditional propagation.
+## Out of Scope
 
-### NOT IN as individual constraints
-
-`NOT IN (1, 2, 3)` decomposes into `!= 1 AND != 2 AND != 3`. Each is an independent AND-connected constraint. A CDC row with `id = 1` fails the `!= 1` constraint → row not in result set → skip invalidation. This is correct and requires no new representation.
-
-### Interaction with BETWEEN
-
-BETWEEN already produces two `Single` inequality constraints. No interaction with OR/IN changes.
-
-### What this does NOT include
-
-- **Compound OR branches**: `(id = 1 AND name = 'x') OR (id = 2 AND name = 'y')` requires `AnyOf(Vec<Vec<ColumnConstraint>>)` — each branch is an AND-group. Deferred.
-- **Cross-table OR**: Correctly identified as non-filterable per-table. Skipped (safe default).
-- **ANY/ALL operators**: `id = ANY(ARRAY[1,2,3])` is semantically similar to IN but has different AST representation. Deferred.
+- **Tseytin transformation**: evaluated and rejected. Tseytin avoids exponential CNF blowup by introducing aux variables, but aux vars aren't column-level literals and can't be evaluated against CDC rows directly. Fits SAT-solver consumers, not our row-predicate evaluation model.
+- **Tree-walk evaluation as the primary path**: evaluating the WHERE AST directly per row would avoid extraction entirely, but gives up canonical per-table clause structure that subsumption and efficient per-table CDC routing rely on. Could be a future fallback for subtrees that exceed the CNF budget, but not the primary design.
+- **ANY / ALL array operators**: `id = ANY(ARRAY[1,2,3])` has IN-like semantics but a different AST shape. Handle as a follow-up in the extraction rules table.
 
 ## Verification
 
-1. `cargo check` — compile check
-2. `cargo test` — all existing tests pass with updated assertions
-3. `cargo clippy -- -D warnings` — no warnings
-4. New OR/IN/NOT IN tests pass
+1. `cargo check`
+2. `cargo test` — all existing tests pass unchanged; new OR and budget tests pass
+3. `cargo clippy -- -D warnings`
