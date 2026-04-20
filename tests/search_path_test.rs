@@ -264,6 +264,204 @@ async fn test_search_path_cache_invalidation() -> Result<(), Error> {
     Ok(())
 }
 
+/// Smoke test: mid-connection `SET search_path` via simple-query goes
+/// through the piggyback path (Query message rewritten to
+/// `SET ...; SHOW search_path`, SHOW response stripped before the client
+/// sees it). The client should see a normal SET response and subsequent
+/// queries must continue to work against the new schema.
+#[tokio::test]
+async fn test_search_path_dynamic_simple_query() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.origin_query("CREATE SCHEMA dyn_simple_a", &[]).await?;
+    ctx.origin_query("CREATE SCHEMA dyn_simple_b", &[]).await?;
+    ctx.origin_query(
+        "CREATE TABLE dyn_simple_a.widgets (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "CREATE TABLE dyn_simple_b.gadgets (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO dyn_simple_a.widgets (id, label) VALUES (1, 'widget_one')",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO dyn_simple_b.gadgets (id, label) VALUES (1, 'gadget_one')",
+        &[],
+    )
+    .await?;
+
+    // Phase 1: search_path points at schema A; query the A-only table.
+    ctx.simple_query("SET search_path TO dyn_simple_a").await?;
+    let res = ctx
+        .simple_query("SELECT id, label FROM widgets WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "widget_one")])?;
+
+    // Phase 2: SET is rewritten to `SET ...; SHOW search_path` on the wire.
+    // The client's API call must not see the SHOW response. Then the B-only
+    // table must still resolve successfully against origin.
+    ctx.simple_query("SET search_path TO dyn_simple_b").await?;
+    let res = ctx
+        .simple_query("SELECT id, label FROM gadgets WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "gadget_one")])?;
+
+    Ok(())
+}
+
+/// Same smoke test but the `SET search_path` goes through the extended
+/// protocol (tokio-postgres `query`), which takes the lazy re-SHOW path
+/// instead of piggyback.
+#[tokio::test]
+async fn test_search_path_dynamic_extended_protocol() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.origin_query("CREATE SCHEMA dyn_ext_a", &[]).await?;
+    ctx.origin_query("CREATE SCHEMA dyn_ext_b", &[]).await?;
+    ctx.origin_query(
+        "CREATE TABLE dyn_ext_a.widgets (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "CREATE TABLE dyn_ext_b.gadgets (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO dyn_ext_a.widgets (id, label) VALUES (1, 'widget_one')",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO dyn_ext_b.gadgets (id, label) VALUES (1, 'gadget_one')",
+        &[],
+    )
+    .await?;
+
+    ctx.query("SET search_path TO dyn_ext_a", &[]).await?;
+    let res = ctx
+        .simple_query("SELECT id, label FROM widgets WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "widget_one")])?;
+
+    ctx.query("SET search_path TO dyn_ext_b", &[]).await?;
+    let res = ctx
+        .simple_query("SELECT id, label FROM gadgets WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "gadget_one")])?;
+
+    Ok(())
+}
+
+/// `SET LOCAL search_path` inside a transaction reverts on ROLLBACK. The
+/// proxy must re-sync search_path on txn end so post-rollback queries resolve
+/// against the original search_path.
+#[tokio::test]
+async fn test_search_path_rollback_reverts_set_local() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.origin_query("CREATE SCHEMA txn_schema", &[]).await?;
+    ctx.origin_query(
+        "CREATE TABLE txn_schema.items (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "CREATE TABLE public.items_txn_revert (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO txn_schema.items (id, label) VALUES (1, 'in_txn_schema')",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO public.items_txn_revert (id, label) VALUES (1, 'in_public')",
+        &[],
+    )
+    .await?;
+
+    // Baseline: public is on the default search_path.
+    let res = ctx
+        .simple_query("SELECT id, label FROM items_txn_revert WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "in_public")])?;
+
+    // Inside a txn, SET LOCAL swaps the schema; query sees the overlay.
+    ctx.simple_query("BEGIN").await?;
+    ctx.simple_query("SET LOCAL search_path TO txn_schema")
+        .await?;
+    let res = ctx
+        .simple_query("SELECT id, label FROM items WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "in_txn_schema")])?;
+    ctx.simple_query("ROLLBACK").await?;
+
+    // After ROLLBACK, SET LOCAL has reverted. The original unqualified query
+    // should again resolve against public.
+    let res = ctx
+        .simple_query("SELECT id, label FROM items_txn_revert WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "in_public")])?;
+
+    Ok(())
+}
+
+/// `DISCARD ALL` resets session state including search_path. The proxy must
+/// drop its cached value and re-resolve.
+#[tokio::test]
+async fn test_search_path_discard_all_resets() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.origin_query("CREATE SCHEMA discard_schema", &[])
+        .await?;
+    ctx.origin_query(
+        "CREATE TABLE discard_schema.items (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "CREATE TABLE public.items_discard (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO discard_schema.items (id, label) VALUES (1, 'from_schema')",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO public.items_discard (id, label) VALUES (1, 'from_public')",
+        &[],
+    )
+    .await?;
+
+    ctx.simple_query("SET search_path TO discard_schema")
+        .await?;
+    let res = ctx
+        .simple_query("SELECT id, label FROM items WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "from_schema")])?;
+
+    // DISCARD ALL reverts session-level SET; search_path returns to default.
+    ctx.simple_query("DISCARD ALL").await?;
+
+    let res = ctx
+        .simple_query("SELECT id, label FROM items_discard WHERE id = 1")
+        .await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "from_public")])?;
+
+    Ok(())
+}
+
 /// Test join queries across tables in custom schemas.
 #[tokio::test]
 async fn test_search_path_join() -> Result<(), Error> {

@@ -57,7 +57,9 @@ use crate::{
 
 use super::client_stream::{ClientReadHalf, ClientSocketSource, ClientStream, ClientWriteHalf};
 use super::query::{Action, ForwardReason, handle_query};
-use super::search_path::SearchPath;
+use super::search_path::{
+    SearchPath, search_path_mutates_any, search_path_mutates_single_piggybackable,
+};
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{CacheSender, ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::result::{MapIntoReport, ReportExt};
@@ -106,18 +108,61 @@ enum OriginIntercept {
     ProactiveParse { statement_name: String },
     /// ParseComplete (or error) handled; consuming final ReadyForQuery.
     AwaitingReadyForQuery,
+    /// Piggyback: the client's Query was rewritten to append `; SHOW search_path`.
+    /// Responses for the original statement are forwarded; the SHOW's response
+    /// is stripped and parsed into `search_path_state`.
+    TrailingShowSearchPath(TrailingShowState),
+}
+
+/// Sub-state for `OriginIntercept::TrailingShowSearchPath`.
+#[derive(Debug, Clone, Copy)]
+enum TrailingShowState {
+    /// Before the first `CommandComplete` or `ErrorResponse` — forwarding
+    /// responses for the original (client-written) statement.
+    PreShow,
+    /// After the original statement's `CommandComplete` — intercepting the
+    /// injected SHOW's `RowDescription`, `DataRow`, `CommandComplete`.
+    InShow,
+    /// Original statement errored; PostgreSQL skips subsequent statements in
+    /// the simple-query batch, so no SHOW response will arrive. Forward
+    /// everything through to the final `ReadyForQuery`.
+    Error,
+}
+
+/// Extract the SQL text (without the trailing null) from a simple-query
+/// `'Q'` message body. Returns `None` if the frame is malformed or the text
+/// is not valid UTF-8.
+fn query_message_sql(data: &BytesMut) -> Option<&str> {
+    // Frame layout: tag(1) | len(4) | sql(N) | nul(1); len counts itself+body,
+    // so the SQL text (excluding the nul) lies at bytes 5..len_field.
+    let len_bytes: [u8; 4] = data.get(1..5)?.try_into().ok()?;
+    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+    str::from_utf8(data.get(5..msg_len)?).ok()
+}
+
+/// Append `; SHOW search_path` to a simple-query message, returning a new
+/// frame. Caller must have verified the original message parses as exactly
+/// one statement with a detected mutation.
+fn query_message_append_show_search_path(data: &BytesMut) -> Option<BytesMut> {
+    let sql = query_message_sql(data)?;
+    Some(simple_query_message_build(&format!(
+        "{sql}; SHOW search_path"
+    )))
 }
 
 /// Search path discovery state machine.
 ///
-/// On connection startup, pgcache needs the session's search_path for table
-/// resolution. PG 18+ sends it via ParameterStatus during authentication.
-/// Older versions require an explicit SHOW query after the first ReadyForQuery.
+/// pgcache needs the session's search_path for table resolution. PG 18+ sends
+/// it via ParameterStatus at startup and again on every change. Older versions
+/// send it only via an explicit `SHOW search_path` query, so we discover and
+/// re-discover it around detected mutations (see `search_path_mutates_*`) and
+/// transaction boundaries.
 enum SearchPathState {
-    /// Waiting for the first ReadyForQuery to determine if PG sent search_path
-    /// via ParameterStatus. If a ParameterStatus arrives with search_path before
-    /// the first ReadyForQuery, transitions directly to Resolved.
-    AwaitingFirstReady,
+    /// No authoritative value: either before the first ReadyForQuery, or after
+    /// a detected mutation (SET/RESET search_path, DISCARD ALL, COMMIT/ROLLBACK).
+    /// Cacheable queries are forwarded until the next SHOW response (or
+    /// ParameterStatus on PG18+) resolves the value.
+    Unknown,
 
     /// search_path has been resolved (either from ParameterStatus or SHOW query)
     Resolved(SearchPath),
@@ -127,7 +172,7 @@ impl SearchPathState {
     /// Resolve the search_path if available, expanding $user to session_user.
     fn resolve(&self, session_user: Option<&str>) -> Option<Vec<String>> {
         match self {
-            Self::AwaitingFirstReady => None,
+            Self::Unknown => None,
             Self::Resolved(sp) => Some(
                 sp.resolve(session_user)
                     .into_iter()
@@ -261,6 +306,22 @@ pub(super) struct ConnectionState {
 
     /// Search path discovery state
     search_path_state: SearchPathState,
+
+    /// Set when the TrailingShowSearchPath piggyback intercept resolves
+    /// search_path within the current origin message batch. Cleared when the
+    /// RFQ for that batch is processed. Used to suppress the txn-end dirty
+    /// marker so piggyback on COMMIT/ROLLBACK doesn't immediately clobber the
+    /// freshly-resolved value.
+    search_path_just_piggyback_resolved: bool,
+
+    /// Set on the first `ParameterStatus("search_path", ...)` message we
+    /// receive. This signals that the origin treats search_path as a
+    /// GUC_REPORT parameter and will emit ParameterStatus on every change
+    /// (PG18+ behavior). Once known, the proxy skips its defensive SHOW
+    /// machinery — mutation detection, piggyback rewrite, and txn-end dirty
+    /// marking — since ParameterStatus keeps state in sync automatically and
+    /// the redundant SHOW would just burn a round trip.
+    search_path_auto_reported: bool,
 
     /// Query timing instrumentation
     telemetry: QueryTelemetry,
@@ -435,7 +496,9 @@ impl ConnectionState {
             portals: HashMap::new(),
             session_user: None,
             origin_intercept: OriginIntercept::None,
-            search_path_state: SearchPathState::AwaitingFirstReady,
+            search_path_state: SearchPathState::Unknown,
+            search_path_just_piggyback_resolved: false,
+            search_path_auto_reported: false,
             telemetry: QueryTelemetry::new(),
             func_volatility,
             extended: ExtendedPending::new(),
@@ -449,13 +512,15 @@ impl ConnectionState {
     /// Handle a message from the client (frontend).
     /// Determines whether to forward to origin, check cache, or take other action.
     #[expect(clippy::wildcard_enum_match_arm)]
-    async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
+    async fn handle_client_message(&mut self, mut msg: PgFrontendMessage) {
         trace!("net: client→proxy {:?}", msg.message_type);
         match msg.message_type {
             PgFrontendMessageType::Query => {
                 metrics::counter!(names::QUERIES_TOTAL).increment(1);
                 metrics::counter!(names::PROTOCOL_SIMPLE_QUERIES).increment(1);
                 self.telemetry.query_receive();
+
+                self.search_path_inspect_query(&mut msg);
 
                 if !self.in_transaction && !self.cache_disabled {
                     self.proxy_mode = match handle_query(
@@ -565,22 +630,25 @@ impl ConnectionState {
     #[expect(clippy::wildcard_enum_match_arm)]
     fn origin_intercept_handle(&mut self, msg: &PgBackendMessage) -> bool {
         match &self.origin_intercept {
-            OriginIntercept::None => return false,
+            OriginIntercept::None => false,
 
-            OriginIntercept::SearchPath => match msg.message_type {
-                PgBackendMessageType::DataRows => {
-                    if let Some(value) = data_row_first_column(&msg.data) {
-                        debug!("received search_path from SHOW query: {}", value);
-                        self.search_path_state =
-                            SearchPathState::Resolved(SearchPath::parse(value));
+            OriginIntercept::SearchPath => {
+                match msg.message_type {
+                    PgBackendMessageType::DataRows => {
+                        if let Some(value) = data_row_first_column(&msg.data) {
+                            debug!("received search_path from SHOW query: {}", value);
+                            self.search_path_state =
+                                SearchPathState::Resolved(SearchPath::parse(value));
+                        }
                     }
+                    PgBackendMessageType::ReadyForQuery => {
+                        debug!("search_path query complete");
+                        self.origin_intercept = OriginIntercept::None;
+                    }
+                    _ => {}
                 }
-                PgBackendMessageType::ReadyForQuery => {
-                    debug!("search_path query complete");
-                    self.origin_intercept = OriginIntercept::None;
-                }
-                _ => {}
-            },
+                true
+            }
 
             OriginIntercept::ProactiveParse { statement_name } => {
                 let stmt_name = statement_name.clone();
@@ -598,15 +666,86 @@ impl ConnectionState {
                     }
                     _ => {}
                 }
+                true
             }
 
             OriginIntercept::AwaitingReadyForQuery => {
                 if matches!(msg.message_type, PgBackendMessageType::ReadyForQuery) {
                     self.origin_intercept = OriginIntercept::None;
                 }
+                true
+            }
+
+            &OriginIntercept::TrailingShowSearchPath(state) => {
+                self.trailing_show_search_path_handle(state, msg)
             }
         }
-        true
+    }
+
+    /// Process one origin message under the piggyback intercept.
+    ///
+    /// Response layout for the rewritten `<stmt>; SHOW search_path`:
+    /// - `<stmt>` responses up to its `CommandComplete` or `ErrorResponse`
+    /// - on success: SHOW's `RowDescription`, one `DataRow`, `CommandComplete`
+    /// - final `ReadyForQuery`
+    ///
+    /// The original-statement responses are forwarded to the client; the
+    /// SHOW portion is consumed and its DataRow is parsed into
+    /// `search_path_state`. If the original statement errored, the SHOW is
+    /// skipped by PostgreSQL and everything forwards through to the RFQ.
+    #[expect(clippy::wildcard_enum_match_arm)]
+    fn trailing_show_search_path_handle(
+        &mut self,
+        state: TrailingShowState,
+        msg: &PgBackendMessage,
+    ) -> bool {
+        match state {
+            TrailingShowState::PreShow => {
+                match msg.message_type {
+                    PgBackendMessageType::CommandComplete => {
+                        self.origin_intercept = OriginIntercept::TrailingShowSearchPath(
+                            TrailingShowState::InShow,
+                        );
+                    }
+                    PgBackendMessageType::ErrorResponse => {
+                        debug!("piggyback: original statement errored, SHOW skipped");
+                        self.origin_intercept =
+                            OriginIntercept::TrailingShowSearchPath(TrailingShowState::Error);
+                    }
+                    _ => {}
+                }
+                false
+            }
+            TrailingShowState::InShow => match msg.message_type {
+                PgBackendMessageType::DataRows => {
+                    if let Some(value) = data_row_first_column(&msg.data) {
+                        debug!("piggyback: received search_path from SHOW: {}", value);
+                        self.search_path_state =
+                            SearchPathState::Resolved(SearchPath::parse(value));
+                        self.search_path_just_piggyback_resolved = true;
+                    }
+                    true
+                }
+                PgBackendMessageType::ReadyForQuery => {
+                    debug!("piggyback: complete");
+                    self.origin_intercept = OriginIntercept::None;
+                    false
+                }
+                // RowDescription and SHOW's CommandComplete are for the client's
+                // eyes: strip them.
+                PgBackendMessageType::RowDescription
+                | PgBackendMessageType::CommandComplete => true,
+                // Anything else at this phase is unexpected; pass through to
+                // avoid stalling the protocol.
+                _ => false,
+            },
+            TrailingShowState::Error => {
+                if matches!(msg.message_type, PgBackendMessageType::ReadyForQuery) {
+                    self.origin_intercept = OriginIntercept::None;
+                }
+                false
+            }
+        }
     }
 
     /// Handle a message from the origin database (backend).
@@ -624,10 +763,15 @@ impl ConnectionState {
                 if let Some((name, value)) = parameter_status_parse(&msg.data) {
                     match name {
                         "search_path" => {
-                            // PG 18+ sends this during startup
+                            // PG18+ reports search_path as a GUC_REPORT parameter,
+                            // emitting this message on every change (including
+                            // startup, SET, DISCARD ALL, and SET LOCAL reverts at
+                            // transaction end). First arrival tells us we can
+                            // skip the defensive SHOW machinery.
                             debug!("received search_path from ParameterStatus: {}", value);
                             self.search_path_state =
                                 SearchPathState::Resolved(SearchPath::parse(value));
+                            self.search_path_auto_reported = true;
                         }
                         "server_version" => {
                             crate::telemetry::pg_version_set(value.to_owned());
@@ -674,6 +818,7 @@ impl ConnectionState {
                 // 'I' = idle (not in transaction)
                 // 'T' = in transaction block
                 // 'E' = in failed transaction block
+                let was_in_transaction = self.in_transaction;
                 self.in_transaction = msg.data.get(5).is_some_and(|&b| b == b'T' || b == b'E');
 
                 self.telemetry.origin_complete();
@@ -683,12 +828,31 @@ impl ConnectionState {
                     self.portals.retain(|name, _| !name.is_empty());
                 }
 
-                // If search_path hasn't been resolved yet (PG < 18 doesn't send
-                // ParameterStatus for search_path), send SHOW query to discover it.
-                if let SearchPathState::AwaitingFirstReady = self.search_path_state
+                // Transaction ended: any SET (including SET LOCAL) within the
+                // txn reverts, so the cached search_path may no longer match.
+                // Skipped on PG18+: ParameterStatus already arrived earlier in
+                // this same batch with the post-txn value. Also skipped if a
+                // piggyback intercept in this batch has already resolved
+                // search_path — marking unknown would clobber that fresh
+                // value.
+                if was_in_transaction
+                    && !self.in_transaction
+                    && !self.search_path_just_piggyback_resolved
+                    && !self.search_path_auto_reported
+                {
+                    debug!("txn ended, marking search_path unknown");
+                    self.search_path_state = SearchPathState::Unknown;
+                }
+                self.search_path_just_piggyback_resolved = false;
+
+                // If search_path is unknown (initial discovery on pre-PG18, or
+                // after a detected mutation / txn-end), inject a SHOW query to
+                // re-sync. Skipped if another intercept is active — another
+                // RFQ will follow.
+                if let SearchPathState::Unknown = self.search_path_state
                     && matches!(self.origin_intercept, OriginIntercept::None)
                 {
-                    debug!("search_path not received, sending SHOW search_path query");
+                    debug!("search_path unknown, sending SHOW search_path query");
                     self.origin_intercept = OriginIntercept::SearchPath;
                     let query_msg = simple_query_message_build("SHOW search_path;");
                     self.origin_write_buf.push_back(query_msg);
@@ -824,10 +988,67 @@ impl ConnectionState {
         }
     }
 
+    /// Inspect an outgoing simple-query `Query` message for search_path
+    /// mutations. Marks the cached search_path stale on any detected mutation
+    /// (SET/RESET search_path, DISCARD ALL, COMMIT/ROLLBACK). When the message
+    /// is a single such statement and no other intercept is active, rewrites
+    /// the message to append `; SHOW search_path` and installs the
+    /// `TrailingShowSearchPath` intercept so the SHOW's response is captured
+    /// and stripped before reaching the client — avoiding the extra round
+    /// trip a lazy SHOW would cost.
+    fn search_path_inspect_query(&mut self, msg: &mut PgFrontendMessage) {
+        // Fast path: PG18+ auto-reports search_path via ParameterStatus, so
+        // the origin will push every change before the next RFQ. Defensive
+        // marking and the piggyback SHOW just waste cycles.
+        if self.search_path_auto_reported {
+            return;
+        }
+
+        let Some(sql) = query_message_sql(&msg.data) else {
+            return;
+        };
+        let Ok(ast) = pg_query::parse(sql) else {
+            return;
+        };
+
+        if search_path_mutates_any(&ast) {
+            debug!("search_path mutation detected in Query");
+            self.search_path_state = SearchPathState::Unknown;
+        }
+
+        // Piggyback only on single-statement, piggyback-safe mutations, and
+        // only when no other intercept is active (otherwise the inline SHOW
+        // response would collide with the existing intercept's state machine).
+        if search_path_mutates_single_piggybackable(&ast).is_some()
+            && matches!(self.origin_intercept, OriginIntercept::None)
+            && let Some(rewritten) = query_message_append_show_search_path(&msg.data)
+        {
+            debug!("piggybacking SHOW search_path onto mutation query");
+            msg.data = rewritten;
+            self.origin_intercept =
+                OriginIntercept::TrailingShowSearchPath(TrailingShowState::PreShow);
+        }
+    }
+
     /// Handle Parse message — analyze cacheability, store statement, buffer bytes.
     fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_parse_message(&msg.data) {
-            let sql_type = match pg_query::parse(&parsed.sql) {
+            let ast_result = pg_query::parse(&parsed.sql);
+
+            // Detect search_path mutation at Parse time (pessimistic: the
+            // client may Execute the statement or not). Piggyback isn't
+            // attempted for extended protocol — a standalone SHOW will be
+            // issued via the lazy path on the next RFQ once state is Unknown.
+            // Skipped on PG18+ where ParameterStatus keeps us in sync.
+            if !self.search_path_auto_reported
+                && let Ok(ast) = &ast_result
+                && search_path_mutates_any(ast)
+            {
+                debug!("search_path mutation detected in Parse");
+                self.search_path_state = SearchPathState::Unknown;
+            }
+
+            let sql_type = match ast_result {
                 Ok(ast) => match crate::query::ast::query_expr_convert(&ast) {
                     Ok(query) => match CacheableQuery::try_new(&query, &self.func_volatility) {
                         Ok(cacheable_query) => StatementType::Cacheable(Arc::new(cacheable_query)),
