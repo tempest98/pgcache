@@ -176,6 +176,9 @@ async fn telemetry_run(cancel: CancellationToken, metrics_handle: PrometheusHand
 
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        .tls_certs_only(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().filter_map(
+            |der| reqwest::Certificate::from_der(der.as_ref()).ok(),
+        ))
         .build()
         .unwrap_or_default();
 
