@@ -232,7 +232,7 @@ async fn test_generation_purge() -> Result<(), Error> {
     );
 
     // Purge generation 1 and below
-    let purged: i64 = cache_db
+    let _purged: i64 = cache_db
         .query_one("SELECT pgcache_generation_purge_all(1)", &[])
         .await
         .map_err(Error::other)?

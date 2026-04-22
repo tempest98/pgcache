@@ -924,6 +924,7 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
 mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::unwrap_used)]
+    #![allow(clippy::wildcard_enum_match_arm)]
 
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
@@ -2427,7 +2428,7 @@ mod tests {
     #[test]
     fn test_in_set_with_range_filter() {
         // IN (1,2,3,4,5) AND id > 3 → InSet({4, 5})
-        let tcs = vec![
+        let tcs = [
             TableConstraint::AnyOf(
                 "id".into(),
                 vec![
@@ -2459,7 +2460,7 @@ mod tests {
     #[test]
     fn test_in_set_with_equality_match() {
         // IN (1,2,3) AND id = 2 → Equal(2)
-        let tcs = vec![
+        let tcs = [
             TableConstraint::AnyOf(
                 "id".into(),
                 vec![
@@ -2481,7 +2482,7 @@ mod tests {
     #[test]
     fn test_in_set_with_equality_mismatch() {
         // IN (1,2,3) AND id = 5 → Empty
-        let tcs = vec![
+        let tcs = [
             TableConstraint::AnyOf(
                 "id".into(),
                 vec![
@@ -2500,7 +2501,7 @@ mod tests {
     #[test]
     fn test_in_set_with_not_equal() {
         // IN (1,2,3) AND id != 2 → InSet({1, 3})
-        let tcs = vec![
+        let tcs = [
             TableConstraint::AnyOf(
                 "id".into(),
                 vec![
