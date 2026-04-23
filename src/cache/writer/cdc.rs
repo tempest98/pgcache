@@ -973,22 +973,8 @@ impl CacheWriter {
             }
             sql.push_str(pk);
         }
-        sql.push_str(") DO UPDATE SET ");
-        let mut first_update = true;
-        for col in &column_names {
-            if table_metadata
-                .primary_key_columns
-                .iter()
-                .any(|pk| pk.as_str() == *col)
-            {
-                continue;
-            }
-            if !first_update {
-                sql.push_str(", ");
-            }
-            let _ = write!(sql, "{col} = EXCLUDED.{col}");
-            first_update = false;
-        }
+        sql.push(')');
+        cdc_on_conflict_tail_append(&mut sql, &column_names, &table_metadata.primary_key_columns);
 
         Ok(sql)
     }
@@ -1041,22 +1027,8 @@ impl CacheWriter {
             }
             sql.push_str(pk);
         }
-        sql.push_str(") DO UPDATE SET ");
-        let mut first_update = true;
-        for col in &column_names {
-            if table_metadata
-                .primary_key_columns
-                .iter()
-                .any(|pk| pk.as_str() == *col)
-            {
-                continue;
-            }
-            if !first_update {
-                sql.push_str(", ");
-            }
-            let _ = write!(sql, "{col} = EXCLUDED.{col}");
-            first_update = false;
-        }
+        sql.push(')');
+        cdc_on_conflict_tail_append(&mut sql, &column_names, &table_metadata.primary_key_columns);
 
         sql
     }
@@ -1098,6 +1070,32 @@ impl CacheWriter {
         }
 
         Ok(sql)
+    }
+}
+
+/// Append the tail of an upsert SQL: either ` DO UPDATE SET <non-pk cols>` or
+/// ` DO NOTHING` if the table has no non-PK columns. PG rejects `DO UPDATE SET`
+/// with an empty SET list, so PK-only tables must use `DO NOTHING`.
+///
+/// Assumes the caller has already emitted `INSERT INTO ... ON CONFLICT (<pk>)`.
+fn cdc_on_conflict_tail_append(sql: &mut String, column_names: &[&str], pkey_columns: &[String]) {
+    let is_pk = |name: &str| pkey_columns.iter().any(|pk| pk.as_str() == name);
+    let has_non_pk = column_names.iter().any(|c| !is_pk(c));
+    if !has_non_pk {
+        sql.push_str(" DO NOTHING");
+        return;
+    }
+    sql.push_str(" DO UPDATE SET ");
+    let mut first = true;
+    for col in column_names {
+        if is_pk(col) {
+            continue;
+        }
+        if !first {
+            sql.push_str(", ");
+        }
+        let _ = write!(sql, "{col} = EXCLUDED.{col}");
+        first = false;
     }
 }
 

@@ -197,14 +197,22 @@ fn insert_statement_build(
 
     let columns_joined = columns.join(",");
     let pkey_joined = pkey_columns.join(",");
-    let update_joined = update_columns.join(", ");
+
+    // PK-only tables have nothing to update on conflict — emit DO NOTHING.
+    // `DO UPDATE SET` with an empty SET list is a PG syntax error.
+    let suffix = if update_columns.is_empty() {
+        format!(" ON CONFLICT ({pkey_joined}) DO NOTHING")
+    } else {
+        let update_joined = update_columns.join(", ");
+        format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}")
+    };
 
     InsertStatement {
         prefix: format!(
             "INSERT INTO \"{}\".\"{}\"({columns_joined}) VALUES ",
             table.schema, table.name
         ),
-        suffix: format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}"),
+        suffix,
         pkey_positions,
         num_columns: row_description.len(),
     }
