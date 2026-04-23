@@ -160,7 +160,7 @@ pub struct DynamicConfig {
     pub mv_size_ratio: u32,
 }
 
-const DEFAULT_ADMISSION_THRESHOLD: u32 = 2;
+const DEFAULT_ADMISSION_THRESHOLD: u32 = 1;
 const DEFAULT_MV_SIZE_RATIO: u32 = 10;
 
 impl DynamicConfig {
@@ -1058,7 +1058,7 @@ impl Settings {
             --num_workers NUMBER \n \
             [--cache_size BYTES] \n \
             [--cache_policy fifo|clock] (default: clock) \n \
-            [--admission_threshold N] (default: 2, clock policy only) \n \
+            [--admission_threshold N] (default: 1, clock policy only) \n \
             [--mv_size_ratio N] (default: 10, materialized view size gate) \n \
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
             [--metrics_socket IP_AND_PORT] \n \
@@ -1831,7 +1831,7 @@ socket = "127.0.0.1:5434"
         assert_eq!(settings.origin.ssl_mode, SslMode::Disable);
         let dynamic = settings.dynamic.load();
         assert_eq!(dynamic.cache_policy, CachePolicy::Clock);
-        assert_eq!(dynamic.admission_threshold, 2);
+        assert_eq!(dynamic.admission_threshold, 1);
         assert_eq!(settings.cache.ssl_mode, SslMode::Disable);
         assert_eq!(settings.cache.password, None);
     }
