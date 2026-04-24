@@ -183,12 +183,6 @@ fn insert_statement_build(
         .map(|c| format!("\"{c}\""))
         .collect();
 
-    let update_columns: Vec<String> = columns
-        .iter()
-        .filter(|c| !pkey_columns.contains(c))
-        .map(|c| format!("{c} = EXCLUDED.{c}"))
-        .collect();
-
     let pkey_positions: Vec<usize> = table
         .primary_key_columns
         .iter()
@@ -198,14 +192,21 @@ fn insert_statement_build(
     let columns_joined = columns.join(",");
     let pkey_joined = pkey_columns.join(",");
 
-    // PK-only tables have nothing to update on conflict — emit DO NOTHING.
-    // `DO UPDATE SET` with an empty SET list is a PG syntax error.
-    let suffix = if update_columns.is_empty() {
-        format!(" ON CONFLICT ({pkey_joined}) DO NOTHING")
-    } else {
-        let update_joined = update_columns.join(", ");
-        format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {update_joined}")
-    };
+    // On conflict we don't overwrite existing rows: CDC keeps their values
+    // consistent with origin, so re-writing non-PK columns from EXCLUDED would
+    // be wasted work. The UPSERT's only job here is to fire
+    // `pgcache_track_modification` (an AFTER UPDATE trigger) so pre-existing
+    // rows get linked to this population's query generation. Writing each PK
+    // column to its own EXCLUDED value is a data no-op (the arbiter guarantees
+    // they're equal) that still fires the trigger; `DO NOTHING` would skip it
+    // and leave the row unlinked from this generation. Unqualified `<pk> =
+    // <pk>` on the RHS is ambiguous per PG 42702 — EXCLUDED qualifies it.
+    let self_assign = pkey_columns
+        .iter()
+        .map(|c| format!("{c} = EXCLUDED.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {self_assign}");
 
     InsertStatement {
         prefix: format!(
