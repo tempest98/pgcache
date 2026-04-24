@@ -573,7 +573,10 @@ fn column_expr_resolve(
             for arg in &func.args {
                 resolved_args.push(column_expr_resolve(arg, scope)?);
             }
-            let resolved_agg_order = order_by_resolve(&func.agg_order, scope)?;
+            // Aggregate ORDER BY (e.g. `string_agg(x, ',' ORDER BY y)`) has no
+            // access to SELECT-list aliases — it's evaluated per row within the
+            // aggregate's input, not against the output.
+            let resolved_agg_order = order_by_resolve(&func.agg_order, scope, None)?;
             let resolved_over = match &func.over {
                 Some(w) => Some(window_spec_resolve(w, scope)?),
                 None => None,
@@ -699,20 +702,43 @@ fn select_columns_resolve(
     }
 }
 
-/// Resolve ORDER BY clauses
+/// Resolve ORDER BY clauses. When `select_columns` is provided, an unqualified
+/// identifier that matches a SELECT-list output name resolves to
+/// `ResolvedColumnExpr::Identifier` — matching PostgreSQL's precedence rule
+/// that ORDER BY matches output names before falling back to column lookup.
 fn order_by_resolve(
     order_by: &[OrderByClause],
     scope: &mut ResolutionScope<'_>,
+    select_columns: Option<&ResolvedSelectColumns>,
 ) -> ResolveResult<Vec<ResolvedOrderByClause>> {
     let mut resolved = Vec::with_capacity(order_by.len());
     for clause in order_by {
-        let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
+        let resolved_expr = match order_by_alias_match(&clause.expr, select_columns) {
+            Some(ident) => ident,
+            None => column_expr_resolve(&clause.expr, scope)?,
+        };
         resolved.push(ResolvedOrderByClause {
             expr: resolved_expr,
             direction: clause.direction.clone(),
         });
     }
     Ok(resolved)
+}
+
+/// If `clause_expr` is an unqualified column reference whose name matches a
+/// SELECT-list output name, return it as an `Identifier`.
+fn order_by_alias_match(
+    clause_expr: &ColumnExpr,
+    select_columns: Option<&ResolvedSelectColumns>,
+) -> Option<ResolvedColumnExpr> {
+    let ColumnExpr::Column(col) = clause_expr else {
+        return None;
+    };
+    if col.table.is_some() {
+        return None;
+    }
+    select_columns?.position_by_output_name(col.column.as_str())?;
+    Some(ResolvedColumnExpr::Identifier(col.column.clone()))
 }
 
 /// Convert ORDER BY clauses to use unqualified Identifier expressions.
@@ -811,7 +837,7 @@ pub fn query_expr_resolve(
             for table_source in &select.from {
                 let _ = table_source_resolve(table_source, tables, &mut scope, search_path);
             }
-            order_by_resolve(&query.order_by, &mut scope)?
+            order_by_resolve(&query.order_by, &mut scope, body.select_columns())?
         }
         QueryBody::SetOp(_) | QueryBody::Values(_) => order_by_as_identifiers(&query.order_by),
     };
@@ -965,7 +991,7 @@ fn query_expr_resolve_scoped(
                     search_path,
                 );
             }
-            order_by_resolve(&query.order_by, &mut order_scope)?
+            order_by_resolve(&query.order_by, &mut order_scope, body.select_columns())?
         }
         QueryBody::SetOp(_) | QueryBody::Values(_) => order_by_as_identifiers(&query.order_by),
     };
@@ -1522,9 +1548,11 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let resolved = resolve_query("SELECT * FROM users ORDER BY name ASC", &tables);
+        // `SELECT *` expands `name` into the output list, so the unqualified
+        // ORDER BY matches the output name and resolves to `Identifier` — PG's
+        // output-first precedence rule.
+        let resolved = resolve_query("SELECT users.name FROM users ORDER BY users.name ASC", &tables);
 
-        // Check ORDER BY was resolved
         assert_eq!(resolved.order_by.len(), 1);
         assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
 
@@ -1543,12 +1571,13 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let resolved = resolve_query("SELECT * FROM users ORDER BY name ASC, id DESC", &tables);
+        let resolved = resolve_query(
+            "SELECT users.name, users.id FROM users ORDER BY users.name ASC, users.id DESC",
+            &tables,
+        );
 
-        // Check ORDER BY was resolved
         assert_eq!(resolved.order_by.len(), 2);
 
-        // First column: name ASC
         assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
         if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
             assert_eq!(col.column, "name");
@@ -1557,7 +1586,6 @@ mod tests {
             panic!("Expected column expression");
         }
 
-        // Second column: id DESC
         assert_eq!(resolved.order_by[1].direction, OrderDirection::Desc);
         if let ResolvedColumnExpr::Column(col) = &resolved.order_by[1].expr {
             assert_eq!(col.column, "id");
@@ -1585,6 +1613,59 @@ mod tests {
             assert_eq!(col.schema, "public");
         } else {
             panic!("Expected column expression");
+        }
+    }
+
+    #[test]
+    fn test_order_by_select_alias() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let sql = "SELECT id, name AS display_name FROM users ORDER BY display_name DESC";
+        let resolved = resolve_query(sql, &tables);
+
+        assert_eq!(resolved.order_by.len(), 1);
+        assert_eq!(resolved.order_by[0].direction, OrderDirection::Desc);
+        match &resolved.order_by[0].expr {
+            ResolvedColumnExpr::Identifier(name) => assert_eq!(name, "display_name"),
+            other => panic!("expected Identifier for alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_order_by_aggregate_alias() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("orders", 1001));
+
+        // Aggregate functions produce no column-derivable output name, so only an
+        // explicit alias lets ORDER BY reference them — this is the key demo case.
+        let sql = "SELECT id, SUM(id) AS total FROM orders GROUP BY id ORDER BY total DESC";
+        let resolved = resolve_query(sql, &tables);
+
+        assert_eq!(resolved.order_by.len(), 1);
+        match &resolved.order_by[0].expr {
+            ResolvedColumnExpr::Identifier(name) => assert_eq!(name, "total"),
+            other => panic!("expected Identifier for alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_order_by_qualified_does_not_match_alias() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        // `u.name` is qualified — must resolve through the column path even if
+        // an alias of the same name existed.
+        let sql = "SELECT id, name AS display FROM users u ORDER BY u.name";
+        let resolved = resolve_query(sql, &tables);
+
+        assert_eq!(resolved.order_by.len(), 1);
+        match &resolved.order_by[0].expr {
+            ResolvedColumnExpr::Column(col) => {
+                assert_eq!(col.table, "users");
+                assert_eq!(col.column, "name");
+            }
+            other => panic!("expected Column for qualified ref, got {other:?}"),
         }
     }
 
@@ -1623,9 +1704,10 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
-        let resolved = resolve_query("SELECT * FROM users ORDER BY name", &tables);
+        // Select a column whose name doesn't appear in the output list to force
+        // the unqualified ORDER BY through column resolution.
+        let resolved = resolve_query("SELECT id FROM users ORDER BY name", &tables);
 
-        // Check unqualified ORDER BY column was resolved
         assert_eq!(resolved.order_by.len(), 1);
         if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
             assert_eq!(col.table, "users");

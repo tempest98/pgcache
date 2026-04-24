@@ -1091,11 +1091,29 @@ impl ResolvedSelectColumns {
     /// (`public.orders.status`, `count(orders.id)`) aren't valid against the
     /// MV; positional ORDER BY sidesteps the naming entirely.
     pub fn columns_position_of(&self, expr: &ResolvedColumnExpr) -> Option<usize> {
-        let cols = match self {
-            ResolvedSelectColumns::Columns(cols) => cols,
-            ResolvedSelectColumns::None => return None,
-        };
-        cols.iter().position(|c| c.expr == *expr).map(|i| i + 1)
+        // ORDER BY against a SELECT-list alias resolves to `Identifier(name)`;
+        // match by output name so positional rewrite still works for MV serving.
+        match expr {
+            ResolvedColumnExpr::Identifier(name) => self.position_by_output_name(name.as_str()),
+            ResolvedColumnExpr::Column(_)
+            | ResolvedColumnExpr::Function { .. }
+            | ResolvedColumnExpr::Literal(_)
+            | ResolvedColumnExpr::Case(_)
+            | ResolvedColumnExpr::Arithmetic(_)
+            | ResolvedColumnExpr::Subquery(..) => {
+                let Self::Columns(cols) = self else { return None };
+                cols.iter().position(|c| c.expr == *expr).map(|i| i + 1)
+            }
+        }
+    }
+
+    /// 1-based position of the first SELECT column whose output name (alias or
+    /// inferred — see `ResolvedSelectColumn::output_name`) matches `name`.
+    pub fn position_by_output_name(&self, name: &str) -> Option<usize> {
+        let Self::Columns(cols) = self else { return None };
+        cols.iter()
+            .position(|c| c.output_name().is_some_and(|n| n == name))
+            .map(|i| i + 1)
     }
 }
 
@@ -1530,6 +1548,15 @@ impl ResolvedQueryBody {
             ResolvedQueryBody::SetOp(set_op) => set_op.nodes(),
         };
         Box::new(current.chain(children))
+    }
+
+    /// SELECT-list columns if this body is a `Select`, else `None`. Set
+    /// operations and VALUES bodies have no single SELECT scope.
+    pub fn select_columns(&self) -> Option<&ResolvedSelectColumns> {
+        match self {
+            ResolvedQueryBody::Select(s) => Some(&s.columns),
+            ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => None,
+        }
     }
 }
 

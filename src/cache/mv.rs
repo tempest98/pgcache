@@ -199,12 +199,8 @@ fn mv_order_by_direct(sql: &mut String, order_by: &[ResolvedOrderByClause]) {
 /// an `Identifier` whose name matches an output column of the leftmost SELECT
 /// (which is what `CREATE TABLE AS` uses for MV column names).
 ///
-/// Structural equality only for v1. Future improvements to consider when
-/// workloads demand them:
-///   - Alias resolution for SELECT-body ORDER BY (`ORDER BY alias_name`).
-///     Gated on the resolver learning about SELECT-list aliases — today
-///     `column_resolve` only consults FROM-scope tables, so `ORDER BY
-///     alias_c` fails resolution upstream and never reaches here.
+/// Matching is structural (or by output name for `Identifier`, which is what
+/// alias-referenced ORDER BY resolves to). Future improvement:
 ///   - Normalized matching (handles small rewrites like constant folding
 ///     between SELECT and ORDER BY, if those turn out to happen in practice).
 fn order_by_serve_viable(resolved: &ResolvedQueryExpr) -> bool {
@@ -221,9 +217,10 @@ fn order_by_serve_viable(resolved: &ResolvedQueryExpr) -> bool {
                 return false;
             };
             resolved.order_by.iter().all(|o| match &o.expr {
-                ResolvedColumnExpr::Identifier(name) => {
-                    select_columns_contains_name(&leftmost.columns, name.as_str())
-                }
+                ResolvedColumnExpr::Identifier(name) => leftmost
+                    .columns
+                    .position_by_output_name(name.as_str())
+                    .is_some(),
                 ResolvedColumnExpr::Column(_)
                 | ResolvedColumnExpr::Function { .. }
                 | ResolvedColumnExpr::Literal(_)
@@ -245,16 +242,6 @@ fn resolved_leftmost_select(resolved: &ResolvedQueryExpr) -> Option<&ResolvedSel
         ResolvedQueryBody::SetOp(setop) => resolved_leftmost_select(&setop.left),
         ResolvedQueryBody::Values(_) => None,
     }
-}
-
-/// True if any column in `columns` has an output name matching `name`. See
-/// `ResolvedSelectColumn::output_name` for the alias-or-inferred rule.
-fn select_columns_contains_name(columns: &ResolvedSelectColumns, name: &str) -> bool {
-    let ResolvedSelectColumns::Columns(cols) = columns else {
-        return false;
-    };
-    cols.iter()
-        .any(|c| c.output_name().is_some_and(|n| n == name))
 }
 
 /// Classify a resolved query's shape to decide whether it's a materialization

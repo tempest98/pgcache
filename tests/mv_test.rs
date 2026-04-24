@@ -567,6 +567,80 @@ async fn test_mv_order_by_top_n() -> Result<(), Error> {
     Ok(())
 }
 
+/// Regression for PGC-98: `ORDER BY <select_alias>` must register successfully
+/// and serve from cache (and from the MV). Pre-fix, the resolver rejected the
+/// alias reference as `ColumnNotFound`, leaving the per-fingerprint state stuck
+/// in `Loading` and hanging every subsequent client.
+#[tokio::test]
+async fn test_mv_order_by_alias() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE mv_alias (id serial primary key, category text not null)",
+        &[],
+    )
+    .await?;
+    for (cat, n) in &[("a", 50), ("b", 30), ("c", 10)] {
+        for _ in 0..*n {
+            ctx.query("INSERT INTO mv_alias (category) VALUES ($1)", &[cat])
+                .await?;
+        }
+    }
+
+    // Alias referenced in ORDER BY — the case that used to fail resolve.
+    let sql = "SELECT category, count(*) AS total FROM mv_alias \
+               GROUP BY category ORDER BY total DESC";
+
+    // First query — cache miss, forwarded to origin.
+    let rows = ctx.simple_query(sql).await?;
+    let data_rows: Vec<(String, i64)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some((
+                r.get(0).unwrap().to_owned(),
+                r.get(1).unwrap().parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        data_rows,
+        vec![("a".to_owned(), 50), ("b".to_owned(), 30), ("c".to_owned(), 10)],
+        "first query (origin): ordered by alias DESC"
+    );
+
+    wait_cache_load().await;
+
+    // Second query — triggers MvFirstPop, falls through to source-row eval.
+    let _ = ctx.simple_query(sql).await?;
+    wait_cache_load().await;
+
+    // Third query — MV fast path must honor ORDER BY through positional rewrite.
+    let m1 = ctx.metrics().await?;
+    let rows = ctx.simple_query(sql).await?;
+    let data_rows: Vec<(String, i64)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some((
+                r.get(0).unwrap().to_owned(),
+                r.get(1).unwrap().parse().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        data_rows,
+        vec![("a".to_owned(), 50), ("b".to_owned(), 30), ("c".to_owned(), 10)],
+        "MV fast path must preserve alias-ordered results"
+    );
+    let m2 = ctx.metrics().await?;
+    let d = metrics_delta(&m1, &m2);
+    assert_eq!(d.cache_mv_hits, 1, "expected MV hit for alias-ordered query");
+    assert_eq!(d.cache_mv_fallthrough, 0);
+
+    Ok(())
+}
+
 /// Regression: plain aggregate + LIMIT served from the source-row cache (no
 /// MV involved) must return the correct count. Previously, `max_limit` was
 /// applied to origin population even for aggregate shapes, truncating the
