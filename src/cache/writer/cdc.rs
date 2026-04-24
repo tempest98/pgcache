@@ -331,12 +331,8 @@ impl CacheWriter {
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
 
-        // Remove update queries
-        for oid in &query.relation_oids {
-            if let Some(mut queries) = self.cache.update_queries.get_mut(oid) {
-                queries.queries.retain(|q| q.fingerprint != fingerprint);
-            }
-        }
+        self.cache
+            .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
 
         // Purge generations based on new threshold
         let new_threshold = self.cache.generation_purge_threshold();

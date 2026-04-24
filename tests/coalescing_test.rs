@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::io::Error;
+use std::time::Duration;
 
 use crate::util::{TestContext, metrics_delta, wait_cache_load, wait_for_cdc};
 
@@ -93,6 +94,52 @@ async fn test_request_coalescing() -> Result<(), Error> {
         delta.queries_cache_miss, 1,
         "only the first query should be a cache miss"
     );
+
+    Ok(())
+}
+
+/// Regression for PGC-99: when the writer's `query_register` fails (here: a
+/// query against a nonexistent table makes `cache_tables_ensure` error out),
+/// the coordinator's `state_view` entry must be cleaned up and any coalesced
+/// waiters drained. Pre-fix, the entry stayed in `Loading` forever and every
+/// subsequent client request for the same fingerprint hung in `waiting`.
+#[tokio::test]
+async fn test_register_failure_drains_waiters() -> Result<(), Error> {
+    let ctx = TestContext::setup().await?;
+
+    // Nonexistent table: passes parse + cacheability, fails at writer-side
+    // table metadata fetch — exercises the defensive cleanup path.
+    let sql = "SELECT * FROM __pgcache_nonexistent_test_table__ WHERE id = 1";
+
+    let num_clients = 5;
+    let mut clients = Vec::with_capacity(num_clients);
+    for _ in 0..num_clients {
+        clients.push(ctx.proxy_client_connect().await?);
+    }
+
+    let mut handles = Vec::with_capacity(num_clients);
+    for client in clients {
+        let q = sql.to_owned();
+        handles.push(tokio::spawn(
+            async move { client.simple_query(&q).await },
+        ));
+    }
+
+    // Bound the wait — bug shape is "later clients coalesce and hang forever".
+    // Cleanup fires synchronously on Register error, so generous 5s is plenty.
+    for handle in handles {
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .map_err(|_| Error::other("client hung — coalesced waiter not drained"))?
+            .unwrap();
+        // Origin will reject the query (relation does not exist). The contract
+        // we're testing is that the request *returned* — success or error
+        // doesn't matter, just that it didn't hang.
+        assert!(
+            result.is_err(),
+            "expected origin error for nonexistent table, got {result:?}"
+        );
+    }
 
     Ok(())
 }

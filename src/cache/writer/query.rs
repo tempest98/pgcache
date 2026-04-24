@@ -587,11 +587,8 @@ impl CacheWriter {
         if admit_action == AdmitAction::CheckOnly {
             // Pending below threshold — don't register, don't populate.
             // Clean up the update_queries we registered in query_resolve.
-            for &oid in &resolution.relation_oids {
-                if let Some(mut queries) = self.cache.update_queries.get_mut(&oid) {
-                    queries.queries.retain(|q| q.fingerprint != fingerprint);
-                }
-            }
+            self.cache
+                .update_queries_remove_fingerprint(fingerprint, &resolution.relation_oids);
             return Ok(());
         }
 
@@ -735,31 +732,36 @@ impl CacheWriter {
         }
     }
 
-    /// Clean up after a failed population.
+    /// Clean up after a failed register/populate/readmit/limit-bump.
+    ///
+    /// Always clears the coordinator-owned `state_view` entry and drains any
+    /// coalesced `waiting` requests via `WriterNotify::Failed` — even when the
+    /// fingerprint never made it into `cached_queries` (e.g. the resolver
+    /// rejected the query). Without this, a failed Register would leave
+    /// `state_view` stuck in `Loading` and every subsequent client request for
+    /// that fingerprint would coalesce into `waiting` and hang.
     pub fn query_failed_cleanup(&mut self, fingerprint: u64) {
         trace!("query_failed_cleanup {fingerprint}");
-        if let Some(query) = self.cache.cached_queries.remove1(&fingerprint) {
-            // Remove generation from active set
-            self.cache.generations.remove(&query.generation);
 
-            // Remove from update_queries
-            for oid in &query.relation_oids {
-                if let Some(mut update_queries) = self.cache.update_queries.get_mut(oid) {
-                    update_queries
-                        .queries
-                        .retain(|q| q.fingerprint != fingerprint);
+        match self.cache.cached_queries.remove1(&fingerprint) {
+            Some(query) => {
+                self.cache.generations.remove(&query.generation);
+                self.cache
+                    .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
+                self.relations_dirty = true;
+                debug!("cleaned up failed query {fingerprint}");
+            }
+            None => {
+                // No cached_query but `update_queries_register` may have run
+                // before the failure — sweep orphan entries by fingerprint.
+                for mut entry in self.cache.update_queries.iter_mut() {
+                    entry.queries.retain(|q| q.fingerprint != fingerprint);
                 }
             }
-
-            // Remove from state view
-            self.state_view.cached_queries.remove(&fingerprint);
-
-            // Notify coordinator to drain coalesced waiters (forward to origin)
-            let _ = self.notify_tx.send(WriterNotify::Failed { fingerprint });
-
-            self.relations_dirty = true;
-            debug!("cleaned up failed query {fingerprint}");
         }
+
+        self.state_view.cached_queries.remove(&fingerprint);
+        let _ = self.notify_tx.send(WriterNotify::Failed { fingerprint });
     }
 
     /// Handle a limit bump: re-populate with a higher limit.

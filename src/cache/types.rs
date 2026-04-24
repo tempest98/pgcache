@@ -214,6 +214,16 @@ impl Cache {
             .map(|min| min.saturating_sub(1))
             .unwrap_or(self.generation_counter)
     }
+
+    /// Drop `fingerprint`'s entries from `update_queries` for each given OID.
+    /// No-op for OIDs without an `update_queries` entry.
+    pub fn update_queries_remove_fingerprint(&mut self, fingerprint: u64, oids: &[u32]) {
+        for oid in oids {
+            if let Some(mut queries) = self.update_queries.get_mut(oid) {
+                queries.queries.retain(|q| q.fingerprint != fingerprint);
+            }
+        }
+    }
 }
 
 /// Shared set of relation OIDs that have active cached queries.

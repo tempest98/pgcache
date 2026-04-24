@@ -320,6 +320,18 @@ impl CacheWriter {
         }
     }
 
+    /// Revert `Scheduled { has_table }` → `Pending { has_table }` after an
+    /// outer-level `mv_build` error (e.g. `mv_gate_passes` failed). The cache
+    /// itself is intact and serving Ready; the next hit retries the build.
+    pub(super) fn mv_build_failed_reset(&self, fingerprint: u64) {
+        let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) else {
+            return;
+        };
+        if let MvState::Scheduled { has_table } = view.mv_state {
+            view.mv_state = MvState::Pending { has_table };
+        }
+    }
+
     /// Measure-gate: `result_rows × mv_size_ratio ≤ source_rows`.
     ///
     /// Runs `SELECT count(*) FROM (<query> LIMIT max_limit) x` against the

@@ -211,6 +211,7 @@ impl CacheWriter {
                     .await
                 {
                     error!("query register failed: {e} {fingerprint}");
+                    self.query_failed_cleanup(fingerprint);
                 }
             }
             QueryCommand::Ready {
@@ -236,18 +237,29 @@ impl CacheWriter {
                 trace!("command limit bump {fingerprint} max_limit={max_limit:?}");
                 if let Err(e) = self.limit_bump_handle(fingerprint, max_limit).await {
                     error!("limit bump failed: {e} {fingerprint}");
+                    // Forward rollback isn't reliable: by the time
+                    // `populate_work_dispatch` could fail, the writer has already
+                    // bumped generation/max_limit and the cache table rows are
+                    // stamped with the old generation. Tear down so reads aren't
+                    // served against an unpopulated new generation.
+                    self.query_failed_cleanup(fingerprint);
                 }
             }
             QueryCommand::Readmit { fingerprint } => {
                 trace!("command readmit {fingerprint}");
                 if let Err(e) = self.query_readmit(fingerprint, Instant::now()).await {
                     error!("pinned readmit failed: {e} {fingerprint}");
+                    self.query_failed_cleanup(fingerprint);
                 }
             }
             QueryCommand::MvBuild { fingerprint } => {
                 trace!("command mv build {fingerprint}");
                 if let Err(e) = self.mv_build(fingerprint).await {
                     error!("mv build failed: {e} {fingerprint}");
+                    // The cache itself is intact and serving Ready; only the MV
+                    // build path failed. Revert to Pending so the next hit retries
+                    // (matches mv_build's own SQL-error fallback at writer/mv.rs).
+                    self.mv_build_failed_reset(fingerprint);
                 }
             }
         }
@@ -618,12 +630,8 @@ impl CacheWriter {
 
         for fp in &stale_fingerprints {
             if let Some(query) = self.cache.cached_queries.remove1(fp) {
-                // Remove update queries
-                for oid in &query.relation_oids {
-                    if let Some(mut queries) = self.cache.update_queries.get_mut(oid) {
-                        queries.queries.retain(|q| q.fingerprint != *fp);
-                    }
-                }
+                self.cache
+                    .update_queries_remove_fingerprint(*fp, &query.relation_oids);
             }
         }
 
