@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ecow::EcoString;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio_util::bytes::BytesMut;
 use tracing::{error, info, instrument, trace};
@@ -79,6 +80,9 @@ pub struct WorkerRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
     pub resolved: SharedResolved,
+    /// Precomputed deparsed SQL body of `resolved`. Spliced into the SET +
+    /// body + LIMIT wire string the worker sends to the cache DB.
+    pub deparsed_sql: EcoString,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
     /// When true, read from `pgcache_mv.q_<fingerprint>` (MV fast path).
@@ -199,6 +203,7 @@ impl QueryCache {
                 state: CachedQueryState::Ready,
                 generation,
                 resolved: Some(resolved),
+                deparsed_sql: Some(deparsed_sql),
                 max_limit,
                 ..
             }) if limit_is_sufficient(*max_limit, rows_needed) => {
@@ -212,6 +217,7 @@ impl QueryCache {
                     fingerprint,
                     msg,
                     Arc::clone(resolved),
+                    deparsed_sql.clone(),
                     *generation,
                     mv_source,
                 )
@@ -332,10 +338,19 @@ impl QueryCache {
         fingerprint: u64,
         msg: QueryRequest,
         resolved: SharedResolved,
+        deparsed_sql: EcoString,
         generation: u64,
         mv_source: bool,
     ) -> CacheResult<()> {
-        self.worker_request_send_with(fingerprint, msg, resolved, generation, mv_source, vec![])
+        self.worker_request_send_with(
+            fingerprint,
+            msg,
+            resolved,
+            deparsed_sql,
+            generation,
+            mv_source,
+            vec![],
+        )
     }
 
     /// Inspect `mv_state` to decide whether this dispatch serves from the MV
@@ -386,11 +401,13 @@ impl QueryCache {
     }
 
     /// Build and send a WorkerRequest with coalesced clients attached.
+    #[allow(clippy::too_many_arguments)]
     fn worker_request_send_with(
         &self,
         fingerprint: u64,
         msg: QueryRequest,
         resolved: SharedResolved,
+        deparsed_sql: EcoString,
         generation: u64,
         mv_source: bool,
         coalesced: Vec<CoalescedClient>,
@@ -423,6 +440,7 @@ impl QueryCache {
                 query_type: msg.query_type,
                 data: msg.data,
                 resolved,
+                deparsed_sql,
                 generation,
                 mv_source,
                 result_formats: msg.result_formats,
@@ -479,6 +497,7 @@ impl QueryCache {
         fingerprint: u64,
         generation: u64,
         resolved: SharedResolved,
+        deparsed_sql: EcoString,
         max_limit: Option<u64>,
     ) {
         let Some(groups) = self.waiting.borrow_mut().remove(&fingerprint) else {
@@ -524,6 +543,7 @@ impl QueryCache {
                 fingerprint,
                 primary,
                 Arc::clone(&resolved),
+                deparsed_sql.clone(),
                 generation,
                 mv_source,
                 coalesced,
@@ -564,6 +584,7 @@ impl QueryCache {
                     state: CachedQueryState::Loading,
                     generation: 0,
                     resolved: None,
+                    deparsed_sql: None,
                     max_limit: None,
                     referenced: false,
                     // shape_gate is filled in by the writer after resolution; default
@@ -639,14 +660,21 @@ impl QueryCache {
             Ok(SubsumptionResult::Subsumed {
                 generation,
                 resolved,
-                ..
+                deparsed_sql,
             }) => {
                 self.metrics_hit_record(fingerprint);
                 // Subsumed queries have mv_state = MeasurePending (see Future Work:
                 // "MV first-pop for subsumed queries"); mv_dispatch_decide returns
                 // false and the serve goes through the fallthrough path.
                 let mv_source = self.mv_dispatch_decide(fingerprint);
-                self.worker_request_send(fingerprint, msg, resolved, generation, mv_source)
+                self.worker_request_send(
+                    fingerprint,
+                    msg,
+                    resolved,
+                    deparsed_sql,
+                    generation,
+                    mv_source,
+                )
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);
@@ -677,6 +705,7 @@ impl QueryCache {
                 state: initial_state,
                 generation: 0,
                 resolved: None,
+                deparsed_sql: None,
                 max_limit: None,
                 referenced: false,
                 // shape_gate is filled in by the writer after resolution; default

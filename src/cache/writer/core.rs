@@ -6,6 +6,7 @@ use std::time::Instant;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, spawn_local, yield_now};
+use ecow::EcoString;
 use tokio_postgres::{Client, Config, NoTls};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
@@ -411,6 +412,7 @@ impl CacheWriter {
         state: CachedQueryState,
         generation: u64,
         resolved: &SharedResolved,
+        deparsed_sql: &EcoString,
         max_limit: Option<u64>,
     ) {
         // Preserve shape_gate and mv_state across state transitions — the writer
@@ -424,6 +426,7 @@ impl CacheWriter {
                 v.state = state;
                 v.generation = generation;
                 v.resolved = Some(Arc::clone(resolved));
+                v.deparsed_sql = Some(deparsed_sql.clone());
                 v.max_limit = max_limit;
                 v.referenced = false;
             })
@@ -431,6 +434,7 @@ impl CacheWriter {
                 state,
                 generation,
                 resolved: Some(Arc::clone(resolved)),
+                deparsed_sql: Some(deparsed_sql.clone()),
                 max_limit,
                 referenced: false,
                 shape_gate: ShapeGate::Skip,

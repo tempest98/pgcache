@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::time::Instant;
 
 use tokio::io::AsyncWriteExt;
@@ -211,20 +212,24 @@ async fn handle_cached_query_text(
     #[cfg(feature = "hotpath")]
     let _m = hotpath::functions::MeasurementGuardSync::new("hcqt:deparse", false, false);
 
-    let combined_sql = if msg.mv_source {
+    // Assemble the wire SQL into the connection's recycled buffer to avoid
+    // per-request allocations. Format differs between MV and source-row paths.
+    conn.sql_buf.clear();
+    if msg.mv_source {
         // MV fast path: SELECT * FROM pgcache_mv.q_<fp> [ORDER BY] [LIMIT].
         // No generation SET — MV tables are not pgcache_pgrx-tracked.
-        let mut sql = mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref());
-        sql.push(';');
-        sql
+        conn.sql_buf
+            .push_str(&mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref()));
+        conn.sql_buf.push(';');
     } else {
-        let mut sql = String::new();
-        msg.resolved.deparse(&mut sql);
+        write!(conn.sql_buf, "SET mem.query_generation = {}; ", msg.generation)
+            .expect("write to String");
+        conn.sql_buf.push_str(&msg.deparsed_sql);
         if let Some(limit) = &msg.limit {
-            limit.deparse(&mut sql);
+            limit.deparse(&mut conn.sql_buf);
         }
-        format!("SET mem.query_generation = {}; {};", msg.generation, &sql)
-    };
+        conn.sql_buf.push(';');
+    }
 
     #[cfg(feature = "hotpath")]
     drop(_m);
@@ -233,11 +238,9 @@ async fn handle_cached_query_text(
     #[cfg(feature = "hotpath")]
     let _m = hotpath::functions::MeasurementGuardSync::new("hcqt:send_query", false, false);
 
-    conn.simple_query_send(&combined_sql)
-        .await
-        .inspect_err(|_| {
-            guard.poisoned = true;
-        })?;
+    conn.simple_query_send().await.inspect_err(|_| {
+        guard.poisoned = true;
+    })?;
 
     #[cfg(feature = "hotpath")]
     drop(_m);
@@ -253,6 +256,7 @@ async fn handle_cached_query_text(
         stream,
         read_buf,
         codec,
+        sql_buf,
     } = conn;
     let mut framed = FramedRead::new(stream, codec);
     *framed.read_buffer_mut() = read_buf;
@@ -372,6 +376,7 @@ async fn handle_cached_query_text(
         stream: parts.io,
         read_buf: parts.read_buf,
         codec: parts.codec,
+        sql_buf,
     });
     if let Err(e) = guard.release().await {
         if let Some(bc) = broadcast.take() {
@@ -455,13 +460,13 @@ async fn handle_cached_query_binary(
                 guard.poisoned = true;
             })?;
     } else {
-        let mut sql = String::new();
-        msg.resolved.deparse(&mut sql);
+        conn.sql_buf.clear();
+        conn.sql_buf.push_str(&msg.deparsed_sql);
         if let Some(limit) = &msg.limit {
-            limit.deparse(&mut sql);
+            limit.deparse(&mut conn.sql_buf);
         }
         let set_sql = format!("SET mem.query_generation = {}", msg.generation);
-        conn.pipelined_binary_query_send(&set_sql, &sql, include_describe)
+        conn.pipelined_binary_query_send(&set_sql, include_describe)
             .await
             .inspect_err(|_| {
                 guard.poisoned = true;
@@ -476,6 +481,7 @@ async fn handle_cached_query_binary(
         stream,
         read_buf,
         codec,
+        sql_buf,
     } = conn;
     let mut framed = FramedRead::new(stream, codec);
     *framed.read_buffer_mut() = read_buf;
@@ -595,6 +601,7 @@ async fn handle_cached_query_binary(
         stream: parts.io,
         read_buf: parts.read_buf,
         codec: parts.codec,
+        sql_buf,
     });
     if let Err(e) = guard.release().await {
         if let Some(bc) = broadcast.take() {

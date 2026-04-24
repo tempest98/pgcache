@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use ecow::EcoString;
 use tokio::sync::oneshot;
 use tokio_util::bytes::{Bytes, BytesMut};
 
@@ -19,6 +20,7 @@ pub enum SubsumptionResult {
     Subsumed {
         generation: u64,
         resolved: SharedResolved,
+        deparsed_sql: EcoString,
     },
     /// Not subsumed. Forward to origin; population dispatched if admit_action was Admit.
     NotSubsumed,
@@ -31,6 +33,7 @@ pub enum WriterNotify {
         fingerprint: u64,
         generation: u64,
         resolved: SharedResolved,
+        deparsed_sql: EcoString,
         max_limit: Option<u64>,
     },
     /// Population failed.

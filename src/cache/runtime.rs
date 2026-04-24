@@ -403,8 +403,8 @@ pub fn cache_run(
                             // Drain coalesced waiters when writer signals Ready/Failed
                             notify = notify_rx.recv() => {
                                 match notify {
-                                    Some(WriterNotify::Ready { fingerprint, generation, resolved, max_limit }) => {
-                                        qcache.waiting_drain_ready(fingerprint, generation, resolved, max_limit);
+                                    Some(WriterNotify::Ready { fingerprint, generation, resolved, deparsed_sql, max_limit }) => {
+                                        qcache.waiting_drain_ready(fingerprint, generation, resolved, deparsed_sql, max_limit);
                                     }
                                     Some(WriterNotify::Failed { fingerprint }) => {
                                         qcache.waiting_drain_failed(fingerprint);

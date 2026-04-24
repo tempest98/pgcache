@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use ecow::EcoString;
 use hdrhistogram::Histogram;
 
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
@@ -46,6 +47,11 @@ pub struct CachedQuery {
     pub relation_oids: Vec<u32>,
     pub query: QueryExpr,
     pub resolved: SharedResolved,
+    /// Deparsed SQL body of the resolved query. Computed once at registration
+    /// and reused on every non-MV cache hit to avoid per-request AST traversal.
+    /// Excludes LIMIT (which varies per request) and the `SET mem.query_generation`
+    /// prefix.
+    pub deparsed_sql: EcoString,
     /// Maximum rows cached for this fingerprint.
     /// `None` = all rows cached (query seen without LIMIT, or OFFSET-only).
     /// `Some(n)` = up to `n` rows cached (max LIMIT+OFFSET across all variants seen).
@@ -326,6 +332,9 @@ pub struct CachedQueryView {
     pub generation: u64,
     /// Resolved query (None for Loading placeholder before writer resolves)
     pub resolved: Option<SharedResolved>,
+    /// Precomputed deparsed SQL body (mirrors `CachedQuery.deparsed_sql`).
+    /// None while Loading; Some once the view transitions to Ready.
+    pub deparsed_sql: Option<EcoString>,
     /// Maximum rows cached for this fingerprint (None = all rows)
     pub max_limit: Option<u64>,
     /// CLOCK reference bit — set by coordinator on cache hit, read/cleared by writer during eviction

@@ -20,6 +20,10 @@ pub struct CacheConnection {
     pub stream: TcpStream,
     pub read_buf: BytesMut,
     pub codec: PgBackendMessageCodec,
+    /// Recycled SQL assembly buffer. The worker clears and rewrites this on every
+    /// cache hit (SET generation prefix + precomputed body + optional LIMIT),
+    /// avoiding per-request String allocations.
+    pub sql_buf: String,
 }
 
 impl CacheConnection {
@@ -36,6 +40,7 @@ impl CacheConnection {
             stream,
             read_buf: BytesMut::with_capacity(64 * 1024),
             codec: PgBackendMessageCodec::default(),
+            sql_buf: String::with_capacity(1024),
         };
 
         // Send startup message
@@ -108,16 +113,19 @@ impl CacheConnection {
         }
     }
 
-    /// Send a simple query message to the cache database.
-    pub async fn simple_query_send(&mut self, sql: &str) -> CacheResult<()> {
-        let msg = simple_query_message_build(sql);
+    /// Send `self.sql_buf` as a simple query message. Callers build the SQL
+    /// into the recycled buffer; this sidesteps split-borrow issues a
+    /// `&str`-taking variant would hit when the buffer lives on `self`.
+    pub async fn simple_query_send(&mut self) -> CacheResult<()> {
+        let msg = simple_query_message_build(&self.sql_buf);
         self.stream
             .write_all(&msg)
             .await
             .map_into_report::<CacheError>()
     }
 
-    /// Send a pipelined SET (simple query) + SELECT (extended query with binary results).
+    /// Send a pipelined SET (simple query) + SELECT (extended query with binary
+    /// results). The SELECT SQL comes from `self.sql_buf`.
     ///
     /// Pipelines all messages in a single write:
     /// - Q: SET query
@@ -129,13 +137,11 @@ impl CacheConnection {
     pub async fn pipelined_binary_query_send(
         &mut self,
         set_sql: &str,
-        select_sql: &str,
         include_describe: bool,
     ) -> CacheResult<()> {
         let set_msg = simple_query_message_build(set_sql);
-        let ext_msg = extended_query_binary_build(select_sql, include_describe);
+        let ext_msg = extended_query_binary_build(&self.sql_buf, include_describe);
 
-        // Pipeline both in a single write
         let mut combined = BytesMut::with_capacity(set_msg.len() + ext_msg.len());
         combined.extend_from_slice(&set_msg);
         combined.extend_from_slice(&ext_msg);

@@ -2,6 +2,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ecow::EcoString;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, instrument, trace};
 
@@ -66,6 +67,9 @@ fn update_eval_strategy_classify(
 /// Intermediate result from resolving a query before subsumption check or population.
 struct QueryResolution {
     resolved: SharedResolved,
+    /// Deparsed SQL body of `resolved`. Computed once here and reused on the
+    /// serving hot path; see `CachedQuery.deparsed_sql`.
+    deparsed_sql: EcoString,
     relation_oids: Vec<u32>,
     base_query: QueryExpr,
     max_limit: Option<u64>,
@@ -281,6 +285,7 @@ impl CacheWriter {
         relation_oids: Vec<u32>,
         base_query: QueryExpr,
         resolved: SharedResolved,
+        deparsed_sql: EcoString,
         max_limit: Option<u64>,
         started_at: Instant,
         pinned: bool,
@@ -295,6 +300,7 @@ impl CacheWriter {
             relation_oids,
             query: base_query,
             resolved,
+            deparsed_sql,
             max_limit,
             cached_bytes: 0,
             registration_started_at: Some(started_at),
@@ -326,6 +332,13 @@ impl CacheWriter {
                 .map(predicate_pushdown_apply)?,
         );
 
+        // Deparse once at registration. The output is a pure function of the
+        // resolved AST, so every cache hit can splice it in instead of
+        // re-running the deparse traversal.
+        let mut buf = String::with_capacity(256);
+        resolved.deparse(&mut buf);
+        let deparsed_sql: EcoString = buf.into();
+
         // Classify the shape once here; `query_register` and MV setup both reuse
         // the result via `QueryResolution.shape_gate` to avoid re-running
         // decorrelation + classification.
@@ -347,6 +360,7 @@ impl CacheWriter {
 
         Ok(QueryResolution {
             resolved,
+            deparsed_sql,
             relation_oids,
             base_query,
             max_limit,
@@ -420,7 +434,7 @@ impl CacheWriter {
         resolution: QueryResolution,
         started_at: Instant,
         pinned: bool,
-    ) -> CacheResult<Option<(u64, SharedResolved)>> {
+    ) -> CacheResult<Option<(u64, SharedResolved, EcoString)>> {
         let subsume_start = Instant::now();
 
         let (generation, relations_changed) = self.cached_query_insert(
@@ -428,6 +442,7 @@ impl CacheWriter {
             resolution.relation_oids,
             resolution.base_query,
             Arc::clone(&resolution.resolved),
+            resolution.deparsed_sql.clone(),
             resolution.max_limit,
             started_at,
             pinned,
@@ -449,12 +464,9 @@ impl CacheWriter {
             return Ok(None);
         }
 
-        let mut sql = String::with_capacity(512);
-        resolution.resolved.deparse(&mut sql);
-
         let cache_exec_result = self
             .db_cache
-            .query(&sql, &[])
+            .query(resolution.deparsed_sql.as_str(), &[])
             .await
             .map_into_report::<CacheError>();
 
@@ -475,6 +487,7 @@ impl CacheWriter {
             CachedQueryState::Ready,
             generation,
             &resolution.resolved,
+            &resolution.deparsed_sql,
             resolution.max_limit,
         );
 
@@ -495,7 +508,7 @@ impl CacheWriter {
             .record(subsume_start.elapsed().as_secs_f64());
 
         debug!("query subsumed {fingerprint}");
-        Ok(Some((generation, resolution.resolved)))
+        Ok(Some((generation, resolution.resolved, resolution.deparsed_sql)))
     }
 
     /// Registers a query in the cache. Checks subsumption first — if the data
@@ -547,10 +560,11 @@ impl CacheWriter {
                 .query_subsume(fingerprint, resolution, started_at, pinned)
                 .await?
             {
-                Some((generation, resolved)) => {
+                Some((generation, resolved, deparsed_sql)) => {
                     let _ = subsumption_tx.send(SubsumptionResult::Subsumed {
                         generation,
                         resolved,
+                        deparsed_sql,
                     });
                     return Ok(());
                 }
@@ -598,6 +612,7 @@ impl CacheWriter {
             resolution.relation_oids,
             resolution.base_query,
             Arc::clone(&resolution.resolved),
+            resolution.deparsed_sql,
             resolution.max_limit,
             started_at,
             pinned,
@@ -648,6 +663,7 @@ impl CacheWriter {
         };
 
         let resolved = Arc::clone(&cached.resolved);
+        let deparsed_sql = cached.deparsed_sql.clone();
         let max_limit = cached.max_limit;
 
         cached.generation = new_generation;
@@ -665,6 +681,7 @@ impl CacheWriter {
             CachedQueryState::Loading,
             new_generation,
             &resolved,
+            &deparsed_sql,
             max_limit,
         );
 
@@ -685,6 +702,7 @@ impl CacheWriter {
             Some((
                 query.generation,
                 Arc::clone(&query.resolved),
+                query.deparsed_sql.clone(),
                 query.max_limit,
                 started_at,
             ))
@@ -692,7 +710,7 @@ impl CacheWriter {
             None
         };
 
-        if let Some((generation, resolved, max_limit, started_at)) = update_info {
+        if let Some((generation, resolved, deparsed_sql, max_limit, started_at)) = update_info {
             // Record registration latency metric
             let population_duration_us = started_at.map(|s| {
                 let latency = s.elapsed();
@@ -716,6 +734,7 @@ impl CacheWriter {
                 CachedQueryState::Ready,
                 generation,
                 &resolved,
+                &deparsed_sql,
                 max_limit,
             );
             // Notify coordinator to drain coalesced waiters
@@ -723,6 +742,7 @@ impl CacheWriter {
                 fingerprint,
                 generation,
                 resolved,
+                deparsed_sql,
                 max_limit,
             });
 
@@ -786,6 +806,7 @@ impl CacheWriter {
 
         // Collect data needed before mutating
         let resolved = Arc::clone(&cached_query.resolved);
+        let deparsed_sql = cached_query.deparsed_sql.clone();
         let relation_oids = cached_query.relation_oids.clone();
         let old_generation = cached_query.generation;
 
@@ -821,6 +842,7 @@ impl CacheWriter {
             CachedQueryState::Loading,
             new_generation,
             &resolved,
+            &deparsed_sql,
             new_max_limit,
         );
 
