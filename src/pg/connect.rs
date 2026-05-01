@@ -4,8 +4,9 @@
 //! connections to PostgreSQL databases with optional TLS support.
 
 use tokio_postgres::{Client, Config, Error, NoTls};
-use tracing::error;
+use tracing::{debug, error, warn};
 
+use crate::result::error_chain_format;
 use crate::settings::{PgSettings, SslMode};
 use crate::tls;
 
@@ -32,7 +33,23 @@ pub fn config_build(settings: &PgSettings) -> Config {
 /// to identify the connection source.
 pub async fn connect(settings: &PgSettings, context: &str) -> Result<Client, Error> {
     let config = config_build(settings);
-    config_connect(config, settings.ssl_mode, context).await
+    debug!(
+        "[{context}] connecting to postgres {}:{} db={} user={} ssl={:?}",
+        settings.host, settings.port, settings.database, settings.user, settings.ssl_mode
+    );
+    let result = config_connect(config, settings.ssl_mode, context).await;
+    if let Err(ref e) = result {
+        warn!(
+            "[{context}] connection failed to {}:{} db={} user={} ssl={:?}: {}",
+            settings.host,
+            settings.port,
+            settings.database,
+            settings.user,
+            settings.ssl_mode,
+            error_chain_format(e),
+        );
+    }
+    result
 }
 
 /// Connect using an existing Config with the specified SSL mode.
@@ -54,8 +71,12 @@ pub async fn config_connect(
             let (client, connection) = config.connect(NoTls).await?;
             let context = context.to_owned();
             tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("{context} connection error: {e}");
+                match connection.await {
+                    Ok(()) => debug!("[{context}] connection task ended"),
+                    Err(e) => error!(
+                        "[{context}] connection task error: {}",
+                        error_chain_format(&e)
+                    ),
                 }
             });
             Ok(client)
@@ -65,8 +86,12 @@ pub async fn config_connect(
             let (client, connection) = config.connect(tls_connector).await?;
             let context = context.to_owned();
             tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    error!("{context} connection error: {e}");
+                match connection.await {
+                    Ok(()) => debug!("[{context}] connection task ended"),
+                    Err(e) => error!(
+                        "[{context}] connection task error: {}",
+                        error_chain_format(&e)
+                    ),
                 }
             });
             Ok(client)

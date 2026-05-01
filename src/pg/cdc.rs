@@ -4,9 +4,9 @@ use rootcause::Report;
 use std::io;
 use tokio_postgres::config::ReplicationMode;
 use tokio_postgres::{Client, Error};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::result::{MapIntoReport, ReportExt};
+use crate::result::{MapIntoReport, ReportExt, error_chain_format};
 use crate::settings::{PgSettings, Settings};
 
 use super::connect::{config_build, config_connect, connect};
@@ -164,5 +164,21 @@ pub async fn slot_confirmed_lsn(settings: &Settings) -> PgCdcResult<Option<u64>>
 pub async fn connect_replication(settings: &PgSettings, context: &str) -> Result<Client, Error> {
     let mut config = config_build(settings);
     config.replication_mode(ReplicationMode::Logical);
-    config_connect(config, settings.ssl_mode, context).await
+    debug!(
+        "[{context}] connecting to postgres (replication=logical) {}:{} db={} user={} ssl={:?}",
+        settings.host, settings.port, settings.database, settings.user, settings.ssl_mode
+    );
+    let result = config_connect(config, settings.ssl_mode, context).await;
+    if let Err(ref e) = result {
+        warn!(
+            "[{context}] replication connection failed to {}:{} db={} user={} ssl={:?}: {}",
+            settings.host,
+            settings.port,
+            settings.database,
+            settings.user,
+            settings.ssl_mode,
+            error_chain_format(e),
+        );
+    }
+    result
 }

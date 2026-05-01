@@ -106,6 +106,22 @@ impl<T, E> MapIntoReport<T, E> for Result<T, E> {
     }
 }
 
+/// Format an error along with its full `source()` chain as `top: cause: cause...`.
+///
+/// `tokio_postgres::Error` and similar wrapper errors hide the useful detail
+/// (SQLSTATE, message, IO cause) behind `source()`. Plain `Display` produces
+/// uninformative strings like "db error". This walker surfaces the full chain.
+pub fn error_chain_format(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
 

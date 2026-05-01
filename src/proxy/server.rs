@@ -66,11 +66,17 @@ impl<'scope> ProxyCacheState<'scope> {
         self.updater.sender_clear();
         self.status_updater.sender_clear();
 
-        let exit_result = self.handle.take().map(|h| h.join());
-        error!(
-            "cache thread exited (attempt {}): {:?}",
-            self.attempts, exit_result
-        );
+        let attempts = self.attempts;
+        match self.handle.take().map(|h| h.join()) {
+            None => error!("cache thread exited (attempt {attempts}): no join handle"),
+            Some(Err(_panic)) => {
+                error!("cache thread exited (attempt {attempts}): thread panicked")
+            }
+            Some(Ok(Ok(()))) => {
+                error!("cache thread exited (attempt {attempts}): unexpected clean exit")
+            }
+            Some(Ok(Err(e))) => error!("cache thread exited (attempt {attempts}): {e}"),
+        }
 
         self.backoff_schedule();
     }

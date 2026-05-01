@@ -281,7 +281,7 @@ pub fn cache_run(
         let _writer_handle = thread::Builder::new()
             .name("cache writer".to_owned())
             .spawn_scoped(scope, move || {
-                writer_run(
+                let result = writer_run(
                     &settings_writer,
                     query_rx,
                     cdc_cmd_rx,
@@ -290,7 +290,11 @@ pub fn cache_run(
                     notify_tx,
                     cancel_writer,
                     status_rx,
-                )
+                );
+                if let Err(ref e) = result {
+                    error!("writer thread exiting with error: {e}");
+                }
+                result
             })
             .map_into_report::<CacheError>()
             .attach_loc("spawning writer thread")?;
@@ -301,7 +305,11 @@ pub fn cache_run(
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
             .spawn_scoped(scope, || {
-                worker_run(settings, worker_rx, worker_metrics_tx, cancel_worker)
+                let result = worker_run(settings, worker_rx, worker_metrics_tx, cancel_worker);
+                if let Err(ref e) = result {
+                    error!("worker thread exiting with error: {e}");
+                }
+                result
             })
             .map_into_report::<CacheError>()
             .attach_loc("spawning worker thread")?;
@@ -313,13 +321,17 @@ pub fn cache_run(
         let _cdc_handle = thread::Builder::new()
             .name("cdc worker".to_owned())
             .spawn_scoped(scope, move || {
-                cdc_run(
+                let result = cdc_run(
                     settings,
                     cdc_cmd_tx,
                     active_relations_cdc,
                     cancel_cdc,
                     cdc_signal_tx,
-                )
+                );
+                if let Err(ref e) = result {
+                    error!("cdc thread exiting with error: {e}");
+                }
+                result
             })
             .map_into_report::<CacheError>()
             .attach_loc("spawning CDC thread")?;
@@ -533,6 +545,7 @@ fn cdc_run(
             CdcProcessor::new(settings, cdc_tx.clone(), Arc::clone(&active_relations))
                 .await
                 .attach_loc("initializing CDC processor")?;
+        debug!("CDC processor initialized, entering stream loop");
 
         loop {
             let stream_result = cdc.run(cancel.clone()).await;
