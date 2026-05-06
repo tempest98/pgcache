@@ -27,6 +27,7 @@ use tracing::{debug, error, trace};
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata, cache_type_name_resolve};
 use crate::metrics::names;
 use crate::pg::cdc::connect_replication;
+use crate::result::error_chain_format;
 use crate::settings::Settings;
 
 use super::{
@@ -118,14 +119,17 @@ impl CdcProcessor {
                     match msg_result {
                         Some(Ok(msg)) => {
                             if let Err(e) = self.process_replication_message(msg, stream.as_mut()).await {
-                                error!("Error processing replication message: {}", e);
+                                error!(
+                                    "Error processing replication message: {}",
+                                    error_chain_format(&e),
+                                );
                                 // Continue processing despite errors
                             }
                             // Flush LSN progress to PostgreSQL periodically while processing
                             self.status_update_throttled(stream.as_mut()).await;
                         }
                         Some(Err(e)) => {
-                            error!("Replication stream error: {}", e);
+                            error!("Replication stream error: {}", error_chain_format(&e));
                             return Err(e);
                         }
                         None => {
@@ -138,7 +142,10 @@ impl CdcProcessor {
                 _ = self.keep_alive_timer.tick() => {
                     debug!("Keep-alive timer tick - sending periodic status update");
                     if let Err(e) = self.send_standby_status_update(stream.as_mut(), false).await {
-                        error!("Error sending periodic keep-alive: {}", e);
+                        error!(
+                            "Error sending periodic keep-alive: {}",
+                            error_chain_format(&e),
+                        );
                         // Continue despite keep-alive errors (graceful degradation)
                     }
                 }
@@ -195,7 +202,10 @@ impl CdcProcessor {
             .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
 
         if should_send && let Err(e) = self.send_standby_status_update(stream, false).await {
-            error!("Error sending throttled status update: {e}");
+            error!(
+                "Error sending throttled status update: {}",
+                error_chain_format(&e),
+            );
         }
     }
 

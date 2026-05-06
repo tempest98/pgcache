@@ -27,6 +27,7 @@ use crate::{
     },
     metrics::names,
     pg::{cache_connection::CacheConnection, cdc::slot_confirmed_lsn},
+    result::error_chain_format,
     settings::Settings,
     timing::duration_to_us_u64,
 };
@@ -50,7 +51,10 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
                 pipeline: proxy_msg.pipeline,
             };
             if let Err(e) = qcache.query_dispatch(request).await {
-                error!("query dispatch failed: {e}");
+                error!(
+                    "query dispatch failed: {}",
+                    error_chain_format(e.current_context()),
+                );
             }
         }
         Err((e, data)) => {
@@ -108,7 +112,10 @@ async fn handle_worker_request(
             CacheReply::Complete(Some(msg.timing))
         }
         Err(e) => {
-            error!("handle_cached_query failed: {e}");
+            error!(
+                "handle_cached_query failed: {}",
+                error_chain_format(e.current_context()),
+            );
             // Coalesced clients already received Error replies inside the worker
             let error_buf = msg
                 .forward_bytes
@@ -173,7 +180,7 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
 
         tokio::spawn(async move {
             if let Err(e) = admin_conn.await {
-                error!("admin connection error: {e}");
+                error!("admin connection error: {}", error_chain_format(&e));
             }
         });
 
@@ -217,7 +224,7 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
 
         tokio::spawn(async move {
             if let Err(e) = cache_conn.await {
-                error!("cache connection error: {e}");
+                error!("cache connection error: {}", error_chain_format(&e));
             }
         });
 
@@ -294,7 +301,10 @@ pub fn cache_run(
                     status_rx,
                 );
                 if let Err(ref e) = result {
-                    error!("writer thread exiting with error: {e}");
+                    error!(
+                        "writer thread exiting with error: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
                 result
             })
@@ -309,7 +319,10 @@ pub fn cache_run(
             .spawn_scoped(scope, || {
                 let result = worker_run(settings, worker_rx, worker_metrics_tx, cancel_worker);
                 if let Err(ref e) = result {
-                    error!("worker thread exiting with error: {e}");
+                    error!(
+                        "worker thread exiting with error: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
                 result
             })
@@ -331,7 +344,10 @@ pub fn cache_run(
                     cdc_signal_tx,
                 );
                 if let Err(ref e) = result {
-                    error!("cdc thread exiting with error: {e}");
+                    error!(
+                        "cdc thread exiting with error: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
                 result
             })
@@ -564,9 +580,10 @@ fn cdc_run(
                 Ok(()) => warn!(
                     "CDC stream ended unexpectedly (last_flushed_lsn: {saved_lsn})"
                 ),
-                Err(e) => {
-                    warn!("CDC stream error (last_flushed_lsn: {saved_lsn}): {e}")
-                }
+                Err(e) => warn!(
+                    "CDC stream error (last_flushed_lsn: {saved_lsn}): {}",
+                    error_chain_format(e),
+                ),
             }
 
             // Signal coordinator to forward all queries to origin
@@ -612,7 +629,10 @@ fn cdc_run(
                         return Err(CacheError::CdcFailure.into());
                     }
                     Err(e) => {
-                        error!("slot LSN check failed: {e}");
+                        error!(
+                            "slot LSN check failed: {}",
+                            error_chain_format(e.current_context()),
+                        );
                         backoff = (backoff * 2).min(CDC_MAX_BACKOFF);
                         continue;
                     }
@@ -635,7 +655,10 @@ fn cdc_run(
                         break; // Back to outer loop to run the stream
                     }
                     Err(e) => {
-                        error!("CDC reconnect failed: {e}");
+                        error!(
+                            "CDC reconnect failed: {}",
+                            error_chain_format(e.current_context()),
+                        );
                         backoff = (backoff * 2).min(CDC_MAX_BACKOFF);
                         continue;
                     }

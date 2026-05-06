@@ -19,6 +19,7 @@ use crate::metrics::names;
 use crate::pg;
 use crate::query::ast::Deparse;
 use crate::query::resolved::ResolvedSelectNode;
+use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, Settings};
 
 use super::super::{
@@ -98,7 +99,7 @@ impl CacheWriter {
 
         tokio::spawn(async move {
             if let Err(e) = cache_connection.await {
-                error!("writer cache connection error: {e}");
+                error!("writer cache connection error: {}", error_chain_format(&e));
             }
         });
 
@@ -130,7 +131,10 @@ impl CacheWriter {
 
             tokio::spawn(async move {
                 if let Err(e) = cache_conn_task.await {
-                    error!("population worker {i} connection error: {e}");
+                    error!(
+                        "population worker {i} connection error: {}",
+                        error_chain_format(&e),
+                    );
                 }
             });
 
@@ -160,7 +164,10 @@ impl CacheWriter {
 
             tokio::spawn(async move {
                 if let Err(e) = pool_conn_task.await {
-                    error!("cache pool connection {i} error: {e}");
+                    error!(
+                        "cache pool connection {i} error: {}",
+                        error_chain_format(&e),
+                    );
                 }
             });
 
@@ -211,7 +218,10 @@ impl CacheWriter {
                     )
                     .await
                 {
-                    error!("query register failed: {e} {fingerprint}");
+                    error!(
+                        "query register failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
                     self.query_failed_cleanup(fingerprint);
                 }
             }
@@ -237,7 +247,10 @@ impl CacheWriter {
             } => {
                 trace!("command limit bump {fingerprint} max_limit={max_limit:?}");
                 if let Err(e) = self.limit_bump_handle(fingerprint, max_limit).await {
-                    error!("limit bump failed: {e} {fingerprint}");
+                    error!(
+                        "limit bump failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
                     // Forward rollback isn't reliable: by the time
                     // `populate_work_dispatch` could fail, the writer has already
                     // bumped generation/max_limit and the cache table rows are
@@ -249,14 +262,20 @@ impl CacheWriter {
             QueryCommand::Readmit { fingerprint } => {
                 trace!("command readmit {fingerprint}");
                 if let Err(e) = self.query_readmit(fingerprint, Instant::now()).await {
-                    error!("pinned readmit failed: {e} {fingerprint}");
+                    error!(
+                        "pinned readmit failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
                     self.query_failed_cleanup(fingerprint);
                 }
             }
             QueryCommand::MvBuild { fingerprint } => {
                 trace!("command mv build {fingerprint}");
                 if let Err(e) = self.mv_build(fingerprint).await {
-                    error!("mv build failed: {e} {fingerprint}");
+                    error!(
+                        "mv build failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
                     // The cache itself is intact and serving Ready; only the MV
                     // build path failed. Revert to Pending so the next hit retries
                     // (matches mv_build's own SQL-error fallback at writer/mv.rs).
@@ -274,7 +293,10 @@ impl CacheWriter {
         match cmd {
             CdcCommand::TableRegister(table_metadata) => {
                 if let Err(e) = self.cache_table_register(table_metadata).await {
-                    error!("table register failed: {e}");
+                    error!(
+                        "table register failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
             }
             CdcCommand::Insert {
@@ -282,7 +304,10 @@ impl CacheWriter {
                 row_data,
             } => {
                 if let Err(e) = self.handle_insert(relation_oid, row_data).await {
-                    error!("cdc insert failed: {e}");
+                    error!(
+                        "cdc insert failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
             }
             CdcCommand::Update {
@@ -291,7 +316,10 @@ impl CacheWriter {
                 row_data,
             } => {
                 if let Err(e) = self.handle_update(relation_oid, key_data, row_data).await {
-                    error!("cdc update failed: {e}");
+                    error!(
+                        "cdc update failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
             }
             CdcCommand::Delete {
@@ -299,12 +327,18 @@ impl CacheWriter {
                 row_data,
             } => {
                 if let Err(e) = self.handle_delete(relation_oid, row_data).await {
-                    error!("cdc delete failed: {e}");
+                    error!(
+                        "cdc delete failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
             }
             CdcCommand::Truncate { relation_oids } => {
                 if let Err(e) = self.handle_truncate(&relation_oids).await {
-                    error!("cdc truncate failed: {e}");
+                    error!(
+                        "cdc truncate failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
                 }
             }
         }
@@ -888,7 +922,10 @@ pub fn writer_run(
                             match msg {
                                 Some(cmd) => {
                                     if let Err(e) = writer.query_command_handle(cmd).await {
-                                        error!("writer query command failed: {e}");
+                                        error!(
+                                            "writer query command failed: {}",
+                                            error_chain_format(e.current_context()),
+                                        );
                                     }
                                 }
                                 None => {
@@ -902,7 +939,10 @@ pub fn writer_run(
                             match msg {
                                 Some(cmd) => {
                                     if let Err(e) = writer.cdc_command_handle(cmd).await {
-                                        error!("writer cdc command failed: {e}");
+                                        error!(
+                                            "writer cdc command failed: {}",
+                                            error_chain_format(e.current_context()),
+                                        );
                                     }
                                 }
                                 None => {
@@ -916,7 +956,10 @@ pub fn writer_run(
                             match msg {
                                 Some(cmd) => {
                                     if let Err(e) = writer.query_command_handle(cmd).await {
-                                        error!("writer internal command failed: {e}");
+                                        error!(
+                                            "writer internal command failed: {}",
+                                            error_chain_format(e.current_context()),
+                                        );
                                     }
                                 }
                                 None => {

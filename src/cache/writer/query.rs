@@ -18,6 +18,7 @@ use crate::query::resolved::{
 };
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
+use crate::result::error_chain_format;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 use super::super::{
@@ -461,7 +462,10 @@ impl CacheWriter {
             .await
             .map_into_report::<CacheError>()
         {
-            error!("subsumption generation set failed: {e}");
+            error!(
+                "subsumption generation set failed: {}",
+                error_chain_format(e.current_context()),
+            );
             return Ok(None);
         }
 
@@ -478,7 +482,10 @@ impl CacheWriter {
             .await;
 
         if let Err(e) = cache_exec_result {
-            error!("subsumption cache query failed: {e}");
+            error!(
+                "subsumption cache query failed: {}",
+                error_chain_format(e.current_context()),
+            );
             return Ok(None);
         }
 

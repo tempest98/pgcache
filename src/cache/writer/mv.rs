@@ -20,6 +20,7 @@ use tracing::{debug, error, trace};
 
 use crate::metrics::names;
 use crate::query::ast::Deparse;
+use crate::result::error_chain_format;
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
@@ -105,7 +106,13 @@ impl CacheWriter {
                 "creating MV table on first build"
             })
         {
-            error!("mv build failed for {fingerprint}: {e}");
+            // error_chain_format walks source() so the postgres SQLSTATE +
+            // message survives — the bare Display on tokio_postgres::Error
+            // is just "db error".
+            error!(
+                "mv build failed for {fingerprint}: {}",
+                error_chain_format(e.current_context()),
+            );
             let cleanup = if has_table {
                 "ROLLBACK; SET mem.query_generation = 0;".to_owned()
             } else {
@@ -285,7 +292,10 @@ impl CacheWriter {
                 .map_into_report::<CacheError>()
                 .attach_loc("truncating dirty MV in eviction sweep")
             {
-                error!("mv dirty-sweep truncate failed for {fingerprint}: {e}");
+                error!(
+                    "mv dirty-sweep truncate failed for {fingerprint}: {}",
+                    error_chain_format(e.current_context()),
+                );
             } else {
                 metrics::counter!(names::CACHE_MV_DIRTY_TRUNCATES).increment(1);
             }

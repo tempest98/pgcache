@@ -13,6 +13,7 @@ use tracing::{error, info, instrument, trace};
 use crate::metrics::names;
 use crate::proxy::ClientSocket;
 use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprint};
+use crate::result::error_chain_format;
 use crate::settings::{Allowlist, CachePolicy, DynamicConfig, DynamicConfigHandle, Settings};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
 
@@ -550,7 +551,10 @@ impl QueryCache {
                 mv_source,
                 coalesced,
             ) {
-                error!("coalesce serve failed: {e}");
+                error!(
+                    "coalesce serve failed: {}",
+                    error_chain_format(e.current_context()),
+                );
             }
         }
 

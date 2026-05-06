@@ -26,6 +26,7 @@ use super::super::types::{
 };
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::CacheWriter;
+use crate::result::error_chain_format;
 
 /// Default capacity for dynamically built SQL strings.
 const SQL_BUFFER_CAPACITY: usize = 1024;
@@ -325,7 +326,10 @@ impl CacheWriter {
         if let Some(mv_state) = mv_state
             && let Err(e) = self.mv_drop(fingerprint, mv_state).await
         {
-            error!("mv drop on eviction failed for {fingerprint}: {e}");
+            error!(
+                "mv drop on eviction failed for {fingerprint}: {}",
+                error_chain_format(e.current_context()),
+            );
         }
 
         // Remove from state view
@@ -882,7 +886,10 @@ impl CacheWriter {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        error!("sql execution error for fingerprint {fingerprint}: {e}");
+                        error!(
+                            "sql execution error for fingerprint {fingerprint}: {}",
+                            error_chain_format(&e),
+                        );
                         batch_error = Some(CacheError::PgError(e));
                     }
                 }
