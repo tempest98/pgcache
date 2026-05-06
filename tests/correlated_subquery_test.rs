@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 //! Correlated subquery caching tests (EXISTS, NOT EXISTS, IN, NOT IN, scalar).
 //!
 //! Correlated subqueries reference columns from the outer query. pgcache

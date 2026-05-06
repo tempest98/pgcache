@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 use std::io::Error;
 use std::time::Duration;
 
@@ -51,9 +48,7 @@ async fn test_request_coalescing() -> Result<(), Error> {
     let mut handles = Vec::with_capacity(num_clients);
     for client in clients {
         let q = query_str.to_owned();
-        handles.push(tokio::spawn(async move {
-            client.simple_query(&q).await
-        }));
+        handles.push(tokio::spawn(async move { client.simple_query(&q).await }));
     }
 
     // Wait for all queries to complete
@@ -120,9 +115,7 @@ async fn test_register_failure_drains_waiters() -> Result<(), Error> {
     let mut handles = Vec::with_capacity(num_clients);
     for client in clients {
         let q = sql.to_owned();
-        handles.push(tokio::spawn(
-            async move { client.simple_query(&q).await },
-        ));
+        handles.push(tokio::spawn(async move { client.simple_query(&q).await }));
     }
 
     // Bound the wait — bug shape is "later clients coalesce and hang forever".

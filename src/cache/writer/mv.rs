@@ -195,7 +195,7 @@ impl CacheWriter {
                 .await
                 .map_into_report::<CacheError>()
                 .attach_loc("counting cache table rows for MV size gate")?;
-            total = total.saturating_add(row.get::<_, i64>(0).max(0) as u64);
+            total = total.saturating_add(u64::try_from(row.get::<_, i64>(0)).unwrap_or(0));
         }
         Ok(total)
     }
@@ -366,7 +366,7 @@ impl CacheWriter {
         let row = result
             .map_into_report::<CacheError>()
             .attach_loc("executing MV size gate count")?;
-        let result_rows = row.get::<_, i64>(0).max(0) as u64;
+        let result_rows = u64::try_from(row.get::<_, i64>(0)).unwrap_or(0);
 
         Ok(result_rows.saturating_mul(ratio) <= source_rows)
     }

@@ -1,5 +1,5 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
+// SimpleQueryMessage is #[non_exhaustive], so a wildcard arm is unavoidable.
+#![allow(clippy::wildcard_enum_match_arm)]
 
 //! Integration tests for the materialized-results feature.
 //!
@@ -22,9 +22,7 @@
 
 use std::io::Error;
 
-use crate::util::{
-    TestContext, connect_cache_db, metrics_delta, wait_cache_load, wait_for_cdc,
-};
+use crate::util::{TestContext, connect_cache_db, metrics_delta, wait_cache_load, wait_for_cdc};
 
 mod util;
 
@@ -64,9 +62,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     }
 
     // --- First query: cache miss, forwarded to origin. MV doesn't exist yet.
-    let row = ctx
-        .query_one("SELECT count(*) FROM mv_count", &[])
-        .await?;
+    let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;
     assert_eq!(row.get::<_, i64>(0), 20);
 
     // Wait for source-row population. MV is still MeasurePending.
@@ -80,9 +76,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     // --- Second query: cache hit on MeasurePending → schedules first-pop and
     // falls through to source-row eval.
     let m1 = ctx.metrics().await?;
-    let row = ctx
-        .query_one("SELECT count(*) FROM mv_count", &[])
-        .await?;
+    let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;
     assert_eq!(row.get::<_, i64>(0), 20);
     let m2 = ctx.metrics().await?;
     let d = metrics_delta(&m1, &m2);
@@ -100,9 +94,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
 
     // --- Third query: MV fast-path hit.
     let m2b = ctx.metrics().await?;
-    let row = ctx
-        .query_one("SELECT count(*) FROM mv_count", &[])
-        .await?;
+    let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;
     assert_eq!(row.get::<_, i64>(0), 20);
     let m2c = ctx.metrics().await?;
     let d = metrics_delta(&m2b, &m2c);
@@ -115,9 +107,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     wait_for_cdc().await;
 
     let m3 = ctx.metrics().await?;
-    let row = ctx
-        .query_one("SELECT count(*) FROM mv_count", &[])
-        .await?;
+    let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;
     assert_eq!(
         row.get::<_, i64>(0),
         21,
@@ -140,9 +130,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     );
 
     // --- Third query: MV should be Fresh again.
-    let row = ctx
-        .query_one("SELECT count(*) FROM mv_count", &[])
-        .await?;
+    let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;
     assert_eq!(row.get::<_, i64>(0), 21);
     let m6 = ctx.metrics().await?;
     let d = metrics_delta(&m5, &m6);
@@ -355,8 +343,7 @@ async fn test_mv_window_materialize() -> Result<(), Error> {
     assert_eq!(d.cache_mv_fallthrough, 0);
 
     // ---- sum(value) OVER (PARTITION BY category) — per-partition sum.
-    let sum_sql =
-        "SELECT id, category, sum(value) OVER (PARTITION BY category) FROM mv_win_sum";
+    let sum_sql = "SELECT id, category, sum(value) OVER (PARTITION BY category) FROM mv_win_sum";
 
     let res = ctx.simple_query(sum_sql).await?;
     let rows: Vec<(i32, String, i64)> = res
@@ -511,7 +498,11 @@ async fn test_mv_order_by_top_n() -> Result<(), Error> {
         .collect();
     assert_eq!(
         data_rows,
-        vec![("a".to_owned(), 100), ("b".to_owned(), 70), ("c".to_owned(), 50)],
+        vec![
+            ("a".to_owned(), 100),
+            ("b".to_owned(), 70),
+            ("c".to_owned(), 50)
+        ],
         "first query (origin): top 3 groups by count DESC"
     );
 
@@ -536,7 +527,11 @@ async fn test_mv_order_by_top_n() -> Result<(), Error> {
         .collect();
     assert_eq!(
         data_rows,
-        vec![("a".to_owned(), 100), ("b".to_owned(), 70), ("c".to_owned(), 50)],
+        vec![
+            ("a".to_owned(), 100),
+            ("b".to_owned(), 70),
+            ("c".to_owned(), 50)
+        ],
         "MV fast path must return same top-3 in same order"
     );
     let m2 = ctx.metrics().await?;
@@ -605,7 +600,11 @@ async fn test_mv_order_by_alias() -> Result<(), Error> {
         .collect();
     assert_eq!(
         data_rows,
-        vec![("a".to_owned(), 50), ("b".to_owned(), 30), ("c".to_owned(), 10)],
+        vec![
+            ("a".to_owned(), 50),
+            ("b".to_owned(), 30),
+            ("c".to_owned(), 10)
+        ],
         "first query (origin): ordered by alias DESC"
     );
 
@@ -630,12 +629,19 @@ async fn test_mv_order_by_alias() -> Result<(), Error> {
         .collect();
     assert_eq!(
         data_rows,
-        vec![("a".to_owned(), 50), ("b".to_owned(), 30), ("c".to_owned(), 10)],
+        vec![
+            ("a".to_owned(), 50),
+            ("b".to_owned(), 30),
+            ("c".to_owned(), 10)
+        ],
         "MV fast path must preserve alias-ordered results"
     );
     let m2 = ctx.metrics().await?;
     let d = metrics_delta(&m1, &m2);
-    assert_eq!(d.cache_mv_hits, 1, "expected MV hit for alias-ordered query");
+    assert_eq!(
+        d.cache_mv_hits, 1,
+        "expected MV hit for alias-ordered query"
+    );
     assert_eq!(d.cache_mv_fallthrough, 0);
 
     Ok(())

@@ -1042,8 +1042,7 @@ pub fn query_expr_fingerprint(query: &QueryExpr) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
-    #![allow(clippy::unwrap_used)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use std::{collections::HashSet, panic};

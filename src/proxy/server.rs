@@ -532,7 +532,6 @@ pub fn proxy_run(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
 
     use std::collections::HashMap;
 

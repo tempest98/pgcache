@@ -28,6 +28,7 @@ use crate::{
     metrics::names,
     pg::{cache_connection::CacheConnection, cdc::slot_confirmed_lsn},
     settings::Settings,
+    timing::duration_to_us_u64,
 };
 
 /// Minimum number of connections in the cache worker pool.
@@ -82,7 +83,7 @@ async fn handle_worker_request(
             let latency_us = msg
                 .timing
                 .worker_start_at
-                .map(|s| s.elapsed().as_micros() as u64)
+                .map(|s| duration_to_us_u64(s.elapsed()))
                 .unwrap_or(0);
             let _ = worker_metrics_tx.send(WorkerMetrics {
                 fingerprint: msg.fingerprint,
@@ -417,6 +418,8 @@ pub fn cache_run(
                             }
                         }
 
+                        // Channel depth gauge; queue length never approaches 2^53.
+                        #[allow(clippy::cast_precision_loss)]
                         metrics::gauge!(names::CACHE_PROXY_MESSAGE_QUEUE)
                             .set(cache_rx.len() as f64);
                     }
@@ -490,6 +493,8 @@ fn worker_run(
                         handle_worker_request(conn, return_tx, msg, metrics_tx).await;
                     });
 
+                    // Channel depth gauge; queue length never approaches 2^53.
+                    #[allow(clippy::cast_precision_loss)]
                     metrics::gauge!(names::CACHE_WORKER_QUEUE).set(worker_rx.len() as f64);
                 }
 

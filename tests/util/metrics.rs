@@ -1,3 +1,5 @@
+#![allow(clippy::indexing_slicing)]
+
 use std::io::Error;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -112,6 +114,8 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         }
     }
 
+    // Test telemetry rates; query counts in tests never approach 2^53.
+    #[allow(clippy::cast_precision_loss)]
     let cache_hit_rate = if queries_cacheable > 0 {
         (queries_cache_hit as f64 / queries_cacheable as f64) * 100.0
     } else {
@@ -121,6 +125,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let queries_select = queries_total
         .saturating_sub(queries_unsupported)
         .saturating_sub(queries_invalid);
+    #[allow(clippy::cast_precision_loss)]
     let cacheability_rate = if queries_select > 0 {
         (queries_cacheable as f64 / queries_select as f64) * 100.0
     } else {
@@ -174,8 +179,7 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_mv_rebuilds: after.cache_mv_rebuilds - before.cache_mv_rebuilds,
         cache_mv_skipped_rebuilds: after.cache_mv_skipped_rebuilds
             - before.cache_mv_skipped_rebuilds,
-        cache_mv_dirty_truncates: after.cache_mv_dirty_truncates
-            - before.cache_mv_dirty_truncates,
+        cache_mv_dirty_truncates: after.cache_mv_dirty_truncates - before.cache_mv_dirty_truncates,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

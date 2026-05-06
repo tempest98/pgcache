@@ -13,17 +13,37 @@ path = "src/lib.rs"
 doctest = false
 
 [lints.clippy]
+panic = "deny"
+string_slice = "deny"
 indexing_slicing = "warn"
+unwrap_used = "warn"
+unchecked_time_subtraction = "warn"
+
+fn_params_excessive_bools = "deny"
 fallible_impl_from = "warn"
 wildcard_enum_match_arm = "warn"
 unneeded_field_pattern = "warn"
-fn_params_excessive_bools = "deny"
-unwrap_used = "warn"
-large_futures = "warn"
 clone_on_ref_ptr = "warn"
 redundant_clone = "warn"
 str_to_string = "warn"
 implicit_clone = "warn"
+lossy_float_literal = "warn"
+cast_sign_loss = "warn"
+invalid_upcast_comparisons = "warn"
+cast_possible_wrap = "warn"
+cast_precision_loss = "warn"
+cast_possible_truncation = "warn"
+
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+large_futures = "warn"
+
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+
 # unnecessary_wraps = "warn"
 # must_use_candidate = "deny"
 

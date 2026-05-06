@@ -14,7 +14,7 @@ use crate::metrics::names;
 use crate::proxy::ClientSocket;
 use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprint};
 use crate::settings::{Allowlist, CachePolicy, DynamicConfig, DynamicConfigHandle, Settings};
-use crate::timing::QueryTiming;
+use crate::timing::{QueryTiming, duration_to_ns_u64};
 
 use super::{
     CacheError, CacheResult,
@@ -258,6 +258,8 @@ impl QueryCache {
                     .entry(key)
                     .or_default()
                     .push(msg);
+                #[allow(clippy::cast_precision_loss)]
+                // queue depth, never near 2^53
                 metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
                 Ok(())
             }
@@ -305,7 +307,7 @@ impl QueryCache {
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.hit_count += 1;
             m.last_hit_at_ns =
-                NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+                NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
         }
     }
 
@@ -555,6 +557,7 @@ impl QueryCache {
         if served > 0 {
             metrics::counter!(names::CACHE_COALESCE_SERVED).increment(served);
         }
+        #[allow(clippy::cast_precision_loss)] // queue depth, never near 2^53
         metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
     }
 
@@ -571,6 +574,7 @@ impl QueryCache {
             }
         }
 
+        #[allow(clippy::cast_precision_loss)] // queue depth, never near 2^53
         metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
     }
 
@@ -593,7 +597,7 @@ impl QueryCache {
                     mv_state: MvState::Skipped,
                 },
             );
-            let now = NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+            let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
             self.state_view
                 .metrics
                 .entry(pq.fingerprint)
@@ -714,7 +718,7 @@ impl QueryCache {
                 mv_state: MvState::Skipped,
             },
         );
-        let now = NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+        let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
         self.state_view
             .metrics
             .entry(fingerprint)

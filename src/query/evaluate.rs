@@ -112,7 +112,7 @@ fn column_value_get<'a>(
     if col.table.as_str() != table_name {
         return None;
     }
-    let pos = col.column_metadata.position as usize - 1;
+    let pos = col.column_metadata.index();
     row_data.get(pos)?.as_deref()
 }
 
@@ -132,7 +132,7 @@ fn column_row_value_get<'a>(
     if col.table.as_str() != table_name {
         return ColumnRowValue::NotInTable;
     }
-    let pos = col.column_metadata.position as usize - 1;
+    let pos = col.column_metadata.index();
     match row_data.get(pos) {
         Some(Some(v)) => ColumnRowValue::Present(v.as_str()),
         Some(None) => ColumnRowValue::Null,
@@ -269,8 +269,6 @@ pub fn is_simple_comparison(binary_expr: &ResolvedBinaryExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
-    #![allow(clippy::unwrap_used)]
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};

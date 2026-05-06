@@ -804,7 +804,8 @@ impl ConnectionState {
 
                         // Update the length field (bytes 1-4, big-endian i32, excludes tag byte)
                         // Safety: Message format guarantees at least 5 bytes (1 tag + 4 length)
-                        let new_len = (msg.data.len() - 1) as i32;
+                        let new_len = i32::try_from(msg.data.len() - 1)
+                            .expect("PG message size fits in i32");
                         #[expect(
                             clippy::indexing_slicing,
                             reason = "PostgreSQL message format guarantees 5+ bytes"
@@ -1674,6 +1675,8 @@ async fn handle_connection(
     // Clean up prepared statements gauge before connection state is dropped
     let remaining_stmts = state.prepared_statements.len();
     if remaining_stmts > 0 {
+        // Gauge value; per-connection prepared statement count never approaches 2^53.
+        #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).decrement(remaining_stmts as f64);
     }
 
@@ -1716,6 +1719,8 @@ pub fn connection_run(
         LocalSet::new()
             .run_until(async {
                 while let Some(socket) = rx.recv().await {
+                    // Channel depth gauge; queue length never approaches 2^53.
+                    #[allow(clippy::cast_precision_loss)]
                     metrics::gauge!(names::PROXY_WORKER_QUEUE, "worker" => worker_id.to_string())
                         .set(rx.len() as f64);
 

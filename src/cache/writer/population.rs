@@ -35,6 +35,8 @@ pub async fn population_worker(
     debug!("population worker {id} started");
 
     while let Some(work) = rx.recv().await {
+        // Channel depth gauge; queue length never approaches 2^53.
+        #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => id.to_string())
             .set(rx.len() as f64);
 

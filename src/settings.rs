@@ -440,7 +440,10 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
 
     if let Some(v) = &patch.cache_size {
         match v {
-            Some(size) => doc["cache_size"] = toml_edit::value(*size as i64),
+            Some(size) => {
+                let size_i64 = i64::try_from(*size).expect("cache size fits in i64");
+                doc["cache_size"] = toml_edit::value(size_i64);
+            }
             None => {
                 doc.remove("cache_size");
             }
@@ -1074,7 +1077,6 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
 
     use super::*;
 

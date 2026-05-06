@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 //! Regression test for PGC-96: source-row cache generated
 //! `INSERT ... ON CONFLICT (<pk>) DO UPDATE SET ` with an empty SET list for
 //! tables whose only columns are primary keys. PG rejects the SQL syntax and
@@ -33,11 +30,8 @@ async fn test_pk_only_table_caching() -> Result<(), Error> {
 
     ctx.query("CREATE TABLE pk_only (id integer primary key)", &[])
         .await?;
-    ctx.query(
-        "INSERT INTO pk_only (id) VALUES (1), (2), (3)",
-        &[],
-    )
-    .await?;
+    ctx.query("INSERT INTO pk_only (id) VALUES (1), (2), (3)", &[])
+        .await?;
 
     // First query — cache miss, exercises insert_statement_build (site 1).
     let m = ctx.metrics().await?;
@@ -94,11 +88,8 @@ async fn test_pk_only_population_stamps_generation() -> Result<(), Error> {
     // population. Wait for CDC to apply them before triggering the cache
     // query. Without this wait, population races CDC and may insert the
     // rows fresh (no conflict) instead of exercising the conflict path.
-    ctx.origin_query(
-        "INSERT INTO pk_only_gen (id) VALUES (10), (20), (30)",
-        &[],
-    )
-    .await?;
+    ctx.origin_query("INSERT INTO pk_only_gen (id) VALUES (10), (20), (30)", &[])
+        .await?;
     wait_for_cdc().await;
 
     // First cached query — population runs against a cache DB that already

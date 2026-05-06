@@ -213,14 +213,13 @@ fn literal_value_parameters_replace(
 
 /// Parse parameter index from placeholder string (e.g., "$1" -> 0, "$2" -> 1)
 fn parameter_index_parse(placeholder: &str) -> AstTransformResult<usize> {
-    if !placeholder.starts_with('$') {
+    let Some(index_str) = placeholder.strip_prefix('$') else {
         return Err(AstTransformError::InvalidParameterPlaceholder {
             placeholder: placeholder.to_owned(),
         }
         .into());
-    }
+    };
 
-    let index_str = &placeholder[1..];
     let param_num = index_str.parse::<usize>().map_err(|_| {
         Report::from(AstTransformError::InvalidParameterPlaceholder {
             placeholder: placeholder.to_owned(),
@@ -440,9 +439,8 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Lit
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
-    #![allow(clippy::unwrap_used)]
 
     use tokio_util::bytes::Bytes;
 

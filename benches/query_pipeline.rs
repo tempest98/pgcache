@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 #![allow(clippy::unwrap_used)]
 
 use std::hint::black_box;
@@ -383,7 +384,7 @@ fn table_metadata_build(name: &str, oid: u32, column_defs: &[(&str, Type, bool)]
         }
         col_vec.push(ColumnMetadata {
             name: col_name.into(),
-            position: (i + 1) as i16,
+            position: i16::try_from(i + 1).expect("column position fits in i16"),
             type_oid: 25,
             data_type: data_type.clone(),
             type_name: "text".into(),
@@ -455,7 +456,7 @@ fn typed_table_build(name: &str, oid: u32, cols: &[(&str, Type, &str, bool)]) ->
         }
         col_vec.push(ColumnMetadata {
             name: EcoString::from(*col_name),
-            position: (i + 1) as i16,
+            position: i16::try_from(i + 1).expect("column position fits in i16"),
             type_oid: 0,
             data_type: data_type.clone(),
             type_name: EcoString::from(*type_name),

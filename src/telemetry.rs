@@ -69,6 +69,10 @@ struct TelemetryMetrics {
 
 /// Extract a counter or gauge value from Prometheus rendered text.
 /// Looks for lines like `metric_name VALUE` (ignoring lines starting with #).
+//
+// Prometheus emits values as text-formatted f64; truncating back to u64 is the
+// intended round-trip for counter values originally stored as u64.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn prometheus_metric_read(rendered: &str, metric_name: &str) -> u64 {
     // Prometheus text format: metric names have dots replaced with underscores
     let prom_name = metric_name.replace('.', "_");
@@ -108,7 +112,14 @@ fn metrics_collect(
     let total_served = total_hits.saturating_add(total_misses);
 
     let cache_hit_rate_pct = if total_served > 0 {
-        ((total_hits as f64 / total_served as f64) * 100.0).round() as u8
+        // Result is bounded to 0..=100, fits in u8; query counts past 2^53 don't matter for a percentage.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let pct = ((total_hits as f64 / total_served as f64) * 100.0).round() as u8;
+        pct
     } else {
         0
     };

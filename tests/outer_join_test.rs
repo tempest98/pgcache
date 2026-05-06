@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 //! LEFT and RIGHT JOIN caching tests.
 //!
 //! pgcache stores per-table data, not materialized join results. JOINs are

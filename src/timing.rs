@@ -5,10 +5,28 @@
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::metrics::names;
+
+/// Nanoseconds between two instants, saturating at `u64::MAX`.
+///
+/// `Duration::as_nanos()` returns `u128`; truncating to `u64` covers ~584 years of
+/// elapsed time, which is unreachable for `Instant` measurements in practice.
+fn instant_diff_ns(later: Instant, earlier: Instant) -> u64 {
+    duration_to_ns_u64(later.duration_since(earlier))
+}
+
+/// `Duration` expressed as `u64` nanoseconds, saturating at `u64::MAX`.
+pub(crate) fn duration_to_ns_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// `Duration` expressed as `u64` microseconds, saturating at `u64::MAX`.
+pub(crate) fn duration_to_us_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
 
 /// Global sequence counter for generating unique query instance IDs.
 static QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -141,41 +159,32 @@ impl QueryTiming {
     /// Calculate per-stage durations from the captured timestamps.
     pub fn durations(&self) -> QueryDurations {
         QueryDurations {
-            parse_ns: self
-                .parsed_at
-                .map(|t| t.duration_since(self.received_at).as_nanos() as u64),
-            dispatch_ns: self.dispatched_at.and_then(|d| {
-                self.parsed_at
-                    .map(|p| d.duration_since(p).as_nanos() as u64)
-            }),
-            lookup_ns: self.lookup_complete_at.and_then(|l| {
-                self.dispatched_at
-                    .map(|d| l.duration_since(d).as_nanos() as u64)
-            }),
-            queue_wait_ns: self.worker_received_at.and_then(|r| {
-                self.lookup_complete_at
-                    .map(|l| r.duration_since(l).as_nanos() as u64)
-            }),
-            conn_wait_ns: self.conn_acquired_at.and_then(|c| {
-                self.worker_received_at
-                    .map(|r| c.duration_since(r).as_nanos() as u64)
-            }),
-            spawn_wait_ns: self.worker_start_at.and_then(|w| {
-                self.conn_acquired_at
-                    .map(|c| w.duration_since(c).as_nanos() as u64)
-            }),
-            worker_execution_ns: self.query_done_at.and_then(|e| {
-                self.worker_start_at
-                    .map(|s| e.duration_since(s).as_nanos() as u64)
-            }),
-            response_write_ns: self.response_written_at.and_then(|r| {
-                self.query_done_at
-                    .map(|e| r.duration_since(e).as_nanos() as u64)
-            }),
+            parse_ns: self.parsed_at.map(|t| instant_diff_ns(t, self.received_at)),
+            dispatch_ns: self
+                .dispatched_at
+                .and_then(|d| self.parsed_at.map(|p| instant_diff_ns(d, p))),
+            lookup_ns: self
+                .lookup_complete_at
+                .and_then(|l| self.dispatched_at.map(|d| instant_diff_ns(l, d))),
+            queue_wait_ns: self
+                .worker_received_at
+                .and_then(|r| self.lookup_complete_at.map(|l| instant_diff_ns(r, l))),
+            conn_wait_ns: self
+                .conn_acquired_at
+                .and_then(|c| self.worker_received_at.map(|r| instant_diff_ns(c, r))),
+            spawn_wait_ns: self
+                .worker_start_at
+                .and_then(|w| self.conn_acquired_at.map(|c| instant_diff_ns(w, c))),
+            worker_execution_ns: self
+                .query_done_at
+                .and_then(|e| self.worker_start_at.map(|s| instant_diff_ns(e, s))),
+            response_write_ns: self
+                .response_written_at
+                .and_then(|r| self.query_done_at.map(|e| instant_diff_ns(r, e))),
             total_ns: self
                 .response_written_at
                 .or(self.origin_response_at)
-                .map(|end| end.duration_since(self.received_at).as_nanos() as u64),
+                .map(|end| instant_diff_ns(end, self.received_at)),
         }
     }
 }
@@ -183,6 +192,10 @@ impl QueryTiming {
 /// Record timing data to Prometheus histograms and optionally trace log.
 ///
 /// Called when a query completes (either via cache hit or forward path).
+//
+// Nanosecond -> seconds conversions feed Prometheus histograms; precision loss past
+// ~104 days of elapsed time is irrelevant for a per-query latency metric.
+#[allow(clippy::cast_precision_loss)]
 pub fn timing_record(timing: &QueryTiming) {
     let durations = timing.durations();
 

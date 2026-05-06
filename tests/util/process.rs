@@ -1,3 +1,6 @@
+#![allow(clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used)]
+
 use std::{
     io::{Error, Read, Write, stdout},
     net::TcpListener,

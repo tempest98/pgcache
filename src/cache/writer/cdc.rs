@@ -452,7 +452,7 @@ impl CacheWriter {
 
         let mut first_col = true;
         for column_meta in &table_metadata.columns {
-            let position = column_meta.position as usize - 1;
+            let position = column_meta.index();
             if let Some(row_value) = row_data.get(position) {
                 let value = row_value
                     .as_deref()
@@ -478,7 +478,7 @@ impl CacheWriter {
         let mut has_pk = false;
         for pk_column in &table_metadata.primary_key_columns {
             if let Some(column_meta) = table_metadata.columns.get(pk_column.as_str()) {
-                let position = column_meta.position as usize - 1;
+                let position = column_meta.index();
                 if let Some(row_value) = row_data.get(position) {
                     let value = row_value
                         .as_deref()
@@ -525,7 +525,7 @@ impl CacheWriter {
             };
 
             if let Some(column_meta) = table_metadata.columns.get(column_name) {
-                let position = column_meta.position as usize - 1;
+                let position = column_meta.index();
                 if let Some(row_value) = row_data.get(position) {
                     let matches = match row_value {
                         Some(row_str) => match constraint {
@@ -923,7 +923,7 @@ impl CacheWriter {
         let mut values = Vec::with_capacity(table_metadata.columns.len());
 
         for column_meta in &table_metadata.columns {
-            let position = column_meta.position as usize - 1;
+            let position = column_meta.index();
             if let Some(row_value) = row_data.get(position) {
                 let value = row_value
                     .as_deref()
@@ -988,7 +988,7 @@ impl CacheWriter {
         let mut values = Vec::with_capacity(table_metadata.columns.len());
 
         for column_meta in &table_metadata.columns {
-            let position = column_meta.position as usize - 1;
+            let position = column_meta.index();
             if let Some(row_value) = row_data.get(position) {
                 let value = row_value
                     .as_deref()
@@ -1046,7 +1046,7 @@ impl CacheWriter {
         let mut has_pk = false;
         for pk_column in &table_metadata.primary_key_columns {
             if let Some(column_meta) = table_metadata.columns.get(pk_column.as_str()) {
-                let position = column_meta.position as usize - 1;
+                let position = column_meta.index();
                 if let Some(row_value) = row_data.get(position) {
                     let value = row_value
                         .as_deref()

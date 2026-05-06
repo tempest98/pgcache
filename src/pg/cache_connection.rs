@@ -177,9 +177,10 @@ fn startup_message_build(user: &str, database: &str) -> BytesMut {
         + 9 + database.len() + 1   // "database\0" + database + \0
         + 1; // final \0 terminator
     let total_len = 4 + body_len; // 4 for the length field itself
+    let total_len_i32 = i32::try_from(total_len).expect("startup message fits in i32");
 
     let mut buf = BytesMut::with_capacity(total_len);
-    buf.put_i32(total_len as i32);
+    buf.put_i32(total_len_i32);
     buf.put_i32(196608); // Protocol 3.0
     buf.put_slice(b"user\0");
     buf.put_slice(user.as_bytes());
@@ -200,39 +201,29 @@ fn extended_query_binary_build(sql: &str, include_describe: bool) -> BytesMut {
     let sql_bytes = sql.as_bytes();
 
     // Parse: 'P' | int32 len | \0 (unnamed) | sql\0 | int16 0 (no param types)
-    let parse_len = 4 + 1 + sql_bytes.len() + 1 + 2; // len field + name + sql + null + param count
+    let parse_len: i32 = i32::try_from(4 + 1 + sql_bytes.len() + 1 + 2)
+        .expect("Parse message fits in i32");
 
     // Bind: 'B' | int32 len | \0 (portal) | \0 (stmt) | int16 0 (param formats)
     //       | int16 0 (params) | int16 1 (result format count) | int16 1 (binary)
-    let bind_len = 4 + 1 + 1 + 2 + 2 + 2 + 2; // 14
+    let bind_len: i32 = 4 + 1 + 1 + 2 + 2 + 2 + 2; // 14
 
     // Describe: 'D' | int32 len | 'P' | \0 (unnamed portal)
-    let describe_len = 4 + 1 + 1; // 6
+    let describe_len: i32 = 4 + 1 + 1; // 6
 
     // Execute: 'E' | int32 len | \0 (portal) | int32 0 (no limit)
-    let execute_len = 4 + 1 + 4; // 9
+    let execute_len: i32 = 4 + 1 + 4; // 9
 
     // Sync: 'S' | int32 4
-    let sync_len = 4;
+    let sync_len: i32 = 4;
 
-    let total = 1
-        + parse_len
-        + 1
-        + bind_len
-        + if include_describe {
-            1 + describe_len
-        } else {
-            0
-        }
-        + 1
-        + execute_len
-        + 1
-        + sync_len;
-    let mut buf = BytesMut::with_capacity(total);
+    let describe_total = if include_describe { 1 + describe_len } else { 0 };
+    let total = 1 + parse_len + 1 + bind_len + describe_total + 1 + execute_len + 1 + sync_len;
+    let mut buf = BytesMut::with_capacity(usize::try_from(total).expect("non-negative size"));
 
     // Parse
     buf.put_u8(b'P');
-    buf.put_i32(parse_len as i32);
+    buf.put_i32(parse_len);
     buf.put_u8(0); // unnamed statement
     buf.put_slice(sql_bytes);
     buf.put_u8(0); // null-terminate SQL
@@ -240,7 +231,7 @@ fn extended_query_binary_build(sql: &str, include_describe: bool) -> BytesMut {
 
     // Bind
     buf.put_u8(b'B');
-    buf.put_i32(bind_len as i32);
+    buf.put_i32(bind_len);
     buf.put_u8(0); // unnamed portal
     buf.put_u8(0); // unnamed statement
     buf.put_i16(0); // no parameter format codes
@@ -251,20 +242,20 @@ fn extended_query_binary_build(sql: &str, include_describe: bool) -> BytesMut {
     // Describe (optional)
     if include_describe {
         buf.put_u8(b'D');
-        buf.put_i32(describe_len as i32);
+        buf.put_i32(describe_len);
         buf.put_u8(b'P'); // describe portal
         buf.put_u8(0); // unnamed portal
     }
 
     // Execute
     buf.put_u8(b'E');
-    buf.put_i32(execute_len as i32);
+    buf.put_i32(execute_len);
     buf.put_u8(0); // unnamed portal
     buf.put_i32(0); // no row limit
 
     // Sync
     buf.put_u8(b'S');
-    buf.put_i32(sync_len as i32);
+    buf.put_i32(sync_len);
 
     buf
 }

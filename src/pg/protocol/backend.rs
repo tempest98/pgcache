@@ -127,7 +127,8 @@ impl PgBackendMessageCodec {
         }
 
         let (_, mut rest) = buf.split_at(1);
-        let msg_len = rest.get_i32() as usize + 1;
+        let msg_len = usize::try_from(rest.get_i32())
+            .map_err(|_| ProtocolError::InvalidStartupFrame)? + 1;
         if buf.remaining() < msg_len {
             return Ok(None);
         }
@@ -188,7 +189,11 @@ impl Decoder for PgBackendMessageCodec {
                 }
 
                 let (_, mut len_slice) = buf.split_at(1);
-                let msg_len = len_slice.get_i32() as usize + 1;
+                let msg_len = usize::try_from(len_slice.get_i32())
+                    .map_err(|_| ProtocolError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "negative backend message length",
+                    )))? + 1;
                 if buf.remaining() < msg_len {
                     return Ok(None);
                 }
@@ -213,7 +218,11 @@ impl Decoder for PgBackendMessageCodec {
 
                         // Read the next message length
                         let (_, mut next_len_slice) = buf.split_at(position + 1);
-                        let next_msg_len = next_len_slice.get_i32() as usize + 1;
+                        let Ok(next_msg_len) =
+                            usize::try_from(next_len_slice.get_i32()).map(|n| n + 1)
+                        else {
+                            break;
+                        };
 
                         // Stop if message is incomplete in buffer
                         if position + next_msg_len > buf.remaining() {
@@ -289,6 +298,7 @@ pub fn data_row_first_column(data: &[u8]) -> Option<&str> {
         return None; // NULL value
     }
 
-    let col_data = payload.get(4..4 + col_len as usize)?;
+    let col_len = usize::try_from(col_len).ok()?;
+    let col_data = payload.get(4..4 + col_len)?;
     std::str::from_utf8(col_data).ok()
 }

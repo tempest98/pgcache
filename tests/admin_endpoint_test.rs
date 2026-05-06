@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 use std::io::Error;
 
 use crate::util::{TestContext, http_get, wait_cache_load};

@@ -92,7 +92,7 @@ pub fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option<&'a st
 pub fn simple_query_message_build(query: &str) -> BytesMut {
     let query_bytes = query.as_bytes();
     // Length includes: 4 bytes for length field + query bytes + 1 null terminator
-    let len = (4 + query_bytes.len() + 1) as i32;
+    let len = i32::try_from(4 + query_bytes.len() + 1).expect("query message fits in i32");
     let mut buf = BytesMut::with_capacity(1 + 4 + query_bytes.len() + 1);
     buf.extend_from_slice(b"Q");
     buf.extend_from_slice(&len.to_be_bytes());
@@ -128,7 +128,8 @@ impl Decoder for PgFrontendMessageCodec {
                 if buf.remaining() < MIN_MESSAGE_LEN {
                     return Ok(None);
                 }
-                let msg_len = buf.as_ref().get_i32() as usize;
+                let msg_len = usize::try_from(buf.as_ref().get_i32())
+                    .map_err(|_| ProtocolError::InvalidStartupFrame)?;
                 if buf.remaining() < msg_len {
                     return Ok(None);
                 }
@@ -183,7 +184,11 @@ impl Decoder for PgFrontendMessageCodec {
                 }
 
                 let (_, mut len_slice) = buf.split_at(1);
-                let msg_len = len_slice.get_i32() as usize + 1;
+                let msg_len = usize::try_from(len_slice.get_i32())
+                    .map_err(|_| ProtocolError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "negative frontend message length",
+                    )))? + 1;
                 if buf.remaining() < msg_len {
                     return Ok(None);
                 }

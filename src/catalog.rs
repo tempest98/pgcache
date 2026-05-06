@@ -135,7 +135,7 @@ impl TableMetadata {
                     column: if let Some(alias) = alias {
                         alias
                             .columns
-                            .get(c.position as usize - 1)
+                            .get(c.index())
                             .map(EcoString::as_str)
                             .unwrap_or(c.name.as_str())
                             .into()
@@ -214,6 +214,17 @@ pub struct ColumnMetadata {
     pub cache_type_name: EcoString,
     /// Whether this column is part of the primary key
     pub is_primary_key: bool,
+}
+
+impl ColumnMetadata {
+    /// 0-based index for a column's position in a user column array.
+    ///
+    /// Converts the PostgreSQL 1-based `attnum` to a usable Rust slice index.
+    /// User columns always have `position >= 1`; system columns (negative attnum)
+    /// are not represented here.
+    pub fn index(&self) -> usize {
+        usize::try_from(self.position - 1).expect("user column position is >= 1")
+    }
 }
 
 impl std::hash::Hash for ColumnMetadata {

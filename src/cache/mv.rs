@@ -350,7 +350,6 @@ fn column_expr_has_window(expr: &ResolvedColumnExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
 
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
@@ -405,7 +404,7 @@ mod tests {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*c).into(),
-                position: (i + 1) as i16,
+                position: i16::try_from(i + 1).expect("column position fits in i16"),
                 type_oid: if is_pk { 23 } else { 25 },
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),
@@ -709,10 +708,7 @@ mod tests {
             "SELECT status, count(*) FROM orders GROUP BY status \
              ORDER BY count(*) DESC, status ASC",
         );
-        assert_eq!(
-            out,
-            "SELECT * FROM pgcache_mv.q_42 ORDER BY 2 DESC, 1 ASC"
-        );
+        assert_eq!(out, "SELECT * FROM pgcache_mv.q_42 ORDER BY 2 DESC, 1 ASC");
     }
 
     // ==================== SetOp body serve SQL ====================

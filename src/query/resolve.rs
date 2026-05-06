@@ -224,7 +224,7 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                     | ResolvedColumnExpr::Arithmetic(_)
                     | ResolvedColumnExpr::Subquery(..) => ColumnMetadata {
                         name: name.clone(),
-                        position: (i + 1) as i16,
+                        position: i16::try_from(i + 1).expect("column position fits in i16"),
                         type_oid: 25, // TEXT OID
                         data_type: Type::TEXT,
                         type_name: EcoString::from("text"),
@@ -237,7 +237,7 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                 // from the source has the original name)
                 Some(ColumnMetadata {
                     name,
-                    position: (i + 1) as i16,
+                    position: i16::try_from(i + 1).expect("column position fits in i16"),
                     ..base_meta
                 })
             })
@@ -1011,8 +1011,7 @@ fn query_expr_resolve_scoped(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
-    #![allow(clippy::unwrap_used)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use tokio_postgres::types::Type;
@@ -1145,7 +1144,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, col_name)| ColumnMetadata {
                         name: (*col_name).into(),
-                        position: (i + 1) as i16,
+                        position: i16::try_from(i + 1).expect("column position fits in i16"),
                         type_oid: 25,
                         data_type: Type::TEXT,
                         type_name: "text".into(),
@@ -1551,7 +1550,10 @@ mod tests {
         // `SELECT *` expands `name` into the output list, so the unqualified
         // ORDER BY matches the output name and resolves to `Identifier` — PG's
         // output-first precedence rule.
-        let resolved = resolve_query("SELECT users.name FROM users ORDER BY users.name ASC", &tables);
+        let resolved = resolve_query(
+            "SELECT users.name FROM users ORDER BY users.name ASC",
+            &tables,
+        );
 
         assert_eq!(resolved.order_by.len(), 1);
         assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);

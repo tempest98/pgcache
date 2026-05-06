@@ -603,9 +603,8 @@ fn bool_expr_convert(expr: &BoolExpr) -> Result<WhereExpr, WhereParseError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
-    #![allow(clippy::unwrap_used)]
 
     use super::*;
     use crate::query::ast::{

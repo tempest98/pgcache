@@ -61,7 +61,7 @@ impl CacheWriter {
 
             let column = ColumnMetadata {
                 name: row.get::<_, String>("column_name").into(),
-                position: pg_position as i16,
+                position: i16::try_from(pg_position).expect("column position fits in i16"),
                 type_oid,
                 data_type,
                 type_name: type_name.into(),

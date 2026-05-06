@@ -380,7 +380,7 @@ fn where_expr_columns_remap(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use iddqd::BiHashMap;
@@ -403,7 +403,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, col_name)| ColumnMetadata {
                         name: (*col_name).into(),
-                        position: (i + 1) as i16,
+                        position: i16::try_from(i + 1).expect("column position fits in i16"),
                         type_oid: 25,
                         data_type: Type::TEXT,
                         type_name: "text".into(),

@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 //! Subquery caching tests.
 //!
 //! Each test is independent with its own TestContext, database, and proxy instance.

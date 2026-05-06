@@ -70,18 +70,19 @@ impl Deparse for LiteralValue {
         match self {
             LiteralValue::String(s) => {
                 let escaped = escape::escape_literal(s);
-                // Remove leading space if escape_literal added one
-                if escaped.starts_with(" E'") {
-                    buf.push_str(&escaped[1..]); // Skip the first space
+                // escape_literal prefixes " E'..." for strings needing escaping; drop the leading space.
+                if let Some(stripped) = escaped.strip_prefix(" E'") {
+                    buf.push_str("E'");
+                    buf.push_str(stripped);
                 } else {
                     buf.push_str(&escaped);
                 }
             }
             LiteralValue::StringWithCast(s, cast) => {
                 let escaped = escape::escape_literal(s);
-                // Remove leading space if escape_literal added one
-                if escaped.starts_with(" E'") {
-                    buf.push_str(&escaped[1..]); // Skip the first space
+                if let Some(stripped) = escaped.strip_prefix(" E'") {
+                    buf.push_str("E'");
+                    buf.push_str(stripped);
                 } else {
                     buf.push_str(&escaped);
                 }

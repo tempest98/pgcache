@@ -18,6 +18,7 @@ use crate::query::resolved::{
 };
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
+use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
@@ -499,7 +500,7 @@ impl CacheWriter {
         // Record per-query metrics for subsumption
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.cached_since_ns =
-                NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+                NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
             m.subsumption_count += 1;
         }
 
@@ -508,7 +509,11 @@ impl CacheWriter {
             .record(subsume_start.elapsed().as_secs_f64());
 
         debug!("query subsumed {fingerprint}");
-        Ok(Some((generation, resolution.resolved, resolution.deparsed_sql)))
+        Ok(Some((
+            generation,
+            resolution.resolved,
+            resolution.deparsed_sql,
+        )))
     }
 
     /// Registers a query in the cache. Checks subsumption first — if the data
@@ -617,7 +622,7 @@ impl CacheWriter {
             started_at,
             pinned,
         );
-        let now = NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+        let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
         self.state_view
             .metrics
             .entry(fingerprint)
@@ -716,7 +721,7 @@ impl CacheWriter {
                 let latency = s.elapsed();
                 metrics::histogram!(names::QUERY_REGISTRATION_LATENCY_SECONDS)
                     .record(latency.as_secs_f64());
-                latency.as_micros() as u64
+                duration_to_us_u64(latency)
             });
 
             // Record per-query population metrics
@@ -724,7 +729,7 @@ impl CacheWriter {
                 m.population_count += 1;
                 m.population_row_count = row_count;
                 m.cached_since_ns =
-                    NonZeroU64::new(self.state_view.started_at.elapsed().as_nanos() as u64);
+                    NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
                 m.last_population_duration_us = population_duration_us.and_then(NonZeroU64::new);
             }
 
@@ -892,8 +897,6 @@ impl CacheWriter {
 
 #[cfg(test)]
 mod classify_tests {
-    #![allow(clippy::unwrap_used)]
-    #![allow(clippy::indexing_slicing)]
 
     use super::*;
 
@@ -912,7 +915,7 @@ mod classify_tests {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*c).into(),
-                position: (i + 1) as i16,
+                position: i16::try_from(i + 1).expect("column position fits in i16"),
                 type_oid: if is_pk { 23 } else { 25 },
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),

@@ -87,7 +87,7 @@ pub fn resolved_select_node_table_replace_with_values(
     let mut values = Vec::new();
     let mut column_names: Vec<EcoString> = Vec::new();
     for column_meta in &table_metadata.columns {
-        let position = column_meta.position as usize - 1;
+        let position = column_meta.index();
         if let Some(row_value) = row_data.get(position) {
             let value = row_value.as_deref().map_or(
                 LiteralValue::NullWithCast(column_meta.type_name.to_string()),
@@ -310,7 +310,7 @@ mod tests {
     fn table_metadata(name: &str, oid: u32, cols: &[(&str, &str)]) -> TableMetadata {
         let columns =
             ColumnStore::new(cols.iter().enumerate().map(|(i, &(col_name, type_name))| {
-                column_metadata(col_name, (i + 1) as i16, type_name)
+                column_metadata(col_name, i16::try_from(i + 1).expect("column position fits in i16"), type_name)
             }));
         TableMetadata {
             relation_oid: oid,

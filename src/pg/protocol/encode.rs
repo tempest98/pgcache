@@ -11,11 +11,14 @@ use crate::pg::protocol::backend::{
 
 #[instrument(skip_all)]
 pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
-    let field_cnt = desc.len() as i16;
-    let string_len = desc.iter().fold(0, |acc, col| acc + col.name().len() + 1);
+    // PostgreSQL caps columns per relation at 1664, so the count always fits in i16.
+    let field_cnt = i16::try_from(desc.len()).expect("column count fits in i16");
+    let string_len: usize = desc.iter().map(|col| col.name().len() + 1).sum();
+    let msg_len = i32::try_from(6 + 18 * desc.len() + string_len)
+        .expect("RowDescription size fits in i32");
 
     buf.put_u8(ROW_DESCRIPTION_TAG);
-    buf.put_i32(6 + (18 * field_cnt as i32) + string_len as i32);
+    buf.put_i32(msg_len);
     buf.put_i16(field_cnt);
     for col in desc.iter() {
         buf.put_slice(col.name().as_bytes());
@@ -31,19 +34,20 @@ pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
 
 #[instrument(skip_all)]
 pub fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
-    let cnt = row.len() as i16;
-    let mut value_len = 0;
-    for i in 0..cnt {
-        let value = row.get(i as usize).unwrap_or_default();
-        value_len += value.len();
-    }
+    let field_cnt = i16::try_from(row.len()).expect("column count fits in i16");
+    let value_len: usize = (0..row.len())
+        .map(|i| row.get(i).unwrap_or_default().len())
+        .sum();
+    let msg_len = i32::try_from(6 + 4 * row.len() + value_len)
+        .expect("DataRow size fits in i32");
 
     buf.put_u8(DATA_ROW_TAG);
-    buf.put_i32(6 + (4 * cnt as i32) + value_len as i32);
-    buf.put_i16(cnt);
-    for i in 0..cnt {
-        let data = row.get(i as usize).unwrap_or_default().as_bytes();
-        buf.put_i32(data.len() as i32);
+    buf.put_i32(msg_len);
+    buf.put_i16(field_cnt);
+    for i in 0..row.len() {
+        let data = row.get(i).unwrap_or_default().as_bytes();
+        let data_len = i32::try_from(data.len()).expect("column value fits in i32");
+        buf.put_i32(data_len);
         buf.put_slice(data);
     }
 }
@@ -51,9 +55,10 @@ pub fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
 #[instrument(skip_all)]
 pub fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
     let msg = format!("SELECT {cnt}");
+    let msg_len = i32::try_from(4 + msg.len() + 1).expect("CommandComplete fits in i32");
 
     buf.put_u8(COMMAND_COMPLETE_TAG);
-    buf.put_i32((4 + msg.len() + 1) as i32);
+    buf.put_i32(msg_len);
     buf.put_slice(msg.as_bytes());
     buf.put_u8(0);
 }

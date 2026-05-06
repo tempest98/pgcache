@@ -5,6 +5,22 @@ use tokio_util::bytes::{Buf, Bytes, BytesMut};
 use super::{ProtocolError, ProtocolResult};
 use crate::cache::query::CacheableQuery;
 
+/// Convert a wire-protocol count (`i16` or `i32`) into a `usize`, returning a parse
+/// error for negative values rather than silently sign-extending into a huge length.
+fn count_to_usize<T>(value: T, what: &'static str) -> ProtocolResult<usize>
+where
+    usize: TryFrom<T>,
+    T: std::fmt::Display + Copy,
+{
+    usize::try_from(value).map_err(|_| {
+        ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid {what}: {value}"),
+        ))
+        .into()
+    })
+}
+
 /// Classification of a prepared statement based on SQL analysis
 #[derive(Debug, Clone)]
 pub enum StatementType {
@@ -155,7 +171,7 @@ pub fn parse_parse_message(data: &BytesMut) -> ProtocolResult<ParsedParseMessage
         .into());
     }
 
-    let param_count = buf.get_i16() as usize;
+    let param_count = count_to_usize(buf.get_i16(), "Parse parameter count")?;
     let mut parameter_oids = Vec::with_capacity(param_count);
 
     for _ in 0..param_count {
@@ -215,7 +231,7 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
         ))
         .into());
     }
-    let format_code_count = buf.get_i16() as usize;
+    let format_code_count = count_to_usize(buf.get_i16(), "Bind format code count")?;
     let mut parameter_formats = Vec::with_capacity(format_code_count);
 
     for _ in 0..format_code_count {
@@ -237,7 +253,7 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
         ))
         .into());
     }
-    let param_value_count = buf.get_i16() as usize;
+    let param_value_count = count_to_usize(buf.get_i16(), "Bind parameter value count")?;
     let mut parameter_values = Vec::with_capacity(param_value_count);
 
     for _ in 0..param_value_count {
@@ -254,7 +270,7 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
             // NULL value
             parameter_values.push(None);
         } else {
-            let param_len = param_len as usize;
+            let param_len = count_to_usize(param_len, "Bind parameter length")?;
             let Some(value_bytes) = buf.get(..param_len) else {
                 return Err(ProtocolError::IoError(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -276,7 +292,7 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
         ))
         .into());
     }
-    let result_format_count = buf.get_i16() as usize;
+    let result_format_count = count_to_usize(buf.get_i16(), "Bind result format count")?;
     let mut result_formats = Vec::with_capacity(result_format_count);
 
     for _ in 0..result_format_count {
@@ -431,7 +447,7 @@ pub fn parse_parameter_description(data: &BytesMut) -> ProtocolResult<ParsedPara
 
     let mut buf = buf; // Skip message tag and length
 
-    let param_count = buf.get_i16() as usize;
+    let param_count = count_to_usize(buf.get_i16(), "ParameterDescription parameter count")?;
     let mut parameter_oids = Vec::with_capacity(param_count);
 
     for _ in 0..param_count {
@@ -450,8 +466,6 @@ pub fn parse_parameter_description(data: &BytesMut) -> ProtocolResult<ParsedPara
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
-    #![allow(clippy::unwrap_used)]
 
     use std::collections::HashMap;
 

@@ -922,8 +922,7 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
-    #![allow(clippy::unwrap_used)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use iddqd::BiHashMap;

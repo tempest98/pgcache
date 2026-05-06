@@ -1504,9 +1504,8 @@ fn query_expr_decorrelate_inner(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
-    #![allow(clippy::unwrap_used)]
 
     use iddqd::BiHashMap;
     use tokio_postgres::types::Type;
@@ -1524,7 +1523,7 @@ mod tests {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*col_name).into(),
-                position: (i + 1) as i16,
+                position: i16::try_from(i + 1).expect("column position fits in i16"),
                 type_oid: if is_pk { 23 } else { 25 },
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),

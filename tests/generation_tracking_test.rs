@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 use std::io::Error;
 
 use crate::util::{TestContext, connect_cache_db, wait_cache_load, wait_for_cdc};

@@ -552,11 +552,11 @@ fn resolved_join_terminality_walk(
 pub fn limit_rows_needed(limit: &Option<LimitClause>) -> Option<u64> {
     let limit_clause = limit.as_ref()?;
     let count = match &limit_clause.count {
-        Some(LiteralValue::Integer(n)) => *n as u64,
+        Some(LiteralValue::Integer(n)) => u64::try_from(*n).ok()?,
         _ => return None,
     };
     let offset = match &limit_clause.offset {
-        Some(LiteralValue::Integer(n)) => *n as u64,
+        Some(LiteralValue::Integer(n)) => u64::try_from(*n).unwrap_or(0),
         _ => 0,
     };
     Some(count + offset)
@@ -576,8 +576,7 @@ pub fn limit_is_sufficient(cached_max: Option<u64>, needed: Option<u64>) -> bool
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
-    #![allow(clippy::indexing_slicing)]
+
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use iddqd::BiHashMap;
@@ -629,7 +628,7 @@ mod tests {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*col_name).into(),
-                position: (i + 1) as i16,
+                position: i16::try_from(i + 1).expect("column position fits in i16"),
                 type_oid: if is_pk { 23 } else { 25 },
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),

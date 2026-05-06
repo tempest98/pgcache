@@ -1,6 +1,3 @@
-#![allow(clippy::indexing_slicing)]
-#![allow(clippy::unwrap_used)]
-
 //! CTE (Common Table Expression) caching tests.
 //!
 //! These tests verify that queries using CTEs are correctly cached

@@ -157,12 +157,15 @@ impl CdcProcessor {
         let server_timestamp = xlog_data.timestamp();
         let now = Self::get_pg_timestamp();
         let lag_micros = now.saturating_sub(server_timestamp);
+        // Lag values are floats for Prometheus; precision past 2^53 µs (~285 yr) is irrelevant.
+        #[allow(clippy::cast_precision_loss)]
         let lag_seconds = lag_micros as f64 / 1_000_000.0;
         metrics::gauge!(names::CDC_LAG_SECONDS).set(lag_seconds);
 
         // Byte-based lag: difference between WAL end and our last acknowledged position
         let wal_end = xlog_data.wal_end();
         let lag_bytes = wal_end.saturating_sub(self.last_flushed_lsn);
+        #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(names::CDC_LAG_BYTES).set(lag_bytes as f64);
 
         // How long since we last acknowledged our position to PostgreSQL
@@ -199,7 +202,8 @@ impl CdcProcessor {
     /// Gets the current PostgreSQL timestamp in microseconds since PostgreSQL epoch (2000-01-01).
     fn get_pg_timestamp() -> i64 {
         let pg_epoch = UNIX_EPOCH + Duration::from_secs(946_684_800); // PostgreSQL epoch: 2000-01-01
-        pg_epoch.elapsed().unwrap_or(Duration::ZERO).as_micros() as i64
+        let micros = pg_epoch.elapsed().unwrap_or(Duration::ZERO).as_micros();
+        i64::try_from(micros).unwrap_or(i64::MAX)
     }
 
     /// Sends a standby status update to PostgreSQL with current LSN progress.
@@ -471,7 +475,7 @@ impl CdcProcessor {
         for (idx, column) in relation_body.columns().iter().enumerate() {
             let is_primary_key = column.flags() == 1; // flags field is 1 when column is part of primary key
 
-            let type_oid = column.type_id() as u32; // Convert i32 to u32
+            let type_oid = column.type_id().cast_unsigned();
             let data_type = tokio_postgres::types::Type::from_oid(type_oid)
                 .unwrap_or(tokio_postgres::types::Type::TEXT); // Fallback for unknown types
 
@@ -483,7 +487,7 @@ impl CdcProcessor {
 
             let column_metadata = ColumnMetadata {
                 name: column.name().unwrap_or("unknown_column").into(),
-                position: (idx + 1) as i16, // PostgreSQL columns are 1-indexed
+                position: i16::try_from(idx + 1).expect("column position fits in i16"),
                 type_oid,
                 data_type,
                 type_name: type_name.into(),

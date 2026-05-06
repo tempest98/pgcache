@@ -443,6 +443,10 @@ impl CacheWriter {
     }
 
     /// Update cache state gauges with current values.
+    //
+    // Counts and byte totals are converted to f64 for Prometheus gauges; gauges
+    // accept f64 by API and the precision loss only matters above 2^53.
+    #[allow(clippy::cast_precision_loss)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn state_gauges_update(&self) {
         metrics::gauge!(names::CACHE_QUERIES_REGISTERED)
@@ -485,7 +489,7 @@ impl CacheWriter {
             .map_into_report::<CacheError>()?
             .get(0);
 
-        Ok(size as usize)
+        Ok(usize::try_from(size).unwrap_or(0))
     }
 
     /// Run eviction loop. For CLOCK policy, uses second-chance algorithm with reference bit.
@@ -662,11 +666,12 @@ impl CacheWriter {
     /// purgeable in future cycles. Only bumps the counter if entries were promoted.
     async fn generation_zero_promote(&mut self) -> CacheResult<()> {
         let new_gen = self.cache.generation_counter + 1;
+        let new_gen_i64 = i64::try_from(new_gen).expect("generation counter fits in i64");
         let promoted: i64 = self
             .db_cache
             .query_one(
                 "SELECT pgcache_generation_zero_promote($1)",
-                &[&(new_gen as i64)],
+                &[&new_gen_i64],
             )
             .await
             .map_into_report::<CacheError>()?
@@ -698,7 +703,8 @@ impl CacheWriter {
             tables_tracked: cache.tables.len(),
             policy: format!("{:?}", dynamic.cache_policy),
             queries_registered: cache.cached_queries.len(),
-            uptime_ms: self.state_view.started_at.elapsed().as_millis() as u64,
+            uptime_ms: u64::try_from(self.state_view.started_at.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
             cache_hits: total_hits,
             cache_misses: total_misses,
         };
@@ -729,7 +735,8 @@ impl CacheWriter {
 
             // Look up per-query metrics (shared read access)
             let metrics = self.state_view.metrics.get(&q.fingerprint);
-            let now_ns = self.state_view.started_at.elapsed().as_nanos() as u64;
+            let now_ns = u64::try_from(self.state_view.started_at.elapsed().as_nanos())
+                .unwrap_or(u64::MAX);
             let (
                 hit_count,
                 miss_count,
@@ -826,9 +833,10 @@ impl CacheWriter {
         self.generation_zero_promote().await?;
 
         if threshold > 0 {
+            let threshold_i64 = i64::try_from(threshold).expect("generation threshold fits in i64");
             let deleted: i64 = self
                 .db_cache
-                .query_one("SELECT pgcache_purge_rows($1)", &[&(threshold as i64)])
+                .query_one("SELECT pgcache_purge_rows($1)", &[&threshold_i64])
                 .await
                 .map_into_report::<CacheError>()?
                 .get(0);
@@ -925,10 +933,15 @@ pub fn writer_run(
                         }
                     }
 
-                    metrics::gauge!(names::CACHE_WRITER_QUERY_QUEUE).set(query_rx.len() as f64);
-                    metrics::gauge!(names::CACHE_WRITER_CDC_QUEUE).set(cdc_rx.len() as f64);
-                    metrics::gauge!(names::CACHE_WRITER_INTERNAL_QUEUE)
-                        .set(internal_rx.len() as f64);
+                    // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        metrics::gauge!(names::CACHE_WRITER_QUERY_QUEUE)
+                            .set(query_rx.len() as f64);
+                        metrics::gauge!(names::CACHE_WRITER_CDC_QUEUE).set(cdc_rx.len() as f64);
+                        metrics::gauge!(names::CACHE_WRITER_INTERNAL_QUEUE)
+                            .set(internal_rx.len() as f64);
+                    }
                 }
 
                 Ok(())
