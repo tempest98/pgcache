@@ -14,8 +14,8 @@ pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
     // PostgreSQL caps columns per relation at 1664, so the count always fits in i16.
     let field_cnt = i16::try_from(desc.len()).expect("column count fits in i16");
     let string_len: usize = desc.iter().map(|col| col.name().len() + 1).sum();
-    let msg_len = i32::try_from(6 + 18 * desc.len() + string_len)
-        .expect("RowDescription size fits in i32");
+    let msg_len =
+        i32::try_from(6 + 18 * desc.len() + string_len).expect("RowDescription size fits in i32");
 
     buf.put_u8(ROW_DESCRIPTION_TAG);
     buf.put_i32(msg_len);
@@ -38,8 +38,7 @@ pub fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
     let value_len: usize = (0..row.len())
         .map(|i| row.get(i).unwrap_or_default().len())
         .sum();
-    let msg_len = i32::try_from(6 + 4 * row.len() + value_len)
-        .expect("DataRow size fits in i32");
+    let msg_len = i32::try_from(6 + 4 * row.len() + value_len).expect("DataRow size fits in i32");
 
     buf.put_u8(DATA_ROW_TAG);
     buf.put_i32(msg_len);

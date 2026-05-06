@@ -218,12 +218,19 @@ async fn handle_cached_query_text(
     if msg.mv_source {
         // MV fast path: SELECT * FROM pgcache_mv.q_<fp> [ORDER BY] [LIMIT].
         // No generation SET — MV tables are not pgcache_pgrx-tracked.
-        conn.sql_buf
-            .push_str(&mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref()));
+        conn.sql_buf.push_str(&mv_serve_sql(
+            msg.fingerprint,
+            &msg.resolved,
+            msg.limit.as_ref(),
+        ));
         conn.sql_buf.push(';');
     } else {
-        write!(conn.sql_buf, "SET mem.query_generation = {}; ", msg.generation)
-            .expect("write to String");
+        write!(
+            conn.sql_buf,
+            "SET mem.query_generation = {}; ",
+            msg.generation
+        )
+        .expect("write to String");
         conn.sql_buf.push_str(&msg.deparsed_sql);
         if let Some(limit) = &msg.limit {
             limit.deparse(&mut conn.sql_buf);
@@ -273,10 +280,18 @@ async fn handle_cached_query_text(
 
     // Prepend ParseComplete / BindComplete for messages the proxy buffered
     if has_parse {
-        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(PARSE_COMPLETE_MSG));
+        push_and_broadcast(
+            &mut write_queue,
+            &broadcast,
+            Bytes::from_static(PARSE_COMPLETE_MSG),
+        );
     }
     if has_bind {
-        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(BIND_COMPLETE_MSG));
+        push_and_broadcast(
+            &mut write_queue,
+            &broadcast,
+            Bytes::from_static(BIND_COMPLETE_MSG),
+        );
     }
 
     // MV path: no SET statement was sent, so skip the SetComplete waiting state
@@ -388,7 +403,11 @@ async fn handle_cached_query_text(
     // Append ReadyForQuery for simple queries (always) and extended queries with Sync
     if query_type == QueryType::Simple || has_sync {
         trace!("net: cache→client ReadyForQuery");
-        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+        push_and_broadcast(
+            &mut write_queue,
+            &broadcast,
+            Bytes::from_static(READY_FOR_QUERY_IDLE_MSG),
+        );
     }
 
     // Tear down broadcast and collect coalesced outcomes
@@ -496,10 +515,18 @@ async fn handle_cached_query_binary(
     let mut write_queue = WriteQueue::new();
 
     if has_parse {
-        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(PARSE_COMPLETE_MSG));
+        push_and_broadcast(
+            &mut write_queue,
+            &broadcast,
+            Bytes::from_static(PARSE_COMPLETE_MSG),
+        );
     }
     if has_bind {
-        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(BIND_COMPLETE_MSG));
+        push_and_broadcast(
+            &mut write_queue,
+            &broadcast,
+            Bytes::from_static(BIND_COMPLETE_MSG),
+        );
     }
 
     // MV path: no SET statement was sent, so skip SetComplete/SetReady and
@@ -612,7 +639,11 @@ async fn handle_cached_query_binary(
 
     if has_sync {
         trace!("net: cache→client ReadyForQuery (binary pipeline)");
-        push_and_broadcast(&mut write_queue, &broadcast, Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+        push_and_broadcast(
+            &mut write_queue,
+            &broadcast,
+            Bytes::from_static(READY_FOR_QUERY_IDLE_MSG),
+        );
     }
 
     let outcomes = match broadcast.take() {

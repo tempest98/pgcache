@@ -48,9 +48,7 @@ fn stmt_classify(node: &NodeEnum) -> Option<MutationKind> {
     match node {
         NodeEnum::VariableSetStmt(stmt) => match VariableSetKind::try_from(stmt.kind).ok()? {
             VariableSetKind::VarResetAll => Some(MutationKind::SearchPathSet),
-            _ if stmt.name.eq_ignore_ascii_case("search_path") => {
-                Some(MutationKind::SearchPathSet)
-            }
+            _ if stmt.name.eq_ignore_ascii_case("search_path") => Some(MutationKind::SearchPathSet),
             _ => None,
         },
         NodeEnum::DiscardStmt(stmt) => match DiscardMode::try_from(stmt.target).ok()? {
@@ -359,9 +357,7 @@ mod tests {
         assert!(!search_path_mutates_any(&parse("RESET work_mem")));
         assert!(!search_path_mutates_any(&parse("BEGIN")));
         assert!(!search_path_mutates_any(&parse("SAVEPOINT sp")));
-        assert!(!search_path_mutates_any(&parse(
-            "ROLLBACK TO SAVEPOINT sp"
-        )));
+        assert!(!search_path_mutates_any(&parse("ROLLBACK TO SAVEPOINT sp")));
     }
 
     #[test]
@@ -394,9 +390,7 @@ mod tests {
             None
         );
         assert_eq!(
-            search_path_mutates_single_piggybackable(&parse(
-                "COMMIT; SET search_path = x"
-            )),
+            search_path_mutates_single_piggybackable(&parse("COMMIT; SET search_path = x")),
             None
         );
     }

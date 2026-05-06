@@ -3,10 +3,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ecow::EcoString;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, spawn_local, yield_now};
-use ecow::EcoString;
 use tokio_postgres::{Client, Config, NoTls};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
@@ -735,8 +735,8 @@ impl CacheWriter {
 
             // Look up per-query metrics (shared read access)
             let metrics = self.state_view.metrics.get(&q.fingerprint);
-            let now_ns = u64::try_from(self.state_view.started_at.elapsed().as_nanos())
-                .unwrap_or(u64::MAX);
+            let now_ns =
+                u64::try_from(self.state_view.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let (
                 hit_count,
                 miss_count,
@@ -936,8 +936,7 @@ pub fn writer_run(
                     // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.
                     #[allow(clippy::cast_precision_loss)]
                     {
-                        metrics::gauge!(names::CACHE_WRITER_QUERY_QUEUE)
-                            .set(query_rx.len() as f64);
+                        metrics::gauge!(names::CACHE_WRITER_QUERY_QUEUE).set(query_rx.len() as f64);
                         metrics::gauge!(names::CACHE_WRITER_CDC_QUEUE).set(cdc_rx.len() as f64);
                         metrics::gauge!(names::CACHE_WRITER_INTERNAL_QUEUE)
                             .set(internal_rx.len() as f64);

@@ -201,8 +201,8 @@ fn extended_query_binary_build(sql: &str, include_describe: bool) -> BytesMut {
     let sql_bytes = sql.as_bytes();
 
     // Parse: 'P' | int32 len | \0 (unnamed) | sql\0 | int16 0 (no param types)
-    let parse_len: i32 = i32::try_from(4 + 1 + sql_bytes.len() + 1 + 2)
-        .expect("Parse message fits in i32");
+    let parse_len: i32 =
+        i32::try_from(4 + 1 + sql_bytes.len() + 1 + 2).expect("Parse message fits in i32");
 
     // Bind: 'B' | int32 len | \0 (portal) | \0 (stmt) | int16 0 (param formats)
     //       | int16 0 (params) | int16 1 (result format count) | int16 1 (binary)
@@ -217,7 +217,11 @@ fn extended_query_binary_build(sql: &str, include_describe: bool) -> BytesMut {
     // Sync: 'S' | int32 4
     let sync_len: i32 = 4;
 
-    let describe_total = if include_describe { 1 + describe_len } else { 0 };
+    let describe_total = if include_describe {
+        1 + describe_len
+    } else {
+        0
+    };
     let total = 1 + parse_len + 1 + bind_len + describe_total + 1 + execute_len + 1 + sync_len;
     let mut buf = BytesMut::with_capacity(usize::try_from(total).expect("non-negative size"));
 

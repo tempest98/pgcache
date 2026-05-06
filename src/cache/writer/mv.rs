@@ -148,7 +148,10 @@ impl CacheWriter {
         }
 
         metrics::counter!(names::CACHE_MV_REBUILDS).increment(1);
-        trace!("mv build ({kind}): fresh for {fingerprint} in {:?}", elapsed);
+        trace!(
+            "mv build ({kind}): fresh for {fingerprint} in {:?}",
+            elapsed
+        );
         Ok(())
     }
 
@@ -295,11 +298,7 @@ impl CacheWriter {
     /// table exists. Called from `cache_query_evict` before the `CachedQueryView`
     /// entry is removed. The caller is expected to pass the current `mv_state`
     /// read just before the evict (post-read the state_view entry will be gone).
-    pub(super) async fn mv_drop(
-        &self,
-        fingerprint: u64,
-        mv_state: MvState,
-    ) -> CacheResult<()> {
+    pub(super) async fn mv_drop(&self, fingerprint: u64, mv_state: MvState) -> CacheResult<()> {
         if !mv_state.has_table() {
             return Ok(());
         }

@@ -184,11 +184,12 @@ impl Decoder for PgFrontendMessageCodec {
                 }
 
                 let (_, mut len_slice) = buf.split_at(1);
-                let msg_len = usize::try_from(len_slice.get_i32())
-                    .map_err(|_| ProtocolError::IoError(std::io::Error::new(
+                let msg_len = usize::try_from(len_slice.get_i32()).map_err(|_| {
+                    ProtocolError::IoError(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "negative frontend message length",
-                    )))? + 1;
+                    ))
+                })? + 1;
                 if buf.remaining() < msg_len {
                     return Ok(None);
                 }

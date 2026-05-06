@@ -95,7 +95,9 @@ async fn handle_worker_request(
             for outcome in coalesced_outcomes {
                 match outcome {
                     CoalescedOutcome::Complete(client) => {
-                        let _ = client.reply_tx.send(CacheReply::Complete(Some(client.timing)));
+                        let _ = client
+                            .reply_tx
+                            .send(CacheReply::Complete(Some(client.timing)));
                     }
                     CoalescedOutcome::Failed(client) => {
                         let _ = client.reply_tx.send(CacheReply::Error(client.data));

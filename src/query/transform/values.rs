@@ -310,7 +310,11 @@ mod tests {
     fn table_metadata(name: &str, oid: u32, cols: &[(&str, &str)]) -> TableMetadata {
         let columns =
             ColumnStore::new(cols.iter().enumerate().map(|(i, &(col_name, type_name))| {
-                column_metadata(col_name, i16::try_from(i + 1).expect("column position fits in i16"), type_name)
+                column_metadata(
+                    col_name,
+                    i16::try_from(i + 1).expect("column position fits in i16"),
+                    type_name,
+                )
             }));
         TableMetadata {
             relation_oid: oid,

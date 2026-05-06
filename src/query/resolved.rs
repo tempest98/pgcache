@@ -759,8 +759,7 @@ impl ResolvedColumnExpr {
     pub fn has_aggregate(&self, agg_fns: &HashSet<String>) -> bool {
         match self {
             ResolvedColumnExpr::Function { name, args, .. } => {
-                agg_fns.contains(name.as_str())
-                    || args.iter().any(|a| a.has_aggregate(agg_fns))
+                agg_fns.contains(name.as_str()) || args.iter().any(|a| a.has_aggregate(agg_fns))
             }
             ResolvedColumnExpr::Case(case) => {
                 case.arg.as_ref().is_some_and(|a| a.has_aggregate(agg_fns))
@@ -1101,7 +1100,9 @@ impl ResolvedSelectColumns {
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)
             | ResolvedColumnExpr::Subquery(..) => {
-                let Self::Columns(cols) = self else { return None };
+                let Self::Columns(cols) = self else {
+                    return None;
+                };
                 cols.iter().position(|c| c.expr == *expr).map(|i| i + 1)
             }
         }
@@ -1110,7 +1111,9 @@ impl ResolvedSelectColumns {
     /// 1-based position of the first SELECT column whose output name (alias or
     /// inferred — see `ResolvedSelectColumn::output_name`) matches `name`.
     pub fn position_by_output_name(&self, name: &str) -> Option<usize> {
-        let Self::Columns(cols) = self else { return None };
+        let Self::Columns(cols) = self else {
+            return None;
+        };
         cols.iter()
             .position(|c| c.output_name().is_some_and(|n| n == name))
             .map(|i| i + 1)

@@ -703,9 +703,8 @@ impl ConnectionState {
             TrailingShowState::PreShow => {
                 match msg.message_type {
                     PgBackendMessageType::CommandComplete => {
-                        self.origin_intercept = OriginIntercept::TrailingShowSearchPath(
-                            TrailingShowState::InShow,
-                        );
+                        self.origin_intercept =
+                            OriginIntercept::TrailingShowSearchPath(TrailingShowState::InShow);
                     }
                     PgBackendMessageType::ErrorResponse => {
                         debug!("piggyback: original statement errored, SHOW skipped");
@@ -733,8 +732,9 @@ impl ConnectionState {
                 }
                 // RowDescription and SHOW's CommandComplete are for the client's
                 // eyes: strip them.
-                PgBackendMessageType::RowDescription
-                | PgBackendMessageType::CommandComplete => true,
+                PgBackendMessageType::RowDescription | PgBackendMessageType::CommandComplete => {
+                    true
+                }
                 // Anything else at this phase is unexpected; pass through to
                 // avoid stalling the protocol.
                 _ => false,
@@ -804,8 +804,8 @@ impl ConnectionState {
 
                         // Update the length field (bytes 1-4, big-endian i32, excludes tag byte)
                         // Safety: Message format guarantees at least 5 bytes (1 tag + 4 length)
-                        let new_len = i32::try_from(msg.data.len() - 1)
-                            .expect("PG message size fits in i32");
+                        let new_len =
+                            i32::try_from(msg.data.len() - 1).expect("PG message size fits in i32");
                         #[expect(
                             clippy::indexing_slicing,
                             reason = "PostgreSQL message format guarantees 5+ bytes"
