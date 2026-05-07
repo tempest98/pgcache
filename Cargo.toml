@@ -122,6 +122,7 @@ hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
+fallible-iterator = "0.2"
 
 [dev-dependencies]
 pgtemp = "0.7.1"
