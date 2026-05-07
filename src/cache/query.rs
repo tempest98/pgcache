@@ -398,6 +398,11 @@ fn is_cacheable_column_expr(
             for arg in &func.args {
                 is_cacheable_column_expr(arg, ctx, fv)?;
             }
+            // FILTER predicates run per input row, so use WhereClause context
+            // to reject volatile functions inside FILTER.
+            if let Some(filter) = &func.agg_filter {
+                is_cacheable_expr(filter, ExprContext::WhereClause, fv)?;
+            }
             Ok(())
         }
         ColumnExpr::Case(case) => {

@@ -106,9 +106,6 @@ impl CacheWriter {
                 "creating MV table on first build"
             })
         {
-            // error_chain_format walks source() so the postgres SQLSTATE +
-            // message survives — the bare Display on tokio_postgres::Error
-            // is just "db error".
             error!(
                 "mv build failed for {fingerprint}: {}",
                 error_chain_format(e.current_context()),

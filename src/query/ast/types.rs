@@ -1495,9 +1495,10 @@ impl Deparse for ColumnExpr {
 pub struct FunctionCall {
     pub name: EcoString,
     pub args: Vec<ColumnExpr>,
-    pub agg_star: bool,                // COUNT(*)
-    pub agg_distinct: bool,            // COUNT(DISTINCT col)
+    pub agg_star: bool,                     // COUNT(*)
+    pub agg_distinct: bool,                 // COUNT(DISTINCT col)
     pub agg_order: Vec<OrderByClause>, // ORDER BY inside aggregate: string_agg(x, ',' ORDER BY x)
+    pub agg_filter: Option<Box<WhereExpr>>, // FILTER (WHERE ...) per-aggregate predicate
     pub over: Option<WindowSpec>,      // Window function OVER clause
 }
 
@@ -1506,10 +1507,12 @@ impl FunctionCall {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let arg_children = self.args.iter().flat_map(|arg| arg.nodes());
         let agg_order_children = self.agg_order.iter().flat_map(|o| o.nodes());
+        let filter_children = self.agg_filter.iter().flat_map(|f| f.nodes());
         let over_children = self.over.iter().flat_map(|w| w.nodes());
         current
             .chain(arg_children)
             .chain(agg_order_children)
+            .chain(filter_children)
             .chain(over_children)
     }
 
@@ -1517,6 +1520,7 @@ impl FunctionCall {
     pub fn has_subqueries(&self) -> bool {
         self.args.iter().any(|arg| arg.has_subqueries())
             || self.agg_order.iter().any(|o| o.expr.has_subqueries())
+            || self.agg_filter.as_ref().is_some_and(|f| f.has_subqueries())
             || self.over.as_ref().is_some_and(|w| w.has_subqueries())
     }
 }
@@ -1548,6 +1552,11 @@ impl Deparse for FunctionCall {
             }
         }
         buf.push(')');
+        if let Some(filter) = &self.agg_filter {
+            buf.push_str(" FILTER (WHERE ");
+            filter.deparse(buf);
+            buf.push(')');
+        }
         if let Some(over) = &self.over {
             buf.push_str(" OVER ");
             over.deparse(buf);

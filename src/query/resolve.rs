@@ -577,6 +577,10 @@ fn column_expr_resolve(
             // access to SELECT-list aliases — it's evaluated per row within the
             // aggregate's input, not against the output.
             let resolved_agg_order = order_by_resolve(&func.agg_order, scope, None)?;
+            let resolved_agg_filter = match &func.agg_filter {
+                Some(f) => Some(Box::new(where_expr_resolve(f, scope)?)),
+                None => None,
+            };
             let resolved_over = match &func.over {
                 Some(w) => Some(window_spec_resolve(w, scope)?),
                 None => None,
@@ -587,6 +591,7 @@ fn column_expr_resolve(
                 agg_star: func.agg_star,
                 agg_distinct: func.agg_distinct,
                 agg_order: resolved_agg_order,
+                agg_filter: resolved_agg_filter,
                 over: resolved_over,
             })
         }
@@ -769,6 +774,7 @@ fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
             agg_star: func.agg_star,
             agg_distinct: func.agg_distinct,
             agg_order: vec![], // ORDER BY within aggregate not needed for set operation ORDER BY
+            agg_filter: None,  // FILTER predicate doesn't reference set-op output names
             over: None,        // Window spec not needed for set operation ORDER BY
         },
         ColumnExpr::Case(_) | ColumnExpr::Subquery(_) => {

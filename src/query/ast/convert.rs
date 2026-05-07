@@ -682,6 +682,15 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
     // Parse aggregate ORDER BY (same structure as window ORDER BY)
     let agg_order = window_order_by_convert(&func_call.agg_order)?;
 
+    // Parse FILTER (WHERE ...) — per-aggregate predicate. Reuses WHERE-clause
+    // parsing since the grammar is identical (a boolean expression).
+    let agg_filter = func_call
+        .agg_filter
+        .as_deref()
+        .map(node_convert_to_expr)
+        .transpose()?
+        .map(Box::new);
+
     // Parse OVER clause for window functions
     let over = func_call
         .over
@@ -695,6 +704,7 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
         agg_star: func_call.agg_star,
         agg_distinct: func_call.agg_distinct,
         agg_order,
+        agg_filter,
         over,
     })
 }
@@ -768,6 +778,7 @@ fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstErr
         agg_star: false,
         agg_distinct: false,
         agg_order: vec![],
+        agg_filter: None,
         over: None,
     })
 }
@@ -795,6 +806,7 @@ fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
         agg_star: false,
         agg_distinct: false,
         agg_order: vec![],
+        agg_filter: None,
         over: None,
     })
 }
@@ -815,6 +827,7 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
         agg_star: false,
         agg_distinct: false,
         agg_order: vec![],
+        agg_filter: None,
         over: None,
     })
 }
@@ -2180,6 +2193,7 @@ mod tests {
             agg_star: false,
             agg_distinct: false,
             agg_order: vec![],
+            agg_filter: None,
             over: None,
         };
 
@@ -2791,6 +2805,7 @@ mod tests {
             agg_star: true,
             agg_distinct: false,
             agg_order: vec![],
+            agg_filter: None,
             over: None,
         };
         let mut buf = String::new();
@@ -2809,6 +2824,7 @@ mod tests {
             agg_star: false,
             agg_distinct: true,
             agg_order: vec![],
+            agg_filter: None,
             over: None,
         };
         let mut buf = String::new();
@@ -3040,6 +3056,7 @@ mod tests {
             agg_star: false,
             agg_distinct: false,
             agg_order: vec![],
+            agg_filter: None,
             over: Some(WindowSpec {
                 partition_by: vec![ColumnExpr::Column(ColumnNode {
                     table: None,
@@ -3150,6 +3167,70 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_aggregate_parsed() {
+        let sql = "SELECT count(*) FILTER (WHERE x = 1) FROM t";
+        let select = parse_select(sql);
+
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+
+        let ColumnExpr::Function(func) = &columns[0].expr else {
+            panic!("expected function");
+        };
+
+        assert!(func.agg_star);
+        assert!(
+            func.agg_filter.is_some(),
+            "FILTER predicate should be captured on the FunctionCall"
+        );
+    }
+
+    /// Two FILTER aggregates with different predicates must round-trip to
+    /// distinct function calls — they must not collapse to plain count(*).
+    #[test]
+    fn test_filter_aggregate_distinct_predicates_roundtrip() {
+        let sql = "SELECT count(*) FILTER (WHERE posttypeid = 1) AS questions, \
+                   count(*) FILTER (WHERE posttypeid = 2) AS answers FROM posts";
+        let select = parse_select(sql);
+
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+        assert_eq!(columns.len(), 2);
+
+        let mut buf = String::new();
+        for (i, col) in columns.iter().enumerate() {
+            let ColumnExpr::Function(func) = &col.expr else {
+                panic!("expected function in column {i}");
+            };
+            assert!(
+                func.agg_filter.is_some(),
+                "column {i} should retain its FILTER predicate"
+            );
+            buf.clear();
+            func.deparse(&mut buf);
+            assert!(
+                buf.contains("FILTER (WHERE"),
+                "column {i} should deparse FILTER clause; got `{buf}`"
+            );
+        }
+
+        // The two columns must deparse differently — collapsing them was the bug.
+        let mut a = String::new();
+        let ColumnExpr::Function(f0) = &columns[0].expr else {
+            unreachable!()
+        };
+        f0.deparse(&mut a);
+        let mut b = String::new();
+        let ColumnExpr::Function(f1) = &columns[1].expr else {
+            unreachable!()
+        };
+        f1.deparse(&mut b);
+        assert_ne!(a, b, "FILTER predicates 1 and 2 must deparse differently");
+    }
+
+    #[test]
     fn test_aggregate_order_by_deparse_roundtrip() {
         let func = FunctionCall {
             name: EcoString::from("string_agg"),
@@ -3169,6 +3250,7 @@ mod tests {
                 }),
                 direction: OrderDirection::Asc,
             }],
+            agg_filter: None,
             over: None,
         };
         let mut buf = String::new();

@@ -648,6 +648,7 @@ pub enum ResolvedColumnExpr {
         agg_star: bool,
         agg_distinct: bool,
         agg_order: Vec<ResolvedOrderByClause>,
+        agg_filter: Option<Box<ResolvedWhereExpr>>,
         over: Option<ResolvedWindowSpec>,
     },
     /// Literal value
@@ -737,13 +738,20 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Function {
                 args,
                 agg_order,
+                agg_filter,
                 over,
                 ..
             } => {
                 let arg_nodes = args.iter().flat_map(|arg| arg.nodes());
                 let agg_order_nodes = agg_order.iter().flat_map(|o| o.nodes());
+                let filter_nodes = agg_filter.iter().flat_map(|f| f.nodes());
                 let over_nodes = over.iter().flat_map(|w| w.nodes());
-                Box::new(arg_nodes.chain(agg_order_nodes).chain(over_nodes))
+                Box::new(
+                    arg_nodes
+                        .chain(agg_order_nodes)
+                        .chain(filter_nodes)
+                        .chain(over_nodes),
+                )
             }
             ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
             ResolvedColumnExpr::Arithmetic(arith) => Box::new(arith.nodes()),
@@ -914,6 +922,7 @@ impl Deparse for ResolvedColumnExpr {
                 agg_star,
                 agg_distinct,
                 agg_order,
+                agg_filter,
                 over,
             } => {
                 buf.push_str(name);
@@ -941,6 +950,11 @@ impl Deparse for ResolvedColumnExpr {
                     }
                 }
                 buf.push(')');
+                if let Some(filter) = agg_filter {
+                    buf.push_str(" FILTER (WHERE ");
+                    filter.deparse(buf);
+                    buf.push(')');
+                }
                 if let Some(window_spec) = over {
                     buf.push_str(" OVER ");
                     window_spec.deparse(buf);

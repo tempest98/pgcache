@@ -236,6 +236,7 @@ fn resolved_column_expr_alias_update(
         ResolvedColumnExpr::Function {
             args,
             agg_order,
+            agg_filter,
             over,
             ..
         } => {
@@ -244,6 +245,9 @@ fn resolved_column_expr_alias_update(
             }
             for clause in agg_order {
                 resolved_column_expr_alias_update(&mut clause.expr, schema, table, alias);
+            }
+            if let Some(filter) = agg_filter {
+                resolved_where_column_alias_update(filter, schema, table, alias);
             }
             if let Some(window_spec) = over {
                 for col in &mut window_spec.partition_by {
