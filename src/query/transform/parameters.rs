@@ -317,21 +317,49 @@ fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Liter
 fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
     let pg_type = PgType::from_oid(oid);
 
-    // PGC-103: array parameters use a binary wire format whose header is
-    // mostly NUL bytes (ndim, hasnull, element OID, dim length + lower
-    // bound), and elements are length-prefixed binary. Those NULs are
-    // valid UTF-8, so the catch-all `str::from_utf8` path used to decode
-    // them into a `LiteralValue::String` carrying embedded NULs — which
-    // then corrupted the deparsed SQL.
-    //
-    // Decode arrays into a PG text array literal here so the query stays
-    // cacheable. Multi-dim arrays and unsupported element types fall
-    // through to `UnsupportedBinaryFormat` and the query is forwarded to
-    // origin uncached.
-    if let Some(ref ty) = pg_type
-        && matches!(ty.kind(), postgres_types::Kind::Array(_))
-    {
-        return binary_array_to_literal(bytes, oid);
+    // Dispatch by Kind first. PGC-103 was one instance of a class of bug:
+    // the previous catch-all UTF-8 fallback silently corrupted SQL
+    // whenever a binary wire format happened to be valid UTF-8 (binary
+    // arrays were the smoking gun, but composite/range/numeric/jsonb and
+    // friends share the same shape — length-prefixed integers and flag
+    // bytes that pass UTF-8 validation but break SQL). Anything without
+    // explicit handling here returns `UnsupportedBinaryFormat` so the
+    // query falls through to origin uncached, rather than being
+    // mis-decoded.
+    if let Some(ref ty) = pg_type {
+        match ty.kind() {
+            postgres_types::Kind::Array(_) => {
+                return binary_array_to_literal(bytes, oid);
+            }
+            postgres_types::Kind::Domain(base) => {
+                // Domains are transparent wrappers; recurse on the base.
+                return binary_parameter_to_literal(bytes, base.oid());
+            }
+            postgres_types::Kind::Enum(_) => {
+                // Enum binary format is the UTF-8 label, by definition.
+                let s = std::str::from_utf8(bytes).map_err(|_| {
+                    Report::from(AstTransformError::InvalidParameterValue {
+                        message: "binary enum value is not valid UTF-8".to_owned(),
+                    })
+                })?;
+                return Ok(LiteralValue::String(s.to_owned()));
+            }
+            postgres_types::Kind::Composite(_)
+            | postgres_types::Kind::Range(_)
+            | postgres_types::Kind::Multirange(_)
+            | postgres_types::Kind::Pseudo => {
+                return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
+            }
+            postgres_types::Kind::Simple => {
+                // Fall through to the per-OID match arms below.
+            }
+            _ => {
+                // `Kind` is `#[non_exhaustive]`; reject anything new
+                // conservatively so future variants don't silently slip
+                // back into the UTF-8 fallback we just removed.
+                return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
+            }
+        }
     }
 
     match pg_type {
@@ -439,19 +467,51 @@ fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Lit
             );
             Ok(LiteralValue::String(uuid_str))
         }
-        // For known but unhandled types, try to interpret as text
-        Some(_) => {
-            // Attempt to decode as UTF-8 text (works for enums which use text labels)
-            match std::str::from_utf8(bytes) {
-                Ok(s) => Ok(LiteralValue::String(s.to_owned())),
-                Err(_) => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
+        Some(PgType::JSON) => {
+            // JSON binary format is plain UTF-8 JSON text — no version
+            // prefix or other framing — so it round-trips as a string
+            // literal, just with an explicit `::json` cast to preserve
+            // the column's expected type.
+            let value = pg_types::text_from_sql(bytes).map_err(|e| {
+                Report::from(AstTransformError::InvalidParameterValue {
+                    message: format!("invalid binary json: {}", e),
+                })
+            })?;
+            Ok(LiteralValue::StringWithCast(
+                value.to_owned(),
+                PgType::JSON.name().to_owned(),
+            ))
+        }
+        Some(PgType::JSONB) => {
+            // JSONB binary format prepends a 1-byte version (currently
+            // 0x01); the rest is UTF-8 JSON text. Strip the prefix so the
+            // deparsed SQL is `'<json>'::jsonb` rather than carrying the
+            // SOH control byte into the literal.
+            match bytes.split_first() {
+                Some((&0x01, json)) => {
+                    let value = std::str::from_utf8(json).map_err(|_| {
+                        Report::from(AstTransformError::InvalidParameterValue {
+                            message: "jsonb body is not valid UTF-8".to_owned(),
+                        })
+                    })?;
+                    Ok(LiteralValue::StringWithCast(
+                        value.to_owned(),
+                        PgType::JSONB.name().to_owned(),
+                    ))
+                }
+                _ => Err(AstTransformError::InvalidParameterValue {
+                    message: "missing or unknown jsonb version byte".to_owned(),
+                }
+                .into()),
             }
         }
-        // Unknown OID (custom types like domains or enums) - try text interpretation
-        None => match std::str::from_utf8(bytes) {
-            Ok(s) => Ok(LiteralValue::String(s.to_owned())),
-            Err(_) => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
-        },
+        // Fail-closed: any type without an explicit decoder above is
+        // rejected rather than coerced via UTF-8. See PGC-103 — the
+        // previous fallback silently produced corrupted SQL for any
+        // binary wire format whose bytes happened to be valid UTF-8.
+        // Unsupported types fall through to origin uncached, which is the
+        // correct behavior.
+        _ => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
     }
 }
 
@@ -473,28 +533,43 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
     // arrays in the wire format and the text format (`{{1,2},{3,4}}`); we
     // can extend later if a workload actually needs it.
     let mut dims = array.dimensions();
-    let mut dim_count = 0usize;
-    while dims
-        .next()
-        .map_err(|_| Report::from(AstTransformError::UnsupportedBinaryFormat { oid }))?
-        .is_some()
-    {
-        dim_count += 1;
-        if dim_count > 1 {
-            return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
-        }
+    let bad_dim = |_| Report::from(AstTransformError::UnsupportedBinaryFormat { oid });
+    let _ = dims.next().map_err(bad_dim)?;
+    if dims.next().map_err(bad_dim)?.is_some() {
+        return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
     }
 
     let element_type = PgType::from_oid(array.element_type())
         .ok_or_else(|| Report::from(AstTransformError::UnsupportedBinaryFormat { oid }))?;
 
-    let mut literal = String::from("{");
+    // Hoist the per-element decoder out of the loop: the element type is
+    // fixed for the whole array, so the type match should run once, not
+    // once per element. Coerces all arms to a `fn` pointer (no captures).
+    let decode_element: fn(&[u8]) -> Option<String> = match element_type {
+        PgType::BOOL => |b| {
+            pg_types::bool_from_sql(b)
+                .ok()
+                .map(|v| if v { "t".to_owned() } else { "f".to_owned() })
+        },
+        PgType::INT2 => |b| pg_types::int2_from_sql(b).ok().map(|n| n.to_string()),
+        PgType::INT4 => |b| pg_types::int4_from_sql(b).ok().map(|n| n.to_string()),
+        PgType::INT8 => |b| pg_types::int8_from_sql(b).ok().map(|n| n.to_string()),
+        PgType::FLOAT4 => |b| pg_types::float4_from_sql(b).ok().map(|n| n.to_string()),
+        PgType::FLOAT8 => |b| pg_types::float8_from_sql(b).ok().map(|n| n.to_string()),
+        PgType::TEXT | PgType::VARCHAR | PgType::BPCHAR | PgType::NAME | PgType::CHAR => {
+            |b| pg_types::text_from_sql(b).ok().map(array_text_quote)
+        }
+        _ => return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
+    };
+
+    // The text form is bounded by the binary input plus a few delimiters
+    // (`{`, `}`, commas, optional quoting); pre-size to avoid the `String`
+    // doubling reallocs as we push elements.
+    let mut literal = String::with_capacity(bytes.len().saturating_add(2));
+    literal.push('{');
     let mut first = true;
     let mut values = array.values();
-    while let Some(value) = values
-        .next()
-        .map_err(|_| Report::from(AstTransformError::UnsupportedBinaryFormat { oid }))?
-    {
+    while let Some(value) = values.next().map_err(bad_dim)? {
         if !first {
             literal.push(',');
         }
@@ -502,10 +577,9 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
         match value {
             None => literal.push_str("NULL"),
             Some(elem_bytes) => {
-                let elem_text = binary_array_element_to_text(elem_bytes, &element_type)
-                    .ok_or_else(|| {
-                        Report::from(AstTransformError::UnsupportedBinaryFormat { oid })
-                    })?;
+                let elem_text = decode_element(elem_bytes).ok_or_else(|| {
+                    Report::from(AstTransformError::UnsupportedBinaryFormat { oid })
+                })?;
                 literal.push_str(&elem_text);
             }
         }
@@ -514,30 +588,6 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
 
     let cast = format!("{}[]", element_type.name());
     Ok(LiteralValue::StringWithCast(literal, cast))
-}
-
-/// Decode a single array element from its binary representation into the
-/// text array form. Returns `None` for element types we don't support, so
-/// the caller can convert to `UnsupportedBinaryFormat`.
-///
-/// Numeric/bool elements never need quoting in array text format; text
-/// elements are routed through `array_text_quote` which handles `{`, `}`,
-/// `,`, `"`, `\`, whitespace, and the literal string `NULL`.
-fn binary_array_element_to_text(bytes: &[u8], element_type: &PgType) -> Option<String> {
-    match *element_type {
-        PgType::BOOL => pg_types::bool_from_sql(bytes)
-            .ok()
-            .map(|b| if b { "t".to_owned() } else { "f".to_owned() }),
-        PgType::INT2 => pg_types::int2_from_sql(bytes).ok().map(|n| n.to_string()),
-        PgType::INT4 => pg_types::int4_from_sql(bytes).ok().map(|n| n.to_string()),
-        PgType::INT8 => pg_types::int8_from_sql(bytes).ok().map(|n| n.to_string()),
-        PgType::FLOAT4 => pg_types::float4_from_sql(bytes).ok().map(|n| n.to_string()),
-        PgType::FLOAT8 => pg_types::float8_from_sql(bytes).ok().map(|n| n.to_string()),
-        PgType::TEXT | PgType::VARCHAR | PgType::BPCHAR | PgType::NAME | PgType::CHAR => {
-            pg_types::text_from_sql(bytes).ok().map(array_text_quote)
-        }
-        _ => None,
-    }
 }
 
 /// Quote a string for use as an element in a PG text array literal.
@@ -570,7 +620,7 @@ mod tests {
 
     use tokio_util::bytes::Bytes;
 
-    use crate::query::ast::{Deparse, query_expr_convert};
+    use crate::query::ast::{Deparse, query_expr_convert, query_expr_fingerprint};
 
     use super::*;
 
@@ -941,17 +991,206 @@ mod tests {
         ));
     }
 
+    // ==================== Kind-dispatch / fail-closed tests ====================
+    //
+    // These exercise the `Kind`-based dispatch added on top of
+    // `binary_parameter_to_literal` after PGC-103. Builtin types reachable
+    // via `PgType::from_oid` only cover `Kind::Simple`, `Array`, `Range`,
+    // `Multirange`, and `Pseudo`. Synthesizing a `Kind::Composite`,
+    // `Kind::Domain`, or `Kind::Enum` requires `PgType::new(...)` with a
+    // custom OID that `from_oid` won't resolve, so those arms are validated
+    // by code review only — the dispatch logic for them mirrors the Range
+    // / Multirange / Pseudo paths exercised here.
+
     #[test]
-    fn test_binary_parameter_unsupported_type_valid_utf8_fallback() {
-        // Known but unhandled types with valid UTF-8 should fallback to string
+    fn test_binary_parameter_range_rejected() {
+        // `Kind::Range(Int4)`: builtin int4range. Even if the binary range
+        // wire format happens to be valid UTF-8, the Kind dispatch rejects.
         let param = QueryParameter {
-            value: Some(Bytes::from_static(b"2024-01-15")), // Valid UTF-8 text representation
+            value: Some(Bytes::from_static(&[0x01])), // empty-range flags byte
             format: 1,
-            oid: PgType::DATE.oid(), // Date not supported in binary
+            oid: PgType::INT4_RANGE.oid(),
         };
 
-        let result = parameter_to_literal(&param).expect("should fallback to string");
-        assert_eq!(result, LiteralValue::String("2024-01-15".to_owned()));
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_multirange_rejected() {
+        let param = QueryParameter {
+            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00])), // ranges count = 0
+            format: 1,
+            oid: PgType::INT4MULTI_RANGE.oid(),
+        };
+
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_pseudo_rejected() {
+        // `record` and `any` are both `Kind::Pseudo`; reject either.
+        let param = QueryParameter {
+            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x01])),
+            format: 1,
+            oid: PgType::RECORD.oid(),
+        };
+
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_unknown_oid_rejected() {
+        // OID that `PgType::from_oid` can't resolve falls through the Kind
+        // dispatch (skipped because pg_type is None) into the new
+        // fail-closed catch-all in the OID match.
+        let param = QueryParameter {
+            value: Some(Bytes::from_static(b"42")),
+            format: 1,
+            oid: 999_999, // not a builtin OID
+        };
+
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_json() {
+        // JSON binary format is plain UTF-8 JSON, no framing.
+        let json = br#"{"a":1,"b":[2,3]}"#;
+        let param = QueryParameter {
+            value: Some(Bytes::copy_from_slice(json)),
+            format: 1,
+            oid: PgType::JSON.oid(),
+        };
+
+        let literal = parameter_to_literal(&param).expect("decode binary json");
+        assert_eq!(
+            literal,
+            LiteralValue::StringWithCast(
+                r#"{"a":1,"b":[2,3]}"#.to_owned(),
+                "json".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn test_binary_parameter_jsonb_strips_version_byte() {
+        // JSONB binary: 0x01 version + UTF-8 JSON. The 0x01 SOH byte must
+        // not end up in the deparsed SQL literal.
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(br#"{"k":"v"}"#);
+        let param = QueryParameter {
+            value: Some(Bytes::copy_from_slice(&bytes)),
+            format: 1,
+            oid: PgType::JSONB.oid(),
+        };
+
+        let literal = parameter_to_literal(&param).expect("decode binary jsonb");
+        assert_eq!(
+            literal,
+            LiteralValue::StringWithCast(r#"{"k":"v"}"#.to_owned(), "jsonb".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_binary_parameter_jsonb_unknown_version_rejected() {
+        // Anything other than the documented 0x01 prefix is malformed.
+        let bytes = [0x02, b'{', b'}'];
+        let param = QueryParameter {
+            value: Some(Bytes::copy_from_slice(&bytes)),
+            format: 1,
+            oid: PgType::JSONB.oid(),
+        };
+
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::InvalidParameterValue { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_numeric_rejected() {
+        // The classic silent-corruption vector before PGC-103: NUMERIC's
+        // binary wire format is mostly small big-endian ints that pass
+        // UTF-8 validation. Confirm we now reject rather than coerce.
+        let bytes = vec![
+            0x00, 0x01, // ndigits = 1
+            0x00, 0x00, // weight = 0
+            0x00, 0x00, // sign = positive
+            0x00, 0x00, // dscale = 0
+            0x00, 0x2A, // digit = 42
+        ];
+        let param = QueryParameter {
+            value: Some(Bytes::copy_from_slice(&bytes)),
+            format: 1,
+            oid: PgType::NUMERIC.oid(),
+        };
+
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_timestamp_rejected_valid_utf8() {
+        // The text version of this test (`...with_invalid_utf8`) covers the
+        // bytes-aren't-valid-UTF-8 path; here the bytes ARE valid UTF-8
+        // (the binary timestamp `0x4000000000000000` decodes to the
+        // four-byte sequence "@" + three NULs, which is valid UTF-8 but
+        // would silently corrupt SQL under the old fallback).
+        let param = QueryParameter {
+            value: Some(Bytes::from_static(&[
+                0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ])),
+            format: 1,
+            oid: PgType::TIMESTAMP.oid(),
+        };
+
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn test_binary_parameter_unsupported_type_rejected_even_with_valid_utf8() {
+        // Sister test of `test_binary_parameter_unsupported_type_with_invalid_utf8`.
+        // Before the fail-closed restructure, valid-UTF-8 binary bytes for an
+        // unsupported type (here, DATE) silently fell through to a String
+        // literal — that is the bug class we removed (PGC-103). Now the
+        // function returns `UnsupportedBinaryFormat` regardless of whether
+        // the bytes happen to be valid UTF-8, so the query falls through
+        // to origin uncached.
+        let param = QueryParameter {
+            value: Some(Bytes::from_static(b"2024-01-15")),
+            format: 1,
+            oid: PgType::DATE.oid(),
+        };
+
+        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
+        assert!(matches!(
+            result,
+            Err(AstTransformError::UnsupportedBinaryFormat { .. })
+        ));
     }
 
     #[test]
@@ -986,6 +1225,17 @@ mod tests {
     /// length-prefix + the 4-byte value. Most bytes are zero — which is the
     /// crux of PGC-103: those zeros are valid UTF-8 and used to slip through
     /// the binary parameter catch-all into a `LiteralValue::String`.
+    /// Encode a single binary text-array element: i32 length prefix
+    /// followed by the UTF-8 bytes. Used to assemble synthetic `text[]`
+    /// payloads in tests.
+    fn array_text_element_bytes(s: &str) -> Vec<u8> {
+        let len = i32::try_from(s.len()).expect("test element fits in i32");
+        let mut buf = Vec::with_capacity(4 + s.len());
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        buf
+    }
+
     fn binary_int4_array_42_100() -> Vec<u8> {
         vec![
             0x00, 0x00, 0x00, 0x01, // ndim = 1
@@ -1018,6 +1268,53 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast("{42,100}".to_owned(), "int4[]".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_binary_int4_array_distinct_values_produce_distinct_fingerprints() {
+        // Sanity check that two different binary int4[] parameter values
+        // substituted into the same query template produce different
+        // post-substitution fingerprints. Otherwise pgcache would route
+        // them to the same cache entry and one query's results would bleed
+        // into the other's. This is the unit-level companion to the
+        // `binary_array_test::test_binary_int4_array_distinct_cache_entries`
+        // integration test.
+        let pg_ast = pg_query::parse("SELECT id FROM widgets WHERE id = ANY($1)")
+            .expect("parse SQL");
+        let q1 = query_expr_convert(&pg_ast).expect("convert to QueryExpr");
+        let q2 = q1.clone();
+
+        let arr1 = vec![
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let arr2 = vec![
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17,
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x05,
+        ];
+        let p1 = binary_params(vec![(Some(&arr1), PgType::INT4_ARRAY)]);
+        let p2 = binary_params(vec![(Some(&arr2), PgType::INT4_ARRAY)]);
+
+        let r1 = query_expr_parameters_replace(&q1, &p1).expect("replace 1");
+        let r2 = query_expr_parameters_replace(&q2, &p2).expect("replace 2");
+
+        let mut s1 = String::new();
+        let mut s2 = String::new();
+        r1.deparse(&mut s1);
+        r2.deparse(&mut s2);
+        assert_ne!(s1, s2, "deparsed SQL should differ between arrays");
+
+        let f1 = query_expr_fingerprint(&r1);
+        let f2 = query_expr_fingerprint(&r2);
+        assert_ne!(
+            f1, f2,
+            "different binary int4[] values must produce different fingerprints"
         );
     }
 
@@ -1096,13 +1393,6 @@ mod tests {
         // `text[]` whose elements include separator chars, embedded quotes,
         // backslashes, whitespace, an empty string, and the literal "NULL".
         // All require quoting per PG array text format rules.
-        let element_bytes = |s: &str| {
-            let len = i32::try_from(s.len()).expect("test element fits in i32");
-            let mut buf = Vec::with_capacity(4 + s.len());
-            buf.extend_from_slice(&len.to_be_bytes());
-            buf.extend_from_slice(s.as_bytes());
-            buf
-        };
         let mut bytes = vec![
             0x00, 0x00, 0x00, 0x01, // ndim = 1
             0x00, 0x00, 0x00, 0x00, // hasnull = 0
@@ -1111,7 +1401,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, // dim 0 lower bound = 1
         ];
         for s in ["plain", "with,comma", "has\"quote", "back\\slash", ""] {
-            bytes.extend_from_slice(&element_bytes(s));
+            bytes.extend_from_slice(&array_text_element_bytes(s));
         }
 
         let param = QueryParameter {
@@ -1134,19 +1424,12 @@ mod tests {
     fn test_binary_text_array_with_null_string_element() {
         // The element value `"null"` (case-insensitive) must be quoted so
         // PG doesn't read it as a NULL marker.
-        let element_bytes = |s: &str| {
-            let len = i32::try_from(s.len()).expect("test element fits in i32");
-            let mut buf = Vec::with_capacity(4 + s.len());
-            buf.extend_from_slice(&len.to_be_bytes());
-            buf.extend_from_slice(s.as_bytes());
-            buf
-        };
         let mut bytes = vec![
             0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19,
             0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
         ];
-        bytes.extend_from_slice(&element_bytes("NULL"));
-        bytes.extend_from_slice(&element_bytes("a"));
+        bytes.extend_from_slice(&array_text_element_bytes("NULL"));
+        bytes.extend_from_slice(&array_text_element_bytes("a"));
 
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
