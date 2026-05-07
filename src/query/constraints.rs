@@ -60,7 +60,7 @@ pub enum TableConstraint {
 }
 
 /// Analysis results for a query showing all constant constraints
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct QueryConstraints {
     /// All column constraints (from WHERE + propagated through JOINs)
     pub column_constraints: HashSet<ColumnConstraint>,
@@ -70,6 +70,28 @@ pub struct QueryConstraints {
 
     /// Constraints organized by table for quick lookup
     pub table_constraints: HashMap<EcoString, Vec<TableConstraint>>,
+
+    /// True when the analyzer recognized every expression in the WHERE
+    /// clause; false if it encountered any expression it can't extract
+    /// constraints from (e.g. `MultiOp::Any`, `OR`, `Unary`, function
+    /// calls, subqueries). PGC-106: subsumption uses this to distinguish
+    /// "no WHERE clause / full table scan" (complete=true, empty
+    /// `table_constraints`) from "WHERE clause we couldn't analyze"
+    /// (complete=false, empty `table_constraints`). Without this, a
+    /// cached query with `WHERE id = ANY(...)` was wrongly treated as a
+    /// full scan and incorrectly subsumed unrelated queries.
+    pub where_analysis_complete: bool,
+}
+
+impl Default for QueryConstraints {
+    fn default() -> Self {
+        Self {
+            column_constraints: HashSet::new(),
+            equivalences: HashSet::new(),
+            table_constraints: HashMap::new(),
+            where_analysis_complete: true,
+        }
+    }
 }
 
 impl QueryConstraints {
@@ -573,10 +595,17 @@ fn constraints_group_by_column<'a>(
 
 /// Extract constraint information from any resolved WHERE expression.
 /// Handles equality, inequality, and BETWEEN operators on column-vs-literal comparisons.
+///
+/// `complete` is set to `false` whenever the analyzer drops an expression
+/// without extracting a constraint from it (e.g. `MultiOp::Any`, `OR`,
+/// non-comparison binary shapes, subqueries). The caller uses this to
+/// gate subsumption: a cached query with a WHERE clause we couldn't
+/// fully analyze must not be assumed to be a full table scan.
 fn analyze_constraint_expr(
     expr: &ResolvedWhereExpr,
     constraints: &mut HashSet<ColumnConstraint>,
     equivalences: &mut HashSet<ColumnEquivalence>,
+    complete: &mut bool,
 ) {
     match expr {
         // Comparison operators: column op value, value op column, column = column
@@ -598,6 +627,8 @@ fn analyze_constraint_expr(
                             op: flipped,
                             value: val.clone(),
                         });
+                    } else {
+                        *complete = false;
                     }
                 }
                 // column = column (equivalence) — equality only
@@ -609,14 +640,14 @@ fn analyze_constraint_expr(
                         right: right.clone(),
                     });
                 }
-                _ => {}
+                _ => *complete = false,
             }
         }
 
         // AND: recursively analyze both sides
         ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::And => {
-            analyze_constraint_expr(&binary.lexpr, constraints, equivalences);
-            analyze_constraint_expr(&binary.rexpr, constraints, equivalences);
+            analyze_constraint_expr(&binary.lexpr, constraints, equivalences, complete);
+            analyze_constraint_expr(&binary.rexpr, constraints, equivalences, complete);
         }
 
         // BETWEEN / BETWEEN SYMMETRIC: extract as two inequality constraints
@@ -636,7 +667,9 @@ fn analyze_constraint_expr(
             not_in_constraints_extract(&multi.exprs, constraints);
         }
 
-        // Everything else: OR, NOT BETWEEN, subqueries, etc. — cannot extract constraints
+        // Everything else: OR, NOT BETWEEN, ANY/ALL, subqueries, function
+        // calls, etc. — cannot extract constraints. Mark the analysis
+        // incomplete so subsumption falls back to "not subsumed".
         ResolvedWhereExpr::Value(_)
         | ResolvedWhereExpr::Column(_)
         | ResolvedWhereExpr::Unary(_)
@@ -644,7 +677,9 @@ fn analyze_constraint_expr(
         | ResolvedWhereExpr::Multi(_)
         | ResolvedWhereExpr::Array(_)
         | ResolvedWhereExpr::Function { .. }
-        | ResolvedWhereExpr::Subquery { .. } => {}
+        | ResolvedWhereExpr::Subquery { .. } => {
+            *complete = false;
+        }
     }
 }
 
@@ -764,37 +799,46 @@ fn collect_from_table_source(
     source: &ResolvedTableSource,
     constraints: &mut HashSet<ColumnConstraint>,
     equivalences: &mut HashSet<ColumnEquivalence>,
+    complete: &mut bool,
 ) {
     if let ResolvedTableSource::Join(join) = source {
         // Analyze this join's condition
         if let Some(condition) = &join.condition {
-            analyze_constraint_expr(condition, constraints, equivalences);
+            analyze_constraint_expr(condition, constraints, equivalences, complete);
         }
 
         // Recurse into nested joins
-        collect_from_table_source(&join.left, constraints, equivalences);
-        collect_from_table_source(&join.right, constraints, equivalences);
+        collect_from_table_source(&join.left, constraints, equivalences, complete);
+        collect_from_table_source(&join.right, constraints, equivalences, complete);
     }
 }
 
 /// Collect all constraints and equivalences from the entire query
 fn collect_query_constraints(
     resolved: &ResolvedSelectNode,
-) -> (HashSet<ColumnConstraint>, HashSet<ColumnEquivalence>) {
+) -> (HashSet<ColumnConstraint>, HashSet<ColumnEquivalence>, bool) {
     let mut constraints = HashSet::new();
     let mut equivalences = HashSet::new();
+    // No WHERE clause is trivially complete — the cache holds the full
+    // table for that source. Only set to false when the analyzer hits an
+    // expression it can't extract constraints from.
+    let mut complete = true;
 
-    // Analyze WHERE clause
     if let Some(where_expr) = &resolved.where_clause {
-        analyze_constraint_expr(where_expr, &mut constraints, &mut equivalences);
+        analyze_constraint_expr(where_expr, &mut constraints, &mut equivalences, &mut complete);
     }
 
     // Analyze JOIN conditions
     for table_source in &resolved.from {
-        collect_from_table_source(table_source, &mut constraints, &mut equivalences);
+        collect_from_table_source(
+            table_source,
+            &mut constraints,
+            &mut equivalences,
+            &mut complete,
+        );
     }
 
-    (constraints, equivalences)
+    (constraints, equivalences, complete)
 }
 
 /// Propagate constraints through column equivalences using fixpoint iteration
@@ -858,6 +902,15 @@ pub fn table_constraints_subsumed(
     cached: &QueryConstraints,
     table: &str,
 ) -> bool {
+    // PGC-106: if the analyzer couldn't fully understand the cached
+    // query's WHERE clause, an empty `table_constraints` doesn't mean
+    // "full table scan" — it means "we don't know what the cache holds".
+    // Refuse to subsume in that case so the new query falls through and
+    // gets its own cache entry.
+    if !cached.where_analysis_complete {
+        return false;
+    }
+
     let cached_for_table = cached.table_constraints.get(table);
     let new_for_table = new.table_constraints.get(table);
 
@@ -891,7 +944,7 @@ pub fn table_constraints_subsumed(
 /// even when subqueries are present.
 pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstraints {
     // Step 1: Collect all constraint information (constraints + equivalences)
-    let (constraints, equivalences) = collect_query_constraints(resolved);
+    let (constraints, equivalences, where_analysis_complete) = collect_query_constraints(resolved);
 
     // Step 2: Propagate constraints through equivalences
     let column_constraints = propagate_constraints(constraints, &equivalences);
@@ -917,6 +970,7 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
         column_constraints,
         equivalences,
         table_constraints,
+        where_analysis_complete,
     }
 }
 
@@ -2521,5 +2575,126 @@ mod tests {
             }
             _ => panic!("expected InSet, got {range:?}"),
         }
+    }
+
+    // ========== PGC-106: where_analysis_complete tracking ==========
+
+    #[test]
+    fn test_no_where_clause_is_complete() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        let resolved = resolve_sql("SELECT * FROM users", &tables);
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        assert!(
+            constraints.where_analysis_complete,
+            "no WHERE clause is trivially complete (full table scan)"
+        );
+    }
+
+    #[test]
+    fn test_simple_equality_is_complete() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        assert!(constraints.where_analysis_complete);
+    }
+
+    #[test]
+    fn test_in_clause_is_complete() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        let resolved = resolve_sql("SELECT * FROM users WHERE id IN (1, 2, 3)", &tables);
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        assert!(constraints.where_analysis_complete);
+    }
+
+    #[test]
+    fn test_any_clause_marks_incomplete() {
+        // PGC-106 regression: `WHERE x = ANY(...)` is not currently extracted
+        // into a constraint, so the analyzer must report incomplete so
+        // subsumption refuses to treat the cached query as a full scan.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        let resolved = resolve_sql(
+            "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
+            &tables,
+        );
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        assert!(
+            !constraints.where_analysis_complete,
+            "ANY-clause queries must mark analysis incomplete"
+        );
+        assert!(
+            !constraints.table_constraints.contains_key("users"),
+            "no constraint extracted for users (this is what makes the flag necessary)"
+        );
+    }
+
+    #[test]
+    fn test_or_clause_marks_incomplete() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        let resolved = resolve_sql(
+            "SELECT * FROM users WHERE id = 1 OR id = 2",
+            &tables,
+        );
+
+        let constraints = analyze_query_constraints(&resolved);
+
+        assert!(!constraints.where_analysis_complete);
+    }
+
+    #[test]
+    fn test_subsumption_refuses_when_cached_analysis_incomplete() {
+        // The PGC-106 scenario distilled to constraint analysis only:
+        // cached query uses ANY (analysis incomplete), new query asks for
+        // a different value. Without the gate, subsumption returned true
+        // because cached.table_constraints was empty.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2])",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = ANY(ARRAY[3, 4, 5])",
+            &tables,
+        ));
+
+        assert!(
+            !table_constraints_subsumed(&new, &cached, "users"),
+            "cached query with unanalyzed WHERE clause must not subsume"
+        );
+    }
+
+    #[test]
+    fn test_subsumption_full_scan_still_subsumes() {
+        // Sanity check that the new gate doesn't regress the legitimate
+        // "full-scan subsumes everything" case: cached query has no WHERE
+        // clause, so analysis is complete AND `table_constraints` is empty.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = 5",
+            &tables,
+        ));
+
+        assert!(cached.where_analysis_complete);
+        assert!(
+            table_constraints_subsumed(&new, &cached, "users"),
+            "true full-scan cached query should still subsume"
+        );
     }
 }

@@ -66,3 +66,62 @@ async fn test_binary_int4_array_in_any_clause() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-106 regression: same prepared statement, two different binary
+/// `int4[]` parameter values must each get their own cache entry and
+/// return the right rows.
+///
+/// Before the constraint-analysis fix in `src/query/constraints.rs`, the
+/// second array was incorrectly considered "subsumed" by the first call's
+/// cache (because `MultiOp::Any` produced no extracted constraints, and
+/// the absence of constraints was conflated with "full table scan, all
+/// rows loaded"). pgcache then ran the new query against the first
+/// array's cached rows — empty intersection, returning `[]` instead of
+/// the correct rows.
+#[tokio::test]
+async fn test_pgc106_distinct_arrays_get_distinct_cache_entries() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query("create table widgets (id integer primary key)", &[])
+        .await?;
+    ctx.query(
+        "insert into widgets (id) values (1), (2), (3), (4), (5)",
+        &[],
+    )
+    .await?;
+
+    let stmt = ctx
+        .prepare("select id from widgets where id = any($1) order by id")
+        .await?;
+
+    // First array: cache miss, populates entry for `[1, 2]`.
+    let m = ctx.metrics().await?;
+    let r1 = ctx.query(&stmt, &[&vec![1i32, 2]]).await?;
+    assert_eq!(r1.len(), 2);
+    assert_eq!(r1[0].get::<_, i32>("id"), 1);
+    assert_eq!(r1[1].get::<_, i32>("id"), 2);
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    wait_cache_load().await;
+
+    // Same array → cache hit on the same entry.
+    let _ = ctx.query(&stmt, &[&vec![1i32, 2]]).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Different array — must NOT be subsumed by the previous entry.
+    // Before PGC-106 fix: returned `[]` and reported a hit.
+    let r2 = ctx.query(&stmt, &[&vec![3i32, 4, 5]]).await?;
+    assert_eq!(
+        r2.iter()
+            .map(|r| r.get::<_, i32>("id"))
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    wait_cache_load().await;
+
+    // Same different array — hits its own newly-populated entry.
+    let _ = ctx.query(&stmt, &[&vec![3i32, 4, 5]]).await?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
