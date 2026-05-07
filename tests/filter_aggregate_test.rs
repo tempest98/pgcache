@@ -116,3 +116,95 @@ async fn test_filter_aggregate_two_predicates() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A subquery inside a FILTER predicate references a separate table.
+/// CDC events on that table must invalidate the cached fingerprint —
+/// otherwise the subquery_nodes_collect traversal misses the dependency
+/// and the cache silently serves stale data.
+#[tokio::test]
+async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id integer primary key, owneruserid integer not null)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE allowed_types (type_id integer primary key)",
+        &[],
+    )
+    .await?;
+
+    // 100 posts so the MV size gate (result_rows × ratio ≤ source_rows,
+    // ratio default 10, result_rows = 1) passes and the MV actually builds.
+    for id in 1..=100 {
+        ctx.query("INSERT INTO posts VALUES ($1, 8)", &[&id])
+            .await?;
+    }
+    // allowed_types starts empty; we INSERT after the MV is built so the
+    // EXISTS predicate flips false → true and forces invalidation.
+
+    // Let CDC register both tables with the writer before the first SELECT.
+    wait_for_cdc().await;
+
+    // Touch each table once so the writer's catalog learns about them.
+    let _ = ctx.simple_query("SELECT count(*) FROM posts").await?;
+    let _ = ctx
+        .simple_query("SELECT count(*) FROM allowed_types")
+        .await?;
+    wait_cache_load().await;
+
+    // FILTER predicate is a non-correlated EXISTS against allowed_types.
+    // While allowed_types is empty the predicate is false for every input
+    // row → count = 0. After we INSERT a row, EXISTS becomes true and
+    // count must jump to 100.
+    let sql = "SELECT count(*) FILTER (WHERE EXISTS \
+                   (SELECT 1 FROM allowed_types WHERE type_id = 1)) AS visible \
+               FROM posts WHERE owneruserid = 8";
+
+    let row = ctx.origin.query_one(sql, &[]).await.map_err(Error::other)?;
+    assert_eq!(row.get::<_, i64>("visible"), 0);
+
+    // Q1: cache miss, triggers source-row population.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 0);
+    wait_cache_load().await;
+
+    // Q2: cache hit on source-row eval; schedules MV first-build.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 0);
+    wait_cache_load().await;
+
+    // Q3: should be served from the MV (the snapshot path). Asserting
+    // cache_mv_hits proves the MV is what serves subsequent reads — and
+    // therefore that an MV staleness bug would actually surface.
+    let m_before_mv = ctx.metrics().await?;
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 0);
+    let m_after_mv = ctx.metrics().await?;
+    let d = metrics_delta(&m_before_mv, &m_after_mv);
+    assert!(
+        d.cache_mv_hits >= 1,
+        "expected MV fast-path hit before the invalidation test (delta {d:?})"
+    );
+
+    // INSERT a row into allowed_types. The cached query depends on this
+    // table only through the FILTER+EXISTS subquery; if
+    // subquery_nodes_collect doesn't walk agg_filter, no update query is
+    // registered for allowed_types and the MV stays Fresh after the
+    // insert — serving stale data.
+    ctx.origin_query("INSERT INTO allowed_types VALUES (1)", &[])
+        .await?;
+    wait_for_cdc().await;
+    wait_cache_load().await;
+
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(
+        row.get::<_, i64>("visible"),
+        100,
+        "INSERT into allowed_types must invalidate the FILTER+EXISTS query's MV"
+    );
+
+    Ok(())
+}

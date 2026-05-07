@@ -825,9 +825,30 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
             | ResolvedColumnExpr::Literal(_) => {}
-            ResolvedColumnExpr::Function { args, .. } => {
+            ResolvedColumnExpr::Function {
+                args,
+                agg_order,
+                agg_filter,
+                over,
+                ..
+            } => {
                 for arg in args {
                     arg.subquery_nodes_collect_with_source(branches);
+                }
+                for clause in agg_order {
+                    clause.expr.subquery_nodes_collect_with_source(branches);
+                }
+                // FILTER predicate is Scalar context — negated=false
+                if let Some(filter) = agg_filter {
+                    filter.subquery_nodes_collect_with_source(branches, false);
+                }
+                if let Some(over) = over {
+                    for col in &over.partition_by {
+                        col.subquery_nodes_collect_with_source(branches);
+                    }
+                    for clause in &over.order_by {
+                        clause.expr.subquery_nodes_collect_with_source(branches);
+                    }
                 }
             }
             ResolvedColumnExpr::Case(case) => {
@@ -861,9 +882,29 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
             | ResolvedColumnExpr::Literal(_) => {}
-            ResolvedColumnExpr::Function { args, .. } => {
+            ResolvedColumnExpr::Function {
+                args,
+                agg_order,
+                agg_filter,
+                over,
+                ..
+            } => {
                 for arg in args {
                     arg.subquery_nodes_collect(branches);
+                }
+                for clause in agg_order {
+                    clause.expr.subquery_nodes_collect(branches);
+                }
+                if let Some(filter) = agg_filter {
+                    filter.subquery_nodes_collect(branches);
+                }
+                if let Some(over) = over {
+                    for col in &over.partition_by {
+                        col.subquery_nodes_collect(branches);
+                    }
+                    for clause in &over.order_by {
+                        clause.expr.subquery_nodes_collect(branches);
+                    }
                 }
             }
             ResolvedColumnExpr::Case(case) => {

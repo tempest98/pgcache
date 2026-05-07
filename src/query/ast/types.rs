@@ -1439,6 +1439,20 @@ impl ColumnExpr {
                 for arg in &func.args {
                     arg.subquery_nodes_collect(branches);
                 }
+                for clause in &func.agg_order {
+                    clause.expr.subquery_nodes_collect(branches);
+                }
+                if let Some(filter) = &func.agg_filter {
+                    filter.subquery_nodes_collect(branches, false);
+                }
+                if let Some(over) = &func.over {
+                    for col in &over.partition_by {
+                        col.subquery_nodes_collect(branches);
+                    }
+                    for clause in &over.order_by {
+                        clause.expr.subquery_nodes_collect(branches);
+                    }
+                }
             }
             ColumnExpr::Case(case) => {
                 if let Some(arg) = &case.arg {
