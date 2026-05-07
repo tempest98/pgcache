@@ -667,6 +667,19 @@ fn analyze_constraint_expr(
             not_in_constraints_extract(&multi.exprs, constraints);
         }
 
+        // PGC-106: `col = ANY(<array literal>)` is semantically equivalent
+        // to `col IN (<elements>)` for set membership. Extract as `InSet`
+        // so the existing per-column range subsumption math handles
+        // narrower-array-subsumed-by-wider-array correctly. Only the `=`
+        // comparison maps cleanly to set membership; other comparisons
+        // (`<`, `<>`, etc.) under ANY have different semantics and stay
+        // unhandled, marking the analysis incomplete.
+        ResolvedWhereExpr::Multi(multi)
+            if matches!(multi.op, MultiOp::Any { comparison } if comparison == BinaryOp::Equal) =>
+        {
+            any_eq_array_constraints_extract(&multi.exprs, constraints, complete);
+        }
+
         // Everything else: OR, NOT BETWEEN, ANY/ALL, subqueries, function
         // calls, etc. — cannot extract constraints. Mark the analysis
         // incomplete so subsumption falls back to "not subsumed".
@@ -747,6 +760,68 @@ fn in_constraints_extract(
     }
 
     // Sort for deterministic Hash on ColumnConstraint::InSet
+    literal_values.sort_by(|a, b| literal_value_order(a, b).unwrap_or(Ordering::Equal));
+    literal_values.dedup();
+
+    constraints.insert(ColumnConstraint::InSet {
+        column: col.clone(),
+        values: literal_values,
+    });
+}
+
+/// Extract an `InSet` constraint from `column = ANY(<array>)`.
+/// `exprs` layout: `[subject, rhs]` where `rhs` is one of:
+///   - `Value(LiteralValue::Array(elements, _))` — produced by binary
+///     array parameter substitution (PGC-103)
+///   - `Array(elements)` — produced by `pg_query`'s `AArrayExpr` for
+///     literal `ARRAY[v1, v2, …]` syntax in the original SQL
+///
+/// Other shapes (subqueries, columns, etc.) leave the constraint set
+/// unchanged and mark the WHERE-clause analysis incomplete so
+/// subsumption refuses to treat the cached query as a full scan.
+fn any_eq_array_constraints_extract(
+    exprs: &[ResolvedWhereExpr],
+    constraints: &mut HashSet<ColumnConstraint>,
+    complete: &mut bool,
+) {
+    let [ResolvedWhereExpr::Column(col), rhs] = exprs else {
+        *complete = false;
+        return;
+    };
+
+    // Collect element values from either AST shape.
+    let mut literal_values: Vec<LiteralValue> = match rhs {
+        ResolvedWhereExpr::Value(LiteralValue::Array(values, _)) => values.clone(),
+        ResolvedWhereExpr::Array(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for elem in elems {
+                let ResolvedWhereExpr::Value(v) = elem else {
+                    *complete = false;
+                    return;
+                };
+                out.push(v.clone());
+            }
+            out
+        }
+        ResolvedWhereExpr::Value(_)
+        | ResolvedWhereExpr::Column(_)
+        | ResolvedWhereExpr::Unary(_)
+        | ResolvedWhereExpr::Binary(_)
+        | ResolvedWhereExpr::Multi(_)
+        | ResolvedWhereExpr::Function { .. }
+        | ResolvedWhereExpr::Subquery { .. } => {
+            *complete = false;
+            return;
+        }
+    };
+
+    if literal_values.iter().any(literal_value_is_incomparable) {
+        *complete = false;
+        return;
+    }
+
+    // Sort for deterministic Hash on ColumnConstraint::InSet (matching
+    // `in_constraints_extract`).
     literal_values.sort_by(|a, b| literal_value_order(a, b).unwrap_or(Ordering::Equal));
     literal_values.dedup();
 
@@ -2616,10 +2691,10 @@ mod tests {
     }
 
     #[test]
-    fn test_any_clause_marks_incomplete() {
-        // PGC-106 regression: `WHERE x = ANY(...)` is not currently extracted
-        // into a constraint, so the analyzer must report incomplete so
-        // subsumption refuses to treat the cached query as a full scan.
+    fn test_any_eq_clause_extracts_inset() {
+        // PGC-106 (option C): `WHERE col = ANY(<array>)` is set membership;
+        // extracted as `ColumnConstraint::InSet` so cached ANY-queries can
+        // subsume narrower ANY-queries on the same column.
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         let resolved = resolve_sql(
@@ -2630,17 +2705,26 @@ mod tests {
         let constraints = analyze_query_constraints(&resolved);
 
         assert!(
-            !constraints.where_analysis_complete,
-            "ANY-clause queries must mark analysis incomplete"
+            constraints.where_analysis_complete,
+            "ANY = is now extractable, analysis is complete"
         );
-        assert!(
-            !constraints.table_constraints.contains_key("users"),
-            "no constraint extracted for users (this is what makes the flag necessary)"
-        );
+        let users_cs = constraints
+            .table_constraints
+            .get("users")
+            .expect("constraint extracted for users");
+        assert_eq!(users_cs.len(), 1);
+        assert!(matches!(
+            users_cs[0],
+            TableConstraint::AnyOf(ref col, ref vs)
+                if col == "id" && vs.len() == 3
+        ));
     }
 
     #[test]
     fn test_or_clause_marks_incomplete() {
+        // OR is still in the unrecognized-expression bucket; subsumption
+        // must continue to fall back to "not subsumed" until/unless the
+        // analyzer learns to handle disjunctions.
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
         let resolved = resolve_sql(
@@ -2654,11 +2738,28 @@ mod tests {
     }
 
     #[test]
-    fn test_subsumption_refuses_when_cached_analysis_incomplete() {
-        // The PGC-106 scenario distilled to constraint analysis only:
-        // cached query uses ANY (analysis incomplete), new query asks for
-        // a different value. Without the gate, subsumption returned true
-        // because cached.table_constraints was empty.
+    fn test_subsumption_any_subsumes_narrower_any() {
+        // PGC-106 (option C) headline: cached `ANY([1,2,3])` should
+        // subsume new `ANY([1])`.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = ANY(ARRAY[1])",
+            &tables,
+        ));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_any_does_not_subsume_disjoint_any() {
+        // The PGC-106 option-B scenario stays correct under option C:
+        // disjoint arrays can't subsume each other.
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
@@ -2671,10 +2772,25 @@ mod tests {
             &tables,
         ));
 
-        assert!(
-            !table_constraints_subsumed(&new, &cached, "users"),
-            "cached query with unanalyzed WHERE clause must not subsume"
-        );
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_subsumption_any_subsumes_equality() {
+        // Cached `ANY([1,2,3])` should also subsume new `WHERE id = 2`.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id = 2",
+            &tables,
+        ));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
     }
 
     #[test]

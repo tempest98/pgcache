@@ -1003,7 +1003,8 @@ fn limit_node_extract(node: Option<&Node>) -> Result<Option<LiteralValue>, AstEr
                 | LiteralValue::Boolean(_)
                 | LiteralValue::Null
                 | LiteralValue::NullWithCast(_)
-                | LiteralValue::Parameter(_) => Err(AstError::UnsupportedFeature {
+                | LiteralValue::Parameter(_)
+                | LiteralValue::Array(_, _) => Err(AstError::UnsupportedFeature {
                     feature: format!("LIMIT/OFFSET value: {value:?}"),
                 }),
             }

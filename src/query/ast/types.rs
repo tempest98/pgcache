@@ -22,6 +22,12 @@ pub enum LiteralValue {
     Null,
     NullWithCast(String),
     Parameter(String), // For $1, $2, etc.
+    /// A 1-D array literal: `(elements, cast)`. Produced by binary array
+    /// parameter substitution (PGC-103) so the constraint analyzer can
+    /// extract `WHERE col = ANY($1)` as an `InSet` constraint and let
+    /// ANY-clause queries subsume each other (PGC-106). The cast string
+    /// is the array type name, e.g. `"int4[]"`.
+    Array(Vec<LiteralValue>, String),
 }
 
 impl LiteralValue {
@@ -61,6 +67,10 @@ impl LiteralValue {
             (Some(_), LiteralValue::Null) => false,
             (Some(_), LiteralValue::NullWithCast(_)) => false,
             (Some(_), LiteralValue::Parameter(_)) => false, // Parameters shouldn't appear in constraints
+            // Array constraints flow through `ColumnConstraint::InSet` not
+            // `Comparison`, so a row-vs-array equality test is never the
+            // right question; reject defensively.
+            (Some(_), LiteralValue::Array(_, _)) => false,
         }
     }
 }
@@ -68,32 +78,19 @@ impl LiteralValue {
 impl Deparse for LiteralValue {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
-            LiteralValue::String(s) => {
-                let escaped = escape::escape_literal(s);
-                // escape_literal prefixes " E'..." for strings needing escaping; drop the leading space.
-                if let Some(stripped) = escaped.strip_prefix(" E'") {
-                    buf.push_str("E'");
-                    buf.push_str(stripped);
-                } else {
-                    buf.push_str(&escaped);
-                }
-            }
+            LiteralValue::String(s) => emit_escaped_string_literal(s, buf),
             LiteralValue::StringWithCast(s, cast) => {
-                let escaped = escape::escape_literal(s);
-                if let Some(stripped) = escaped.strip_prefix(" E'") {
-                    buf.push_str("E'");
-                    buf.push_str(stripped);
-                } else {
-                    buf.push_str(&escaped);
-                }
+                emit_escaped_string_literal(s, buf);
                 buf.push_str("::");
                 buf.push_str(cast);
             }
             LiteralValue::Integer(i) => {
-                buf.push_str(i.to_string().as_str());
+                use std::fmt::Write;
+                let _ = write!(buf, "{i}");
             }
             LiteralValue::Float(f) => {
-                buf.push_str(f.into_inner().to_string().as_str());
+                use std::fmt::Write;
+                let _ = write!(buf, "{}", f.into_inner());
             }
             LiteralValue::Boolean(b) => {
                 buf.push_str(if *b { "true" } else { "false" });
@@ -108,10 +105,91 @@ impl Deparse for LiteralValue {
             LiteralValue::Parameter(p) => {
                 buf.push_str(p);
             }
+            LiteralValue::Array(elements, cast) => {
+                // Bytes must match the previous `StringWithCast(text, cast)`
+                // representation produced for binary array params (PGC-103),
+                // so cache fingerprints don't shift between options B and C.
+                let mut text = String::with_capacity(2 + elements.len() * 4);
+                text.push('{');
+                let mut first = true;
+                for elem in elements {
+                    if !first {
+                        text.push(',');
+                    }
+                    first = false;
+                    array_element_text_render(elem, &mut text);
+                }
+                text.push('}');
+
+                emit_escaped_string_literal(&text, buf);
+                buf.push_str("::");
+                buf.push_str(cast);
+            }
         };
 
         buf
     }
+}
+
+/// Emit a SQL string literal — `'...'` or `E'...'` if any byte needs
+/// escaping. `escape_literal` returns the leading-space `" E'..."` form
+/// for the latter case; we strip the space so the output stays
+/// concatenation-friendly.
+fn emit_escaped_string_literal(s: &str, buf: &mut String) {
+    let escaped = escape::escape_literal(s);
+    if let Some(stripped) = escaped.strip_prefix(" E'") {
+        buf.push_str("E'");
+        buf.push_str(stripped);
+    } else {
+        buf.push_str(&escaped);
+    }
+}
+
+fn array_element_text_render(elem: &LiteralValue, out: &mut String) {
+    use std::fmt::Write;
+    match elem {
+        LiteralValue::Null | LiteralValue::NullWithCast(_) => out.push_str("NULL"),
+        LiteralValue::Integer(n) => {
+            let _ = write!(out, "{n}");
+        }
+        LiteralValue::Float(f) => {
+            let _ = write!(out, "{}", f.into_inner());
+        }
+        // PG array text format uses single-character `t`/`f`, not `true`/`false`.
+        LiteralValue::Boolean(b) => out.push(if *b { 't' } else { 'f' }),
+        LiteralValue::String(s) | LiteralValue::StringWithCast(s, _) => {
+            array_element_text_push_quoted(s, out);
+        }
+        // `binary_array_to_literal` rejects multi-dim and only produces
+        // scalar elements, so nested Array / unsubstituted Parameter
+        // shouldn't reach this branch. `?` marks them visibly without
+        // panicking (the resulting SQL would be invalid, fail loudly at
+        // origin) — easier to debug than a silent wrong answer.
+        LiteralValue::Array(_, _) | LiteralValue::Parameter(_) => out.push('?'),
+    }
+}
+
+fn array_element_text_push_quoted(s: &str, out: &mut String) {
+    // PG array text format requires quoting around elements containing
+    // `{`, `}`, `,`, `"`, `\`, whitespace, the empty string, or the
+    // literal `NULL` (case-insensitive — otherwise PG reads it as the
+    // array null marker). Inside quotes, `"` and `\` are backslash-escaped.
+    let needs_quote = s.is_empty()
+        || s.eq_ignore_ascii_case("null")
+        || s.chars()
+            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
+    if !needs_quote {
+        out.push_str(s);
+        return;
+    }
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
 }
 
 // Column reference (potentially qualified: table.column)

@@ -543,74 +543,55 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
         .ok_or_else(|| Report::from(AstTransformError::UnsupportedBinaryFormat { oid }))?;
 
     // Hoist the per-element decoder out of the loop: the element type is
-    // fixed for the whole array, so the type match should run once, not
-    // once per element. Coerces all arms to a `fn` pointer (no captures).
-    let decode_element: fn(&[u8]) -> Option<String> = match element_type {
-        PgType::BOOL => |b| {
-            pg_types::bool_from_sql(b)
+    // fixed for the whole array, so the type match runs once instead of
+    // per element. Typed `LiteralValue` outputs let the constraint
+    // analyzer treat `WHERE col = ANY(<array>)` as `InSet(values)` and
+    // subsume narrower ANY-queries (PGC-106).
+    let decode_element: fn(&[u8]) -> Option<LiteralValue> = match element_type {
+        PgType::BOOL => |b| pg_types::bool_from_sql(b).ok().map(LiteralValue::Boolean),
+        PgType::INT2 => |b| pg_types::int2_from_sql(b).ok().map(|n| LiteralValue::Integer(n.into())),
+        PgType::INT4 => |b| pg_types::int4_from_sql(b).ok().map(|n| LiteralValue::Integer(n.into())),
+        PgType::INT8 => |b| pg_types::int8_from_sql(b).ok().map(LiteralValue::Integer),
+        PgType::FLOAT4 => |b| {
+            pg_types::float4_from_sql(b)
                 .ok()
-                .map(|v| if v { "t".to_owned() } else { "f".to_owned() })
+                .and_then(|f| NotNan::new(f64::from(f)).ok())
+                .map(LiteralValue::Float)
         },
-        PgType::INT2 => |b| pg_types::int2_from_sql(b).ok().map(|n| n.to_string()),
-        PgType::INT4 => |b| pg_types::int4_from_sql(b).ok().map(|n| n.to_string()),
-        PgType::INT8 => |b| pg_types::int8_from_sql(b).ok().map(|n| n.to_string()),
-        PgType::FLOAT4 => |b| pg_types::float4_from_sql(b).ok().map(|n| n.to_string()),
-        PgType::FLOAT8 => |b| pg_types::float8_from_sql(b).ok().map(|n| n.to_string()),
-        PgType::TEXT | PgType::VARCHAR | PgType::BPCHAR | PgType::NAME | PgType::CHAR => {
-            |b| pg_types::text_from_sql(b).ok().map(array_text_quote)
-        }
+        PgType::FLOAT8 => |b| {
+            pg_types::float8_from_sql(b)
+                .ok()
+                .and_then(|f| NotNan::new(f).ok())
+                .map(LiteralValue::Float)
+        },
+        PgType::TEXT | PgType::VARCHAR | PgType::BPCHAR | PgType::NAME | PgType::CHAR => |b| {
+            pg_types::text_from_sql(b)
+                .ok()
+                .map(|s| LiteralValue::String(s.to_owned()))
+        },
         _ => return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
     };
 
-    // The text form is bounded by the binary input plus a few delimiters
-    // (`{`, `}`, commas, optional quoting); pre-size to avoid the `String`
-    // doubling reallocs as we push elements.
-    let mut literal = String::with_capacity(bytes.len().saturating_add(2));
-    literal.push('{');
-    let mut first = true;
+    // Build typed elements; deparse will format them as the PG text
+    // array literal `'{e1,e2,…}'::cast` at SQL emit time. Pre-size from
+    // the iterator's reported remaining count to avoid Vec doubling
+    // reallocations.
     let mut values = array.values();
+    let mut elements: Vec<LiteralValue> = Vec::with_capacity(values.size_hint().0);
     while let Some(value) = values.next().map_err(bad_dim)? {
-        if !first {
-            literal.push(',');
-        }
-        first = false;
         match value {
-            None => literal.push_str("NULL"),
+            None => elements.push(LiteralValue::Null),
             Some(elem_bytes) => {
-                let elem_text = decode_element(elem_bytes).ok_or_else(|| {
+                let lit = decode_element(elem_bytes).ok_or_else(|| {
                     Report::from(AstTransformError::UnsupportedBinaryFormat { oid })
                 })?;
-                literal.push_str(&elem_text);
+                elements.push(lit);
             }
         }
     }
-    literal.push('}');
 
     let cast = format!("{}[]", element_type.name());
-    Ok(LiteralValue::StringWithCast(literal, cast))
-}
-
-/// Quote a string for use as an element in a PG text array literal.
-/// Quoting is required when the element contains `{`, `}`, `,`, `"`, `\`,
-/// any whitespace, is empty, or matches the literal string `NULL`.
-fn array_text_quote(s: &str) -> String {
-    let needs_quote = s.is_empty()
-        || s.eq_ignore_ascii_case("null")
-        || s.chars()
-            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
-    if !needs_quote {
-        return s.to_owned();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
+    Ok(LiteralValue::Array(elements, cast))
 }
 
 #[cfg(test)]
@@ -1267,7 +1248,10 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary int4[]");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("{42,100}".to_owned(), "int4[]".to_owned())
+            LiteralValue::Array(
+                vec![LiteralValue::Integer(42), LiteralValue::Integer(100)],
+                "int4[]".to_owned()
+            )
         );
     }
 
@@ -1358,7 +1342,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode empty int4[]");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("{}".to_owned(), "int4[]".to_owned())
+            LiteralValue::Array(vec![], "int4[]".to_owned())
         );
     }
 
@@ -1384,7 +1368,14 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode int4[] with null");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("{1,NULL,3}".to_owned(), "int4[]".to_owned())
+            LiteralValue::Array(
+                vec![
+                    LiteralValue::Integer(1),
+                    LiteralValue::Null,
+                    LiteralValue::Integer(3),
+                ],
+                "int4[]".to_owned()
+            )
         );
     }
 
@@ -1411,12 +1402,32 @@ mod tests {
         };
 
         let literal = parameter_to_literal(&param).expect("decode text[]");
+        // Decoded elements are stored as plain `LiteralValue::String` —
+        // PG-array-text quoting (`"`-wrap, `\`-escape) is applied at
+        // deparse time, not at decode time, so the constraint analyzer
+        // can compare element values directly.
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                r#"{plain,"with,comma","has\"quote","back\\slash",""}"#.to_owned(),
+            LiteralValue::Array(
+                vec![
+                    LiteralValue::String("plain".to_owned()),
+                    LiteralValue::String("with,comma".to_owned()),
+                    LiteralValue::String("has\"quote".to_owned()),
+                    LiteralValue::String("back\\slash".to_owned()),
+                    LiteralValue::String(String::new()),
+                ],
                 "text[]".to_owned()
             )
+        );
+
+        // Also verify the deparsed SQL still applies array-text-format
+        // quoting and SQL string-literal escaping (the byte-identity
+        // guarantee from PGC-103's previous representation).
+        let mut buf = String::new();
+        literal.deparse(&mut buf);
+        assert_eq!(
+            buf,
+            r#"E'{plain,"with,comma","has\\"quote","back\\\\slash",""}'::text[]"#
         );
     }
 
@@ -1440,8 +1451,20 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode text[]");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(r#"{"NULL",a}"#.to_owned(), "text[]".to_owned())
+            LiteralValue::Array(
+                vec![
+                    LiteralValue::String("NULL".to_owned()),
+                    LiteralValue::String("a".to_owned()),
+                ],
+                "text[]".to_owned()
+            )
         );
+
+        // Deparse still wraps the literal `"NULL"` so PG doesn't read
+        // it as a SQL NULL marker.
+        let mut buf = String::new();
+        literal.deparse(&mut buf);
+        assert_eq!(buf, r#"'{"NULL",a}'::text[]"#);
     }
 
     #[test]

@@ -67,6 +67,54 @@ async fn test_binary_int4_array_in_any_clause() -> Result<(), Error> {
     Ok(())
 }
 
+/// PGC-106 (option C): a narrower binary `int4[]` array hits the cached
+/// entry of a wider one via subsumption — the cache holds rows
+/// matching `[1, 2, 3]`, the new query asks for `[1]`, the worker runs
+/// the new SQL against the cache and returns `[1]`. Before the option-C
+/// constraint extraction, the analyzer didn't recognize `MultiOp::Any`
+/// and option-B's safety gate refused the subsumption (every distinct
+/// array got its own miss).
+#[tokio::test]
+async fn test_pgc106_any_subsumes_narrower_any() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query("create table widgets (id integer primary key)", &[])
+        .await?;
+    ctx.query(
+        "insert into widgets (id) values (1), (2), (3), (4), (5)",
+        &[],
+    )
+    .await?;
+
+    let stmt = ctx
+        .prepare("select id from widgets where id = any($1) order by id")
+        .await?;
+
+    // Cache the wider set first.
+    let m = ctx.metrics().await?;
+    let r1 = ctx.query(&stmt, &[&vec![1i32, 2, 3]]).await?;
+    assert_eq!(
+        r1.iter()
+            .map(|r| r.get::<_, i32>("id"))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    wait_cache_load().await;
+
+    // Narrower subset: subsumption hit, returns the right row.
+    let r2 = ctx.query(&stmt, &[&vec![1i32]]).await?;
+    assert_eq!(
+        r2.iter()
+            .map(|r| r.get::<_, i32>("id"))
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
 /// PGC-106 regression: same prepared statement, two different binary
 /// `int4[]` parameter values must each get their own cache entry and
 /// return the right rows.

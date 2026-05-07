@@ -225,6 +225,10 @@ pub fn where_value_compare_string(
         LiteralValue::Null => false, // Row has non-NULL value, filter expects NULL
         LiteralValue::NullWithCast(_) => false, // Row has non-NULL value, filter expects NULL
         LiteralValue::Parameter(_) => false, // Parameters not supported in cache matching
+        // Array literals only appear via `MultiOp::Any` / `MultiOp::All`,
+        // which the evaluator handles at the WHERE-expr level — never here
+        // as a scalar comparison value.
+        LiteralValue::Array(_, _) => false,
     }
 }
 
