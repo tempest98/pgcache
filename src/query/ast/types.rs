@@ -11,23 +11,28 @@ use crate::cache::{SubqueryKind, UpdateQuerySource};
 
 use super::{AstError, Deparse};
 
-// Core literal value types that can appear in SQL expressions
+// Core literal value types that can appear in SQL expressions.
+//
+// Cast fields use `EcoString` because they're nearly always short PG type
+// names (`"bytea"`, `"int4[]"`, …) that fit `EcoString`'s inline-storage
+// threshold — zero-alloc to construct from a `&'static str` and cheap to
+// clone. See PGC-109.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LiteralValue {
     String(String),
-    StringWithCast(String, String),
+    StringWithCast(String, EcoString),
     Integer(i64),
     Float(NotNan<f64>),
     Boolean(bool),
     Null,
-    NullWithCast(String),
+    NullWithCast(EcoString),
     Parameter(String), // For $1, $2, etc.
     /// A 1-D array literal: `(elements, cast)`. Produced by binary array
     /// parameter substitution (PGC-103) so the constraint analyzer can
     /// extract `WHERE col = ANY($1)` as an `InSet` constraint and let
     /// ANY-clause queries subsume each other (PGC-106). The cast string
     /// is the array type name, e.g. `"int4[]"`.
-    Array(Vec<LiteralValue>, String),
+    Array(Vec<LiteralValue>, EcoString),
 }
 
 impl LiteralValue {

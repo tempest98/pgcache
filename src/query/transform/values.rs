@@ -89,9 +89,9 @@ pub fn resolved_select_node_table_replace_with_values(
     for column_meta in &table_metadata.columns {
         let position = column_meta.index();
         if let Some(row_value) = row_data.get(position) {
-            let value = row_value.as_deref().map_or(
-                LiteralValue::NullWithCast(column_meta.type_name.to_string()),
-                |v| LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.to_string()),
+            let value = row_value.as_deref().map_or_else(
+                || LiteralValue::NullWithCast(column_meta.type_name.clone()),
+                |v| LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone()),
             );
             values.push(value);
             column_names.push(EcoString::from(column_meta.name.as_str()));
