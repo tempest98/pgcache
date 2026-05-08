@@ -593,38 +593,44 @@ fn numeric_to_text(weight: i16, sign: u16, dscale: usize, digits: &[i16]) -> Opt
             .unwrap_or(0)
     };
 
-    let mut int_part = String::new();
     let int_top = i32::from(weight).max(0);
-    for w in (0..=int_top).rev() {
-        let d = digit_at(w);
-        if int_part.is_empty() {
-            let _ = write!(int_part, "{d}");
-        } else {
-            let _ = write!(int_part, "{d:04}");
-        }
-    }
-    if int_part.is_empty() {
-        int_part.push('0');
-    }
+    let int_digit_count = usize::from(weight.max(0).unsigned_abs()) + 1;
+    // Upper bound: sign byte + ≤4 chars per base-10000 digit + dot + dscale.
+    let capacity = usize::from(neg)
+        + 4 * int_digit_count
+        + if dscale > 0 { 1 + dscale } else { 0 };
+    let mut out = String::with_capacity(capacity);
 
-    let mut frac_part = String::new();
-    let mut w: i32 = -1;
-    while frac_part.len() < dscale {
-        let d = digit_at(w);
-        let _ = write!(frac_part, "{d:04}");
-        w -= 1;
-    }
-    frac_part.truncate(dscale);
-
-    let mut out = String::new();
     if neg {
         out.push('-');
     }
-    out.push_str(&int_part);
-    if !frac_part.is_empty() {
-        out.push('.');
-        out.push_str(&frac_part);
+
+    let mut first_int = true;
+    for w in (0..=int_top).rev() {
+        let d = digit_at(w);
+        if first_int {
+            // First digit has no leading zeros (`5` not `0005`).
+            let _ = write!(out, "{d}");
+            first_int = false;
+        } else {
+            let _ = write!(out, "{d:04}");
+        }
     }
+
+    if dscale > 0 {
+        out.push('.');
+        let frac_start = out.len();
+        let mut w: i32 = -1;
+        while out.len() - frac_start < dscale {
+            let d = digit_at(w);
+            let _ = write!(out, "{d:04}");
+            w -= 1;
+        }
+        // Last 4-char chunk may overshoot when dscale isn't a multiple of
+        // 4; trim to exactly `dscale` fractional digits.
+        out.truncate(frac_start + dscale);
+    }
+
     Some(out)
 }
 
