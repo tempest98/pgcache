@@ -1,3 +1,8 @@
+//! Binary-format parameter decoding (Bind format=1). Each PG type has its
+//! own wire format; we decode to a typed `LiteralValue` (or a
+//! `StringWithCast` carrying canonical PG text) so the deparsed SQL
+//! re-binds safely without round-tripping through PG's text input parser.
+
 use std::fmt::Write as _;
 
 use fallible_iterator::FallibleIterator;
@@ -6,316 +11,25 @@ use postgres_protocol::types as pg_types;
 use postgres_types::Type as PgType;
 use rootcause::Report;
 
-use crate::cache::{QueryParameter, QueryParameters};
-use crate::query::ast::{LiteralValue, QueryBody, QueryExpr, SelectNode, TableSource, WhereExpr};
+use crate::query::ast::LiteralValue;
 
-use super::{AstTransformError, AstTransformResult};
+use super::super::{AstTransformError, AstTransformResult};
 
-/// Replace parameter placeholders ($1, $2, etc.) in a QueryExpr with actual values.
-///
-/// This function traverses the AST and replaces all `LiteralValue::Parameter` nodes
-/// with appropriate typed `LiteralValue` nodes based on the provided parameter values.
-pub fn query_expr_parameters_replace(
-    query_expr: &QueryExpr,
-    parameters: &QueryParameters,
-) -> AstTransformResult<QueryExpr> {
-    let mut new_query = query_expr.clone();
+/// JDN of `2000-01-01`, PG's epoch for both `date` and `timestamp[tz]`.
+const POSTGRES_EPOCH_JDATE: i32 = 2_451_545;
+const USECS_PER_DAY: i64 = 86_400_000_000;
 
-    // Replace parameters in CTE definitions
-    for cte in &mut new_query.ctes {
-        let replaced = query_expr_parameters_replace(&cte.query, parameters)?;
-        cte.query = replaced;
-    }
+// `numeric` sign codes — see PG `src/backend/utils/adt/numeric.c`.
+const NUMERIC_POS: u16 = 0x0000;
+const NUMERIC_NEG: u16 = 0x4000;
+const NUMERIC_NAN: u16 = 0xC000;
+const NUMERIC_PINF: u16 = 0xD000;
+const NUMERIC_NINF: u16 = 0xF000;
 
-    // Replace parameters in body
-    query_body_parameters_replace(&mut new_query.body, parameters)?;
-
-    // Replace parameters in LIMIT clause
-    if let Some(limit) = &mut new_query.limit {
-        if let Some(count) = &mut limit.count {
-            literal_value_parameters_replace(count, parameters)?;
-        }
-        if let Some(offset) = &mut limit.offset {
-            literal_value_parameters_replace(offset, parameters)?;
-        }
-    }
-
-    Ok(new_query)
-}
-
-/// Replace parameters in a QueryBody
-fn query_body_parameters_replace(
-    body: &mut QueryBody,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    match body {
-        QueryBody::Select(select_node) => {
-            select_node_parameters_replace(select_node, parameters)?;
-        }
-        QueryBody::Values(_) => {
-            // Values clauses contain literals, no parameters to replace
-        }
-        QueryBody::SetOp(set_op) => {
-            query_expr_parameters_replace_mut(&mut set_op.left, parameters)?;
-            query_expr_parameters_replace_mut(&mut set_op.right, parameters)?;
-        }
-    }
-    Ok(())
-}
-
-/// Replace parameters in a QueryExpr (mutable version for recursive calls)
-fn query_expr_parameters_replace_mut(
-    query_expr: &mut QueryExpr,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    query_body_parameters_replace(&mut query_expr.body, parameters)?;
-    if let Some(limit) = &mut query_expr.limit {
-        if let Some(count) = &mut limit.count {
-            literal_value_parameters_replace(count, parameters)?;
-        }
-        if let Some(offset) = &mut limit.offset {
-            literal_value_parameters_replace(offset, parameters)?;
-        }
-    }
-    Ok(())
-}
-
-/// Replace parameters in a SelectNode (mutates in place)
-pub fn select_node_parameters_replace(
-    select_node: &mut SelectNode,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    // Replace parameters in WHERE clause
-    if let Some(where_clause) = &mut select_node.where_clause {
-        where_expr_parameters_replace(where_clause, parameters)?;
-    }
-
-    // Replace parameters in HAVING clause
-    if let Some(having) = &mut select_node.having {
-        where_expr_parameters_replace(having, parameters)?;
-    }
-
-    // Replace parameters in JOIN conditions
-    for table_source in &mut select_node.from {
-        table_source_parameters_replace(table_source, parameters)?;
-    }
-
-    Ok(())
-}
-
-/// Replace parameters in a TableSource (recursively handles JOINs)
-fn table_source_parameters_replace(
-    table_source: &mut TableSource,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    match table_source {
-        TableSource::Join(join) => {
-            // Replace in JOIN condition
-            if let Some(condition) = &mut join.condition {
-                where_expr_parameters_replace(condition, parameters)?;
-            }
-            // Recursively handle nested joins
-            table_source_parameters_replace(&mut join.left, parameters)?;
-            table_source_parameters_replace(&mut join.right, parameters)?;
-        }
-        TableSource::Subquery(subquery) => {
-            // Replace parameters in subquery
-            query_expr_parameters_replace_mut(&mut subquery.query, parameters)?;
-        }
-        TableSource::CteRef(cte_ref) => {
-            // Replace parameters in CTE reference body
-            query_expr_parameters_replace_mut(&mut cte_ref.query, parameters)?;
-        }
-        TableSource::Table(_) => {
-            // No parameters in simple table references
-        }
-    }
-    Ok(())
-}
-
-/// Replace parameters in a WhereExpr tree (mutates in place)
-fn where_expr_parameters_replace(
-    expr: &mut WhereExpr,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    match expr {
-        WhereExpr::Value(literal) => {
-            // Only replace if this is a parameter placeholder
-            if let LiteralValue::Parameter(placeholder) = literal {
-                // Parse parameter index from placeholder (e.g., "$1" -> 0)
-                let index = parameter_index_parse(placeholder)?;
-
-                // Get parameter
-                let param = parameters.get(index).ok_or_else(|| {
-                    Report::from(AstTransformError::ParameterOutOfBounds {
-                        index,
-                        count: parameters.len(),
-                    })
-                })?;
-
-                // Replace the LiteralValue in place
-                *literal = parameter_to_literal(&param)?;
-            }
-        }
-        WhereExpr::Column(_) => {
-            // No parameters in column references
-        }
-        WhereExpr::Unary(unary) => {
-            where_expr_parameters_replace(&mut unary.expr, parameters)?;
-        }
-        WhereExpr::Binary(binary) => {
-            where_expr_parameters_replace(&mut binary.lexpr, parameters)?;
-            where_expr_parameters_replace(&mut binary.rexpr, parameters)?;
-        }
-        WhereExpr::Multi(multi) => {
-            for expr in &mut multi.exprs {
-                where_expr_parameters_replace(expr, parameters)?;
-            }
-        }
-        WhereExpr::Array(elems) => {
-            for elem in elems {
-                where_expr_parameters_replace(elem, parameters)?;
-            }
-        }
-        WhereExpr::Function { args, .. } => {
-            for arg in args {
-                where_expr_parameters_replace(arg, parameters)?;
-            }
-        }
-        WhereExpr::Subquery {
-            query, test_expr, ..
-        } => {
-            query_expr_parameters_replace_mut(query, parameters)?;
-            if let Some(test) = test_expr {
-                where_expr_parameters_replace(test, parameters)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Replace a parameter in a LiteralValue (mutates in place)
-fn literal_value_parameters_replace(
-    literal: &mut LiteralValue,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    if let LiteralValue::Parameter(placeholder) = literal {
-        let index = parameter_index_parse(placeholder)?;
-
-        let param = parameters.get(index).ok_or_else(|| {
-            Report::from(AstTransformError::ParameterOutOfBounds {
-                index,
-                count: parameters.len(),
-            })
-        })?;
-
-        *literal = parameter_to_literal(&param)?;
-    }
-    Ok(())
-}
-
-/// Parse parameter index from placeholder string (e.g., "$1" -> 0, "$2" -> 1)
-fn parameter_index_parse(placeholder: &str) -> AstTransformResult<usize> {
-    let Some(index_str) = placeholder.strip_prefix('$') else {
-        return Err(AstTransformError::InvalidParameterPlaceholder {
-            placeholder: placeholder.to_owned(),
-        }
-        .into());
-    };
-
-    let param_num = index_str.parse::<usize>().map_err(|_| {
-        Report::from(AstTransformError::InvalidParameterPlaceholder {
-            placeholder: placeholder.to_owned(),
-        })
-    })?;
-
-    if param_num == 0 {
-        return Err(AstTransformError::InvalidParameterPlaceholder {
-            placeholder: placeholder.to_owned(),
-        }
-        .into());
-    }
-
-    Ok(param_num - 1) // Convert 1-indexed to 0-indexed
-}
-
-/// Convert a parameter value (bytes) to a LiteralValue.
-///
-/// Handles both text format (format=0) and binary format (format=1) parameters
-/// from the PostgreSQL extended query protocol. Uses the OID to determine the
-/// appropriate type conversion.
-fn parameter_to_literal(param: &QueryParameter) -> AstTransformResult<LiteralValue> {
-    match &param.value {
-        None => Ok(LiteralValue::Null),
-        Some(bytes) => {
-            if param.format == 0 {
-                text_parameter_to_literal(bytes, param.oid)
-            } else {
-                binary_parameter_to_literal(bytes, param.oid)
-            }
-        }
-    }
-}
-
-/// Convert a text format parameter to a LiteralValue based on OID.
-fn text_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
-    let s = std::str::from_utf8(bytes).map_err(|_| Report::from(AstTransformError::InvalidUtf8))?;
-
-    // Use postgres_types to identify the type from OID
-    let pg_type = PgType::from_oid(oid);
-
-    match pg_type {
-        Some(PgType::BOOL) => {
-            let value = matches!(s, "t" | "true" | "TRUE" | "1");
-            Ok(LiteralValue::Boolean(value))
-        }
-        Some(PgType::INT2 | PgType::INT4 | PgType::INT8) => {
-            let value = s.parse::<i64>().map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid integer '{s}': {e}"),
-                })
-            })?;
-            Ok(LiteralValue::Integer(value))
-        }
-        Some(PgType::FLOAT4 | PgType::FLOAT8) => {
-            let value = s.parse::<f64>().map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid float '{s}': {e}"),
-                })
-            })?;
-            let value = NotNan::new(value).map_err(|_| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("NaN is not a valid float value: {s}"),
-                })
-            })?;
-            Ok(LiteralValue::Float(value))
-        }
-        // String-like types
-        Some(
-            PgType::TEXT
-            | PgType::VARCHAR
-            | PgType::BPCHAR
-            | PgType::NAME
-            | PgType::CHAR
-            | PgType::UNKNOWN,
-        ) => Ok(LiteralValue::String(s.to_owned())),
-        // Types that pass through as strings (UUID, temporal, numeric)
-        Some(
-            PgType::UUID
-            | PgType::TIMESTAMP
-            | PgType::TIMESTAMPTZ
-            | PgType::DATE
-            | PgType::TIME
-            | PgType::TIMETZ
-            | PgType::INTERVAL
-            | PgType::NUMERIC,
-        ) => Ok(LiteralValue::String(s.to_owned())),
-        // Unknown OID or unhandled type - fallback to string
-        _ => Ok(LiteralValue::String(s.to_owned())),
-    }
-}
-
-fn binary_parameter_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
+pub(super) fn binary_parameter_to_literal(
+    bytes: &[u8],
+    oid: u32,
+) -> AstTransformResult<LiteralValue> {
     if let Some(ty) = PgType::from_oid(oid)
         && matches!(ty.kind(), postgres_types::Kind::Array(_))
     {
@@ -439,7 +153,6 @@ fn binary_parameter_to_literal_scalar(
             Ok(LiteralValue::String(value.to_owned()))
         }
         Some(PgType::UUID) => {
-            // UUID binary format is 16 bytes
             let bytes: &[u8; 16] = bytes.try_into().map_err(|_| {
                 Report::from(AstTransformError::InvalidParameterValue {
                     message: format!(
@@ -707,17 +420,6 @@ fn time_micros_to_text(micros: i64) -> String {
     let s = total_secs % 60;
     format!("{h:02}:{m:02}:{s:02}.{frac:06}")
 }
-
-/// JDN of `2000-01-01`, PG's epoch for both `date` and `timestamp[tz]`.
-const POSTGRES_EPOCH_JDATE: i32 = 2_451_545;
-const USECS_PER_DAY: i64 = 86_400_000_000;
-
-// `numeric` sign codes — see PG `src/backend/utils/adt/numeric.c`.
-const NUMERIC_POS: u16 = 0x0000;
-const NUMERIC_NEG: u16 = 0x4000;
-const NUMERIC_NAN: u16 = 0xC000;
-const NUMERIC_PINF: u16 = 0xD000;
-const NUMERIC_NINF: u16 = 0xF000;
 
 /// PostgreSQL `j2date` algorithm: convert `i32` days-since-2000-01-01
 /// into proleptic-Gregorian `(year, month, day)`. Year 0 means 1 BC,
@@ -1007,16 +709,24 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
 
 #[cfg(test)]
 mod tests {
-
     #![allow(clippy::wildcard_enum_match_arm)]
 
+    use postgres_types::Type as PgType;
     use tokio_util::bytes::Bytes;
 
-    use crate::query::ast::{Deparse, query_expr_convert, query_expr_fingerprint};
+    use crate::cache::{QueryParameter, QueryParameters};
+    use crate::query::ast::{
+        Deparse, LiteralValue, QueryBody, SelectNode, query_expr_convert, query_expr_fingerprint,
+    };
 
-    use super::*;
+    use super::super::super::AstTransformError;
+    use super::super::{
+        parameter_to_literal, query_expr_parameters_replace, select_node_parameters_replace,
+    };
+    use super::{NUMERIC_NEG, NUMERIC_NINF, NUMERIC_PINF, NUMERIC_POS, USECS_PER_DAY};
+    // NUMERIC_NAN is also used; pull in too.
+    use super::NUMERIC_NAN;
 
-    /// Parse SQL and return a SelectNode
     fn parse_select_node(sql: &str) -> SelectNode {
         let ast = pg_query::parse(sql).expect("parse SQL");
         let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
@@ -1026,34 +736,6 @@ mod tests {
         }
     }
 
-    /// Helper to create QueryParameters for text format with TEXT OID
-    fn text_params(values: Vec<Option<&[u8]>>) -> QueryParameters {
-        let len = values.len();
-        QueryParameters {
-            values: values
-                .into_iter()
-                .map(|v| v.map(Bytes::copy_from_slice))
-                .collect(),
-            formats: vec![0; len], // 0 = text format
-            oids: vec![PgType::TEXT.oid(); len],
-        }
-    }
-
-    /// Helper to create QueryParameters with specific OIDs (text format)
-    fn typed_text_params(values: Vec<(Option<&[u8]>, PgType)>) -> QueryParameters {
-        let len = values.len();
-        let (values, oids): (Vec<_>, Vec<_>) = values
-            .into_iter()
-            .map(|(v, t)| (v.map(Bytes::copy_from_slice), t.oid()))
-            .unzip();
-        QueryParameters {
-            values,
-            formats: vec![0; len], // 0 = text format
-            oids,
-        }
-    }
-
-    /// Helper to create QueryParameters with binary format
     fn binary_params(values: Vec<(Option<&[u8]>, PgType)>) -> QueryParameters {
         let len = values.len();
         let (values, oids): (Vec<_>, Vec<_>) = values
@@ -1062,182 +744,107 @@ mod tests {
             .unzip();
         QueryParameters {
             values,
-            formats: vec![1; len], // 1 = binary format
+            formats: vec![1; len],
             oids,
         }
     }
 
-    #[test]
-    fn test_ast_parameters_replace_simple() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
-
-        // Replace $1 with value "42"
-        let params = text_params(vec![Some(b"42")]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        // Deparse to verify
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(buf, "SELECT id FROM users WHERE id = '42'");
+    /// Build the 20-byte header (`ndim=1, hasnull=0, elemtype, dim_len,
+    /// dim_lower`) shared by every 1-D binary array test payload.
+    fn array_header_bytes(elem_type: PgType, n_elements: i32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(20);
+        buf.extend_from_slice(&1_i32.to_be_bytes());
+        buf.extend_from_slice(&0_i32.to_be_bytes());
+        buf.extend_from_slice(&elem_type.oid().to_be_bytes());
+        buf.extend_from_slice(&n_elements.to_be_bytes());
+        buf.extend_from_slice(&1_i32.to_be_bytes());
+        buf
     }
 
-    #[test]
-    fn test_ast_parameters_replace_multiple_params() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1 AND name = $2");
-
-        // Replace $1 with "42", $2 with "alice"
-        let params = text_params(vec![Some(b"42"), Some(b"alice")]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        // Deparse to verify
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE id = '42' AND name = 'alice'"
-        );
+    fn timetz_bytes(micros: i64, zone_secs: i32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12);
+        buf.extend_from_slice(&micros.to_be_bytes());
+        buf.extend_from_slice(&zone_secs.to_be_bytes());
+        buf
     }
 
-    #[test]
-    fn test_ast_parameters_replace_null() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE name = $1");
-
-        // Replace $1 with NULL
-        let params = text_params(vec![None]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        // Deparse to verify
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(buf, "SELECT id FROM users WHERE name = NULL");
+    fn interval_bytes(micros: i64, days: i32, months: i32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&micros.to_be_bytes());
+        buf.extend_from_slice(&days.to_be_bytes());
+        buf.extend_from_slice(&months.to_be_bytes());
+        buf
     }
 
-    #[test]
-    fn test_ast_parameters_replace_out_of_bounds() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = $2");
+    fn inet_bytes(addr: &[u8], netmask: u8, is_cidr: bool) -> Vec<u8> {
+        let family: u8 = if addr.len() == 4 { 2 } else { 3 };
+        let mut buf = Vec::with_capacity(4 + addr.len());
+        buf.push(family);
+        buf.push(netmask);
+        buf.push(u8::from(is_cidr));
+        buf.push(u8::try_from(addr.len()).expect("test addr fits in u8"));
+        buf.extend_from_slice(addr);
+        buf
+    }
 
-        // Only provide 1 parameter, but query uses $2
-        let params = text_params(vec![Some(b"42")]);
-        let result = select_node_parameters_replace(&mut node, &params);
-
-        assert!(result.is_err());
-        match result.map_err(|e| e.into_current_context()) {
-            Err(AstTransformError::ParameterOutOfBounds { index, count }) => {
-                assert_eq!(index, 1); // $2 -> index 1
-                assert_eq!(count, 1); // Only 1 parameter provided
-            }
-            _ => panic!("Expected ParameterOutOfBounds error"),
+    /// Build a binary `numeric` payload from its component fields.
+    fn numeric_bytes(weight: i16, sign: u16, dscale: i16, digits: &[i16]) -> Vec<u8> {
+        let ndigits =
+            i16::try_from(digits.len()).expect("test numeric digit count fits in i16");
+        let mut buf = Vec::with_capacity(8 + 2 * digits.len());
+        buf.extend_from_slice(&ndigits.to_be_bytes());
+        buf.extend_from_slice(&weight.to_be_bytes());
+        buf.extend_from_slice(&sign.to_be_bytes());
+        buf.extend_from_slice(&dscale.to_be_bytes());
+        for d in digits {
+            buf.extend_from_slice(&d.to_be_bytes());
         }
+        buf
     }
 
-    #[test]
-    fn test_ast_parameters_replace_in_join() {
-        let mut node = parse_select_node(
-            "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > $1",
-        );
-
-        // Replace $1 with "100"
-        let params = text_params(vec![Some(b"100")]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        // Deparse to verify
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert!(buf.contains("WHERE o.total > '100'"));
-    }
-
-    // ==================== Text Format Parameter Tests ====================
-
-    #[test]
-    fn test_text_parameter_integer() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
-
-        // Integer type should produce integer literal
-        let params = typed_text_params(vec![(Some(b"42"), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        // Integer literal renders without quotes
-        assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
-    }
-
-    #[test]
-    fn test_text_parameter_boolean() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE active = $1");
-
-        // Boolean 't' -> true
-        let params = typed_text_params(vec![(Some(b"t"), PgType::BOOL)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(buf, "SELECT id FROM users WHERE active = true");
-    }
-
-    #[test]
-    fn test_text_parameter_float() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE score > $1");
-
-        let params = typed_text_params(vec![(Some(b"3.14"), PgType::FLOAT8)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(buf, "SELECT id FROM users WHERE score > 3.14");
-    }
-
-    #[test]
-    fn test_text_parameter_invalid_integer() {
+    fn assert_numeric(bytes: Vec<u8>, expected: &str) {
         let param = QueryParameter {
-            value: Some(Bytes::from_static(b"not_a_number")),
-            format: 0,
-            oid: PgType::INT4.oid(),
+            value: Some(Bytes::copy_from_slice(&bytes)),
+            format: 1,
+            oid: PgType::NUMERIC.oid(),
         };
-
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
-    }
-
-    #[test]
-    fn test_text_parameter_uuid() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE uuid = $1");
-
-        let params = typed_text_params(vec![(
-            Some(b"550e8400-e29b-41d4-a716-446655440000"),
-            PgType::UUID,
-        )]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
+        let literal = parameter_to_literal(&param).expect("decode binary numeric");
         assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE uuid = '550e8400-e29b-41d4-a716-446655440000'"
+            literal,
+            LiteralValue::StringWithCast(expected.to_owned(), "numeric".to_owned()),
+            "wire bytes {bytes:?}"
         );
     }
 
-    // ==================== Binary Format Parameter Tests ====================
+    /// Encode a single binary text-array element: i32 length prefix
+    /// followed by the UTF-8 bytes.
+    fn array_text_element_bytes(s: &str) -> Vec<u8> {
+        let len = i32::try_from(s.len()).expect("test element fits in i32");
+        let mut buf = Vec::with_capacity(4 + s.len());
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        buf
+    }
+
+    fn binary_int4_array_42_100() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x01, // ndim = 1
+            0x00, 0x00, 0x00, 0x00, // hasnull = 0
+            0x00, 0x00, 0x00, 0x17, // elemtype = 23 (int4)
+            0x00, 0x00, 0x00, 0x02, // dim 0 length = 2
+            0x00, 0x00, 0x00, 0x01, // dim 0 lower bound = 1
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A, // 42
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x64, // 100
+        ]
+    }
 
     #[test]
     fn test_binary_parameter_bool_true() {
         let param = QueryParameter {
-            value: Some(Bytes::from_static(&[1])), // PostgreSQL binary bool: 1 = true
+            value: Some(Bytes::from_static(&[1])),
             format: 1,
             oid: PgType::BOOL.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::Boolean(true));
     }
@@ -1245,11 +852,10 @@ mod tests {
     #[test]
     fn test_binary_parameter_bool_false() {
         let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0])), // PostgreSQL binary bool: 0 = false
+            value: Some(Bytes::from_static(&[0])),
             format: 1,
             oid: PgType::BOOL.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::Boolean(false));
     }
@@ -1257,11 +863,10 @@ mod tests {
     #[test]
     fn test_binary_parameter_int2() {
         let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x2A])), // 42 in big-endian i16
+            value: Some(Bytes::from_static(&[0x00, 0x2A])),
             format: 1,
             oid: PgType::INT2.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::Integer(42));
     }
@@ -1269,11 +874,10 @@ mod tests {
     #[test]
     fn test_binary_parameter_int4() {
         let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x2A])), // 42 in big-endian i32
+            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x2A])),
             format: 1,
             oid: PgType::INT4.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::Integer(42));
     }
@@ -1283,27 +887,23 @@ mod tests {
         let param = QueryParameter {
             value: Some(Bytes::from_static(&[
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A,
-            ])), // 42 in big-endian i64
+            ])),
             format: 1,
             oid: PgType::INT8.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::Integer(42));
     }
 
     #[test]
     fn test_binary_parameter_float4() {
-        // 3.14 as f32 in big-endian IEEE 754
         let value: f32 = 2.73;
         let bytes = value.to_be_bytes();
-
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
             format: 1,
             oid: PgType::FLOAT4.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         match result {
             LiteralValue::Float(f) => {
@@ -1317,13 +917,11 @@ mod tests {
     fn test_binary_parameter_float8() {
         let value: f64 = 2.73821;
         let bytes = value.to_be_bytes();
-
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
             format: 1,
             oid: PgType::FLOAT8.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         match result {
             LiteralValue::Float(f) => {
@@ -1340,25 +938,21 @@ mod tests {
             format: 1,
             oid: PgType::TEXT.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::String("hello world".to_owned()));
     }
 
     #[test]
     fn test_binary_parameter_uuid() {
-        // UUID: 550e8400-e29b-41d4-a716-446655440000
         let uuid_bytes: [u8; 16] = [
             0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
             0x00, 0x00,
         ];
-
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&uuid_bytes)),
             format: 1,
             oid: PgType::UUID.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(
             result,
@@ -1375,7 +969,6 @@ mod tests {
             format: 1,
             oid: PgType::POINT.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -1383,27 +976,15 @@ mod tests {
         ));
     }
 
-    // ==================== Kind-dispatch / fail-closed tests ====================
-    //
-    // These exercise the `Kind`-based dispatch added on top of
-    // `binary_parameter_to_literal` after PGC-103. Builtin types reachable
-    // via `PgType::from_oid` only cover `Kind::Simple`, `Array`, `Range`,
-    // `Multirange`, and `Pseudo`. Synthesizing a `Kind::Composite`,
-    // `Kind::Domain`, or `Kind::Enum` requires `PgType::new(...)` with a
-    // custom OID that `from_oid` won't resolve, so those arms are validated
-    // by code review only — the dispatch logic for them mirrors the Range
-    // / Multirange / Pseudo paths exercised here.
-
     #[test]
     fn test_binary_parameter_range_rejected() {
         // `Kind::Range(Int4)`: builtin int4range. Even if the binary range
         // wire format happens to be valid UTF-8, the Kind dispatch rejects.
         let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x01])), // empty-range flags byte
+            value: Some(Bytes::from_static(&[0x01])),
             format: 1,
             oid: PgType::INT4_RANGE.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -1414,11 +995,10 @@ mod tests {
     #[test]
     fn test_binary_parameter_multirange_rejected() {
         let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00])), // ranges count = 0
+            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00])),
             format: 1,
             oid: PgType::INT4MULTI_RANGE.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -1434,7 +1014,6 @@ mod tests {
             format: 1,
             oid: PgType::RECORD.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -1445,14 +1024,12 @@ mod tests {
     #[test]
     fn test_binary_parameter_unknown_oid_rejected() {
         // OID that `PgType::from_oid` can't resolve falls through the Kind
-        // dispatch (skipped because pg_type is None) into the new
-        // fail-closed catch-all in the OID match.
+        // dispatch into the fail-closed catch-all in the OID match.
         let param = QueryParameter {
             value: Some(Bytes::from_static(b"42")),
             format: 1,
-            oid: 999_999, // not a builtin OID
+            oid: 999_999,
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -1469,14 +1046,10 @@ mod tests {
             format: 1,
             oid: PgType::JSON.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary json");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                r#"{"a":1,"b":[2,3]}"#.to_owned(),
-                "json".to_owned()
-            )
+            LiteralValue::StringWithCast(r#"{"a":1,"b":[2,3]}"#.to_owned(), "json".to_owned())
         );
     }
 
@@ -1491,7 +1064,6 @@ mod tests {
             format: 1,
             oid: PgType::JSONB.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary jsonb");
         assert_eq!(
             literal,
@@ -1508,7 +1080,6 @@ mod tests {
             format: 1,
             oid: PgType::JSONB.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -1518,13 +1089,11 @@ mod tests {
 
     #[test]
     fn test_binary_parameter_bytea() {
-        // PG bytea binary wire format is the raw bytes — no header.
         let param = QueryParameter {
             value: Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
             format: 1,
             oid: PgType::BYTEA.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary bytea");
         assert_eq!(
             literal,
@@ -1539,7 +1108,6 @@ mod tests {
             format: 1,
             oid: PgType::BYTEA.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode empty bytea");
         assert_eq!(
             literal,
@@ -1549,19 +1117,12 @@ mod tests {
 
     #[test]
     fn test_binary_bytea_in_query_renders_clean_sql() {
-        // Full pipeline: bound binary bytea must produce a deparseable SQL
-        // string with no NUL bytes and the expected E-string + bytea cast.
         let mut node = parse_select_node("SELECT id FROM blobs WHERE data = $1");
-
-        let params = binary_params(vec![(
-            Some(&[0xde, 0xad, 0xbe, 0xef]),
-            PgType::BYTEA,
-        )]);
+        let params = binary_params(vec![(Some(&[0xde, 0xad, 0xbe, 0xef]), PgType::BYTEA)]);
         select_node_parameters_replace(&mut node, &params).expect("substitute binary bytea");
 
         let mut buf = String::new();
         node.deparse(&mut buf);
-
         assert!(
             !buf.as_bytes().contains(&0),
             "deparsed SQL must not contain NUL bytes; got {buf:?}"
@@ -1582,7 +1143,6 @@ mod tests {
             format: 1,
             oid: PgType::BYTEA_ARRAY.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode bytea[]");
         assert_eq!(
             literal,
@@ -1595,14 +1155,11 @@ mod tests {
             )
         );
 
-        // Deparse round-trip: PG-array-text quotes each element (each
-        // contains a backslash), then the SQL E-string escapes the
-        // resulting `"` and `\` characters.
-        let mut buf = String::new();
-        literal.deparse(&mut buf);
         // Each `\` is doubled twice on the way out: once by PG-array-text
         // quoting (`\x01` → `"\\x01"`), once by SQL E-string escaping
         // (`\\` → `\\\\`). End result: four backslashes per element.
+        let mut buf = String::new();
+        literal.deparse(&mut buf);
         assert_eq!(buf, r#"E'{"\\\\x01","\\\\xab"}'::bytea[]"#);
     }
 
@@ -1614,7 +1171,6 @@ mod tests {
             format: 1,
             oid: PgType::TIME.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary time");
         assert_eq!(
             literal,
@@ -1631,7 +1187,6 @@ mod tests {
             format: 1,
             oid: PgType::TIME.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary time");
         assert_eq!(
             literal,
@@ -1642,7 +1197,7 @@ mod tests {
     #[test]
     fn test_binary_time_in_query_renders_clean_sql() {
         let mut node = parse_select_node("SELECT id FROM events WHERE start = $1");
-        let micros: i64 = 9 * 3600 * 1_000_000; // 09:00:00.000000
+        let micros: i64 = 9 * 3600 * 1_000_000;
         let bytes = micros.to_be_bytes();
         let params = binary_params(vec![(Some(&bytes), PgType::TIME)]);
         select_node_parameters_replace(&mut node, &params).expect("substitute time");
@@ -1671,7 +1226,6 @@ mod tests {
             format: 1,
             oid: PgType::TIME_ARRAY.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode time[]");
         assert_eq!(
             literal,
@@ -1685,25 +1239,6 @@ mod tests {
         );
     }
 
-    /// Build the 20-byte header (`ndim=1, hasnull=0, elemtype, dim_len,
-    /// dim_lower`) shared by every 1-D binary array test payload.
-    fn array_header_bytes(elem_type: PgType, n_elements: i32) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(20);
-        buf.extend_from_slice(&1_i32.to_be_bytes());
-        buf.extend_from_slice(&0_i32.to_be_bytes());
-        buf.extend_from_slice(&elem_type.oid().to_be_bytes());
-        buf.extend_from_slice(&n_elements.to_be_bytes());
-        buf.extend_from_slice(&1_i32.to_be_bytes());
-        buf
-    }
-
-    fn timetz_bytes(micros: i64, zone_secs: i32) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(12);
-        buf.extend_from_slice(&micros.to_be_bytes());
-        buf.extend_from_slice(&zone_secs.to_be_bytes());
-        buf
-    }
-
     #[test]
     fn test_binary_parameter_timetz_utc() {
         let micros: i64 = 12 * 3600 * 1_000_000;
@@ -1713,14 +1248,10 @@ mod tests {
             format: 1,
             oid: PgType::TIMETZ.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "12:00:00.000000+00".to_owned(),
-                "timetz".to_owned()
-            )
+            LiteralValue::StringWithCast("12:00:00.000000+00".to_owned(), "timetz".to_owned())
         );
     }
 
@@ -1735,20 +1266,15 @@ mod tests {
             format: 1,
             oid: PgType::TIMETZ.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "12:00:00.000000+05".to_owned(),
-                "timetz".to_owned()
-            )
+            LiteralValue::StringWithCast("12:00:00.000000+05".to_owned(), "timetz".to_owned())
         );
     }
 
     #[test]
     fn test_binary_parameter_timetz_west_of_utc() {
-        // `'12:00:00-08:00'::timetz` — PG stores zone = +28800.
         let micros: i64 = 12 * 3600 * 1_000_000;
         let bytes = timetz_bytes(micros, 8 * 3600);
         let param = QueryParameter {
@@ -1756,14 +1282,10 @@ mod tests {
             format: 1,
             oid: PgType::TIMETZ.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "12:00:00.000000-08".to_owned(),
-                "timetz".to_owned()
-            )
+            LiteralValue::StringWithCast("12:00:00.000000-08".to_owned(), "timetz".to_owned())
         );
     }
 
@@ -1777,7 +1299,6 @@ mod tests {
             format: 1,
             oid: PgType::TIMETZ.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
@@ -1795,20 +1316,11 @@ mod tests {
             format: 1,
             oid: PgType::TIMETZ.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
             Err(AstTransformError::InvalidParameterValue { .. })
         ));
-    }
-
-    fn interval_bytes(micros: i64, days: i32, months: i32) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(16);
-        buf.extend_from_slice(&micros.to_be_bytes());
-        buf.extend_from_slice(&days.to_be_bytes());
-        buf.extend_from_slice(&months.to_be_bytes());
-        buf
     }
 
     #[test]
@@ -1819,7 +1331,6 @@ mod tests {
             format: 1,
             oid: PgType::INTERVAL.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary interval");
         assert_eq!(
             literal,
@@ -1840,7 +1351,6 @@ mod tests {
             format: 1,
             oid: PgType::INTERVAL.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary interval");
         assert_eq!(
             literal,
@@ -1861,7 +1371,6 @@ mod tests {
             format: 1,
             oid: PgType::INTERVAL.oid(),
         };
-
         let literal = parameter_to_literal(&param).expect("decode binary interval");
         assert_eq!(
             literal,
@@ -1875,7 +1384,7 @@ mod tests {
     #[test]
     fn test_binary_interval_in_query_renders_clean_sql() {
         let mut node = parse_select_node("SELECT id FROM events WHERE age > $1");
-        let bytes = interval_bytes(0, 7, 0); // 7 days
+        let bytes = interval_bytes(0, 7, 0);
         let params = binary_params(vec![(Some(&bytes), PgType::INTERVAL)]);
         select_node_parameters_replace(&mut node, &params).expect("substitute interval");
 
@@ -1895,7 +1404,6 @@ mod tests {
             format: 1,
             oid: PgType::INTERVAL.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -2025,9 +1533,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_timestamp_with_time() {
         // 2000-01-02 12:34:56.123456 = 1 day + 12h34m56.123456s.
-        let micros: i64 = USECS_PER_DAY
-            + (12 * 3600 + 34 * 60 + 56) * 1_000_000
-            + 123_456;
+        let micros: i64 = USECS_PER_DAY + (12 * 3600 + 34 * 60 + 56) * 1_000_000 + 123_456;
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&micros.to_be_bytes())),
             format: 1,
@@ -2079,8 +1585,6 @@ mod tests {
 
     #[test]
     fn test_binary_parameter_timestamptz_epoch() {
-        // TIMESTAMPTZ wire format is identical to TIMESTAMP; the value is
-        // UTC and the cast plus `+00` suffix preserve that on round-trip.
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&0_i64.to_be_bytes())),
             format: 1,
@@ -2107,17 +1611,14 @@ mod tests {
             parameter_to_literal(&param).expect("decode -infinity timestamptz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "-infinity".to_owned(),
-                "timestamptz".to_owned()
-            )
+            LiteralValue::StringWithCast("-infinity".to_owned(), "timestamptz".to_owned())
         );
     }
 
     #[test]
     fn test_binary_date_in_query_renders_clean_sql() {
         let mut node = parse_select_node("SELECT id FROM events WHERE day = $1");
-        let bytes = 1_i32.to_be_bytes(); // 2000-01-02
+        let bytes = 1_i32.to_be_bytes();
         let params = binary_params(vec![(Some(&bytes), PgType::DATE)]);
         select_node_parameters_replace(&mut node, &params).expect("substitute date");
 
@@ -2134,7 +1635,6 @@ mod tests {
             bytes.extend_from_slice(&4_i32.to_be_bytes());
             bytes.extend_from_slice(&days.to_be_bytes());
         }
-
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
             format: 1,
@@ -2145,29 +1645,12 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::StringWithCast(
-                        "2000-01-01".to_owned(),
-                        "date".to_owned()
-                    ),
-                    LiteralValue::StringWithCast(
-                        "2000-01-02".to_owned(),
-                        "date".to_owned()
-                    ),
+                    LiteralValue::StringWithCast("2000-01-01".to_owned(), "date".to_owned()),
+                    LiteralValue::StringWithCast("2000-01-02".to_owned(), "date".to_owned()),
                 ],
                 "date[]".to_owned()
             )
         );
-    }
-
-    fn inet_bytes(addr: &[u8], netmask: u8, is_cidr: bool) -> Vec<u8> {
-        let family: u8 = if addr.len() == 4 { 2 } else { 3 };
-        let mut buf = Vec::with_capacity(4 + addr.len());
-        buf.push(family);
-        buf.push(netmask);
-        buf.push(u8::from(is_cidr));
-        buf.push(u8::try_from(addr.len()).expect("test addr fits in u8"));
-        buf.extend_from_slice(addr);
-        buf
     }
 
     #[test]
@@ -2180,10 +1663,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary macaddr");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "00:11:22:33:44:55".to_owned(),
-                "macaddr".to_owned()
-            )
+            LiteralValue::StringWithCast("00:11:22:33:44:55".to_owned(), "macaddr".to_owned())
         );
     }
 
@@ -2352,35 +1832,6 @@ mod tests {
         );
     }
 
-    /// Build a binary `numeric` payload from its component fields.
-    fn numeric_bytes(weight: i16, sign: u16, dscale: i16, digits: &[i16]) -> Vec<u8> {
-        let ndigits =
-            i16::try_from(digits.len()).expect("test numeric digit count fits in i16");
-        let mut buf = Vec::with_capacity(8 + 2 * digits.len());
-        buf.extend_from_slice(&ndigits.to_be_bytes());
-        buf.extend_from_slice(&weight.to_be_bytes());
-        buf.extend_from_slice(&sign.to_be_bytes());
-        buf.extend_from_slice(&dscale.to_be_bytes());
-        for d in digits {
-            buf.extend_from_slice(&d.to_be_bytes());
-        }
-        buf
-    }
-
-    fn assert_numeric(bytes: Vec<u8>, expected: &str) {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::NUMERIC.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary numeric");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast(expected.to_owned(), "numeric".to_owned()),
-            "wire bytes {bytes:?}"
-        );
-    }
-
     #[test]
     fn test_binary_parameter_numeric_simple_int() {
         assert_numeric(numeric_bytes(0, NUMERIC_POS, 0, &[42]), "42");
@@ -2388,7 +1839,6 @@ mod tests {
 
     #[test]
     fn test_binary_parameter_numeric_zero_no_scale() {
-        // ndigits = 0 — the canonical zero encoding.
         assert_numeric(numeric_bytes(0, NUMERIC_POS, 0, &[]), "0");
     }
 
@@ -2425,14 +1875,12 @@ mod tests {
 
     #[test]
     fn test_binary_parameter_numeric_small_fraction() {
-        // 0.00001 = 1000 × 10000⁻², single digit at weight -2 (PG strips
-        // leading zero digits and shifts weight).
+        // 0.00001 = 1000 × 10000⁻², single digit at weight -2.
         assert_numeric(numeric_bytes(-2, NUMERIC_POS, 5, &[1000]), "0.00001");
     }
 
     #[test]
     fn test_binary_parameter_numeric_nan() {
-        // ndigits/weight/dscale are ignored for special values.
         assert_numeric(numeric_bytes(0, NUMERIC_NAN, 0, &[]), "NaN");
     }
 
@@ -2576,7 +2024,6 @@ mod tests {
             format: 1,
             oid: PgType::POINT.oid(),
         };
-
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(matches!(
             result,
@@ -2591,7 +2038,6 @@ mod tests {
             format: 1,
             oid: PgType::INT4.oid(),
         };
-
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::Null);
     }
@@ -2599,56 +2045,16 @@ mod tests {
     #[test]
     fn test_binary_int4_in_query() {
         let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
-
-        // Binary INT4: 42 in big-endian
         let params = binary_params(vec![(Some(&[0x00, 0x00, 0x00, 0x2A]), PgType::INT4)]);
         select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
 
         let mut buf = String::new();
         node.deparse(&mut buf);
-
         assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
-    }
-
-    /// Postgres binary `int4[]` wire format for the array `[42, 100]`.
-    /// Header is 4 bytes ndim + 4 bytes hasnull + 4 bytes element OID, then
-    /// per-dim 4 bytes length + 4 bytes lower bound, then per-element 4 bytes
-    /// length-prefix + the 4-byte value. Most bytes are zero — which is the
-    /// crux of PGC-103: those zeros are valid UTF-8 and used to slip through
-    /// the binary parameter catch-all into a `LiteralValue::String`.
-    /// Encode a single binary text-array element: i32 length prefix
-    /// followed by the UTF-8 bytes. Used to assemble synthetic `text[]`
-    /// payloads in tests.
-    fn array_text_element_bytes(s: &str) -> Vec<u8> {
-        let len = i32::try_from(s.len()).expect("test element fits in i32");
-        let mut buf = Vec::with_capacity(4 + s.len());
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(s.as_bytes());
-        buf
-    }
-
-    fn binary_int4_array_42_100() -> Vec<u8> {
-        vec![
-            0x00, 0x00, 0x00, 0x01, // ndim = 1
-            0x00, 0x00, 0x00, 0x00, // hasnull = 0
-            0x00, 0x00, 0x00, 0x17, // elemtype = 23 (int4)
-            0x00, 0x00, 0x00, 0x02, // dim 0 length = 2
-            0x00, 0x00, 0x00, 0x01, // dim 0 lower bound = 1
-            0x00, 0x00, 0x00, 0x04, // element 0 length = 4
-            0x00, 0x00, 0x00, 0x2A, // element 0 value = 42
-            0x00, 0x00, 0x00, 0x04, // element 1 length = 4
-            0x00, 0x00, 0x00, 0x64, // element 1 value = 100
-        ]
     }
 
     #[test]
     fn test_binary_int4_array_decoded() {
-        // PGC-103 regression: binary array parameters used to fall through
-        // to the UTF-8 catch-all in `binary_parameter_to_literal`, producing
-        // a `LiteralValue::String` carrying NUL bytes from the array header
-        // and corrupting the deparsed SQL. The fix decodes the binary
-        // wire format into a PG text array literal so the query stays
-        // cacheable.
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&binary_int4_array_42_100())),
             format: 1,
@@ -2671,9 +2077,7 @@ mod tests {
         // substituted into the same query template produce different
         // post-substitution fingerprints. Otherwise pgcache would route
         // them to the same cache entry and one query's results would bleed
-        // into the other's. This is the unit-level companion to the
-        // `binary_array_test::test_binary_int4_array_distinct_cache_entries`
-        // integration test.
+        // into the other's.
         let pg_ast = pg_query::parse("SELECT id FROM widgets WHERE id = ANY($1)")
             .expect("parse SQL");
         let q1 = query_expr_convert(&pg_ast).expect("convert to QueryExpr");
@@ -2714,9 +2118,6 @@ mod tests {
 
     #[test]
     fn test_binary_int4_array_in_query_renders_clean_sql() {
-        // PGC-103 integration regression: `WHERE id = ANY($1)` with a
-        // binary int4[] must produce a SQL string with no NUL bytes and a
-        // properly cast text array literal.
         let mut node = parse_select_node("SELECT id FROM users WHERE id = ANY($1)");
 
         let array_bytes = binary_int4_array_42_100();
@@ -2736,8 +2137,6 @@ mod tests {
 
     #[test]
     fn test_binary_int4_array_empty() {
-        // Encoded `{}::int4[]`: dimensions=0, hasnull=0, elemtype=23, no
-        // dim entries and no elements.
         let bytes = vec![
             0x00, 0x00, 0x00, 0x00, // ndim = 0
             0x00, 0x00, 0x00, 0x00, // hasnull = 0
@@ -2750,10 +2149,7 @@ mod tests {
         };
 
         let literal = parameter_to_literal(&param).expect("decode empty int4[]");
-        assert_eq!(
-            literal,
-            LiteralValue::Array(vec![], "int4[]".to_owned())
-        );
+        assert_eq!(literal, LiteralValue::Array(vec![], "int4[]".to_owned()));
     }
 
     #[test]
@@ -2765,9 +2161,9 @@ mod tests {
             0x00, 0x00, 0x00, 0x17, // elemtype = 23 (int4)
             0x00, 0x00, 0x00, 0x03, // dim 0 length = 3
             0x00, 0x00, 0x00, 0x01, // dim 0 lower bound = 1
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, // 1
-            0xFF, 0xFF, 0xFF, 0xFF, // NULL (length = -1)
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03, // 3
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
         ];
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
@@ -2791,9 +2187,7 @@ mod tests {
 
     #[test]
     fn test_binary_text_array_quoting() {
-        // `text[]` whose elements include separator chars, embedded quotes,
-        // backslashes, whitespace, an empty string, and the literal "NULL".
-        // All require quoting per PG array text format rules.
+        // `text[]` with elements that all need PG-array-text quoting.
         let mut bytes = vec![
             0x00, 0x00, 0x00, 0x01, // ndim = 1
             0x00, 0x00, 0x00, 0x00, // hasnull = 0
@@ -2812,10 +2206,6 @@ mod tests {
         };
 
         let literal = parameter_to_literal(&param).expect("decode text[]");
-        // Decoded elements are stored as plain `LiteralValue::String` —
-        // PG-array-text quoting (`"`-wrap, `\`-escape) is applied at
-        // deparse time, not at decode time, so the constraint analyzer
-        // can compare element values directly.
         assert_eq!(
             literal,
             LiteralValue::Array(
@@ -2830,9 +2220,6 @@ mod tests {
             )
         );
 
-        // Also verify the deparsed SQL still applies array-text-format
-        // quoting and SQL string-literal escaping (the byte-identity
-        // guarantee from PGC-103's previous representation).
         let mut buf = String::new();
         literal.deparse(&mut buf);
         assert_eq!(
@@ -2870,8 +2257,6 @@ mod tests {
             )
         );
 
-        // Deparse still wraps the literal `"NULL"` so PG doesn't read
-        // it as a SQL NULL marker.
         let mut buf = String::new();
         literal.deparse(&mut buf);
         assert_eq!(buf, r#"'{"NULL",a}'::text[]"#);
@@ -2879,17 +2264,14 @@ mod tests {
 
     #[test]
     fn test_binary_multidim_array_rejected() {
-        // 2-D arrays are deliberately not supported; we want them to fall
-        // through to origin uncached rather than emit half-correct text.
-        // Encoded as 2-D even though there's only one element so the buffer
-        // stays small.
+        // 2-D arrays fall through to origin uncached.
         let bytes = vec![
             0x00, 0x00, 0x00, 0x02, // ndim = 2
             0x00, 0x00, 0x00, 0x00, // hasnull = 0
             0x00, 0x00, 0x00, 0x17, // elemtype = 23 (int4)
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // dim 0: len=1, lb=1
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // dim 1: len=1, lb=1
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A, // single element = 42
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A,
         ];
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
@@ -2923,132 +2305,5 @@ mod tests {
             "expected UnsupportedBinaryFormat for point[], got {result:?}"
         );
     }
-
-    // ==================== WHERE Subquery Parameter Tests ====================
-
-    #[test]
-    fn test_parameters_replace_in_subquery() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > $1)",
-        );
-
-        let params = typed_text_params(vec![(Some(b"100"), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 100)"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_exists_subquery() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > $1)",
-        );
-
-        let params = typed_text_params(vec![(Some(b"50"), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > 50)"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_subquery_with_outer_param() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE status = $1 AND id IN (SELECT user_id FROM orders WHERE total > $2)",
-        );
-
-        let params = typed_text_params(vec![
-            (Some(b"active"), PgType::TEXT),
-            (Some(b"200"), PgType::INT4),
-        ]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE status = 'active' AND id IN (SELECT user_id FROM orders WHERE total > 200)"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_nested_subquery() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > $1))",
-        );
-
-        let params = typed_text_params(vec![(Some(b"99"), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > 99))"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_scalar_subquery_in_where() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE age > (SELECT avg(age) FROM users WHERE status = $1)",
-        );
-
-        let params = typed_text_params(vec![(Some(b"active"), PgType::TEXT)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE age > (SELECT AVG(age) FROM users WHERE status = 'active')"
-        );
-    }
-
-    // ==================== CTE Parameter Replacement Tests ====================
-
-    #[test]
-    fn test_cte_parameter_replacement() {
-        let sql = "WITH active_users AS (SELECT id, name FROM users WHERE status = $1) \
-                   SELECT id FROM active_users WHERE name = $2";
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
-
-        let params = typed_text_params(vec![
-            (Some(b"active"), PgType::TEXT),
-            (Some(b"alice"), PgType::TEXT),
-        ]);
-
-        let replaced =
-            query_expr_parameters_replace(&query_expr, &params).expect("parameter replacement");
-
-        let mut buf = String::new();
-        replaced.deparse(&mut buf);
-
-        // Parameters should be replaced in both the CTE body and the main query
-        assert!(
-            buf.contains("status = 'active'"),
-            "CTE body should have $1 replaced: {buf}"
-        );
-        assert!(
-            buf.contains("name = 'alice'"),
-            "Main query should have $2 replaced: {buf}"
-        );
-        assert!(!buf.contains("$1"), "No unreplaced $1 should remain: {buf}");
-        assert!(!buf.contains("$2"), "No unreplaced $2 should remain: {buf}");
-    }
 }
+
