@@ -1,7 +1,7 @@
 use std::io::Error;
 use std::time::Duration;
 
-use crate::util::{TestContext, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{TestContext, metrics_delta, wait_cache_load};
 
 mod util;
 
@@ -31,7 +31,7 @@ async fn test_request_coalescing() -> Result<(), Error> {
     );
     ctx.query(&insert_sql as &str, &[]).await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Open multiple proxy connections before firing queries
     let num_clients = 10;

@@ -674,8 +674,7 @@ fn analyze_constraint_expr(
         // comparison maps cleanly to set membership; other comparisons
         // (`<`, `<>`, etc.) under ANY have different semantics and stay
         // unhandled, marking the analysis incomplete.
-        ResolvedWhereExpr::Multi(multi)
-            if matches!(multi.op, MultiOp::Any { comparison } if comparison == BinaryOp::Equal) =>
+        ResolvedWhereExpr::Multi(multi) if matches!(multi.op, MultiOp::Any { comparison } if comparison == BinaryOp::Equal) =>
         {
             any_eq_array_constraints_extract(&multi.exprs, constraints, complete);
         }
@@ -900,7 +899,12 @@ fn collect_query_constraints(
     let mut complete = true;
 
     if let Some(where_expr) = &resolved.where_clause {
-        analyze_constraint_expr(where_expr, &mut constraints, &mut equivalences, &mut complete);
+        analyze_constraint_expr(
+            where_expr,
+            &mut constraints,
+            &mut equivalences,
+            &mut complete,
+        );
     }
 
     // Analyze JOIN conditions
@@ -2727,10 +2731,7 @@ mod tests {
         // analyzer learns to handle disjunctions.
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
-        let resolved = resolve_sql(
-            "SELECT * FROM users WHERE id = 1 OR id = 2",
-            &tables,
-        );
+        let resolved = resolve_sql("SELECT * FROM users WHERE id = 1 OR id = 2", &tables);
 
         let constraints = analyze_query_constraints(&resolved);
 
@@ -2785,10 +2786,8 @@ mod tests {
             "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
             &tables,
         ));
-        let new = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id = 2",
-            &tables,
-        ));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 2", &tables));
 
         assert!(table_constraints_subsumed(&new, &cached, "users"));
     }
@@ -2802,10 +2801,8 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
-        let new = analyze_query_constraints(&resolve_sql(
-            "SELECT * FROM users WHERE id = 5",
-            &tables,
-        ));
+        let new =
+            analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 5", &tables));
 
         assert!(cached.where_analysis_complete);
         assert!(

@@ -1,7 +1,10 @@
 use std::io::Error;
+use std::time::{Duration, Instant};
 
 use postgres_types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, Statement, ToStatement};
+
+use super::http::http_get;
 
 use super::metrics::MetricsSnapshot;
 use super::process::{
@@ -209,4 +212,73 @@ impl TestContext {
             .await
             .map_err(Error::other)
     }
+
+    /// Wait for pgcache to apply all CDC events committed up to the current
+    /// origin WAL position. Captures `pg_current_wal_lsn()` from origin and
+    /// polls `/status` until `cdc.last_applied_lsn` reaches that LSN.
+    ///
+    /// Use this after a write to origin (directly or via the cache proxy)
+    /// before reading data that should reflect the write.
+    ///
+    /// Times out after 5 seconds. The error includes both LSNs to make
+    /// stalls diagnosable.
+    pub async fn cdc_settle(&self) -> Result<(), Error> {
+        self.cdc_settle_with_timeout(Duration::from_secs(5)).await
+    }
+
+    /// Same as `cdc_settle` with an explicit timeout. Useful for tests that
+    /// stress slow paths or need a tighter bound.
+    pub async fn cdc_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        // Use `pg_current_wal_insert_lsn()` (not `pg_current_wal_lsn()`):
+        // the latter returns the WAL *write* position, which can lag behind
+        // the just-committed record under synchronous_commit=off (the
+        // walwriter flushes asynchronously). The insert position always
+        // includes the committed record. CDC will eventually catch up to
+        // it via flush + decode, advancing `last_applied_lsn`.
+        let captured_lsn_str: String = self
+            .origin
+            .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
+            .await
+            .map_err(Error::other)?
+            .get(0);
+        let captured_lsn = lsn_parse(&captured_lsn_str)?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (status, body) = http_get(self.metrics_port, "/status").await?;
+            if status != 200 {
+                return Err(Error::other(format!("/status returned {status}: {body}")));
+            }
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+            let applied = json
+                .get("cdc")
+                .and_then(|c| c.get("last_applied_lsn"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| Error::other("cdc.last_applied_lsn missing or not a u64"))?;
+            if applied >= captured_lsn {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::other(format!(
+                    "cdc_settle timed out: applied={applied} captured={captured_lsn} ({captured_lsn_str})"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// Parse a PostgreSQL LSN in `"X/Y"` hex form (as returned by
+/// `pg_current_wal_lsn()::text`) into a `u64` matching the wire-protocol
+/// encoding used in `cdc.last_applied_lsn`.
+pub fn lsn_parse(s: &str) -> Result<u64, Error> {
+    let (hi, lo) = s
+        .split_once('/')
+        .ok_or_else(|| Error::other(format!("invalid LSN format: {s}")))?;
+    let hi = u64::from_str_radix(hi, 16)
+        .map_err(|e| Error::other(format!("invalid LSN high: {s}: {e}")))?;
+    let lo = u64::from_str_radix(lo, 16)
+        .map_err(|e| Error::other(format!("invalid LSN low: {s}: {e}")))?;
+    Ok((hi << 32) | lo)
 }

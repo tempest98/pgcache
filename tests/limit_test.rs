@@ -1,7 +1,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
 };
 
 mod util;
@@ -255,7 +255,7 @@ async fn test_limit_cdc_delete_invalidates() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM items WHERE id = 7", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Should be cache miss — DELETE on a limited query invalidates
     let res = ctx.simple_query(query).await?;
@@ -306,7 +306,7 @@ async fn test_limit_cdc_insert_no_invalidation() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Should still be cache hit — INSERT doesn't invalidate limited queries
     let res = ctx.simple_query(query).await?;

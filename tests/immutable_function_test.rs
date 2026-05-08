@@ -1,8 +1,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta,
-    wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta, wait_cache_load,
 };
 
 mod util;
@@ -185,7 +184,7 @@ async fn test_immutable_function_cdc_insert() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now include the new row
     let res = ctx.simple_query(query_str).await?;
@@ -239,7 +238,7 @@ async fn test_immutable_function_join_cdc() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Equality constraint on child (parent_id = 1) gives CDC something to extract.
     // The immutable function on the parent is an additional filter.
@@ -282,7 +281,7 @@ async fn test_immutable_function_join_cdc() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Should still be a cache hit — row doesn't match child constraint
     let res = ctx.simple_query(query_str).await?;

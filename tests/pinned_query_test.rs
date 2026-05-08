@@ -1,8 +1,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta,
-    wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta, wait_cache_load,
 };
 
 mod util;
@@ -113,7 +112,7 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
     .await?;
 
     // Wait for CDC invalidation + auto-readmit + re-population
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
     wait_cache_load().await;
 
     // Verify invalidation and readmission happened

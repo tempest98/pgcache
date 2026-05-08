@@ -94,9 +94,7 @@ async fn test_pgc106_any_subsumes_narrower_any() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let r1 = ctx.query(&stmt, &[&vec![1i32, 2, 3]]).await?;
     assert_eq!(
-        r1.iter()
-            .map(|r| r.get::<_, i32>("id"))
-            .collect::<Vec<_>>(),
+        r1.iter().map(|r| r.get::<_, i32>("id")).collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
     let m = assert_cache_miss(&mut ctx, m).await?;
@@ -105,9 +103,7 @@ async fn test_pgc106_any_subsumes_narrower_any() -> Result<(), Error> {
     // Narrower subset: subsumption hit, returns the right row.
     let r2 = ctx.query(&stmt, &[&vec![1i32]]).await?;
     assert_eq!(
-        r2.iter()
-            .map(|r| r.get::<_, i32>("id"))
-            .collect::<Vec<_>>(),
+        r2.iter().map(|r| r.get::<_, i32>("id")).collect::<Vec<_>>(),
         vec![1]
     );
     let _ = assert_cache_hit(&mut ctx, m).await?;
@@ -159,9 +155,7 @@ async fn test_pgc106_distinct_arrays_get_distinct_cache_entries() -> Result<(), 
     // Before PGC-106 fix: returned `[]` and reported a hit.
     let r2 = ctx.query(&stmt, &[&vec![3i32, 4, 5]]).await?;
     assert_eq!(
-        r2.iter()
-            .map(|r| r.get::<_, i32>("id"))
-            .collect::<Vec<_>>(),
+        r2.iter().map(|r| r.get::<_, i32>("id")).collect::<Vec<_>>(),
         vec![3, 4, 5]
     );
     let m = assert_cache_miss(&mut ctx, m).await?;

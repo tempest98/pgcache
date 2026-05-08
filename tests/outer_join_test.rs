@@ -14,7 +14,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
 };
 
 mod util;
@@ -57,7 +57,7 @@ async fn test_left_join_terminal_cache_hit() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query = "SELECT o.id, o.customer, d.item \
                  FROM lj_orders o LEFT JOIN lj_details d ON o.id = d.order_id \
@@ -132,7 +132,7 @@ async fn test_left_join_terminal_cdc_insert_optional_side() -> Result<(), Error>
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query = "SELECT o.id, o.customer, d.item \
                  FROM ljins_orders o LEFT JOIN ljins_details d ON o.id = d.order_id \
@@ -158,7 +158,7 @@ async fn test_left_join_terminal_cdc_insert_optional_side() -> Result<(), Error>
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache hit — new row appears via LEFT JOIN at retrieval
     let res = ctx.simple_query(query).await?;
@@ -205,7 +205,7 @@ async fn test_left_join_null_padding() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query = "SELECT o.id, o.customer, d.item \
                  FROM ljnull_orders o LEFT JOIN ljnull_details d ON o.id = d.order_id \
@@ -230,7 +230,7 @@ async fn test_left_join_null_padding() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache hit — NULLs replaced by the new row
     let res = ctx.simple_query(query).await?;
@@ -275,7 +275,7 @@ async fn test_left_join_terminal_cdc_delete_optional_side() -> Result<(), Error>
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query = "SELECT o.id, o.customer, d.item \
                  FROM ljdel_orders o LEFT JOIN ljdel_details d ON o.id = d.order_id \
@@ -293,7 +293,7 @@ async fn test_left_join_terminal_cdc_delete_optional_side() -> Result<(), Error>
     ctx.origin_query("DELETE FROM ljdel_details WHERE id = 11", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache hit — only one detail remains
     let res = ctx.simple_query(query).await?;
@@ -345,7 +345,7 @@ async fn test_right_join_terminal_cache_hit() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // RIGHT JOIN: orders is preserved, details is optional
     let query = "SELECT d.item, o.id, o.customer \
@@ -416,7 +416,7 @@ async fn test_left_join_non_terminal_cdc_invalidation() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Non-terminal: d.status appears in WHERE (optional-side column in WHERE)
     let query = "SELECT o.id, o.customer, d.status \
@@ -448,7 +448,7 @@ async fn test_left_join_non_terminal_cdc_invalidation() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache miss — query was invalidated by non-terminal CDC
     let res = ctx.simple_query(query).await?;
@@ -506,7 +506,7 @@ async fn test_left_join_cdc_insert_preserved_side() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // WHERE on preserved side only — details is terminal
     let query = "SELECT o.id, o.customer, d.item \
@@ -531,7 +531,7 @@ async fn test_left_join_cdc_insert_preserved_side() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache miss — query was invalidated, re-registers with updated data
     let res = ctx.simple_query(query).await?;

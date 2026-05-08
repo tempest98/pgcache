@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, wait_cache_load, wait_for_cdc,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, wait_cache_load};
 
 mod util;
 
@@ -278,7 +276,7 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
         &[],
     )
     .await?;
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query again — cache was updated via CDC INSERT, still a cache hit
     let rows = ctx.query(&stmt, &[&"foo"]).await?;

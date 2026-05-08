@@ -19,7 +19,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
 };
 
 mod util;
@@ -58,7 +58,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
 
     // Wait for setup CDC events to be processed before caching —
     // INSERT events on subquery tables would trigger invalidation
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query = "SELECT name, price FROM (SELECT * FROM products WHERE category = 'gadgets') AS gadget_products ORDER BY price";
 
@@ -87,7 +87,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // CDC INSERT on derived table (Inclusion) invalidates → cache miss
     let res = ctx.simple_query(query).await?;
@@ -103,7 +103,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM products WHERE id = 2", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // CDC DELETE on derived table (Inclusion) does NOT invalidate → cache hit
     // Row removed from cache table, query re-evaluates correctly
@@ -156,7 +156,7 @@ async fn test_subquery_where_in() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events to be processed before caching
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query: customers who have placed orders
     let query =
@@ -185,7 +185,7 @@ async fn test_subquery_where_in() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // CDC INSERT on IN subquery table (Inclusion) invalidates → cache miss
     // Charlie should now appear
@@ -242,7 +242,7 @@ async fn test_subquery_where_not_in() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query: products NOT on sale
     let query = "SELECT name FROM products WHERE id NOT IN (SELECT product_id FROM sale_items) ORDER BY name";
@@ -295,7 +295,7 @@ async fn test_subquery_scalar_in_where() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query: products with price above average
     // Average = (100 + 200 + 50 + 150) / 4 = 125
@@ -372,7 +372,7 @@ async fn test_subquery_nested() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Nested IN subqueries across 3 tables:
     // find products in stores that belong to the 'East' region
@@ -462,7 +462,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // products in stores in East region
     let query = "SELECT name FROM products \
@@ -504,7 +504,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Stores insert (Inclusion) should invalidate
     let res = ctx.simple_query(query).await?;
@@ -522,7 +522,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM stores WHERE id = 13", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache hit — Inclusion DELETE does not invalidate.
     // Thingamajig's store is gone, so Thingamajig won't be included in results.
@@ -538,7 +538,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     ctx.origin_query("UPDATE regions SET name = 'East' WHERE id = 2", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Now both regions are 'East', so LA(12) is included → Gizmo appears
     let res = ctx.simple_query(query).await?;
@@ -621,7 +621,7 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Products in stores whose region is NOT excluded
     // stores WHERE region_id IN (regions WHERE id NOT IN (excluded_regions))
@@ -658,7 +658,7 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Exclusion INSERT does not invalidate → cache hit
     // But cache tables are updated: South is now excluded, so
@@ -673,7 +673,7 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM excluded_regions WHERE region_id = 2", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Exclusion DELETE invalidates → cache miss
     // Non-excluded: East(1), West(2) → NYC, LA → Widget, Gizmo
@@ -744,7 +744,7 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Products NOT in the blacklist for Electronics category
     // NOT IN (blacklisted WHERE category_id IN (categories WHERE name = 'Electronics'))
@@ -782,7 +782,7 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Exclusion INSERT: no invalidation → cache hit
     // But Teddy Bear should be removed from cache in-place
@@ -799,7 +799,7 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Exclusion DELETE invalidates → cache miss
     // Blacklisted for Electronics: 101 (Teddy Bear), 102 (Phone)
@@ -864,7 +864,7 @@ async fn test_subquery_multi_table_dependency() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events to be processed before caching
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Get items in active categories that have inventory
     let query = "SELECT i.name, inv.quantity \
@@ -895,7 +895,7 @@ async fn test_subquery_multi_table_dependency() -> Result<(), Error> {
     ctx.origin_query("UPDATE categories SET active = true WHERE id = 2", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Chair should now appear (Furniture is now active)
     let res = ctx.simple_query(query).await?;
@@ -942,7 +942,7 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events to settle before caching
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Derived table with inner predicate: dept = 'kitchen'
     // The inner SELECT produces constraint {appliances.dept = 'kitchen'} on
@@ -976,7 +976,7 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache hit — non-matching INSERT was filtered by constraint
     let res = ctx.simple_query(query).await?;
@@ -991,7 +991,7 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache miss — matching INSERT triggered invalidation
     let res = ctx.simple_query(query).await?;
@@ -1048,7 +1048,7 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events to settle
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // IN subquery with inner predicate: active = true
     // The inner SELECT produces constraint {departments.active = true} on
@@ -1080,7 +1080,7 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache hit — non-matching INSERT on inner table was filtered
     let res = ctx.simple_query(query).await?;
@@ -1095,7 +1095,7 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     ctx.origin_query("UPDATE departments SET active = true WHERE id = 3", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Cache miss — matching UPDATE triggered invalidation
     // Charlie now appears (Sales dept is active)

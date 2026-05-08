@@ -39,10 +39,7 @@ pub(super) fn binary_parameter_to_literal(
     binary_parameter_to_literal_scalar(bytes, oid)
 }
 
-fn binary_parameter_to_literal_scalar(
-    bytes: &[u8],
-    oid: u32,
-) -> AstTransformResult<LiteralValue> {
+fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
     let pg_type = PgType::from_oid(oid);
 
     // Fail-closed Kind dispatch: types without an explicit per-OID arm
@@ -326,10 +323,8 @@ fn binary_parameter_to_literal_scalar(
                     ),
                 })
             })?;
-            let micros =
-                i64::from_be_bytes(arr[0..8].try_into().expect("8-byte time component"));
-            let zone =
-                i32::from_be_bytes(arr[8..12].try_into().expect("4-byte zone component"));
+            let micros = i64::from_be_bytes(arr[0..8].try_into().expect("8-byte time component"));
+            let zone = i32::from_be_bytes(arr[8..12].try_into().expect("4-byte zone component"));
             Ok(LiteralValue::StringWithCast(
                 timetz_to_text(micros, zone),
                 PgType::TIMETZ.name().into(),
@@ -345,11 +340,8 @@ fn binary_parameter_to_literal_scalar(
                     ),
                 })
             })?;
-            let micros = i64::from_be_bytes(
-                arr[0..8].try_into().expect("8-byte time component"),
-            );
-            let days =
-                i32::from_be_bytes(arr[8..12].try_into().expect("4-byte days component"));
+            let micros = i64::from_be_bytes(arr[0..8].try_into().expect("8-byte time component"));
+            let days = i32::from_be_bytes(arr[8..12].try_into().expect("4-byte days component"));
             let months =
                 i32::from_be_bytes(arr[12..16].try_into().expect("4-byte months component"));
             Ok(LiteralValue::StringWithCast(
@@ -449,10 +441,8 @@ fn pg_days_to_ymd(days: i32) -> (i32, u32, u32) {
     let month = (q + 10) % 12 + 1;
 
     let year_combined = i64::from(y) + i64::from(quad2) * 4 - 4_800;
-    let year = i32::try_from(
-        year_combined.clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
-    )
-    .expect("clamped to i32 range");
+    let year = i32::try_from(year_combined.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
+        .expect("clamped to i32 range");
     (year, month, day)
 }
 
@@ -472,11 +462,7 @@ fn ymd_to_text(year: i32, month: u32, day: u32) -> String {
 /// at the call site.
 fn timestamp_micros_to_text(micros: i64) -> String {
     let days_i64 = micros.div_euclid(USECS_PER_DAY);
-    let days = i32::try_from(days_i64).unwrap_or(if days_i64 < 0 {
-        i32::MIN
-    } else {
-        i32::MAX
-    });
+    let days = i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX });
     let sub_day_micros = micros.rem_euclid(USECS_PER_DAY);
     let (year, month, day) = pg_days_to_ymd(days);
     format!(
@@ -520,10 +506,7 @@ fn inet_to_text(inet: &pg_types::Inet, force_prefix: bool) -> String {
 fn numeric_parse_wire(bytes: &[u8]) -> AstTransformResult<(i16, u16, usize, Vec<i16>)> {
     let (header, rest) = bytes.split_first_chunk::<8>().ok_or_else(|| {
         Report::from(AstTransformError::InvalidParameterValue {
-            message: format!(
-                "invalid numeric: header needs 8 bytes, got {}",
-                bytes.len()
-            ),
+            message: format!("invalid numeric: header needs 8 bytes, got {}", bytes.len()),
         })
     })?;
     let &[n0, n1, w0, w1, s0, s1, d0, d1] = header;
@@ -797,8 +780,7 @@ mod tests {
 
     /// Build a binary `numeric` payload from its component fields.
     fn numeric_bytes(weight: i16, sign: u16, dscale: i16, digits: &[i16]) -> Vec<u8> {
-        let ndigits =
-            i16::try_from(digits.len()).expect("test numeric digit count fits in i16");
+        let ndigits = i16::try_from(digits.len()).expect("test numeric digit count fits in i16");
         let mut buf = Vec::with_capacity(8 + 2 * digits.len());
         buf.extend_from_slice(&ndigits.to_be_bytes());
         buf.extend_from_slice(&weight.to_be_bytes());
@@ -1310,10 +1292,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "09:00:00.000000+05:30".to_owned(),
-                "timetz".into()
-            )
+            LiteralValue::StringWithCast("09:00:00.000000+05:30".to_owned(), "timetz".into())
         );
     }
 
@@ -1615,8 +1594,7 @@ mod tests {
             format: 1,
             oid: PgType::TIMESTAMPTZ.oid(),
         };
-        let literal =
-            parameter_to_literal(&param).expect("decode -infinity timestamptz");
+        let literal = parameter_to_literal(&param).expect("decode -infinity timestamptz");
         assert_eq!(
             literal,
             LiteralValue::StringWithCast("-infinity".to_owned(), "timestamptz".into())
@@ -1965,7 +1943,12 @@ mod tests {
     fn test_binary_parameter_numeric_digit_out_of_range_rejected() {
         // 10000 is one past the legal max.
         let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&numeric_bytes(0, NUMERIC_POS, 0, &[10000]))),
+            value: Some(Bytes::copy_from_slice(&numeric_bytes(
+                0,
+                NUMERIC_POS,
+                0,
+                &[10000],
+            ))),
             format: 1,
             oid: PgType::NUMERIC.oid(),
         };
@@ -2086,23 +2069,21 @@ mod tests {
         // post-substitution fingerprints. Otherwise pgcache would route
         // them to the same cache entry and one query's results would bleed
         // into the other's.
-        let pg_ast = pg_query::parse("SELECT id FROM widgets WHERE id = ANY($1)")
-            .expect("parse SQL");
+        let pg_ast =
+            pg_query::parse("SELECT id FROM widgets WHERE id = ANY($1)").expect("parse SQL");
         let q1 = query_expr_convert(&pg_ast).expect("convert to QueryExpr");
         let q2 = q1.clone();
 
         let arr1 = vec![
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17,
-            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
             0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02,
         ];
         let arr2 = vec![
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17,
-            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+            0x00, 0x05,
         ];
         let p1 = binary_params(vec![(Some(&arr1), PgType::INT4_ARRAY)]);
         let p2 = binary_params(vec![(Some(&arr2), PgType::INT4_ARRAY)]);
@@ -2140,7 +2121,10 @@ mod tests {
             !buf.as_bytes().contains(&0),
             "deparsed SQL must not contain NUL bytes; got {buf:?}"
         );
-        assert_eq!(buf, "SELECT id FROM users WHERE id = ANY ('{42,100}'::int4[])");
+        assert_eq!(
+            buf,
+            "SELECT id FROM users WHERE id = ANY ('{42,100}'::int4[])"
+        );
     }
 
     #[test]
@@ -2169,9 +2153,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x17, // elemtype = 23 (int4)
             0x00, 0x00, 0x00, 0x03, // dim 0 length = 3
             0x00, 0x00, 0x00, 0x01, // dim 0 lower bound = 1
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
-            0xFF, 0xFF, 0xFF, 0xFF,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
         ];
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
@@ -2241,8 +2224,8 @@ mod tests {
         // The element value `"null"` (case-insensitive) must be quoted so
         // PG doesn't read it as a NULL marker.
         let mut bytes = vec![
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19,
-            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
         ];
         bytes.extend_from_slice(&array_text_element_bytes("NULL"));
         bytes.extend_from_slice(&array_text_element_bytes("a"));
@@ -2277,9 +2260,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x02, // ndim = 2
             0x00, 0x00, 0x00, 0x00, // hasnull = 0
             0x00, 0x00, 0x00, 0x17, // elemtype = 23 (int4)
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A,
         ];
         let param = QueryParameter {
             value: Some(Bytes::copy_from_slice(&bytes)),
@@ -2289,7 +2271,10 @@ mod tests {
 
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(
-            matches!(result, Err(AstTransformError::UnsupportedBinaryFormat { .. })),
+            matches!(
+                result,
+                Err(AstTransformError::UnsupportedBinaryFormat { .. })
+            ),
             "expected UnsupportedBinaryFormat for 2-D array, got {result:?}"
         );
     }
@@ -2309,9 +2294,11 @@ mod tests {
 
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
         assert!(
-            matches!(result, Err(AstTransformError::UnsupportedBinaryFormat { .. })),
+            matches!(
+                result,
+                Err(AstTransformError::UnsupportedBinaryFormat { .. })
+            ),
             "expected UnsupportedBinaryFormat for point[], got {result:?}"
         );
     }
 }
-

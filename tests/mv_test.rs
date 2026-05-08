@@ -22,7 +22,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, connect_cache_db, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{TestContext, connect_cache_db, metrics_delta, wait_cache_load};
 
 mod util;
 
@@ -104,7 +104,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     // --- CDC INSERT: MV becomes Dirty. Next hit falls through + schedules rebuild.
     ctx.origin_query("INSERT INTO mv_count VALUES (100, 'new')", &[])
         .await?;
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let m3 = ctx.metrics().await?;
     let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;

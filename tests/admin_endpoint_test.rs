@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use crate::util::{TestContext, http_get, wait_cache_load};
+use crate::util::{TestContext, http_get, lsn_parse, wait_cache_load};
 
 mod util;
 
@@ -301,9 +301,11 @@ async fn test_status_applied_lsn_advances_after_write() -> Result<(), Error> {
         &[],
     )
     .await?;
+    // `pg_current_wal_insert_lsn` (not `pg_current_wal_lsn`) — see the
+    // doc comment on `TestContext::cdc_settle_with_timeout`.
     let captured_lsn_str: String = ctx
         .origin
-        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
         .await
         .map_err(Error::other)?
         .get(0);
@@ -336,18 +338,4 @@ async fn test_status_applied_lsn_advances_after_write() -> Result<(), Error> {
     );
 
     Ok(())
-}
-
-/// Parse a PostgreSQL LSN in `"X/Y"` hex form (as returned by
-/// `pg_current_wal_lsn()::text`) into a `u64` matching the wire-protocol
-/// encoding used in `cdc.last_applied_lsn`.
-fn lsn_parse(s: &str) -> Result<u64, Error> {
-    let (hi, lo) = s
-        .split_once('/')
-        .ok_or_else(|| Error::other(format!("invalid LSN format: {s}")))?;
-    let hi = u64::from_str_radix(hi, 16)
-        .map_err(|e| Error::other(format!("invalid LSN high: {s}: {e}")))?;
-    let lo = u64::from_str_radix(lo, 16)
-        .map_err(|e| Error::other(format!("invalid LSN low: {s}: {e}")))?;
-    Ok((hi << 32) | lo)
 }

@@ -4,7 +4,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, metrics_delta, wait_cache_load, wait_for_cdc};
+use crate::util::{TestContext, metrics_delta, wait_cache_load};
 
 mod util;
 
@@ -99,7 +99,7 @@ async fn test_filter_aggregate_two_predicates() -> Result<(), Error> {
         &[],
     )
     .await?;
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
     wait_cache_load().await;
 
     let row = ctx.query_one(sql, &[]).await?;
@@ -146,7 +146,7 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
     // EXISTS predicate flips false → true and forces invalidation.
 
     // Let CDC register both tables with the writer before the first SELECT.
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Touch each table once so the writer's catalog learns about them.
     let _ = ctx.simple_query("SELECT count(*) FROM posts").await?;
@@ -196,7 +196,7 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
     // insert — serving stale data.
     ctx.origin_query("INSERT INTO allowed_types VALUES (1)", &[])
         .await?;
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
     wait_cache_load().await;
 
     let row = ctx.query_one(sql, &[]).await?;

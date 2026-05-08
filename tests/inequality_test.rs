@@ -1,7 +1,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
 };
 
 mod util;
@@ -98,7 +98,7 @@ async fn test_inequality_join_insert_matching() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now show both rows
     let res = ctx.simple_query(query_str).await?;
@@ -150,7 +150,7 @@ async fn test_inequality_join_insert_not_matching() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "select c.id, c.parent_id, c.score, p.name \
                      from ij_ins_nm_child c \
@@ -179,7 +179,7 @@ async fn test_inequality_join_insert_not_matching() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Should still be a cache hit — row doesn't match inequality constraint
     let res = ctx.simple_query(query_str).await?;
@@ -237,7 +237,7 @@ async fn test_inequality_join_update_entering_range() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now show both rows
     let res = ctx.simple_query(query_str).await?;
@@ -289,7 +289,7 @@ async fn test_inequality_join_update_leaving_range() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "select c.id, c.parent_id, c.score, p.name \
                      from ij_upd_leave_child c \
@@ -318,7 +318,7 @@ async fn test_inequality_join_update_leaving_range() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now show only 1 row
     let res = ctx.simple_query(query_str).await?;
@@ -364,7 +364,7 @@ async fn test_between_join_insert() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "select c.id, c.parent_id, c.score, p.name \
                      from ij_btw_child c \
@@ -399,7 +399,7 @@ async fn test_between_join_insert() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let res = ctx.simple_query(query_str).await?;
 
@@ -413,7 +413,7 @@ async fn test_between_join_insert() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let res = ctx.simple_query(query_str).await?;
 

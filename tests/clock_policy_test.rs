@@ -1,7 +1,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
 };
 
 mod util;
@@ -120,7 +120,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "SELECT t.id, t.data, tm.data AS map_data \
         FROM test_readmit t JOIN test_readmit_map tm ON tm.test_id = t.id \
@@ -150,7 +150,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // gamma (test_id=2) is not in the cached result — update it to enter
     ctx.origin_query(
@@ -159,7 +159,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Next query — cache miss, but triggers fast readmission (skips admission gate)
     let res = ctx.simple_query(query_str).await?;

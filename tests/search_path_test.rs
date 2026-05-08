@@ -1,7 +1,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
 };
 
 mod util;
@@ -248,7 +248,7 @@ async fn test_search_path_cache_invalidation() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should return updated value (cache invalidated by CDC)
     let res = ctx
@@ -491,7 +491,7 @@ async fn test_search_path_join() -> Result<(), Error> {
     ctx.query("SET search_path TO store_join, public", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Join query with unqualified table names
     let m = ctx.metrics().await?;

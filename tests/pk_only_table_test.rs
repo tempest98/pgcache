@@ -17,7 +17,6 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, connect_cache_db, wait_cache_load,
-    wait_for_cdc,
 };
 
 mod util;
@@ -58,7 +57,7 @@ async fn test_pk_only_table_caching() -> Result<(), Error> {
     // cache_upsert_unconditional_sql in LocalEval).
     ctx.origin_query("INSERT INTO pk_only (id) VALUES (4)", &[])
         .await?;
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let res = ctx.simple_query("SELECT id FROM pk_only").await?;
     let rows: Vec<_> = res
@@ -90,7 +89,7 @@ async fn test_pk_only_population_stamps_generation() -> Result<(), Error> {
     // rows fresh (no conflict) instead of exercising the conflict path.
     ctx.origin_query("INSERT INTO pk_only_gen (id) VALUES (10), (20), (30)", &[])
         .await?;
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // First cached query — population runs against a cache DB that already
     // contains the three rows, so every row hits the ON CONFLICT branch.

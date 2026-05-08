@@ -2,7 +2,7 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, connect_cache_db,
-    connect_pgcache_tls, metrics_http_get, start_databases, wait_cache_load, wait_for_cdc,
+    connect_pgcache_tls, metrics_http_get, start_databases, wait_cache_load,
 };
 
 mod util;
@@ -52,7 +52,7 @@ async fn test_cache_simple() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Third query — cache hit (Direct + INSERT, row added in place)
     let res = ctx
@@ -102,7 +102,7 @@ async fn test_cache_join() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "select t.id, t.data as test_data, tm.test_id, tm.data as map_data \
         from test_join t join test_map_join tm on tm.test_id = t.id where t.id = 1 \
@@ -158,7 +158,7 @@ async fn test_cache_join() -> Result<(), Error> {
     ctx.origin_query("update test_join set id = 1 where id = 10", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query after CDC — cache miss (UPDATE invalidates)
     let res = ctx.simple_query(query_str).await?;
@@ -229,7 +229,7 @@ async fn test_cache_self_join() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Self-join: test_self appears as both t0 and t1, joined on data.
     // t0 is filtered via test_map_self, t1 fans out on matching data.
@@ -327,7 +327,7 @@ async fn test_cache_self_join() -> Result<(), Error> {
     ctx.origin_query("insert into test_self (id, data) values (4, 'bar')", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query after CDC — cache miss, now t1 has an additional match for data='bar'
     let res = ctx.simple_query(query_str).await?;

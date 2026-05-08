@@ -1,7 +1,7 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load, wait_for_cdc,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
 };
 
 mod util;
@@ -57,7 +57,7 @@ async fn test_insert_matching_constraint() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should show all 3 rows with test_id = 1
     let res = ctx
@@ -123,7 +123,7 @@ async fn test_insert_non_matching_constraint() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should still return only the original 2 rows (cache not invalidated, new row doesn't match)
     let res = ctx
@@ -189,7 +189,7 @@ async fn test_update_entering_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now show 3 rows including gamma
     let res = ctx
@@ -256,7 +256,7 @@ async fn test_update_leaving_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now return 1 row (only beta)
     let res = ctx
@@ -321,7 +321,7 @@ async fn test_update_non_join_column() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should show updated data
     let res = ctx
@@ -408,7 +408,7 @@ async fn test_update_where_column_entering_result_set() -> Result<(), Error> {
     ctx.origin_query("update users_where set status = 'active' where id = 2", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now return 4 orders (both users are active)
     let res = ctx
@@ -483,7 +483,7 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
 
     // Wait for setup CDC events to be processed before caching —
     // INSERT events on cached tables would trigger invalidation
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "select o.id, o.user_id, o.amount, u.status \
             from orders_leave o join users_leave u on o.user_id = u.id \
@@ -535,7 +535,7 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query should now return only 2 orders (only user 2 is active)
     let res = ctx.simple_query(query_str).await?;
@@ -600,7 +600,7 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
     .await?;
 
     // Wait for initial data to settle
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "select fa.film_id, a.actor_id, a.first_name, a.last_name from film_actor_opt fa join actor_opt a on fa.actor_id = a.actor_id where fa.film_id = 19 order by a.actor_id";
 
@@ -643,7 +643,7 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
     )
     .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query again - should still be a cache hit (not invalidated)
     let res = ctx.simple_query(query_str).await?;
@@ -717,7 +717,7 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
     .await?;
 
     // Wait for initial data to settle
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     let query_str = "select film_id, title from film where film_id in ( \
                 select fa.film_id \
@@ -752,7 +752,7 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
     ctx.origin_query("update actor set last_name = 'Updated' where id = 2", &[])
         .await?;
 
-    wait_for_cdc().await;
+    ctx.cdc_settle().await?;
 
     // Query again - should still be a cache hit (not invalidated)
     let res = ctx.simple_query(query_str).await?;

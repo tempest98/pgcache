@@ -18,7 +18,7 @@ use tokio_postgres::{Client, Row, SimpleQueryMessage, ToStatement};
 // --- Re-exports: keep the `crate::util::Foo` import paths stable ---
 
 pub use assertions::{assert_row_at, assert_row_fields, extract_row};
-pub use context::TestContext;
+pub use context::{TestContext, lsn_parse};
 pub use http::{http_get, http_post, http_put};
 pub use metrics::{
     MetricsSnapshot, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_subsume_hit,
@@ -51,13 +51,6 @@ pub async fn simple_query(
     query: &str,
 ) -> Result<Vec<SimpleQueryMessage>, Error> {
     client.simple_query(query).await.map_err(Error::other)
-}
-
-/// Wait for CDC events to be processed by the cache system.
-/// Uses a short sleep to allow logical replication changes to propagate.
-pub async fn wait_for_cdc() {
-    // TODO: Replace with proper synchronization mechanism (polling, notification, etc.)
-    sleep(Duration::from_millis(500)).await;
 }
 
 /// Wait for queries to be loaded into cache.
