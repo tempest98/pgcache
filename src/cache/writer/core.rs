@@ -78,6 +78,10 @@ pub struct CacheWriter {
     pub(super) query_tx: UnboundedSender<QueryCommand>,
     /// Notifications to coordinator for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
+    /// Highest LSN whose effects (cache mutations and invalidations) have been
+    /// applied by this writer. Advances on `CommitMark` and `KeepAliveMark`,
+    /// guaranteed transaction-aligned by mpsc ordering.
+    last_applied_lsn: u64,
 }
 
 impl CacheWriter {
@@ -189,6 +193,7 @@ impl CacheWriter {
             relations_dirty: false,
             query_tx,
             notify_tx,
+            last_applied_lsn: 0,
         })
     }
 
@@ -341,10 +346,24 @@ impl CacheWriter {
                     );
                 }
             }
+            CdcCommand::CommitMark { lsn } | CdcCommand::KeepAliveMark { lsn } => {
+                self.applied_lsn_advance(lsn);
+            }
         }
         self.publication_dirty_drain().await?;
         self.state_gauges_update();
         Ok(())
+    }
+
+    /// Advance `last_applied_lsn` forward to `lsn`, updating the Prometheus
+    /// gauge. No-op if `lsn` does not advance the watermark.
+    fn applied_lsn_advance(&mut self, lsn: u64) {
+        if lsn > self.last_applied_lsn {
+            self.last_applied_lsn = lsn;
+            // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!(names::CDC_APPLIED_LSN).set(lsn as f64);
+        }
     }
 
     /// Rebuild the shared active relations set from current cached queries.
@@ -854,7 +873,9 @@ impl CacheWriter {
 
         let response = StatusResponse {
             cache: cache_status,
-            cdc: CdcStatusData::default(),
+            cdc: CdcStatusData {
+                last_applied_lsn: self.last_applied_lsn,
+            },
             queries,
         };
 

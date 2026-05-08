@@ -265,16 +265,89 @@ async fn test_status_cdc_fields() -> Result<(), Error> {
         .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
 
     let cdc = &json["cdc"];
-    assert!(cdc.get("tables").is_some(), "missing cdc.tables");
     assert!(
-        cdc.get("last_received_lsn").is_some(),
-        "missing cdc.last_received_lsn"
+        cdc.get("last_applied_lsn").is_some(),
+        "missing cdc.last_applied_lsn"
     );
-    assert!(
-        cdc.get("last_flushed_lsn").is_some(),
-        "missing cdc.last_flushed_lsn"
-    );
-    assert!(cdc.get("lag_bytes").is_some(), "missing cdc.lag_bytes");
 
     Ok(())
+}
+
+/// `cdc.last_applied_lsn` advances past `pg_current_wal_lsn()` captured after
+/// a committed origin transaction. This is the watermark the conformance
+/// harness will poll on between DML and the next SELECT.
+#[tokio::test]
+async fn test_status_applied_lsn_advances_after_write() -> Result<(), Error> {
+    use std::time::{Duration, Instant};
+
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE applied_lsn_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+
+    // Register a query against the table so its OID enters the publication.
+    // Without this, INSERTs are filtered out by pgoutput on the origin and
+    // the writer never sees a CommitMark for them.
+    ctx.simple_query("SELECT id, name FROM applied_lsn_test WHERE id = 1")
+        .await?;
+    wait_cache_load().await;
+
+    // Commit a transaction on origin and capture its post-commit WAL position.
+    ctx.origin_query(
+        "INSERT INTO applied_lsn_test (id, name) VALUES (1, 'alice')",
+        &[],
+    )
+    .await?;
+    let captured_lsn_str: String = ctx
+        .origin
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .map_err(Error::other)?
+        .get(0);
+    let captured_lsn = lsn_parse(&captured_lsn_str)?;
+
+    // Poll /status until the writer has applied past the captured LSN.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let applied_lsn = loop {
+        let (status, body) = http_get(ctx.metrics_port, "/status").await?;
+        assert_eq!(status, 200, "status body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+        let applied = json["cdc"]["last_applied_lsn"]
+            .as_u64()
+            .ok_or_else(|| Error::other("cdc.last_applied_lsn not a u64"))?;
+        if applied >= captured_lsn {
+            break applied;
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::other(format!(
+                "timed out waiting for cdc.last_applied_lsn ({applied}) to reach captured LSN ({captured_lsn} / {captured_lsn_str})"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert!(
+        applied_lsn >= captured_lsn,
+        "applied {applied_lsn} should be >= captured {captured_lsn}"
+    );
+
+    Ok(())
+}
+
+/// Parse a PostgreSQL LSN in `"X/Y"` hex form (as returned by
+/// `pg_current_wal_lsn()::text`) into a `u64` matching the wire-protocol
+/// encoding used in `cdc.last_applied_lsn`.
+fn lsn_parse(s: &str) -> Result<u64, Error> {
+    let (hi, lo) = s
+        .split_once('/')
+        .ok_or_else(|| Error::other(format!("invalid LSN format: {s}")))?;
+    let hi = u64::from_str_radix(hi, 16)
+        .map_err(|e| Error::other(format!("invalid LSN high: {s}: {e}")))?;
+    let lo = u64::from_str_radix(lo, 16)
+        .map_err(|e| Error::other(format!("invalid LSN low: {s}: {e}")))?;
+    Ok((hi << 32) | lo)
 }

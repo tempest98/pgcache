@@ -333,6 +333,20 @@ pub enum CdcCommand {
 
     /// CDC Truncate operation
     Truncate { relation_oids: Vec<u32> },
+
+    /// Transaction commit marker. Emitted by the CDC processor after all
+    /// mutations from a single transaction have been sent. Carries the
+    /// `end_lsn` of the commit record. The writer advances its
+    /// `last_applied_lsn` watermark when it processes this command —
+    /// guaranteeing the watermark is transaction-aligned.
+    CommitMark { lsn: u64 },
+
+    /// Keep-alive marker. Emitted when the CDC processor receives a
+    /// PrimaryKeepAlive whose `wal_end` advances past the previously
+    /// observed position. Carries `wal_end`. Allows the writer's
+    /// `last_applied_lsn` watermark to advance during idle periods
+    /// (no published-table transactions) so the gauge remains current.
+    KeepAliveMark { lsn: u64 },
 }
 
 /// Signals from the CDC thread to the coordinator about replication connection health.

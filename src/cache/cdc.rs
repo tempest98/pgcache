@@ -46,7 +46,11 @@ pub struct CdcProcessor {
     active_relations: ActiveRelations,
 
     last_received_lsn: u64,
-    last_applied_lsn: u64,
+    /// Highest LSN whose XLogData has been decoded by this processor and
+    /// whose CdcCommands have been enqueued to the writer. Distinct from
+    /// the writer's `last_applied_lsn`, which only advances after the
+    /// writer has actually executed the resulting cache mutations.
+    last_decoded_lsn: u64,
     last_flushed_lsn: u64,
     keep_alive_timer: Interval,
     last_flush_sent: Option<Instant>,
@@ -76,7 +80,7 @@ impl CdcProcessor {
             cdc_tx,
             active_relations,
             last_received_lsn: 0,
-            last_applied_lsn: 0,
+            last_decoded_lsn: 0,
             last_flushed_lsn: 0,
             keep_alive_timer: timer,
             last_flush_sent: None,
@@ -159,6 +163,9 @@ impl CdcProcessor {
     async fn update_lsn(&mut self, xlog_data: &XLogDataBody<LogicalReplicationMessage>) {
         let lsn = xlog_data.wal_start();
         self.last_received_lsn = lsn;
+        // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(names::CDC_RECEIVED_LSN).set(lsn as f64);
 
         // Calculate time-based lag: difference between server timestamp and our current time
         let server_timestamp = xlog_data.timestamp();
@@ -182,13 +189,13 @@ impl CdcProcessor {
         metrics::gauge!(names::CDC_FLUSH_STALENESS_SECONDS).set(flush_staleness);
     }
 
-    /// Marks the current LSN as fully applied after successful processing.
+    /// Marks the current LSN as decoded after successful processing.
     /// Only advances forward — keep-alive acknowledgments may have already moved
     /// past this position when the decoder read ahead of buffered transaction output.
-    fn mark_lsn_applied(&mut self) {
+    fn mark_lsn_decoded(&mut self) {
         let received = self.last_received_lsn;
-        if received > self.last_applied_lsn {
-            self.last_applied_lsn = received;
+        if received > self.last_decoded_lsn {
+            self.last_decoded_lsn = received;
         }
     }
 
@@ -223,31 +230,33 @@ impl CdcProcessor {
         stream: std::pin::Pin<&mut LogicalReplicationStream>,
         reply_requested: bool,
     ) -> Result<(), Error> {
-        let applied_lsn = self.last_applied_lsn;
-        let pg_lsn = PgLsn::from(applied_lsn);
+        let decoded_lsn = self.last_decoded_lsn;
+        let pg_lsn = PgLsn::from(decoded_lsn);
         let timestamp = Self::get_pg_timestamp();
         let reply_flag = if reply_requested { 1 } else { 0 };
 
-        // Send standby status update: write_lsn, flush_lsn, apply_lsn all set to applied_lsn
+        // Send standby status update: write_lsn, flush_lsn, apply_lsn all set to decoded_lsn
         match stream
             .standby_status_update(pg_lsn, pg_lsn, pg_lsn, timestamp, reply_flag)
             .await
         {
             Ok(()) => {
                 // Update tracking on successful send
-                self.last_flushed_lsn = applied_lsn;
+                self.last_flushed_lsn = decoded_lsn;
+                #[allow(clippy::cast_precision_loss)]
+                metrics::gauge!(names::CDC_FLUSHED_LSN).set(decoded_lsn as f64);
                 self.last_flush_sent = Some(Instant::now());
                 self.keep_alive_sent_count += 1;
                 let count = self.keep_alive_sent_count;
 
-                debug!("Sent keep-alive #{count} (LSN: {applied_lsn}, reply: {reply_flag})");
+                debug!("Sent keep-alive #{count} (LSN: {decoded_lsn}, reply: {reply_flag})");
 
                 Ok(())
             }
             Err(e) => {
                 // Log warning but don't terminate CDC processing for keep-alive failures
                 error!(
-                    "Warning: Failed to send standby status update (LSN: {applied_lsn}, reply: {reply_flag}): {e}"
+                    "Warning: Failed to send standby status update (LSN: {decoded_lsn}, reply: {reply_flag}): {e}"
                 );
                 error!("CDC processing will continue despite keep-alive failure");
                 Ok(()) // Return Ok to continue processing
@@ -279,9 +288,19 @@ impl CdcProcessor {
         // Advance our position to the decoder's read cursor. All WAL up to this point
         // has been processed by the logical decoder — any pending output is buffered
         // server-side and will be re-decoded on reconnect.
-        if wal_end > self.last_applied_lsn {
+        if wal_end > self.last_decoded_lsn {
             self.last_received_lsn = wal_end;
-            self.last_applied_lsn = wal_end;
+            self.last_decoded_lsn = wal_end;
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!(names::CDC_RECEIVED_LSN).set(wal_end as f64);
+
+            // Forward a keep-alive mark to the writer so its applied-LSN
+            // watermark can advance during idle periods (no published-table
+            // transactions). Channel-send failure means the writer is gone;
+            // the next stream operation will surface that.
+            if let Err(e) = self.cdc_tx.send(CdcCommand::KeepAliveMark { lsn: wal_end }) {
+                error!("Failed to forward keep-alive mark to writer: {e:?}");
+            }
         }
 
         if reply_requested {
@@ -318,7 +337,7 @@ impl CdcProcessor {
                     }
                 };
                 if result.is_ok() {
-                    self.mark_lsn_applied();
+                    self.mark_lsn_decoded();
                 }
                 result
             }
@@ -347,9 +366,17 @@ impl CdcProcessor {
     }
 
     /// Processes transaction commit messages.
-    async fn process_commit(&self, _body: &CommitBody) -> Result<(), Error> {
-        // transaction begin and end messages can be ignored since all logical replication
-        // messages are sent after the transaction has been committed
+    ///
+    /// Forwards a `CommitMark` to the writer carrying the commit's `end_lsn`.
+    /// The writer advances its `last_applied_lsn` watermark on this mark,
+    /// guaranteeing the watermark is transaction-aligned: by the time the
+    /// writer processes the mark, every mutation enqueued earlier in this
+    /// transaction has been applied (mpsc preserves order).
+    async fn process_commit(&self, body: &CommitBody) -> Result<(), Error> {
+        let lsn = body.end_lsn();
+        if let Err(e) = self.cdc_tx.send(CdcCommand::CommitMark { lsn }) {
+            error!("Failed to forward commit mark (lsn {lsn}) to writer: {e:?}");
+        }
         Ok(())
     }
 

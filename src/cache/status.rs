@@ -29,12 +29,18 @@ pub struct CacheStatusData {
 }
 
 /// CDC / logical replication state.
+///
+/// Only fields whose source of truth is the writer thread live here.
+/// CDC-processor-local LSNs (`received_lsn`, `flushed_lsn`) and lag values
+/// are exposed as Prometheus gauges on `/metrics` instead — that's their
+/// natural home, and avoids cross-thread plumbing for read-only display.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CdcStatusData {
-    pub tables: Vec<String>,
-    pub last_received_lsn: u64,
-    pub last_flushed_lsn: u64,
-    pub lag_bytes: u64,
+    /// Highest LSN whose effects (cache mutations and invalidations) have
+    /// been fully applied by the writer. Advances on transaction commit
+    /// markers and keep-alive markers delivered through the CDC command
+    /// channel — guaranteed transaction-aligned.
+    pub last_applied_lsn: u64,
 }
 
 /// Per-query status for a cached query.

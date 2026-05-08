@@ -80,6 +80,16 @@ pub mod names {
     pub const CDC_LAG_BYTES: &str = "pgcache.cdc.lag_bytes";
     pub const CDC_LAG_SECONDS: &str = "pgcache.cdc.lag_seconds";
     pub const CDC_FLUSH_STALENESS_SECONDS: &str = "pgcache.cdc.flush_staleness_seconds";
+    /// Last LSN received from origin via XLogData. Set in the CDC processor
+    /// thread on every replication message.
+    pub const CDC_RECEIVED_LSN: &str = "pgcache.cdc.received_lsn";
+    /// Last LSN acknowledged to origin via standby status update. Set in the
+    /// CDC processor thread after each successful keep-alive send.
+    pub const CDC_FLUSHED_LSN: &str = "pgcache.cdc.flushed_lsn";
+    /// Highest LSN whose effects (cache mutations and invalidations) have been
+    /// fully applied by the writer. Advances on transaction-commit and keep-alive
+    /// marks delivered through the CDC command channel.
+    pub const CDC_APPLIED_LSN: &str = "pgcache.cdc.applied_lsn";
 
     // Cache performance metrics
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
