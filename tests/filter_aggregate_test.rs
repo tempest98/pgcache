@@ -4,7 +4,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, metrics_delta, wait_cache_load};
+use crate::util::{TestContext, metrics_delta};
 
 mod util;
 
@@ -60,7 +60,7 @@ async fn test_filter_aggregate_two_predicates() -> Result<(), Error> {
     assert_eq!(row.get::<_, i64>("questions"), 10);
     assert_eq!(row.get::<_, i64>("answers"), 1);
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit via source-row eval.
     let m1 = ctx.metrics().await?;
@@ -81,7 +81,7 @@ async fn test_filter_aggregate_two_predicates() -> Result<(), Error> {
 
     // Trigger MV first-build, then wait for it to land.
     let _ = ctx.query_one(sql, &[]).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let m3 = ctx.metrics().await?;
     let row = ctx.query_one(sql, &[]).await?;
@@ -100,7 +100,7 @@ async fn test_filter_aggregate_two_predicates() -> Result<(), Error> {
     )
     .await?;
     ctx.cdc_settle().await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let row = ctx.query_one(sql, &[]).await?;
     assert_eq!(
@@ -153,7 +153,7 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
     let _ = ctx
         .simple_query("SELECT count(*) FROM allowed_types")
         .await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // FILTER predicate is a non-correlated EXISTS against allowed_types.
     // While allowed_types is empty the predicate is false for every input
@@ -169,12 +169,12 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
     // Q1: cache miss, triggers source-row population.
     let row = ctx.query_one(sql, &[]).await?;
     assert_eq!(row.get::<_, i64>("visible"), 0);
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Q2: cache hit on source-row eval; schedules MV first-build.
     let row = ctx.query_one(sql, &[]).await?;
     assert_eq!(row.get::<_, i64>("visible"), 0);
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Q3: should be served from the MV (the snapshot path). Asserting
     // cache_mv_hits proves the MV is what serves subsequent reads — and
@@ -197,7 +197,7 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
     ctx.origin_query("INSERT INTO allowed_types VALUES (1)", &[])
         .await?;
     ctx.cdc_settle().await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let row = ctx.query_one(sql, &[]).await?;
     assert_eq!(

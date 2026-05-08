@@ -12,9 +12,7 @@
 
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -63,7 +61,7 @@ async fn test_cte_simple() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Diana"), ("department", "sales")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — should hit cache
     let res = ctx.simple_query(query).await?;
@@ -93,7 +91,7 @@ async fn test_cte_simple() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Bob"), ("department", "eng")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Delete an employee via CDC
     ctx.origin_query("DELETE FROM employees WHERE id = 4", &[])
@@ -167,7 +165,7 @@ async fn test_cte_with_join() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("project", "Beta"), ("lead", "Charlie")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
@@ -233,7 +231,7 @@ async fn test_cte_multiple_tables() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Charlie"), ("total", "200")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
@@ -283,7 +281,7 @@ async fn test_cte_materialized() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Bob")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;

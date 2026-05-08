@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::time::sleep;
 
-use crate::util::{TestContext, wait_cache_load};
+use crate::util::TestContext;
 
 mod util;
 
@@ -126,7 +126,7 @@ async fn test_eviction_removes_table_from_publication() -> Result<(), Error> {
     // Register query on table_c — this should push cache over the 200KB limit
     // and evict the oldest query (evict_a) via FIFO.
     ctx.simple_query("SELECT id, data FROM evict_c").await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // After eviction, evict_a should be removed from the publication.
     let tables = publication_table_removed_wait(&mut ctx, "evict_a", timeout).await?;

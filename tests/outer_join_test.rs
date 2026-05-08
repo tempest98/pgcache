@@ -13,9 +13,7 @@
 
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -79,7 +77,7 @@ async fn test_left_join_terminal_cache_hit() -> Result<(), Error> {
     )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
@@ -149,7 +147,7 @@ async fn test_left_join_terminal_cdc_insert_optional_side() -> Result<(), Error>
     )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // INSERT on optional side — should be added to cache in place
     ctx.origin_query(
@@ -221,7 +219,7 @@ async fn test_left_join_null_padding() -> Result<(), Error> {
     assert_eq!(row.get::<&str>("item"), None, "item should be NULL");
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // INSERT a matching detail on the optional side
     ctx.origin_query(
@@ -287,7 +285,7 @@ async fn test_left_join_terminal_cdc_delete_optional_side() -> Result<(), Error>
     assert_eq!(res.len(), 4); // 2 rows
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // DELETE one detail — row removed from cache in place
     ctx.origin_query("DELETE FROM ljdel_details WHERE id = 11", &[])
@@ -368,7 +366,7 @@ async fn test_right_join_terminal_cache_hit() -> Result<(), Error> {
     )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
@@ -434,7 +432,7 @@ async fn test_left_join_non_terminal_cdc_invalidation() -> Result<(), Error> {
     )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
@@ -518,7 +516,7 @@ async fn test_left_join_cdc_insert_preserved_side() -> Result<(), Error> {
     let _ = ctx.simple_query(query).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let _ = ctx.simple_query(query).await?;

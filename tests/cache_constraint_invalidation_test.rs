@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -520,7 +518,7 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     // Wait for cache to be populated
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Run same query again to verify cache hit
     let _ = ctx.simple_query(query_str).await?;
@@ -623,8 +621,8 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     // Wait for cache to load (use longer wait for reliability)
-    wait_cache_load().await;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
+    ctx.cache_settle().await?;
 
     // Verify cache hit
     let _ = ctx.simple_query(query_str).await?;
@@ -737,8 +735,8 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
     let m = assert_cache_miss(&mut ctx, m).await?;
 
     // Wait for cache to load (use longer wait for reliability)
-    wait_cache_load().await;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
+    ctx.cache_settle().await?;
 
     // Verify cache hit
     let _ = ctx.simple_query(query_str).await?;

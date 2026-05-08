@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -49,7 +47,7 @@ async fn test_limit_basic_cache() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("id", "3"), ("name", "c")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit, same data
     let res = ctx.simple_query(query).await?;
@@ -83,7 +81,7 @@ async fn test_limit_shared_fingerprint() -> Result<(), Error> {
     assert_row_at(&res, 4, &[("id", "10")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // LIMIT 2 → cache hit (2 ≤ 4)
     let res = ctx.simple_query(&format!("{base} LIMIT 2")).await?;
@@ -129,7 +127,7 @@ async fn test_limit_bump() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "5"), ("name", "e")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // LIMIT 2 → cache hit
     let res = ctx.simple_query(&format!("{base} LIMIT 2")).await?;
@@ -144,7 +142,7 @@ async fn test_limit_bump() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("id", "6")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     dbg!("hihihi");
 
@@ -193,7 +191,7 @@ async fn test_limit_bump_to_unlimited() -> Result<(), Error> {
     ctx.simple_query(&format!("{base} LIMIT 2")).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // No LIMIT → cache miss (needs all rows, only 2 cached)
     let res = ctx.simple_query(base).await?;
@@ -204,7 +202,7 @@ async fn test_limit_bump_to_unlimited() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("id", "3")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // No LIMIT → cache hit (now unlimited)
     let res = ctx.simple_query(base).await?;
@@ -245,7 +243,7 @@ async fn test_limit_cdc_delete_invalidates() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("id", "9")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     ctx.simple_query(query).await?;
@@ -293,7 +291,7 @@ async fn test_limit_cdc_insert_no_invalidation() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "2"), ("name", "b")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     ctx.simple_query(query).await?;
@@ -336,7 +334,7 @@ async fn test_limit_offset_cache_hit() -> Result<(), Error> {
     ctx.simple_query(&format!("{base} LIMIT 4")).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // LIMIT 2 OFFSET 1 → cache hit (2+1=3 ≤ 4)
     let res = ctx
@@ -368,7 +366,7 @@ async fn test_limit_offset_limit_cache_hit() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let res = ctx.simple_query(&format!("{base} LIMIT 4")).await?;
     assert_eq!(res.len(), 6); // RowDescription + 4 rows + CommandComplete
@@ -404,7 +402,7 @@ async fn test_limit_extended_protocol() -> Result<(), Error> {
     assert_eq!(rows[3].get::<_, i32>("id"), 10);
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // LIMIT 4 → cache hit
     let rows = ctx.query(&stmt, &[&"z", &4i64]).await?;
@@ -440,7 +438,7 @@ async fn test_limit_union_cacheable() -> Result<(), Error> {
     assert_eq!(res.len(), 5); // RowDescription + 3 rows + CommandComplete
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit, LIMIT applied at serve time
     let res = ctx.simple_query(query).await?;
@@ -473,7 +471,7 @@ async fn test_offset_only() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "3"), ("name", "c")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same query → cache hit (unlimited rows cached)
     let res = ctx.simple_query(query).await?;

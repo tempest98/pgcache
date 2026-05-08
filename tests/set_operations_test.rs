@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -54,7 +52,7 @@ async fn test_set_op_union() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("id", "10"), ("name", "Admin1")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query - should hit cache
     let res = ctx.simple_query(query).await?;
@@ -162,7 +160,7 @@ async fn test_set_op_intersect() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("sku", "SKU-003")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
@@ -232,7 +230,7 @@ async fn test_set_op_except() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("item", "Cherry")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
@@ -302,7 +300,7 @@ async fn test_set_op_union_all() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("value", "Z")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // UNION ALL (not deduplicated) - should have X, Y, Y, Z
     let query_union_all = "SELECT value FROM list_a \
@@ -318,7 +316,7 @@ async fn test_set_op_union_all() -> Result<(), Error> {
     assert_row_at(&res, 4, &[("value", "Z")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Verify both queries hit cache on subsequent runs
     let res = ctx.simple_query(query_union).await?;
@@ -430,7 +428,7 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("amount", "500")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;

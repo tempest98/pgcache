@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
 
 mod util;
 
@@ -34,7 +32,7 @@ async fn test_pinned_query_cache_hit_on_first_request() -> Result<(), Error> {
         .await?;
 
     // Wait for pinned query to finish populating
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // First client request — should be a cache hit (pinned query already populated)
     let m = ctx.metrics().await?;
@@ -91,7 +89,7 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
     .await?;
 
     // Wait for pinned query population
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // First request — cache hit from pinned pre-population
     let m = ctx.metrics().await?;
@@ -113,7 +111,7 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
 
     // Wait for CDC invalidation + auto-readmit + re-population
     ctx.cdc_settle().await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Verify invalidation and readmission happened
     let m_after_cdc = ctx.metrics().await?;
@@ -202,7 +200,7 @@ async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
     .await?;
 
     // Wait for pinned query population
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Verify pinned query is serving hits
     let m = ctx.metrics().await?;
@@ -211,14 +209,14 @@ async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
 
     // Register non-pinned queries to fill the cache and trigger eviction
     ctx.simple_query("SELECT id, data FROM evict_x").await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     ctx.simple_query("SELECT id, data FROM evict_y").await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     ctx.simple_query("SELECT id, data FROM evict_z").await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Extra wait for eviction to complete
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Take fresh metrics snapshot after eviction-fodder queries
     let m = ctx.metrics().await?;
@@ -263,7 +261,7 @@ async fn test_pinned_query_invalid_sql_skipped() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "works")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let res = ctx
         .simple_query("SELECT id, data FROM normal_table")

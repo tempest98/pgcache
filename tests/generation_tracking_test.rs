@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use crate::util::{TestContext, connect_cache_db, wait_cache_load};
+use crate::util::{TestContext, connect_cache_db};
 
 mod util;
 
@@ -27,7 +27,7 @@ async fn test_generation_tracking_basic() -> Result<(), Error> {
         .simple_query("select id, data from test where id = 1")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Execute the cached query again (cache hit) - this records row access
     let _res = ctx
@@ -87,14 +87,14 @@ async fn test_generation_tracking_multiple_queries() -> Result<(), Error> {
         .simple_query("select id, data from test where id = 1")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second cached query (different WHERE) - generation 2
     let _res = ctx
         .simple_query("select id, data from test where id = 2")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Execute both cached queries to record row access
     let _res = ctx
@@ -171,13 +171,13 @@ async fn test_generation_purge() -> Result<(), Error> {
         .simple_query("select id, data from test where id = 1")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let _res = ctx
         .simple_query("select id, data from test where id = 2")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Execute both to record row access
     let _res = ctx
@@ -301,7 +301,7 @@ async fn test_generation_zero_promote() -> Result<(), Error> {
         .simple_query("select id, data from test where id = 1")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Execute cached query to record row access at generation 1
     let _res = ctx
@@ -458,7 +458,7 @@ async fn test_generation_zero_promote_noop() -> Result<(), Error> {
         .simple_query("select id, data from test where id = 1")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let _res = ctx
         .simple_query("select id, data from test where id = 1")
@@ -529,7 +529,7 @@ async fn test_generation_tracking_join() -> Result<(), Error> {
         )
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Execute to record row access
     let _res = ctx

@@ -14,7 +14,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, wait_cache_load};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss};
 
 mod util;
 
@@ -55,7 +55,7 @@ async fn test_binary_int4_array_in_any_clause() -> Result<(), Error> {
     assert_eq!(rows[1].get::<_, &str>("name"), "c");
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second execution with the same array — same fingerprint, cache hit.
     let rows = ctx.query(&stmt, &[&ids]).await?;
@@ -98,7 +98,7 @@ async fn test_pgc106_any_subsumes_narrower_any() -> Result<(), Error> {
         vec![1, 2, 3]
     );
     let m = assert_cache_miss(&mut ctx, m).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Narrower subset: subsumption hit, returns the right row.
     let r2 = ctx.query(&stmt, &[&vec![1i32]]).await?;
@@ -145,7 +145,7 @@ async fn test_pgc106_distinct_arrays_get_distinct_cache_entries() -> Result<(), 
     assert_eq!(r1[0].get::<_, i32>("id"), 1);
     assert_eq!(r1[1].get::<_, i32>("id"), 2);
     let m = assert_cache_miss(&mut ctx, m).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same array → cache hit on the same entry.
     let _ = ctx.query(&stmt, &[&vec![1i32, 2]]).await?;
@@ -159,7 +159,7 @@ async fn test_pgc106_distinct_arrays_get_distinct_cache_entries() -> Result<(), 
         vec![3, 4, 5]
     );
     let m = assert_cache_miss(&mut ctx, m).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same different array — hits its own newly-populated entry.
     let _ = ctx.query(&stmt, &[&vec![3i32, 4, 5]]).await?;

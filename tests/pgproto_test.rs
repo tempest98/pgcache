@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, metrics_delta, pgproto_run, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, metrics_delta, pgproto_run};
 
 mod util;
 
@@ -51,7 +49,7 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
     assert_pgproto_select(&output, 3);
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second run: cache hit (same query, new connection)
     let output = pgproto_run(

@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -40,7 +38,7 @@ async fn test_search_path_custom_schema() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("name", "Alice")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query - same query, should hit cache
     let res = ctx
@@ -105,7 +103,7 @@ async fn test_search_path_schema_priority() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit should return same result
     let res = ctx
@@ -152,7 +150,7 @@ async fn test_search_path_explicit_schema() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "secret_value")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit with explicit schema
     let res = ctx
@@ -194,7 +192,7 @@ async fn test_search_path_default() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("name", "widget")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx
@@ -239,7 +237,7 @@ async fn test_search_path_cache_invalidation() -> Result<(), Error> {
     assert_eq!(res.len(), 3);
     assert_row_at(&res, 1, &[("id", "1"), ("price", "100")])?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Update via origin (simulating external change)
     ctx.origin_query(
@@ -508,7 +506,7 @@ async fn test_search_path_join() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "1"), ("name", "Alice"), ("total", "200")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx

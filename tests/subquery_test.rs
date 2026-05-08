@@ -18,9 +18,7 @@
 
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -71,7 +69,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Gizmo"), ("price", "200")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
@@ -96,7 +94,7 @@ async fn test_subquery_from_derived_table() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Widget"), ("price", "100")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE: derived table (Inclusion) → does NOT invalidate ---
 
@@ -170,7 +168,7 @@ async fn test_subquery_where_in() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Bob")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
@@ -256,7 +254,7 @@ async fn test_subquery_where_not_in() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Gizmo")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let res_cached = ctx.simple_query(query).await?;
     assert_eq!(res.len(), res_cached.len(), "cache returns same results");
@@ -310,7 +308,7 @@ async fn test_subquery_scalar_in_where() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Gizmo"), ("price", "200")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let res_cached = ctx.simple_query(query).await?;
     assert_eq!(res.len(), res_cached.len(), "cache returns same results");
@@ -395,7 +393,7 @@ async fn test_subquery_nested() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Widget")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let res_cached = ctx.simple_query(query).await?;
     assert_eq!(res.len(), res_cached.len(), "cache returns same results");
@@ -484,7 +482,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Widget")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -515,7 +513,7 @@ async fn test_subquery_nested_in_in_cdc() -> Result<(), Error> {
     assert_row_at(&res, 4, &[("name", "Widget")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE at middle level (stores): Inclusion → no invalidation ---
     // Remove Philly store — shrinkage is safe for Inclusion
@@ -643,7 +641,7 @@ async fn test_subquery_nested_not_in_inside_in() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Widget")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -766,7 +764,7 @@ async fn test_subquery_nested_in_inside_not_in() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Teddy Bear")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -884,7 +882,7 @@ async fn test_subquery_multi_table_dependency() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Phone"), ("quantity", "5")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     let res = ctx.simple_query(query).await?;
@@ -960,7 +958,7 @@ async fn test_subquery_derived_table_constraint_filter() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Blender"), ("price", "80")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;
@@ -1065,7 +1063,7 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Bob")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query).await?;

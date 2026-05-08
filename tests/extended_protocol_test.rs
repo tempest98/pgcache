@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, wait_cache_load};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss};
 
 mod util;
 
@@ -30,7 +30,7 @@ async fn test_extended_protocol_basic() -> Result<(), Error> {
     ctx.query(&stmt, &[&"foo"]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let rows = ctx.query(&stmt, &[&"foo"]).await?;
@@ -68,7 +68,7 @@ async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
     ctx.query(&stmt, &[&"foo"]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same parameter — cache hit
     let rows1 = ctx.query(&stmt, &[&"foo"]).await?;
@@ -81,7 +81,7 @@ async fn test_extended_protocol_statement_reuse() -> Result<(), Error> {
     ctx.query(&stmt, &[&"bar"]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same parameter — cache hit
     let rows2 = ctx.query(&stmt, &[&"bar"]).await?;
@@ -119,7 +119,7 @@ async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
     ctx.query(&stmt, &[&"foo", &50]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same parameters — cache hit
     let rows = ctx.query(&stmt, &[&"foo", &50]).await?;
@@ -133,7 +133,7 @@ async fn test_extended_protocol_multiple_params() -> Result<(), Error> {
     ctx.query(&stmt, &[&"bar", &100]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same parameters — cache hit
     let rows = ctx.query(&stmt, &[&"bar", &100]).await?;
@@ -261,7 +261,7 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
     ctx.query(&stmt, &[&"foo"]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second execution — cache hit
     let rows = ctx.query(&stmt, &[&"foo"]).await?;
@@ -289,7 +289,7 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
     ctx.query(&stmt, &[&"bar"]).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit for 'bar'
     let rows = ctx.query(&stmt, &[&"bar"]).await?;

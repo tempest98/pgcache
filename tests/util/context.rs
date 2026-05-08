@@ -267,6 +267,75 @@ impl TestContext {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    /// Wait for all currently-registered queries to reach a terminal state
+    /// (i.e. no entry remains in `Loading` or `Pending(_)`). Use after a
+    /// cache miss when the next read should be served from cache.
+    ///
+    /// A small grace period precedes the first poll because there's a brief
+    /// window after a SELECT returns to the client during which the
+    /// proxy → coordinator → writer registration message hasn't yet been
+    /// processed. The grace lets registration land so we observe the
+    /// `Loading` state we then wait to leave.
+    ///
+    /// Times out after 5 seconds. The error lists the offending entries.
+    pub async fn cache_settle(&self) -> Result<(), Error> {
+        self.cache_settle_with_timeout(Duration::from_secs(5)).await
+    }
+
+    /// Same as `cache_settle` with an explicit timeout.
+    pub async fn cache_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        cache_settle_at(self.metrics_port, timeout).await
+    }
+}
+
+/// Free-function variant of `TestContext::cache_settle_with_timeout` for
+/// tests that don't use `TestContext` (e.g. those that drive the proxy
+/// through a custom client like `connect_pgcache_tls`).
+pub async fn cache_settle_at(metrics_port: u16, timeout: Duration) -> Result<(), Error> {
+    // Grace window for the registration message to reach the writer.
+    // Typical hop latency is sub-millisecond; 20 ms is comfortably above.
+    // If registration takes longer, the subsequent poll will observe
+    // the resulting `Loading` state and continue to wait.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (status, body) = http_get(metrics_port, "/status").await?;
+        if status != 200 {
+            return Err(Error::other(format!("/status returned {status}: {body}")));
+        }
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+        let queries = json
+            .get("queries")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::other("queries missing or not an array"))?;
+        let in_flight: Vec<String> = queries
+            .iter()
+            .filter_map(|q| {
+                let state = q.get("state").and_then(serde_json::Value::as_str)?;
+                if state == "Loading" || state.starts_with("Pending") {
+                    let fp = q
+                        .get("fingerprint")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    Some(format!("{fp}={state}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if in_flight.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::other(format!(
+                "cache_settle timed out: {in_flight:?}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Parse a PostgreSQL LSN in `"X/Y"` hex form (as returned by

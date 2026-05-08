@@ -22,9 +22,7 @@
 
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -90,7 +88,7 @@ async fn test_correlated_exists_basic() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Charlie")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -114,7 +112,7 @@ async fn test_correlated_exists_basic() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Charlie")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE on inner table (orders) → in-place removal, cache hit ---
     // Direct source: row removed from cache table, serve-time EXISTS
@@ -193,7 +191,7 @@ async fn test_correlated_not_exists_basic() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Marketing")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -214,7 +212,7 @@ async fn test_correlated_not_exists_basic() -> Result<(), Error> {
     assert_eq!(res.len(), 2); // no departments without employees + RowDesc + CommandComplete
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE on inner table (employees) → invalidates ---
     // Remove Bob from Sales — Sales should reappear
@@ -287,7 +285,7 @@ async fn test_correlated_exists_residual_constraint_filter() -> Result<(), Error
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -388,7 +386,7 @@ async fn test_correlated_not_exists_residual_predicates() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Sales")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -475,7 +473,7 @@ async fn test_correlated_exists_with_group_by() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -557,7 +555,7 @@ async fn test_correlated_exists_outer_table_cdc() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Bob")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
@@ -647,7 +645,7 @@ async fn test_correlated_exists_inner_join() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3);
@@ -736,7 +734,7 @@ async fn test_correlated_in_basic() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Charlie")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -760,7 +758,7 @@ async fn test_correlated_in_basic() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Charlie")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE on inner table → in-place removal, cache hit ---
     // Direct source: row removed from cache table, serve-time IN
@@ -841,7 +839,7 @@ async fn test_correlated_in_with_correlation() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Bob")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -927,7 +925,7 @@ async fn test_correlated_in_residual_constraint_filter() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1032,7 +1030,7 @@ async fn test_correlated_not_in_basic() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Marketing")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1053,7 +1051,7 @@ async fn test_correlated_not_in_basic() -> Result<(), Error> {
     assert_eq!(res.len(), 2); // no departments without employees + RowDesc + CommandComplete
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE on inner table (employees) → invalidates ---
     // Remove Bob from Sales — Sales should reappear
@@ -1133,7 +1131,7 @@ async fn test_correlated_not_in_with_correlation() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Bob")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1154,7 +1152,7 @@ async fn test_correlated_not_in_with_correlation() -> Result<(), Error> {
     assert_eq!(res.len(), 2); // RowDesc + CommandComplete only
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE: remove Alice's order → Alice should reappear ---
     ctx.origin_query("DELETE FROM orders WHERE id = 100", &[])
@@ -1229,7 +1227,7 @@ async fn test_correlated_not_in_residual_constraint_filter() -> Result<(), Error
     assert_row_at(&res, 2, &[("name", "Charlie")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1352,7 +1350,7 @@ async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Charlie")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1370,7 +1368,7 @@ async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
     assert_eq!(res.len(), 4); // still Alice, Charlie
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC: add project for dept 20 → Bob should appear ---
     ctx.origin_query("INSERT INTO projects (id, dept_id) VALUES (101, 20)", &[])
@@ -1455,7 +1453,7 @@ async fn test_correlated_scalar_select_count() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Charlie"), ("order_count", "0")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1481,7 +1479,7 @@ async fn test_correlated_scalar_select_count() -> Result<(), Error> {
     assert_row_at(&res, 3, &[("name", "Charlie"), ("order_count", "1")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- CDC DELETE on inner table → invalidates ---
     ctx.origin_query("DELETE FROM orders WHERE id = 100", &[])
@@ -1553,7 +1551,7 @@ async fn test_correlated_scalar_select_lookup() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Bob"), ("dept_name", "Marketing")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1623,7 +1621,7 @@ async fn test_correlated_scalar_where_aggregate() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Sales")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1701,7 +1699,7 @@ async fn test_correlated_scalar_where_lookup() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("name", "Alice")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;
@@ -1789,7 +1787,7 @@ async fn test_correlated_scalar_and_exists_combined() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("name", "Charlie"), ("order_count", "1")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // --- Cache hit ---
     let res = ctx.simple_query(query).await?;

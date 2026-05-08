@@ -2,7 +2,6 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_miss, assert_not_subsumed, assert_row_at, assert_subsume_hit,
-    wait_cache_load,
 };
 
 mod util;
@@ -32,7 +31,7 @@ async fn test_subsumption_unconstrained_covers_constrained() -> Result<(), Error
     assert_eq!(res.len(), 5); // 3 rows + RowDescription + CommandComplete
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Constrained query should be subsumed — served from cache immediately
     let res = ctx
@@ -69,7 +68,7 @@ async fn test_subsumption_equality_superset() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Narrower query (superset of constraints) should be subsumed
     let res = ctx
@@ -106,7 +105,7 @@ async fn test_subsumption_different_values_not_subsumed() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Query tenant_id = 2 — different value, should NOT be subsumed
     ctx.simple_query("SELECT * FROM test_sub_diff WHERE tenant_id = 2")
@@ -141,7 +140,7 @@ async fn test_subsumption_different_table_not_subsumed() -> Result<(), Error> {
     ctx.simple_query("SELECT * FROM test_sub_t1").await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Query t2 — different table, not subsumed
     ctx.simple_query("SELECT * FROM test_sub_t2").await?;
@@ -173,7 +172,7 @@ async fn test_subsumption_inequality_subsumed() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Narrower inequality — subsumed (value > 100 implies value > 50)
     let rows = ctx
@@ -222,7 +221,7 @@ async fn test_subsumption_join_not_subsumed() -> Result<(), Error> {
     .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Same JOIN with additional WHERE — not subsumed (multi-table cached query)
     ctx.simple_query(
@@ -269,7 +268,7 @@ async fn test_subsumption_join_partial_coverage_not_subsumed() -> Result<(), Err
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // JOIN query — orders is covered but customers is not
     ctx.simple_query(
@@ -306,7 +305,7 @@ async fn test_subsumption_with_limit_not_subsumed() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Query without LIMIT — not subsumed (cached has LIMIT)
     ctx.simple_query("SELECT * FROM test_sub_limit WHERE id = 1")
@@ -349,13 +348,13 @@ async fn test_subsumption_two_single_tables_cover_join() -> Result<(), Error> {
     ctx.simple_query("SELECT * FROM test_sub_items").await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     ctx.simple_query("SELECT * FROM test_sub_categories")
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // JOIN query referencing both tables — each table covered by its own cached query
     let res = ctx

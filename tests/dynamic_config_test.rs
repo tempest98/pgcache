@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use crate::util::{TestContext, http_get, http_post, http_put, wait_cache_load};
+use crate::util::{TestContext, http_get, http_post, http_put};
 
 mod util;
 
@@ -176,7 +176,7 @@ async fn test_config_change_affects_cache_behavior() -> Result<(), Error> {
     // With FIFO (default), query should be admitted immediately
     ctx.simple_query("SELECT id, name FROM config_test WHERE id = 1")
         .await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     ctx.simple_query("SELECT id, name FROM config_test WHERE id = 1")
         .await?;
 
@@ -209,7 +209,7 @@ async fn test_config_change_affects_cache_behavior() -> Result<(), Error> {
         ctx.simple_query("SELECT name FROM config_test WHERE id = 2")
             .await?;
     }
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // The registered query count should not have grown
     let (_, body) = http_get(ctx.metrics_port, "/status").await?;

@@ -2,7 +2,7 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at,
-    assert_subsume_hit, wait_cache_load,
+    assert_subsume_hit,
 };
 
 mod util;
@@ -30,7 +30,7 @@ async fn test_range_subsumption_tighter_lower() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Narrower range — subsumed
     let res = ctx
@@ -71,7 +71,7 @@ async fn test_range_subsumption_between_containment() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Narrower range — subsumed
     let res = ctx
@@ -115,7 +115,7 @@ async fn test_range_subsumption_point_in_range() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Equality within range — subsumed
     let res = ctx
@@ -150,7 +150,7 @@ async fn test_range_subsumption_cdc_insert() -> Result<(), Error> {
     assert_eq!(res.len(), 4); // 2 rows
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     ctx.simple_query("SELECT id, value FROM test_rsub_cdc WHERE value > 50 ORDER BY id")
@@ -198,7 +198,7 @@ async fn test_in_set_subsumption_subset() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Subset IN-set — subsumed
     let res = ctx
@@ -242,7 +242,7 @@ async fn test_in_set_subsumption_not_subset() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // IN-set with value outside cached set — NOT subsumed
     ctx.simple_query("SELECT * FROM test_insub_no WHERE id IN (1, 10)")
@@ -273,7 +273,7 @@ async fn test_unconstrained_subsumes_in_set() -> Result<(), Error> {
     ctx.simple_query("SELECT * FROM test_uncon_in").await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // IN-set query — subsumed by full table
     let res = ctx
@@ -309,7 +309,7 @@ async fn test_range_subsumes_in_set() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // IN-set where all values > 0 — subsumed
     let res = ctx
@@ -349,7 +349,7 @@ async fn test_in_set_cdc_insert_matching() -> Result<(), Error> {
     assert_eq!(res.len(), 4); // 2 rows
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit
     ctx.simple_query(
@@ -400,7 +400,7 @@ async fn test_in_set_cdc_insert_non_matching() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // INSERT non-matching row via origin
     ctx.origin_query("INSERT INTO test_in_cdc_no VALUES (3, 'inactive')", &[])

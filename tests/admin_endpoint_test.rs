@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use crate::util::{TestContext, http_get, lsn_parse, wait_cache_load};
+use crate::util::{TestContext, http_get, lsn_parse};
 
 mod util;
 
@@ -81,7 +81,7 @@ async fn test_status_shows_cached_queries() -> Result<(), Error> {
     // Cache miss — registers the query
     ctx.simple_query("SELECT id, name FROM status_test WHERE id = 1")
         .await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let (status, body) = http_get(ctx.metrics_port, "/status").await?;
     assert_eq!(status, 200, "status body: {body}");
@@ -293,7 +293,7 @@ async fn test_status_applied_lsn_advances_after_write() -> Result<(), Error> {
     // the writer never sees a CommitMark for them.
     ctx.simple_query("SELECT id, name FROM applied_lsn_test WHERE id = 1")
         .await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Commit a transaction on origin and capture its post-commit WAL position.
     ctx.origin_query(

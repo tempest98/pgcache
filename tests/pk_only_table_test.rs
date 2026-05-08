@@ -15,9 +15,7 @@
 
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, connect_cache_db, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, connect_cache_db};
 
 mod util;
 
@@ -42,7 +40,7 @@ async fn test_pk_only_table_caching() -> Result<(), Error> {
     assert_eq!(rows.len(), 3, "first query returns 3 rows");
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit. Proves population (site 1) succeeded.
     let res = ctx.simple_query("SELECT id FROM pk_only").await?;
@@ -100,7 +98,7 @@ async fn test_pk_only_population_stamps_generation() -> Result<(), Error> {
         .collect();
     assert_eq!(rows.len(), 3);
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Dump the generation tracker and count entries for this table at gen > 0.
     // The tracker is keyed by pk_hash, computed from the row's ctid in the

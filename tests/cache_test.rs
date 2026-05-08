@@ -1,8 +1,8 @@
 use std::io::Error;
 
 use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, connect_cache_db,
-    connect_pgcache_tls, metrics_http_get, start_databases, wait_cache_load,
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, cache_settle_at,
+    connect_cache_db, connect_pgcache_tls, metrics_http_get, start_databases,
 };
 
 mod util;
@@ -34,7 +34,7 @@ async fn test_cache_simple() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx
@@ -113,7 +113,7 @@ async fn test_cache_join() -> Result<(), Error> {
     let _ = ctx.simple_query(query_str).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query_str).await?;
@@ -286,7 +286,7 @@ async fn test_cache_self_join() -> Result<(), Error> {
     )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit with identical data
     let res = ctx.simple_query(query_str).await?;
@@ -392,7 +392,7 @@ async fn test_cache_index_creation() -> Result<(), Error> {
         .simple_query("SELECT * FROM test_indexed WHERE id = 1")
         .await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Connect directly to the cache database to verify indexes
     let cache_db = connect_cache_db(&ctx.dbs).await?;
@@ -531,7 +531,7 @@ async fn test_client_tls() -> Result<(), Error> {
     assert_eq!(data, "encrypted");
 
     // Wait for cache to load
-    wait_cache_load().await;
+    cache_settle_at(metrics_port, std::time::Duration::from_secs(5)).await?;
 
     // Second query - should be a cache hit
     let rows = client

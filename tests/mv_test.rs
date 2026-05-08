@@ -22,7 +22,7 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, connect_cache_db, metrics_delta, wait_cache_load};
+use crate::util::{TestContext, connect_cache_db, metrics_delta};
 
 mod util;
 
@@ -66,7 +66,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     assert_eq!(row.get::<_, i64>(0), 20);
 
     // Wait for source-row population. MV is still MeasurePending.
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         0,
@@ -85,7 +85,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     assert_eq!(d.cache_mv_fallthrough, 1);
 
     // Wait for the writer to build the MV.
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         1,
@@ -120,7 +120,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     assert_eq!(d.cache_mv_fallthrough, 1);
 
     // Rebuild runs on writer task; wait for it.
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let m5 = ctx.metrics().await?;
     assert!(
@@ -182,7 +182,7 @@ async fn test_mv_groupby_measure_hits() -> Result<(), Error> {
         .collect();
     assert_eq!(data_rows.len(), 6, "first query should return 6 groups");
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         0,
@@ -199,7 +199,7 @@ async fn test_mv_groupby_measure_hits() -> Result<(), Error> {
         .collect();
     assert_eq!(data_rows.len(), 6);
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         1,
@@ -310,7 +310,7 @@ async fn test_mv_window_materialize() -> Result<(), Error> {
         ]
     );
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         0,
@@ -319,7 +319,7 @@ async fn test_mv_window_materialize() -> Result<(), Error> {
 
     // Second query: cache hit on MeasurePending → schedules MvFirstPop, falls through.
     let _ = ctx.simple_query(rank_sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         1,
@@ -372,7 +372,7 @@ async fn test_mv_window_materialize() -> Result<(), Error> {
         assert_eq!(*sum, expected_sum, "partition sum for {cat} (id={id})");
     }
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         1,
@@ -381,7 +381,7 @@ async fn test_mv_window_materialize() -> Result<(), Error> {
 
     // Second sum query: cache hit on MeasurePending → schedules MvFirstPop, falls through.
     let _ = ctx.simple_query(sum_sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         2,
@@ -426,7 +426,7 @@ async fn test_mv_skip_shape_no_mv_table() -> Result<(), Error> {
     let _ = ctx
         .query("SELECT id, val FROM mv_skip WHERE val = 'v1'", &[])
         .await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let _ = ctx
         .query("SELECT id, val FROM mv_skip WHERE val = 'v1'", &[])
@@ -506,11 +506,11 @@ async fn test_mv_order_by_top_n() -> Result<(), Error> {
         "first query (origin): top 3 groups by count DESC"
     );
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — triggers MvFirstPop, falls through to source-row eval.
     let _ = ctx.simple_query(sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Third query — MV fast path.
     let m1 = ctx.metrics().await?;
@@ -608,11 +608,11 @@ async fn test_mv_order_by_alias() -> Result<(), Error> {
         "first query (origin): ordered by alias DESC"
     );
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — triggers MvFirstPop, falls through to source-row eval.
     let _ = ctx.simple_query(sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Third query — MV fast path must honor ORDER BY through positional rewrite.
     let m1 = ctx.metrics().await?;
@@ -680,7 +680,7 @@ async fn test_aggregate_limit_source_row_cache_correctness() -> Result<(), Error
         "first query (origin): count is 50"
     );
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit, re-evaluated against the source-row cache.
     // Pre-fix this returned 3 (the truncated source-row count) because the
@@ -719,9 +719,9 @@ async fn test_mv_order_by_not_in_select_list_skips() -> Result<(), Error> {
                ORDER BY sum(value) DESC";
 
     let _ = ctx.simple_query(sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     let _ = ctx.simple_query(sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
@@ -783,10 +783,10 @@ async fn test_mv_setop_lifecycle() -> Result<(), Error> {
         .count();
     assert_eq!(n, 4, "UNION (dedup) from origin: 4 distinct tags");
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     // Second query — triggers MvFirstPop, falls through.
     let _ = ctx.simple_query(union_sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         1,
@@ -815,9 +815,9 @@ async fn test_mv_setop_lifecycle() -> Result<(), Error> {
         .count();
     assert_eq!(n, 2, "INTERSECT from origin: 2 overlapping tags (y, z)");
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     let _ = ctx.simple_query(intersect_sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         2,
@@ -838,9 +838,9 @@ async fn test_mv_setop_lifecycle() -> Result<(), Error> {
     // ---- UNION ALL — must NOT create an MV (classifier Skip).
     let union_all_sql = "SELECT tag FROM mv_setop_a UNION ALL SELECT tag FROM mv_setop_b";
     let _ = ctx.simple_query(union_all_sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     let _ = ctx.simple_query(union_all_sql).await?;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
     assert_eq!(
         mv_table_count(&ctx.dbs).await?,
         2,

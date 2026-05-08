@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -39,7 +37,7 @@ async fn test_clock_admission_threshold_2() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Third query — cache hit (population completed)
     let res = ctx.simple_query(query_str).await?;
@@ -76,7 +74,7 @@ async fn test_clock_admission_threshold_1() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "foo")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query_str).await?;
@@ -135,7 +133,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     let _ = ctx.simple_query(query_str).await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Cache hit — query is Ready
     let _ = ctx.simple_query(query_str).await?;
@@ -172,7 +170,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Query after readmission population — cache hit
     let res = ctx.simple_query(query_str).await?;

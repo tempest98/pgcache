@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
 
 mod util;
 
@@ -37,7 +35,7 @@ async fn test_inequality_greater_than_cacheable() -> Result<(), Error> {
     assert_row_at(&res, 2, &[("id", "3"), ("value", "90"), ("data", "high")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx.simple_query(query_str).await?;
@@ -165,8 +163,8 @@ async fn test_inequality_join_insert_not_matching() -> Result<(), Error> {
     assert_eq!(res.len(), 4);
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
+    ctx.cache_settle().await?;
 
     // Verify cache hit
     let _ = ctx.simple_query(query_str).await?;
@@ -304,8 +302,8 @@ async fn test_inequality_join_update_leaving_range() -> Result<(), Error> {
     assert_eq!(res.len(), 4);
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
+    ctx.cache_settle().await?;
 
     // Verify cache hit
     let _ = ctx.simple_query(query_str).await?;
@@ -385,8 +383,8 @@ async fn test_between_join_insert() -> Result<(), Error> {
     )?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
+    ctx.cache_settle().await?;
 
     // Verify cache hit
     let _ = ctx.simple_query(query_str).await?;

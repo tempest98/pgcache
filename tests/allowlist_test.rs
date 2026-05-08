@@ -1,8 +1,6 @@
 use std::io::Error;
 
-use crate::util::{
-    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta, wait_cache_load,
-};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
 
 mod util;
 
@@ -27,7 +25,7 @@ async fn test_allowlist_allows_configured_table() -> Result<(), Error> {
     assert_row_at(&res, 1, &[("id", "1"), ("data", "hello")])?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Second query — cache hit
     let res = ctx
@@ -71,7 +69,7 @@ async fn test_allowlist_rejects_non_configured_table() -> Result<(), Error> {
     );
     assert_eq!(delta.queries_cache_hit, 0, "unexpected cache hit");
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     // Repeat — still forwarded, never becomes a cache hit
     let m2 = ctx.metrics().await?;
@@ -150,7 +148,7 @@ async fn test_allowlist_multiple_tables() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     ctx.simple_query("SELECT a.data FROM table_a a JOIN table_b b ON a.id = b.ref_id")
         .await?;
@@ -188,7 +186,7 @@ async fn test_allowlist_schema_qualified() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     ctx.simple_query("SELECT * FROM public.target_table WHERE id = 1")
         .await?;
@@ -213,7 +211,7 @@ async fn test_allowlist_unqualified_matches_any_schema() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     ctx.simple_query("SELECT * FROM public.my_table WHERE id = 1")
         .await?;
@@ -270,7 +268,7 @@ async fn test_no_allowlist_allows_all_tables() -> Result<(), Error> {
         .await?;
     let m = assert_cache_miss(&mut ctx, m).await?;
 
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     ctx.simple_query("SELECT * FROM any_table WHERE id = 1")
         .await?;

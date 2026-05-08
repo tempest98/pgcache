@@ -1,7 +1,7 @@
 use std::io::Error;
 use std::time::Duration;
 
-use crate::util::{TestContext, metrics_delta, wait_cache_load};
+use crate::util::{TestContext, metrics_delta};
 
 mod util;
 
@@ -58,7 +58,7 @@ async fn test_request_coalescing() -> Result<(), Error> {
     }
 
     // Wait for population to finish and metrics to settle
-    wait_cache_load().await;
+    ctx.cache_settle().await?;
 
     let m_after = ctx.metrics().await?;
     let delta = metrics_delta(&m_before, &m_after);
