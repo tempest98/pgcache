@@ -579,9 +579,7 @@ fn numeric_to_text(weight: i16, sign: u16, dscale: usize, digits: &[i16]) -> Opt
     let int_top = i32::from(weight).max(0);
     let int_digit_count = usize::from(weight.max(0).unsigned_abs()) + 1;
     // Upper bound: sign byte + ≤4 chars per base-10000 digit + dot + dscale.
-    let capacity = usize::from(neg)
-        + 4 * int_digit_count
-        + if dscale > 0 { 1 + dscale } else { 0 };
+    let capacity = usize::from(neg) + 4 * int_digit_count + if dscale > 0 { 1 + dscale } else { 0 };
     let mut out = String::with_capacity(capacity);
 
     if neg {
@@ -1679,10 +1677,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary macaddr8");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "00:11:22:33:44:55:66:77".to_owned(),
-                "macaddr8".into()
-            )
+            LiteralValue::StringWithCast("00:11:22:33:44:55:66:77".to_owned(), "macaddr8".into())
         );
     }
 
@@ -1804,14 +1799,8 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::StringWithCast(
-                        "00:11:22:33:44:55".to_owned(),
-                        "macaddr".into()
-                    ),
-                    LiteralValue::StringWithCast(
-                        "aa:bb:cc:dd:ee:ff".to_owned(),
-                        "macaddr".into()
-                    ),
+                    LiteralValue::StringWithCast("00:11:22:33:44:55".to_owned(), "macaddr".into()),
+                    LiteralValue::StringWithCast("aa:bb:cc:dd:ee:ff".to_owned(), "macaddr".into()),
                 ],
                 "macaddr[]".into()
             )

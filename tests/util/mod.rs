@@ -50,4 +50,3 @@ pub async fn simple_query(
 ) -> Result<Vec<SimpleQueryMessage>, Error> {
     client.simple_query(query).await.map_err(Error::other)
 }
-
