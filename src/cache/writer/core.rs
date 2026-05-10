@@ -568,6 +568,13 @@ impl CacheWriter {
 
         let cfg = self.cache.dynamic.load();
 
+        debug!(
+            current_size = self.cache.current_size,
+            cache_size = ?cfg.cache_size,
+            cache_policy = ?cfg.cache_policy,
+            "eviction_run entry"
+        );
+
         // Pre-sweep: reclaim bytes held by Dirty MVs before considering live
         // entries for eviction. If this alone brings current_size under the
         // limit, the loop below exits immediately without evicting anything.
@@ -617,8 +624,7 @@ impl CacheWriter {
                 }
             }
 
-            // Evict (full removal)
-            trace!("evicting query {fingerprint}");
+            // Evict (full removal) — cache_query_evict emits its own entry log
             metrics::counter!(names::CACHE_EVICTIONS).increment(1);
             self.cache_query_evict(fingerprint).await?;
             // publication_dirty_drain drops the orphaned cache tables; the
@@ -902,6 +908,7 @@ impl CacheWriter {
     /// Purge rows with generation <= threshold.
     /// First promotes any gen-0 entries so they become purgeable in future cycles.
     pub(super) async fn generation_purge(&mut self, threshold: u64) -> CacheResult<i64> {
+        debug!(threshold, "generation_purge entry");
         self.generation_zero_promote().await?;
 
         if threshold > 0 {
@@ -912,7 +919,7 @@ impl CacheWriter {
                 .await
                 .map_into_report::<CacheError>()?
                 .get(0);
-            trace!("purged generations <= {threshold}: rows removed [{deleted}]");
+            debug!(threshold, deleted, "generation_purge complete");
             Ok(deleted)
         } else {
             Ok(0)

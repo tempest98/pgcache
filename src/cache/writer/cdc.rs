@@ -301,10 +301,16 @@ impl CacheWriter {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn cache_query_evict(&mut self, fingerprint: u64) -> CacheResult<()> {
         let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
+            trace!(fingerprint, "cache_query_evict: not found, skipping");
             return Ok(());
         };
 
-        debug!("evicting query {fingerprint}");
+        debug!(
+            fingerprint,
+            generation = query.generation,
+            relation_oids = ?query.relation_oids,
+            "cache_query_evict entry"
+        );
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.eviction_count += 1;
             m.cached_since_ns = None;
