@@ -48,6 +48,13 @@ error_set! {
     ReadError := {
         IoError(io::Error),
         InvalidMessage,
+        /// Cache DB returned an ErrorResponse on the hit path. Triggers a
+        /// forward-to-origin retry via CacheReply::Error. `sqlstate` is
+        /// `None` only when the ErrorResponse frame was malformed.
+        #[display("Cache server error (SQLSTATE: {sqlstate:?})")]
+        CacheServerError {
+            sqlstate: Option<[u8; 5]>,
+        },
     }
 
     DbError := {

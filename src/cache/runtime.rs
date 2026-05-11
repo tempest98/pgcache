@@ -22,7 +22,7 @@ use crate::{
         messages::{CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
         query_cache::{QueryCache, QueryRequest, WorkerRequest},
         types::{ActiveRelations, CacheStateView, WorkerMetrics},
-        worker::{CoalescedOutcome, handle_cached_query},
+        worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         writer::writer_run,
     },
     metrics::names,
@@ -112,10 +112,18 @@ async fn handle_worker_request(
             CacheReply::Complete(Some(msg.timing))
         }
         Err(e) => {
-            error!(
-                "handle_cached_query failed: {}",
-                error_chain_format(e.current_context()),
+            // 42P01 is the expected eviction-window race; other SQLSTATEs are bugs.
+            let ctx = e.current_context();
+            let undefined_table = matches!(
+                ctx,
+                CacheError::CacheServerError { sqlstate: Some(s) }
+                    if *s == SQLSTATE_UNDEFINED_TABLE
             );
+            if undefined_table {
+                debug!("cache hit fell through to origin (table dropped during eviction)");
+            } else {
+                error!("handle_cached_query failed: {}", error_chain_format(ctx));
+            }
             // Coalesced clients already received Error replies inside the worker
             let error_buf = msg
                 .forward_bytes

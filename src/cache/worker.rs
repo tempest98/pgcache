@@ -39,6 +39,69 @@ struct BroadcastState {
     tasks: Vec<JoinHandle<Result<CoalescedClient, CoalescedClient>>>,
 }
 
+/// SQLSTATE `42P01` — `undefined_table`. The expected outcome when the cache
+/// table is dropped between dispatch and SELECT (eviction-window race).
+pub(crate) const SQLSTATE_UNDEFINED_TABLE: [u8; 5] = *b"42P01";
+
+/// Extract the 5-char SQLSTATE from a backend `ErrorResponse` frame.
+///
+/// Frame layout: `'E' (1 byte) | len (4 bytes BE) | field* | 0`, where each
+/// field is `code (1 byte) | value (null-terminated string)`. Field code `'C'`
+/// carries SQLSTATE — always exactly 5 ASCII bytes per the protocol.
+/// Returns `None` when the frame is malformed or the field is missing.
+fn sqlstate_extract(frame_data: &[u8]) -> Option<[u8; 5]> {
+    let payload = frame_data.get(5..)?;
+    let mut i = 0;
+    while i < payload.len() {
+        let code = *payload.get(i)?;
+        if code == 0 {
+            return None;
+        }
+        let value_start = i + 1;
+        let rest = payload.get(value_start..)?;
+        let value_len = rest.iter().position(|&b| b == 0)?;
+        if code == b'C' && value_len == 5 {
+            let value = rest.get(..5)?;
+            let mut out = [0u8; 5];
+            out.copy_from_slice(value);
+            return Some(out);
+        }
+        i = value_start + value_len + 1;
+    }
+    None
+}
+
+/// Handle an `ErrorResponse` from the cache DB on the hit path. Poisons the
+/// connection (the trailing ReadyForQuery would otherwise leak to the next
+/// user) and returns a typed error so `handle_worker_request` forwards to
+/// origin via `CacheReply::Error`.
+///
+/// Safe to call only when `bytes_served == 0` — the cache emits ErrorResponse
+/// before RowDescription/DataRow, so the worker hasn't streamed any cache
+/// payload toward the client yet. A mid-stream error would need a different
+/// recovery path.
+async fn cache_error_response_handle(
+    guard: &mut ConnectionGuard,
+    frame_data: &[u8],
+    bytes_served: usize,
+    broadcast: &mut Option<BroadcastState>,
+) -> rootcause::Report<CacheError> {
+    guard.poisoned = true;
+    let sqlstate = sqlstate_extract(frame_data);
+    let sqlstate_str = sqlstate
+        .as_ref()
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .unwrap_or("?");
+    debug!(
+        "cache ErrorResponse sqlstate={sqlstate_str} bytes_served={bytes_served} — \
+         forwarding to origin"
+    );
+    if let Some(bc) = broadcast.take() {
+        broadcast_error_reply(bc).await;
+    }
+    CacheError::CacheServerError { sqlstate }.into()
+}
+
 /// Push bytes to the primary WriteQueue and broadcast to coalesced clients.
 fn push_and_broadcast(
     write_queue: &mut WriteQueue,
@@ -355,6 +418,15 @@ async fn handle_cached_query_text(
                     (_, PgBackendMessageType::ReadyForQuery) => {
                         state = TextResponseState::Done;
                     }
+                    (_, PgBackendMessageType::ErrorResponse) => {
+                        return Err(cache_error_response_handle(
+                            &mut guard,
+                            &frame.data,
+                            bytes_served,
+                            &mut broadcast,
+                        )
+                        .await);
+                    }
                     _ => {}
                 }
 
@@ -596,6 +668,15 @@ async fn handle_cached_query_binary(
                     {
                         state = BinaryResponseState::Done;
                     }
+                    (_, PgBackendMessageType::ErrorResponse) => {
+                        return Err(cache_error_response_handle(
+                            &mut guard,
+                            &frame.data,
+                            bytes_served,
+                            &mut broadcast,
+                        )
+                        .await);
+                    }
                     _ => {}
                 }
             }
@@ -665,4 +746,64 @@ async fn handle_cached_query_binary(
     msg.timing.response_written_at = Some(Instant::now());
 
     Ok((bytes_served, outcomes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal PG ErrorResponse frame with the given (code, value)
+    /// fields. Layout: `'E' | len(u32 BE) | (code: u8, value: cstring)* | 0`.
+    fn error_response_frame(fields: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for (code, value) in fields {
+            payload.push(*code);
+            payload.extend_from_slice(value);
+            payload.push(0);
+        }
+        payload.push(0); // terminator
+
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(b'E');
+        let len = u32::try_from(4 + payload.len()).expect("test frame fits in u32");
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    #[test]
+    fn sqlstate_extract_undefined_table() {
+        let frame = error_response_frame(&[
+            (b'S', b"ERROR"),
+            (b'C', b"42P01"),
+            (b'M', b"relation \"public.evict_a\" does not exist"),
+        ]);
+        assert_eq!(sqlstate_extract(&frame), Some(*b"42P01"));
+    }
+
+    #[test]
+    fn sqlstate_extract_first_field() {
+        // SQLSTATE-first ordering should still parse.
+        let frame = error_response_frame(&[(b'C', b"23505"), (b'S', b"ERROR")]);
+        assert_eq!(sqlstate_extract(&frame), Some(*b"23505"));
+    }
+
+    #[test]
+    fn sqlstate_extract_missing_returns_none() {
+        let frame = error_response_frame(&[(b'S', b"ERROR"), (b'M', b"boom")]);
+        assert_eq!(sqlstate_extract(&frame), None);
+    }
+
+    #[test]
+    fn sqlstate_extract_wrong_length_returns_none() {
+        // SQLSTATE must be exactly 5 chars; anything else is malformed.
+        let frame = error_response_frame(&[(b'C', b"42P0")]);
+        assert_eq!(sqlstate_extract(&frame), None);
+    }
+
+    #[test]
+    fn sqlstate_extract_short_frame_returns_none() {
+        // Frame shorter than the 5-byte header (tag + length) — graceful None.
+        assert_eq!(sqlstate_extract(b"E\x00"), None);
+    }
 }

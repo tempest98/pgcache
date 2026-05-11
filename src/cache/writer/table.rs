@@ -1,10 +1,11 @@
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
-use tracing::instrument;
+use tracing::{debug, error, instrument};
 
 use crate::catalog::{
     ColumnMetadata, ColumnStore, IndexMetadata, TableMetadata, cache_type_name_resolve,
 };
+use crate::result::error_chain_format;
 
 use super::super::{CacheError, CacheResult, MapIntoReport};
 use super::CacheWriter;
@@ -352,5 +353,39 @@ impl CacheWriter {
             .map_into_report::<CacheError>()?;
 
         Ok(())
+    }
+
+    /// Drop the source-row cache tables for `relation_oids` and remove their
+    /// metadata. Dropping the table also drops its
+    /// `pgcache_track_modification` trigger, which is what
+    /// `pgcache_total_size` sums — without this, evicted tables keep
+    /// contributing to the cache-size accounting.
+    ///
+    /// Best-effort: logs and continues on DB failures rather than aborting
+    /// the eviction path. Oids without metadata are silently skipped.
+    #[instrument(skip(self, relation_oids))]
+    pub(super) async fn cache_tables_drop(&mut self, relation_oids: &[u32]) {
+        let mut quoted = Vec::with_capacity(relation_oids.len());
+        for oid in relation_oids {
+            if let Some(table) = self.cache.tables.remove1(oid) {
+                quoted.push(format!("\"{}\".\"{}\"", table.schema, table.name));
+            }
+        }
+        if quoted.is_empty() {
+            return;
+        }
+        let sql = format!("DROP TABLE IF EXISTS {}", quoted.join(", "));
+        debug!("dropping {} orphaned cache table(s)", quoted.len());
+        if let Err(e) = self
+            .db_cache
+            .execute(&sql, &[])
+            .await
+            .map_into_report::<CacheError>()
+        {
+            error!(
+                "dropping orphaned cache tables: {}",
+                error_chain_format(e.current_context()),
+            );
+        }
     }
 }

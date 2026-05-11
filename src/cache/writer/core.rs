@@ -384,9 +384,11 @@ impl CacheWriter {
         true
     }
 
-    /// Synchronize the origin publication's table list with active relations.
-    /// Compares `publication_oids` (current publication state) with the shared
-    /// active relations set and issues ALTER PUBLICATION as needed.
+    /// Sync the origin publication to `active_relations` and drop any cache
+    /// tables that just fell out of the active set. The drop happens here,
+    /// after the ALTER PUBLICATION, because `oids_to_table_list` resolves
+    /// oid → schema.name from `cache.tables` — if we dropped first that
+    /// lookup would return empty.
     pub(super) async fn publication_update(&mut self) -> CacheResult<()> {
         let new_oids: HashSet<u32> = (**self.active_relations.load()).clone();
 
@@ -394,8 +396,13 @@ impl CacheWriter {
             return Ok(());
         }
 
+        let removed: Vec<u32> = self
+            .publication_oids
+            .difference(&new_oids)
+            .copied()
+            .collect();
+
         let sql = if new_oids.is_empty() {
-            // Drop all tables from the publication
             let table_list =
                 self.oids_to_table_list(&self.publication_oids.iter().copied().collect::<Vec<_>>());
             format!(
@@ -417,6 +424,10 @@ impl CacheWriter {
             .map_into_report::<CacheError>()
             .attach_loc("updating publication table list")?;
         self.publication_oids = new_oids;
+
+        if !removed.is_empty() {
+            self.cache_tables_drop(&removed).await;
+        }
         Ok(())
     }
 
@@ -433,7 +444,8 @@ impl CacheWriter {
             .join(", ")
     }
 
-    /// Drain the dirty flag: rebuild active relations and update the publication if changed.
+    /// Drain the dirty flag: rebuild active relations and sync the publication
+    /// (which also drops orphaned cache tables).
     async fn publication_dirty_drain(&mut self) -> CacheResult<()> {
         if !self.relations_dirty {
             return Ok(());
@@ -609,6 +621,11 @@ impl CacheWriter {
             trace!("evicting query {fingerprint}");
             metrics::counter!(names::CACHE_EVICTIONS).increment(1);
             self.cache_query_evict(fingerprint).await?;
+            // publication_dirty_drain drops the orphaned cache tables; the
+            // trigger is what pgcache_total_size sums, so the next iteration's
+            // cache_size_load needs the drain to observe a shrink.
+            self.publication_dirty_drain().await?;
+            self.cache.current_size = self.cache_size_load().await?;
             bumps = 0;
             pinned_skips = 0;
         }
