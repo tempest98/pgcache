@@ -49,6 +49,9 @@ pub struct PopulationWork {
     pub branches: Vec<ResolvedSelectNode>,
     /// Maximum rows to fetch during population. `None` = fetch all rows.
     pub max_limit: Option<u64>,
+    /// Stamped at construction; used by the population worker to record
+    /// `pgcache.cache.population.wait_seconds`.
+    pub enqueued_at: Instant,
 }
 
 /// Cache writer that owns the Cache and serializes all mutations.
@@ -199,6 +202,15 @@ impl CacheWriter {
 
     /// Handle a query command, dispatching to the appropriate method.
     pub async fn query_command_handle(&mut self, cmd: QueryCommand) -> CacheResult<()> {
+        let cmd_label = match &cmd {
+            QueryCommand::Register { .. } => "register",
+            QueryCommand::Ready { .. } => "ready",
+            QueryCommand::Failed { .. } => "failed",
+            QueryCommand::LimitBump { .. } => "limit_bump",
+            QueryCommand::Readmit { .. } => "readmit",
+            QueryCommand::MvBuild { .. } => "mv_build",
+        };
+        let handle_start = Instant::now();
         match cmd {
             QueryCommand::Register {
                 fingerprint,
@@ -290,11 +302,24 @@ impl CacheWriter {
         }
         self.publication_dirty_drain().await?;
         self.state_gauges_update();
+        self.writer_scale_gauges_update();
+        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
+            .record(handle_start.elapsed().as_secs_f64());
         Ok(())
     }
 
     /// Handle a CDC command, dispatching to the appropriate method.
     pub async fn cdc_command_handle(&mut self, cmd: CdcCommand) -> CacheResult<()> {
+        let cmd_label = match &cmd {
+            CdcCommand::TableRegister(_) => "cdc_table_register",
+            CdcCommand::Insert { .. } => "cdc_insert",
+            CdcCommand::Update { .. } => "cdc_update",
+            CdcCommand::Delete { .. } => "cdc_delete",
+            CdcCommand::Truncate { .. } => "cdc_truncate",
+            CdcCommand::CommitMark { .. } => "cdc_commit_mark",
+            CdcCommand::KeepAliveMark { .. } => "cdc_keepalive_mark",
+        };
+        let handle_start = Instant::now();
         match cmd {
             CdcCommand::TableRegister(table_metadata) => {
                 if let Err(e) = self.cache_table_register(table_metadata).await {
@@ -352,6 +377,8 @@ impl CacheWriter {
         }
         self.publication_dirty_drain().await?;
         self.state_gauges_update();
+        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
+            .record(handle_start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -542,6 +569,22 @@ impl CacheWriter {
         }
         metrics::gauge!(names::CACHE_GENERATION).set(self.cache.generation_counter as f64);
         metrics::gauge!(names::CACHE_TABLES_TRACKED).set(self.cache.tables.len() as f64);
+    }
+
+    /// Update gauges that correlate Register cost against state size. Suspected
+    /// O(N) hot spots (`subsumption_check`, `update_query_register` sort) scale
+    /// with these.
+    #[allow(clippy::cast_precision_loss)]
+    pub(super) fn writer_scale_gauges_update(&self) {
+        let (total, max_per_relation) = self
+            .cache
+            .update_queries
+            .iter()
+            .map(|entry| entry.queries.len())
+            .fold((0usize, 0usize), |(sum, max), n| (sum + n, max.max(n)));
+        metrics::gauge!(names::CACHE_WRITER_UPDATE_QUERIES_TOTAL).set(total as f64);
+        metrics::gauge!(names::CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION)
+            .set(max_per_relation as f64);
     }
 
     /// Utility function to get the size of the currently cached data

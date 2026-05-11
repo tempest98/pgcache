@@ -40,6 +40,10 @@ pub async fn population_worker(
         metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => id.to_string())
             .set(rx.len() as f64);
 
+        metrics::histogram!(names::CACHE_POPULATION_WAIT_SECONDS)
+            .record(work.enqueued_at.elapsed().as_secs_f64());
+
+        let task_start = Instant::now();
         let result = population_task(
             work.fingerprint,
             work.generation,
@@ -50,6 +54,8 @@ pub async fn population_worker(
             &db_cache,
         )
         .await;
+        metrics::histogram!(names::CACHE_POPULATION_TASK_SECONDS)
+            .record(task_start.elapsed().as_secs_f64());
 
         match result {
             Ok((cached_bytes, row_count)) => {
@@ -131,6 +137,8 @@ async fn population_task(
                 population_stream(&db_origin, db_cache, table, table_node, branch, max_limit)
                     .await?;
             let stream_elapsed = stream_start.elapsed();
+            metrics::histogram!(names::CACHE_POPULATION_STREAM_SECONDS)
+                .record(stream_elapsed.as_secs_f64());
 
             total_bytes += bytes;
             total_rows += rows;

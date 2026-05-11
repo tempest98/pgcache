@@ -156,6 +156,39 @@ pub mod names {
     pub const PROTOCOL_EXTENDED_QUERIES: &str = "pgcache.protocol.extended_queries";
     pub const PROTOCOL_PREPARED_STATEMENTS: &str = "pgcache.protocol.prepared_statements";
 
+    // Writer thread instrumentation (PGC-117)
+    /// Per-command handler latency. Labeled with `cmd` for each QueryCommand /
+    /// CdcCommand variant.
+    pub const CACHE_WRITER_COMMAND_HANDLE_SECONDS: &str =
+        "pgcache.cache.writer.command_handle_seconds";
+    /// Phase timings inside `query_register`. Suspected O(N) growth lives in
+    /// `subsumption_check` and (transitively) in `resolve.update_queries_register`.
+    pub const CACHE_WRITER_REGISTER_RESOLVE_SECONDS: &str =
+        "pgcache.cache.writer.register.resolve_seconds";
+    pub const CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS: &str =
+        "pgcache.cache.writer.register.subsumption_check_seconds";
+    pub const CACHE_WRITER_REGISTER_SUBSUME_SECONDS: &str =
+        "pgcache.cache.writer.register.subsume_seconds";
+    pub const CACHE_WRITER_REGISTER_INSERT_SECONDS: &str =
+        "pgcache.cache.writer.register.insert_seconds";
+    pub const CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS: &str =
+        "pgcache.cache.writer.register.publication_update_seconds";
+    pub const CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS: &str =
+        "pgcache.cache.writer.register.populate_dispatch_seconds";
+    /// Sub-phases inside `query_resolve`.
+    pub const CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS: &str =
+        "pgcache.cache.writer.resolve.update_queries_register_seconds";
+    pub const CACHE_WRITER_RESOLVE_DEPARSE_SECONDS: &str =
+        "pgcache.cache.writer.resolve.deparse_seconds";
+    /// Population pipeline timings (per-task, per-stream, channel-wait).
+    pub const CACHE_POPULATION_TASK_SECONDS: &str = "pgcache.cache.population.task_seconds";
+    pub const CACHE_POPULATION_STREAM_SECONDS: &str = "pgcache.cache.population.stream_seconds";
+    pub const CACHE_POPULATION_WAIT_SECONDS: &str = "pgcache.cache.population.wait_seconds";
+    /// Scaling signals for correlating per-Register cost against state size.
+    pub const CACHE_WRITER_UPDATE_QUERIES_TOTAL: &str = "pgcache.cache.writer.update_queries_total";
+    pub const CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION: &str =
+        "pgcache.cache.writer.update_queries_max_per_relation";
+
     // Per-stage timing histograms
     pub const QUERY_STAGE_PARSE_SECONDS: &str = "pgcache.query.stage.parse_seconds";
     pub const QUERY_STAGE_DISPATCH_SECONDS: &str = "pgcache.query.stage.dispatch_seconds";

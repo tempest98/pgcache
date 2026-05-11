@@ -162,6 +162,7 @@ impl CacheWriter {
             table_metadata,
             branches,
             max_limit,
+            enqueued_at: Instant::now(),
         }
     }
 
@@ -337,9 +338,12 @@ impl CacheWriter {
         // Deparse once at registration. The output is a pure function of the
         // resolved AST, so every cache hit can splice it in instead of
         // re-running the deparse traversal.
+        let deparse_start = Instant::now();
         let mut buf = String::with_capacity(256);
         resolved.deparse(&mut buf);
         let deparsed_sql: EcoString = buf.into();
+        metrics::histogram!(names::CACHE_WRITER_RESOLVE_DEPARSE_SECONDS)
+            .record(deparse_start.elapsed().as_secs_f64());
 
         // Classify the shape once here; `query_register` and MV setup both reuse
         // the result via `QueryResolution.shape_gate` to avoid re-running
@@ -357,8 +361,11 @@ impl CacheWriter {
             user_max_limit
         };
 
+        let uq_start = Instant::now();
         let relation_oids =
             self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;
+        metrics::histogram!(names::CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS)
+            .record(uq_start.elapsed().as_secs_f64());
 
         Ok(QueryResolution {
             resolved,
@@ -551,9 +558,12 @@ impl CacheWriter {
         }
 
         // Phase 1: Resolve
+        let resolve_start = Instant::now();
         let resolution = self
             .query_resolve(fingerprint, cacheable_query, search_path)
             .await?;
+        metrics::histogram!(names::CACHE_WRITER_REGISTER_RESOLVE_SECONDS)
+            .record(resolve_start.elapsed().as_secs_f64());
 
         // Classify shape for MV eligibility. Sticky — readmit and limit-bump
         // paths preserve the result via state_view_update. Classification
@@ -561,17 +571,23 @@ impl CacheWriter {
         self.mv_state_set(fingerprint, resolution.shape_gate);
 
         // Phase 2: Subsumption check
+        let subsumption_start = Instant::now();
         let subsumed = self.subsumption_check(&resolution);
+        metrics::histogram!(names::CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS)
+            .record(subsumption_start.elapsed().as_secs_f64());
 
         if subsumed {
             // Phase 3a: Subsume — stamp rows, mark Ready
             let fallback_resolved = Arc::clone(&resolution.resolved);
             let fallback_max_limit = resolution.max_limit;
 
-            match self
+            let subsume_start = Instant::now();
+            let subsume_result = self
                 .query_subsume(fingerprint, resolution, started_at, pinned)
-                .await?
-            {
+                .await?;
+            metrics::histogram!(names::CACHE_WRITER_REGISTER_SUBSUME_SECONDS)
+                .record(subsume_start.elapsed().as_secs_f64());
+            match subsume_result {
                 Some((generation, resolved, deparsed_sql)) => {
                     let _ = subsumption_tx.send(SubsumptionResult::Subsumed {
                         generation,
@@ -619,6 +635,7 @@ impl CacheWriter {
         }
 
         // Register and populate
+        let insert_start = Instant::now();
         let (generation, relations_changed) = self.cached_query_insert(
             fingerprint,
             resolution.relation_oids,
@@ -634,11 +651,17 @@ impl CacheWriter {
             .metrics
             .entry(fingerprint)
             .or_insert_with(|| QueryMetrics::new(now));
+        metrics::histogram!(names::CACHE_WRITER_REGISTER_INSERT_SECONDS)
+            .record(insert_start.elapsed().as_secs_f64());
 
         if relations_changed {
+            let pub_start = Instant::now();
             self.publication_update().await?;
+            metrics::histogram!(names::CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS)
+                .record(pub_start.elapsed().as_secs_f64());
         }
 
+        let dispatch_start = Instant::now();
         let work = self.population_work_build(
             fingerprint,
             generation,
@@ -646,6 +669,8 @@ impl CacheWriter {
             resolution.max_limit,
         );
         self.populate_work_dispatch(work)?;
+        metrics::histogram!(names::CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS)
+            .record(dispatch_start.elapsed().as_secs_f64());
         trace!("population work queued for query {fingerprint}");
         Ok(())
     }
