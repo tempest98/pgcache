@@ -175,22 +175,9 @@ The writer handler is the same one the coordinator drives for non-pinned queries
 
 ### Storage accounting
 
-MV table bytes should count toward the cache size total (`pgcache_total_size()` in `pgcache_pgrx/src/generation.rs:1272`) so a large MV cannot push overall cache DB usage past the configured `cache_size`, and eviction runs against the combined total.
+MV table bytes count toward the cache size total via `pgcache_total_size()` (`pgcache_pgrx/src/generation.rs`), which sums tracked source tables (those carrying the `pgcache_track_modification` trigger) UNION tables in the `pgcache_mv` schema. A large MV therefore counts against `cache_size` and triggers eviction the same way source-row growth does.
 
-Current impl sums only tables present in `pgcache_generation_dump()` — since MV tables are explicitly not pgrx-tracked, they're invisible to the size function today. Extend the SQL to union the `pgcache_mv` schema:
-
-```sql
-SELECT COALESCE(SUM(pg_total_relation_size(oid)), 0)::bigint
-FROM (
-  SELECT DISTINCT table_oid AS oid FROM pgcache_generation_dump()
-  UNION
-  SELECT oid FROM pg_class
-  WHERE relnamespace = 'pgcache_mv'::regnamespace
-    AND relkind = 'r'
-) t;
-```
-
-Related entry points that sweep cache tables (`pgcache_reset()`, `pgcache_purge_rows()`) also need auditing — they may require equivalent extensions to drop/purge MVs, or the MV lifecycle may be handled entirely by pgcache's own eviction path. Tracked as a separate work item during implementation.
+`pgcache_purge_rows` does **not** touch MV tables — it only acts on dshash-tracked source rows. MV cleanup is owned by pgcache's writer: `cache_query_evict` (`writer/cdc.rs`) calls `mv_drop` (`writer/mv.rs`), which executes `DROP TABLE IF EXISTS pgcache_mv.<table>`. Cluster-wide reset (`cache_database_reset` in `runtime.rs`) sweeps the whole `pgcache_mv` schema as a side effect of `DROP DATABASE`.
 
 ---
 
@@ -533,6 +520,5 @@ enum MvState {
   - Alias resolution — `ORDER BY alias_name` referencing a SELECT alias. Today this doesn't reach the MV classifier because `column_resolve` doesn't consult SELECT aliases (see "Resolver: ORDER BY alias support" below), so these queries fail resolution upstream. If the resolver is extended to accept alias references, the MV classifier would need to match them against the SELECT list.
   - Normalized matching — handles small rewrites like constant folding between SELECT and ORDER BY, if any turn out to appear in practice.
 - **Resolver: ORDER BY alias support**: pgcache's `column_resolve` only searches FROM-scope tables for unqualified names, so `SELECT count(*) AS c FROM t GROUP BY x ORDER BY c` fails with `ColumnNotFound`. PostgreSQL resolves `c` against the SELECT-list alias first. This is a pre-existing pgcache limitation (not MV-specific); fixing it would make MV classification transparently cover a common idiom.
-- **`pgcache_reset()` / `pgcache_purge_rows()` audit**: verify these correctly sweep `pgcache_mv` tables or delegate to pgcache's eviction path. Flagged during implementation.
 - **"Row entering the cache from outside" limitation**: a known limitation of the source-row cache layer (UPDATEs that shift ORDER BY + LIMIT windows by promoting an untracked row). Fix would live in the source-row cache, not the MV layer.
 - **Per-MV size metrics** (size-by-fingerprint): helps validate the `mv_size_ratio` default against real workloads.
