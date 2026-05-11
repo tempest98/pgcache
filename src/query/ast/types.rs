@@ -1399,6 +1399,12 @@ pub enum ColumnExpr {
     Case(CaseExpr),             // CASE WHEN ... THEN ... END
     Arithmetic(ArithmeticExpr), // amount * -1, price + tax
     Subquery(Box<QueryExpr>),
+    // target_type pre-rendered at AST-conversion time so deparse stays a
+    // pure tree walk (no TypeName re-traversal per cache hit).
+    TypeCast {
+        expr: Box<ColumnExpr>,
+        target_type: EcoString,
+    },
 }
 
 impl ColumnExpr {
@@ -1418,6 +1424,7 @@ impl ColumnExpr {
                 Box::new((arith as &dyn Any).downcast_ref::<N>().into_iter())
             }
             ColumnExpr::Subquery(query) => query.nodes(),
+            ColumnExpr::TypeCast { expr, .. } => expr.nodes(),
         }
     }
 
@@ -1428,6 +1435,7 @@ impl ColumnExpr {
             ColumnExpr::Case(case) => case.has_subqueries(),
             ColumnExpr::Arithmetic(arith) => arith.has_subqueries(),
             ColumnExpr::Subquery(_) => true,
+            ColumnExpr::TypeCast { expr, .. } => expr.has_subqueries(),
             ColumnExpr::Column(_) | ColumnExpr::Star(_) | ColumnExpr::Literal(_) => false,
         }
     }
@@ -1480,6 +1488,9 @@ impl ColumnExpr {
                 let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);
                 query.select_nodes_collect(branches, source, false);
             }
+            ColumnExpr::TypeCast { expr, .. } => {
+                expr.subquery_nodes_collect(branches);
+            }
         }
     }
 }
@@ -1504,6 +1515,13 @@ impl Deparse for ColumnExpr {
                 buf.push('(');
                 select.deparse(buf);
                 buf.push(')');
+                buf
+            }
+            ColumnExpr::TypeCast { expr, target_type } => {
+                buf.push('(');
+                expr.deparse(buf);
+                buf.push_str(")::");
+                buf.push_str(target_type);
                 buf
             }
         }

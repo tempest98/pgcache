@@ -226,7 +226,8 @@ fn order_by_serve_viable(resolved: &ResolvedQueryExpr) -> bool {
                 | ResolvedColumnExpr::Literal(_)
                 | ResolvedColumnExpr::Case(_)
                 | ResolvedColumnExpr::Arithmetic(_)
-                | ResolvedColumnExpr::Subquery(_, _) => false,
+                | ResolvedColumnExpr::Subquery(_, _)
+                | ResolvedColumnExpr::TypeCast { .. } => false,
             })
         }
         ResolvedQueryBody::Values(_) => false,
@@ -341,6 +342,7 @@ fn column_expr_has_window(expr: &ResolvedColumnExpr) -> bool {
         ResolvedColumnExpr::Arithmetic(a) => {
             column_expr_has_window(&a.left) || column_expr_has_window(&a.right)
         }
+        ResolvedColumnExpr::TypeCast { expr, .. } => column_expr_has_window(expr),
         ResolvedColumnExpr::Column(_)
         | ResolvedColumnExpr::Identifier(_)
         | ResolvedColumnExpr::Literal(_)

@@ -659,6 +659,11 @@ pub enum ResolvedColumnExpr {
     Arithmetic(ResolvedArithmeticExpr),
     /// Scalar subquery in SELECT list
     Subquery(Box<ResolvedQueryExpr>, Vec<ResolvedColumnNode>),
+    /// target_type pre-rendered by `query::ast::convert::type_name_render`.
+    TypeCast {
+        expr: Box<ResolvedColumnExpr>,
+        target_type: EcoString,
+    },
 }
 
 /// Resolved window specification for OVER clause
@@ -756,6 +761,7 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
             ResolvedColumnExpr::Arithmetic(arith) => Box::new(arith.nodes()),
             ResolvedColumnExpr::Subquery(query, _) => Box::new(query.nodes()),
+            ResolvedColumnExpr::TypeCast { expr, .. } => Box::new(expr.nodes()),
         };
         current.chain(children)
     }
@@ -780,6 +786,7 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Arithmetic(arith) => {
                 arith.left.has_aggregate(agg_fns) || arith.right.has_aggregate(agg_fns)
             }
+            ResolvedColumnExpr::TypeCast { expr, .. } => expr.has_aggregate(agg_fns),
             ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
             | ResolvedColumnExpr::Literal(_)
@@ -812,6 +819,7 @@ impl ResolvedColumnExpr {
                 .subquery_depth()
                 .max(arith.right.subquery_depth()),
             ResolvedColumnExpr::Subquery(query, _) => 1 + query.subquery_depth(),
+            ResolvedColumnExpr::TypeCast { expr, .. } => expr.subquery_depth(),
         }
     }
 
@@ -873,6 +881,9 @@ impl ResolvedColumnExpr {
                 let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);
                 query.select_nodes_collect_with_source(branches, source, false);
             }
+            ResolvedColumnExpr::TypeCast { expr, .. } => {
+                expr.subquery_nodes_collect_with_source(branches);
+            }
         }
     }
 
@@ -925,6 +936,9 @@ impl ResolvedColumnExpr {
             }
             ResolvedColumnExpr::Subquery(query, _) => {
                 query.select_nodes_collect(branches);
+            }
+            ResolvedColumnExpr::TypeCast { expr, .. } => {
+                expr.subquery_nodes_collect(branches);
             }
         }
     }
@@ -1010,6 +1024,13 @@ impl Deparse for ResolvedColumnExpr {
                 buf.push(')');
                 buf
             }
+            ResolvedColumnExpr::TypeCast { expr, target_type } => {
+                buf.push('(');
+                expr.deparse(buf);
+                buf.push_str(")::");
+                buf.push_str(target_type);
+                buf
+            }
         }
     }
 }
@@ -1066,7 +1087,8 @@ impl ResolvedSelectColumn {
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(_, _) => None,
+            | ResolvedColumnExpr::Subquery(_, _)
+            | ResolvedColumnExpr::TypeCast { .. } => None,
         }
     }
 }
@@ -1154,7 +1176,8 @@ impl ResolvedSelectColumns {
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(..) => {
+            | ResolvedColumnExpr::Subquery(..)
+            | ResolvedColumnExpr::TypeCast { .. } => {
                 let Self::Columns(cols) = self else {
                     return None;
                 };

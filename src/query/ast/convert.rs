@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use pg_query::ParseResult;
 use pg_query::protobuf::{
     AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, CteMaterialize, FuncCall, JoinExpr,
-    MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir,
+    MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir, TypeCast, TypeName,
 };
 use pg_query::protobuf::{
     ColumnRef, Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum,
@@ -394,6 +394,10 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                         alias,
                     });
                 }
+                Some(NodeEnum::TypeCast(tc)) => {
+                    let expr = type_cast_convert(tc)?;
+                    columns.push(SelectColumn { expr, alias });
+                }
                 other => {
                     return Err(AstError::UnsupportedSelectFeature {
                         feature: format!("Column expression: {other:?}"),
@@ -648,10 +652,91 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
             let case = case_expr_convert(case_expr)?;
             Ok(ColumnExpr::Case(case))
         }
+        Some(NodeEnum::TypeCast(tc)) => type_cast_convert(tc),
         other => Err(AstError::UnsupportedFeature {
             feature: format!("Column expression node: {other:?}"),
         }),
     }
+}
+
+fn type_cast_convert(tc: &TypeCast) -> Result<ColumnExpr, AstError> {
+    let arg = tc
+        .arg
+        .as_ref()
+        .ok_or_else(|| AstError::UnsupportedFeature {
+            feature: "TypeCast missing argument".to_owned(),
+        })?;
+    let inner = node_convert_to_column_expr(arg)?;
+    let type_name = tc
+        .type_name
+        .as_ref()
+        .ok_or_else(|| AstError::UnsupportedFeature {
+            feature: "TypeCast missing type name".to_owned(),
+        })?;
+    let target_type = type_name_render(type_name)?;
+    Ok(ColumnExpr::TypeCast {
+        expr: Box::new(inner),
+        target_type,
+    })
+}
+
+/// Render a pg_query `TypeName` to a canonical SQL string (e.g. `int4`,
+/// `numeric(10,2)`, `text`). Strips the implicit `pg_catalog.` qualifier
+/// PostgreSQL adds for built-in types.
+fn type_name_render(tn: &TypeName) -> Result<EcoString, AstError> {
+    let mut parts: Vec<&str> = Vec::with_capacity(tn.names.len());
+    for n in &tn.names {
+        match n.node.as_ref() {
+            Some(NodeEnum::String(s)) => parts.push(s.sval.as_str()),
+            other => {
+                return Err(AstError::UnsupportedFeature {
+                    feature: format!("TypeName component: {other:?}"),
+                });
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(AstError::UnsupportedFeature {
+            feature: "TypeName with no components".to_owned(),
+        });
+    }
+    let name_start = if parts.len() > 1 && parts.first() == Some(&"pg_catalog") {
+        1
+    } else {
+        0
+    };
+
+    let mut out = parts.get(name_start..).unwrap_or(&[]).join(".");
+
+    if !tn.typmods.is_empty() {
+        let mut typmod_strs: Vec<String> = Vec::with_capacity(tn.typmods.len());
+        for tm in &tn.typmods {
+            match tm.node.as_ref() {
+                Some(NodeEnum::AConst(c)) => {
+                    let lit = const_value_extract(c).map_err(|_| AstError::UnsupportedFeature {
+                        feature: "TypeName typmod literal".to_owned(),
+                    })?;
+                    let mut buf = String::new();
+                    lit.deparse(&mut buf);
+                    typmod_strs.push(buf);
+                }
+                other => {
+                    return Err(AstError::UnsupportedFeature {
+                        feature: format!("TypeName typmod: {other:?}"),
+                    });
+                }
+            }
+        }
+        out.push('(');
+        out.push_str(&typmod_strs.join(","));
+        out.push(')');
+    }
+
+    for _ in &tn.array_bounds {
+        out.push_str("[]");
+    }
+
+    Ok(EcoString::from(out))
 }
 
 fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
@@ -3379,6 +3464,97 @@ mod tests {
             panic!("expected nested arithmetic expression");
         };
         assert_eq!(inner.op, ArithmeticOp::Add);
+    }
+
+    // ========================================================================
+    // TypeCast tests
+    // ========================================================================
+
+    /// Parse `sql` and return the first SELECT column's expr.
+    fn parse_first_column(sql: &str) -> ColumnExpr {
+        let select = parse_select(sql);
+        let SelectColumns::Columns(columns) = select.columns else {
+            panic!("expected columns");
+        };
+        columns
+            .into_iter()
+            .next()
+            .expect("at least one column")
+            .expr
+    }
+
+    /// Parse `sql` and unwrap the first column as a `(inner, target_type)` cast.
+    fn parse_first_typecast(sql: &str) -> (ColumnExpr, EcoString) {
+        match parse_first_column(sql) {
+            ColumnExpr::TypeCast { expr, target_type } => (*expr, target_type),
+            other => panic!("expected type cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_type_cast_count_star_int() {
+        let (expr, target_type) = parse_first_typecast("SELECT COUNT(*)::INT FROM t");
+        assert_eq!(target_type.as_str(), "int4");
+        assert!(matches!(expr, ColumnExpr::Function(f) if f.name == "count"));
+    }
+
+    #[test]
+    fn test_type_cast_column_text() {
+        let (expr, target_type) = parse_first_typecast("SELECT col::text FROM t");
+        assert_eq!(target_type.as_str(), "text");
+        assert!(matches!(expr, ColumnExpr::Column(c) if c.column == "col"));
+    }
+
+    #[test]
+    fn test_type_cast_arithmetic_numeric_typmods() {
+        let (expr, target_type) = parse_first_typecast("SELECT (a + b)::numeric(10,2) FROM t");
+        assert_eq!(target_type.as_str(), "numeric(10,2)");
+        assert!(matches!(expr, ColumnExpr::Arithmetic(_)));
+    }
+
+    #[test]
+    fn test_type_cast_qualified_column() {
+        let (expr, target_type) = parse_first_typecast("SELECT t.col::int FROM t");
+        assert_eq!(target_type.as_str(), "int4");
+        let ColumnExpr::Column(col) = expr else {
+            panic!("expected column");
+        };
+        assert_eq!(col.table.as_deref(), Some("t"));
+        assert_eq!(col.column.as_str(), "col");
+    }
+
+    #[test]
+    fn test_type_cast_literal_date_still_parses() {
+        let (expr, target_type) = parse_first_typecast("SELECT '2024-01-01'::DATE FROM t");
+        assert_eq!(target_type.as_str(), "date");
+        assert!(matches!(expr, ColumnExpr::Literal(LiteralValue::String(_))));
+    }
+
+    #[test]
+    fn test_type_cast_deparse_round_trip() {
+        let sql = "SELECT COUNT(*)::INT, SUM(amount)::NUMERIC(18,2) FROM t";
+        let select = parse_select(sql);
+
+        let mut buf = String::new();
+        select.deparse(&mut buf);
+        assert!(
+            buf.contains("(COUNT(*))::int4"),
+            "expected count cast in: {buf}"
+        );
+        assert!(
+            buf.contains("(SUM(amount))::numeric(18,2)"),
+            "expected sum cast in: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_type_cast_aliased() {
+        let select = parse_select("SELECT COUNT(*)::INT AS n FROM t");
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+        assert_eq!(columns[0].alias.as_deref(), Some("n"));
+        assert!(matches!(&columns[0].expr, ColumnExpr::TypeCast { .. }));
     }
 
     // ========================================================================

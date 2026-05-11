@@ -222,7 +222,8 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                     | ResolvedColumnExpr::Literal(_)
                     | ResolvedColumnExpr::Case(_)
                     | ResolvedColumnExpr::Arithmetic(_)
-                    | ResolvedColumnExpr::Subquery(..) => ColumnMetadata {
+                    | ResolvedColumnExpr::Subquery(..)
+                    | ResolvedColumnExpr::TypeCast { .. } => ColumnMetadata {
                         name: name.clone(),
                         position: i16::try_from(i + 1).expect("column position fits in i16"),
                         type_oid: 25, // TEXT OID
@@ -633,6 +634,13 @@ fn column_expr_resolve(
                 outer_refs,
             ))
         }
+        ColumnExpr::TypeCast { expr, target_type } => {
+            let inner = column_expr_resolve(expr, scope)?;
+            Ok(ResolvedColumnExpr::TypeCast {
+                expr: Box::new(inner),
+                target_type: target_type.clone(),
+            })
+        }
     }
 }
 
@@ -786,6 +794,10 @@ fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
             op: arith.op,
             right: Box::new(column_expr_to_identifier(&arith.right)),
         }),
+        ColumnExpr::TypeCast { expr, target_type } => ResolvedColumnExpr::TypeCast {
+            expr: Box::new(column_expr_to_identifier(expr)),
+            target_type: target_type.clone(),
+        },
     }
 }
 

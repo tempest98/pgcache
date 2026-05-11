@@ -427,6 +427,7 @@ fn column_expr_has_correlation(expr: &ResolvedColumnExpr) -> bool {
         ResolvedColumnExpr::Arithmetic(arith) => {
             column_expr_has_correlation(&arith.left) || column_expr_has_correlation(&arith.right)
         }
+        ResolvedColumnExpr::TypeCast { expr, .. } => column_expr_has_correlation(expr),
         ResolvedColumnExpr::Column(_)
         | ResolvedColumnExpr::Identifier(_)
         | ResolvedColumnExpr::Literal(_) => false,
@@ -528,7 +529,8 @@ fn in_any_inner_output_column(
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(..) => Err(DecorrelateError::NonDecorrelatable {
+            | ResolvedColumnExpr::Subquery(..)
+            | ResolvedColumnExpr::TypeCast { .. } => Err(DecorrelateError::NonDecorrelatable {
                 reason: "IN subquery output is not a simple column reference".to_owned(),
             }
             .into()),
@@ -1010,7 +1012,8 @@ fn select_columns_decorrelate(
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(..)) => {
+            | ResolvedColumnExpr::Subquery(..)
+            | ResolvedColumnExpr::TypeCast { .. }) => {
                 // Reject nested correlation in non-Subquery exprs (e.g., CASE with
                 // correlated subquery) — we don't walk into arbitrary column exprs.
                 if column_expr_has_correlation(other) {

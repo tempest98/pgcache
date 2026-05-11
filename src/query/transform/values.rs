@@ -277,6 +277,9 @@ fn resolved_column_expr_alias_update(
         ResolvedColumnExpr::Subquery(query, _) => {
             resolved_query_expr_column_alias_update(query, schema, table, alias);
         }
+        ResolvedColumnExpr::TypeCast { expr, .. } => {
+            resolved_column_expr_alias_update(expr, schema, table, alias);
+        }
         ResolvedColumnExpr::Identifier(_) | ResolvedColumnExpr::Literal(_) => {}
     }
 }

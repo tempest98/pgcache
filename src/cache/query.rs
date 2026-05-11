@@ -429,6 +429,10 @@ fn is_cacheable_column_expr(
             // Scalar subquery in SELECT list - check inner query
             is_cacheable_subquery_inner(query, fv)
         }
+        ColumnExpr::TypeCast { expr, .. } => {
+            // Type cast is pure coercion — defer to the wrapped expression.
+            is_cacheable_column_expr(expr, ctx, fv)
+        }
     }
 }
 
@@ -1424,6 +1428,26 @@ mod tests {
             fp_base, fp_both,
             "LIMIT+OFFSET should not affect fingerprint"
         );
+    }
+
+    #[test]
+    fn test_type_cast_cacheable() {
+        // TypeCast on non-literal SELECT expressions is pure coercion; the
+        // wrapper must not block cacheability.
+        let cases = [
+            "SELECT COUNT(*)::INT FROM a",
+            "SELECT col::text FROM a",
+            "SELECT (col + 1)::numeric(10,2) FROM a",
+            "SELECT a.col::int FROM a",
+            "SELECT COUNT(*)::INT, SUM(col)::NUMERIC(18,2) FROM a GROUP BY col",
+        ];
+        for sql in cases {
+            let result = check_cacheable(sql);
+            assert!(
+                result.is_ok(),
+                "should be cacheable: {sql} (err: {result:?})"
+            );
+        }
     }
 
     #[test]
