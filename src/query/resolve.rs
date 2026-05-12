@@ -11,11 +11,11 @@ use crate::query::ast::{
 };
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr,
-    ResolvedCaseWhen, ResolvedColumnExpr, ResolvedColumnNode, ResolvedJoinNode,
-    ResolvedLimitClause, ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody,
-    ResolvedQueryExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
-    ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource, ResolvedTableSubqueryNode,
-    ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowSpec,
+    ResolvedCaseWhen, ResolvedColumnExpr, ResolvedColumnNode, ResolvedFunctionCall,
+    ResolvedJoinNode, ResolvedLimitClause, ResolvedMultiExpr, ResolvedOrderByClause,
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumn, ResolvedSelectColumns,
+    ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource,
+    ResolvedTableSubqueryNode, ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowSpec,
 };
 
 /// Resolution scope tracking available tables and their aliases
@@ -218,7 +218,7 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                 let base_meta = match &col.expr {
                     ResolvedColumnExpr::Column(c) => c.column_metadata.clone(),
                     ResolvedColumnExpr::Identifier(_)
-                    | ResolvedColumnExpr::Function { .. }
+                    | ResolvedColumnExpr::Function(_)
                     | ResolvedColumnExpr::Literal(_)
                     | ResolvedColumnExpr::Case(_)
                     | ResolvedColumnExpr::Arithmetic(_)
@@ -586,7 +586,7 @@ fn column_expr_resolve(
                 Some(w) => Some(window_spec_resolve(w, scope)?),
                 None => None,
             };
-            Ok(ResolvedColumnExpr::Function {
+            Ok(ResolvedColumnExpr::Function(ResolvedFunctionCall {
                 name: func.name.as_str().into(),
                 args: resolved_args,
                 agg_star: func.agg_star,
@@ -594,7 +594,7 @@ fn column_expr_resolve(
                 agg_order: resolved_agg_order,
                 agg_filter: resolved_agg_filter,
                 over: resolved_over,
-            })
+            }))
         }
         ColumnExpr::Case(case) => {
             let arg = match &case.arg {
@@ -776,7 +776,7 @@ fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
         ColumnExpr::Star(_) => unreachable!("Star expanded in select_columns_resolve"),
         ColumnExpr::Column(col) => ResolvedColumnExpr::Identifier(col.column.as_str().into()),
         ColumnExpr::Literal(lit) => ResolvedColumnExpr::Literal(lit.clone()),
-        ColumnExpr::Function(func) => ResolvedColumnExpr::Function {
+        ColumnExpr::Function(func) => ResolvedColumnExpr::Function(ResolvedFunctionCall {
             name: func.name.as_str().into(),
             args: func.args.iter().map(column_expr_to_identifier).collect(),
             agg_star: func.agg_star,
@@ -784,7 +784,7 @@ fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
             agg_order: vec![], // ORDER BY within aggregate not needed for set operation ORDER BY
             agg_filter: None,  // FILTER predicate doesn't reference set-op output names
             over: None,        // Window spec not needed for set operation ORDER BY
-        },
+        }),
         ColumnExpr::Case(_) | ColumnExpr::Subquery(_) => {
             // CASE and subquery expressions in ORDER BY are uncommon; use null as fallback
             ResolvedColumnExpr::Literal(LiteralValue::Null)
@@ -2346,17 +2346,17 @@ mod tests {
         };
 
         let ResolvedSelectColumn {
-            expr: ResolvedColumnExpr::Function { name, over, .. },
+            expr: ResolvedColumnExpr::Function(func),
             ..
         } = &columns[0]
         else {
             panic!("expected function");
         };
 
-        assert_eq!(name, "sum");
-        assert!(over.is_some(), "should have OVER clause");
+        assert_eq!(func.name, "sum");
+        assert!(func.over.is_some(), "should have OVER clause");
 
-        let window_spec = over.as_ref().unwrap();
+        let window_spec = func.over.as_ref().unwrap();
         assert_eq!(window_spec.partition_by.len(), 1);
         assert_eq!(window_spec.order_by.len(), 1);
     }

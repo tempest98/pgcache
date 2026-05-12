@@ -410,7 +410,7 @@ fn merge_where_clauses(
 fn column_expr_has_correlation(expr: &ResolvedColumnExpr) -> bool {
     match expr {
         ResolvedColumnExpr::Subquery(_, outer_refs) => !outer_refs.is_empty(),
-        ResolvedColumnExpr::Function { args, .. } => args.iter().any(column_expr_has_correlation),
+        ResolvedColumnExpr::Function(func) => func.args.iter().any(column_expr_has_correlation),
         ResolvedColumnExpr::Case(case) => {
             case.arg
                 .as_ref()
@@ -525,7 +525,7 @@ fn in_any_inner_output_column(
         [col] => match &col.expr {
             ResolvedColumnExpr::Column(col_node) => Ok(col_node.clone()),
             ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Function { .. }
+            | ResolvedColumnExpr::Function(_)
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)
@@ -1008,7 +1008,7 @@ fn select_columns_decorrelate(
             }
             other @ (ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Function { .. }
+            | ResolvedColumnExpr::Function(_)
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)

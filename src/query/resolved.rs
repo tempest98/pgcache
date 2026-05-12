@@ -641,16 +641,8 @@ pub enum ResolvedColumnExpr {
     Column(ResolvedColumnNode),
     /// Unqualified column name (used in set operation ORDER BY)
     Identifier(EcoString),
-    /// Function call (including window functions)
-    Function {
-        name: EcoString,
-        args: Vec<ResolvedColumnExpr>,
-        agg_star: bool,
-        agg_distinct: bool,
-        agg_order: Vec<ResolvedOrderByClause>,
-        agg_filter: Option<Box<ResolvedWhereExpr>>,
-        over: Option<ResolvedWindowSpec>,
-    },
+    /// Function call (including aggregates and window functions)
+    Function(ResolvedFunctionCall),
     /// Literal value
     Literal(LiteralValue),
     /// CASE expression
@@ -664,6 +656,73 @@ pub enum ResolvedColumnExpr {
         expr: Box<ResolvedColumnExpr>,
         target_type: EcoString,
     },
+}
+
+/// Resolved function call — mirrors `query::ast::FunctionCall`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedFunctionCall {
+    pub name: EcoString,
+    pub args: Vec<ResolvedColumnExpr>,
+    pub agg_star: bool,
+    pub agg_distinct: bool,
+    pub agg_order: Vec<ResolvedOrderByClause>,
+    pub agg_filter: Option<Box<ResolvedWhereExpr>>,
+    pub over: Option<ResolvedWindowSpec>,
+}
+
+impl ResolvedFunctionCall {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
+        let arg_nodes = self.args.iter().flat_map(|arg| arg.nodes());
+        let agg_order_nodes = self.agg_order.iter().flat_map(|o| o.nodes());
+        let filter_nodes = self.agg_filter.iter().flat_map(|f| f.nodes());
+        let over_nodes = self.over.iter().flat_map(|w| w.nodes());
+        current
+            .chain(arg_nodes)
+            .chain(agg_order_nodes)
+            .chain(filter_nodes)
+            .chain(over_nodes)
+    }
+}
+
+impl Deparse for ResolvedFunctionCall {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        buf.push_str(&self.name);
+        buf.push('(');
+        if self.agg_distinct {
+            buf.push_str("DISTINCT ");
+        }
+        if self.agg_star {
+            buf.push('*');
+        } else {
+            let mut sep = "";
+            for arg in &self.args {
+                buf.push_str(sep);
+                arg.deparse(buf);
+                sep = ", ";
+            }
+        }
+        if !self.agg_order.is_empty() {
+            buf.push_str(" ORDER BY ");
+            let mut sep = "";
+            for clause in &self.agg_order {
+                buf.push_str(sep);
+                clause.deparse(buf);
+                sep = ", ";
+            }
+        }
+        buf.push(')');
+        if let Some(filter) = &self.agg_filter {
+            buf.push_str(" FILTER (WHERE ");
+            filter.deparse(buf);
+            buf.push(')');
+        }
+        if let Some(window_spec) = &self.over {
+            buf.push_str(" OVER ");
+            window_spec.deparse(buf);
+        }
+        buf
+    }
 }
 
 /// Resolved window specification for OVER clause
@@ -740,24 +799,7 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Column(col) => Box::new(col.nodes()),
             ResolvedColumnExpr::Identifier(_) => Box::new(std::iter::empty()),
             ResolvedColumnExpr::Literal(lit) => Box::new(lit.nodes()),
-            ResolvedColumnExpr::Function {
-                args,
-                agg_order,
-                agg_filter,
-                over,
-                ..
-            } => {
-                let arg_nodes = args.iter().flat_map(|arg| arg.nodes());
-                let agg_order_nodes = agg_order.iter().flat_map(|o| o.nodes());
-                let filter_nodes = agg_filter.iter().flat_map(|f| f.nodes());
-                let over_nodes = over.iter().flat_map(|w| w.nodes());
-                Box::new(
-                    arg_nodes
-                        .chain(agg_order_nodes)
-                        .chain(filter_nodes)
-                        .chain(over_nodes),
-                )
-            }
+            ResolvedColumnExpr::Function(func) => Box::new(func.nodes()),
             ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
             ResolvedColumnExpr::Arithmetic(arith) => Box::new(arith.nodes()),
             ResolvedColumnExpr::Subquery(query, _) => Box::new(query.nodes()),
@@ -772,8 +814,9 @@ impl ResolvedColumnExpr {
     /// subquery doesn't make the outer expression aggregating).
     pub fn has_aggregate(&self, agg_fns: &HashSet<String>) -> bool {
         match self {
-            ResolvedColumnExpr::Function { name, args, .. } => {
-                agg_fns.contains(name.as_str()) || args.iter().any(|a| a.has_aggregate(agg_fns))
+            ResolvedColumnExpr::Function(func) => {
+                agg_fns.contains(func.name.as_str())
+                    || func.args.iter().any(|a| a.has_aggregate(agg_fns))
             }
             ResolvedColumnExpr::Case(case) => {
                 case.arg.as_ref().is_some_and(|a| a.has_aggregate(agg_fns))
@@ -800,9 +843,12 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
             | ResolvedColumnExpr::Literal(_) => 0,
-            ResolvedColumnExpr::Function { args, .. } => {
-                args.iter().map(|a| a.subquery_depth()).max().unwrap_or(0)
-            }
+            ResolvedColumnExpr::Function(func) => func
+                .args
+                .iter()
+                .map(|a| a.subquery_depth())
+                .max()
+                .unwrap_or(0),
             ResolvedColumnExpr::Case(case) => {
                 let arg_depth = case.arg.as_ref().map_or(0, |a| a.subquery_depth());
                 let when_depth = case
@@ -833,24 +879,18 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
             | ResolvedColumnExpr::Literal(_) => {}
-            ResolvedColumnExpr::Function {
-                args,
-                agg_order,
-                agg_filter,
-                over,
-                ..
-            } => {
-                for arg in args {
+            ResolvedColumnExpr::Function(func) => {
+                for arg in &func.args {
                     arg.subquery_nodes_collect_with_source(branches);
                 }
-                for clause in agg_order {
+                for clause in &func.agg_order {
                     clause.expr.subquery_nodes_collect_with_source(branches);
                 }
                 // FILTER predicate is Scalar context — negated=false
-                if let Some(filter) = agg_filter {
+                if let Some(filter) = &func.agg_filter {
                     filter.subquery_nodes_collect_with_source(branches, false);
                 }
-                if let Some(over) = over {
+                if let Some(over) = &func.over {
                     for col in &over.partition_by {
                         col.subquery_nodes_collect_with_source(branches);
                     }
@@ -893,23 +933,17 @@ impl ResolvedColumnExpr {
             ResolvedColumnExpr::Column(_)
             | ResolvedColumnExpr::Identifier(_)
             | ResolvedColumnExpr::Literal(_) => {}
-            ResolvedColumnExpr::Function {
-                args,
-                agg_order,
-                agg_filter,
-                over,
-                ..
-            } => {
-                for arg in args {
+            ResolvedColumnExpr::Function(func) => {
+                for arg in &func.args {
                     arg.subquery_nodes_collect(branches);
                 }
-                for clause in agg_order {
+                for clause in &func.agg_order {
                     clause.expr.subquery_nodes_collect(branches);
                 }
-                if let Some(filter) = agg_filter {
+                if let Some(filter) = &func.agg_filter {
                     filter.subquery_nodes_collect(branches);
                 }
-                if let Some(over) = over {
+                if let Some(over) = &func.over {
                     for col in &over.partition_by {
                         col.subquery_nodes_collect(branches);
                     }
@@ -971,51 +1005,7 @@ impl Deparse for ResolvedColumnExpr {
             ResolvedColumnExpr::Column(col) => col.deparse(buf),
             ResolvedColumnExpr::Identifier(name) => name.deparse(buf),
             ResolvedColumnExpr::Literal(lit) => lit.deparse(buf),
-            ResolvedColumnExpr::Function {
-                name,
-                args,
-                agg_star,
-                agg_distinct,
-                agg_order,
-                agg_filter,
-                over,
-            } => {
-                buf.push_str(name);
-                buf.push('(');
-                if *agg_distinct {
-                    buf.push_str("DISTINCT ");
-                }
-                if *agg_star {
-                    buf.push('*');
-                } else {
-                    let mut sep = "";
-                    for arg in args {
-                        buf.push_str(sep);
-                        arg.deparse(buf);
-                        sep = ", ";
-                    }
-                }
-                if !agg_order.is_empty() {
-                    buf.push_str(" ORDER BY ");
-                    let mut sep = "";
-                    for clause in agg_order {
-                        buf.push_str(sep);
-                        clause.deparse(buf);
-                        sep = ", ";
-                    }
-                }
-                buf.push(')');
-                if let Some(filter) = agg_filter {
-                    buf.push_str(" FILTER (WHERE ");
-                    filter.deparse(buf);
-                    buf.push(')');
-                }
-                if let Some(window_spec) = over {
-                    buf.push_str(" OVER ");
-                    window_spec.deparse(buf);
-                }
-                buf
-            }
+            ResolvedColumnExpr::Function(func) => func.deparse(buf),
             ResolvedColumnExpr::Case(case) => case.deparse(buf),
             ResolvedColumnExpr::Arithmetic(arith) => arith.deparse(buf),
             ResolvedColumnExpr::Subquery(query, _) => {
@@ -1083,7 +1073,7 @@ impl ResolvedSelectColumn {
         match &self.expr {
             ResolvedColumnExpr::Column(c) => Some(&c.column),
             ResolvedColumnExpr::Identifier(name) => Some(name),
-            ResolvedColumnExpr::Function { .. }
+            ResolvedColumnExpr::Function(_)
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)
@@ -1172,7 +1162,7 @@ impl ResolvedSelectColumns {
         match expr {
             ResolvedColumnExpr::Identifier(name) => self.position_by_output_name(name.as_str()),
             ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Function { .. }
+            | ResolvedColumnExpr::Function(_)
             | ResolvedColumnExpr::Literal(_)
             | ResolvedColumnExpr::Case(_)
             | ResolvedColumnExpr::Arithmetic(_)

@@ -173,7 +173,7 @@ fn subquery_output_column_names(query: &ResolvedQueryExpr) -> Vec<EcoString> {
                     match &col.expr {
                         ResolvedColumnExpr::Column(c) => Some(c.column.clone()),
                         ResolvedColumnExpr::Identifier(ident) => Some(ident.clone()),
-                        ResolvedColumnExpr::Function { .. }
+                        ResolvedColumnExpr::Function(_)
                         | ResolvedColumnExpr::Literal(_)
                         | ResolvedColumnExpr::Case(_)
                         | ResolvedColumnExpr::Arithmetic(_)
@@ -198,7 +198,9 @@ fn branch_pushdown_is_safe(select: &ResolvedSelectNode) -> bool {
     // Check for window functions in SELECT columns
     if let ResolvedSelectColumns::Columns(cols) = &select.columns {
         for col in cols {
-            if let ResolvedColumnExpr::Function { over: Some(_), .. } = &col.expr {
+            if let ResolvedColumnExpr::Function(func) = &col.expr
+                && func.over.is_some()
+            {
                 return false;
             }
         }
@@ -267,7 +269,7 @@ fn predicate_push_into_select(
             match &col.expr {
                 ResolvedColumnExpr::Column(node) => Some((col_name, node)),
                 ResolvedColumnExpr::Identifier(_)
-                | ResolvedColumnExpr::Function { .. }
+                | ResolvedColumnExpr::Function(_)
                 | ResolvedColumnExpr::Literal(_)
                 | ResolvedColumnExpr::Case(_)
                 | ResolvedColumnExpr::Arithmetic(_)

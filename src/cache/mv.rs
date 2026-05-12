@@ -222,7 +222,7 @@ fn order_by_serve_viable(resolved: &ResolvedQueryExpr) -> bool {
                     .position_by_output_name(name.as_str())
                     .is_some(),
                 ResolvedColumnExpr::Column(_)
-                | ResolvedColumnExpr::Function { .. }
+                | ResolvedColumnExpr::Function(_)
                 | ResolvedColumnExpr::Literal(_)
                 | ResolvedColumnExpr::Case(_)
                 | ResolvedColumnExpr::Arithmetic(_)
@@ -328,8 +328,8 @@ where
 /// Arithmetic operands, but not into scalar subqueries.
 fn column_expr_has_window(expr: &ResolvedColumnExpr) -> bool {
     match expr {
-        ResolvedColumnExpr::Function { over, args, .. } => {
-            over.is_some() || args.iter().any(column_expr_has_window)
+        ResolvedColumnExpr::Function(func) => {
+            func.over.is_some() || func.args.iter().any(column_expr_has_window)
         }
         ResolvedColumnExpr::Case(case) => {
             case.arg.as_ref().is_some_and(|a| column_expr_has_window(a))

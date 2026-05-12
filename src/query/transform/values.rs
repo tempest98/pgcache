@@ -233,23 +233,17 @@ fn resolved_column_expr_alias_update(
                 col.table_alias = Some(EcoString::from(alias));
             }
         }
-        ResolvedColumnExpr::Function {
-            args,
-            agg_order,
-            agg_filter,
-            over,
-            ..
-        } => {
-            for arg in args {
+        ResolvedColumnExpr::Function(func) => {
+            for arg in &mut func.args {
                 resolved_column_expr_alias_update(arg, schema, table, alias);
             }
-            for clause in agg_order {
+            for clause in &mut func.agg_order {
                 resolved_column_expr_alias_update(&mut clause.expr, schema, table, alias);
             }
-            if let Some(filter) = agg_filter {
+            if let Some(filter) = &mut func.agg_filter {
                 resolved_where_column_alias_update(filter, schema, table, alias);
             }
-            if let Some(window_spec) = over {
+            if let Some(window_spec) = &mut func.over {
                 for col in &mut window_spec.partition_by {
                     resolved_column_expr_alias_update(col, schema, table, alias);
                 }
