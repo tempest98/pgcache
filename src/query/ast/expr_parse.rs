@@ -186,7 +186,7 @@ fn boolean_test_convert(bool_test: &BooleanTest) -> Result<WhereExpr, WhereParse
 }
 
 /// Extract column reference from pg_query ColumnRef
-fn column_ref_extract(col_ref: &ColumnRef) -> Result<ColumnNode, WhereParseError> {
+pub(super) fn column_ref_extract(col_ref: &ColumnRef) -> Result<ColumnNode, WhereParseError> {
     if col_ref.fields.is_empty() {
         return Err(WhereParseError::InvalidColumnRef);
     }

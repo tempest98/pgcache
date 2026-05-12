@@ -7,10 +7,12 @@ use pg_query::protobuf::{
     MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir, TypeCast, TypeName,
 };
 use pg_query::protobuf::{
-    ColumnRef, Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum,
+    Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum,
 };
 
-use super::expr_parse::{const_value_extract, node_convert_to_expr, select_stmt_parse_where};
+use super::expr_parse::{
+    column_ref_extract, const_value_extract, node_convert_to_expr, select_stmt_parse_where,
+};
 use super::*;
 
 /// Convert a pg_query ParseResult into a QueryExpr
@@ -312,7 +314,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                     }
 
                     // Regular column reference
-                    let column_ref = column_ref_convert(col_ref)?;
+                    let column_ref = column_ref_extract(col_ref)?;
 
                     columns.push(SelectColumn::Expr {
                         expr: ScalarExpr::Column(column_ref),
@@ -570,37 +572,10 @@ fn table_subquery_node_convert(
     }))
 }
 
-fn column_ref_convert(col_ref: &ColumnRef) -> Result<ColumnNode, AstError> {
-    if col_ref.fields.is_empty() {
-        return Err(AstError::InvalidTableRef);
-    }
-
-    let mut table: Option<EcoString> = None;
-    let mut column: Option<EcoString> = None;
-
-    for field in &col_ref.fields {
-        match field.node.as_ref() {
-            Some(NodeEnum::String(s)) => {
-                if column.is_none() {
-                    column = Some(EcoString::from(s.sval.as_str()));
-                } else {
-                    // If we already have a column, previous value becomes table
-                    table = column.clone();
-                    column = Some(EcoString::from(s.sval.as_str()));
-                }
-            }
-            _ => return Err(AstError::InvalidTableRef),
-        }
-    }
-
-    let column = column.ok_or(AstError::InvalidTableRef)?;
-    Ok(ColumnNode { table, column })
-}
-
 pub(super) fn node_convert_to_scalar_expr(node: &Node) -> Result<ScalarExpr, AstError> {
     match node.node.as_ref() {
         Some(NodeEnum::ColumnRef(col_ref)) => {
-            let column = column_ref_convert(col_ref)?;
+            let column = column_ref_extract(col_ref)?;
             Ok(ScalarExpr::Column(column))
         }
         Some(NodeEnum::AConst(const_val)) => {
@@ -1050,7 +1025,7 @@ fn group_by_clause_convert(group_clause: &[Node]) -> Result<Vec<ColumnNode>, Ast
     let mut group_by = Vec::with_capacity(group_clause.len());
     for node in group_clause {
         if let Some(NodeEnum::ColumnRef(col_ref)) = &node.node {
-            group_by.push(column_ref_convert(col_ref)?);
+            group_by.push(column_ref_extract(col_ref)?);
         } else {
             return Err(AstError::UnsupportedFeature {
                 feature: format!("GROUP BY expression: {node:?}"),
