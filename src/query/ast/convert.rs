@@ -168,7 +168,7 @@ fn select_stmt_to_query_expr_with_ctx(
                 QueryBody::Values(ValuesClause { rows })
             } else {
                 let select_node = select_stmt_to_select_node(select_stmt, &ctx)?;
-                QueryBody::Select(select_node)
+                QueryBody::Select(Box::new(select_node))
             }
         }
         SetOperation::SetopUnion | SetOperation::SetopIntersect | SetOperation::SetopExcept => {
@@ -289,10 +289,7 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                     if let [field] = fields.as_slice()
                         && let Some(NodeEnum::AStar(_)) = &field.node
                     {
-                        columns.push(SelectColumn {
-                            expr: ColumnExpr::Star(None),
-                            alias,
-                        });
+                        columns.push(SelectColumn::Star(None));
                         continue;
                     }
 
@@ -310,18 +307,15 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                             Some(NodeEnum::String(s)) => EcoString::from(s.sval.as_str()),
                             _ => return Err(AstError::InvalidTableRef),
                         };
-                        columns.push(SelectColumn {
-                            expr: ColumnExpr::Star(Some(table)),
-                            alias,
-                        });
+                        columns.push(SelectColumn::Star(Some(table)));
                         continue;
                     }
 
                     // Regular column reference
                     let column_ref = column_ref_convert(col_ref)?;
 
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Column(column_ref),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Column(column_ref),
                         alias,
                     });
                 }
@@ -329,8 +323,8 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                     match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
                         Some(NodeEnum::SelectStmt(select_stmt)) => {
                             let query = select_stmt_to_query_expr(select_stmt)?;
-                            columns.push(SelectColumn {
-                                expr: ColumnExpr::Subquery(Box::new(query)),
+                            columns.push(SelectColumn::Expr {
+                                expr: ScalarExpr::Subquery(Box::new(query)),
                                 alias,
                             });
                         }
@@ -343,29 +337,29 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                 }
                 Some(NodeEnum::FuncCall(func_call)) => {
                     let function = func_call_convert(func_call)?;
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Function(function),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Function(function),
                         alias,
                     });
                 }
                 Some(NodeEnum::AConst(const_val)) => {
                     let value = const_value_extract(const_val)?;
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Literal(value),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Literal(value),
                         alias,
                     });
                 }
                 Some(NodeEnum::CoalesceExpr(coalesce)) => {
                     let function = coalesce_expr_convert(coalesce)?;
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Function(function),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Function(function),
                         alias,
                     });
                 }
                 Some(NodeEnum::MinMaxExpr(minmax)) => {
                     let function = minmax_expr_convert(minmax)?;
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Function(function),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Function(function),
                         alias,
                     });
                 }
@@ -373,8 +367,8 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                     if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprNullif) =>
                 {
                     let function = aexpr_nullif_convert(aexpr)?;
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Function(function),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Function(function),
                         alias,
                     });
                 }
@@ -382,21 +376,21 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                     if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprOp) =>
                 {
                     let arith = aexpr_arithmetic_convert(aexpr)?;
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Arithmetic(arith),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Arithmetic(arith),
                         alias,
                     });
                 }
                 Some(NodeEnum::CaseExpr(case_expr)) => {
                     let case = case_expr_convert(case_expr)?;
-                    columns.push(SelectColumn {
-                        expr: ColumnExpr::Case(case),
+                    columns.push(SelectColumn::Expr {
+                        expr: ScalarExpr::Case(case),
                         alias,
                     });
                 }
                 Some(NodeEnum::TypeCast(tc)) => {
                     let expr = type_cast_convert(tc)?;
-                    columns.push(SelectColumn { expr, alias });
+                    columns.push(SelectColumn::Expr { expr, alias });
                 }
                 other => {
                     return Err(AstError::UnsupportedSelectFeature {
@@ -603,21 +597,21 @@ fn column_ref_convert(col_ref: &ColumnRef) -> Result<ColumnNode, AstError> {
     Ok(ColumnNode { table, column })
 }
 
-fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
+pub(super) fn node_convert_to_scalar_expr(node: &Node) -> Result<ScalarExpr, AstError> {
     match node.node.as_ref() {
         Some(NodeEnum::ColumnRef(col_ref)) => {
             let column = column_ref_convert(col_ref)?;
-            Ok(ColumnExpr::Column(column))
+            Ok(ScalarExpr::Column(column))
         }
         Some(NodeEnum::AConst(const_val)) => {
             let value = const_value_extract(const_val)?;
-            Ok(ColumnExpr::Literal(value))
+            Ok(ScalarExpr::Literal(value))
         }
         Some(NodeEnum::SubLink(sub_link)) => {
             match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
                 Some(NodeEnum::SelectStmt(select_stmt)) => {
                     let query = select_stmt_to_query_expr(select_stmt)?;
-                    Ok(ColumnExpr::Subquery(Box::new(query)))
+                    Ok(ScalarExpr::Subquery(Box::new(query)))
                 }
                 other => Err(AstError::UnsupportedFeature {
                     feature: format!("Sublink type: {other:?}"),
@@ -626,31 +620,31 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
         }
         Some(NodeEnum::FuncCall(func_call)) => {
             let function = func_call_convert(func_call)?;
-            Ok(ColumnExpr::Function(function))
+            Ok(ScalarExpr::Function(function))
         }
         Some(NodeEnum::CoalesceExpr(coalesce)) => {
             let function = coalesce_expr_convert(coalesce)?;
-            Ok(ColumnExpr::Function(function))
+            Ok(ScalarExpr::Function(function))
         }
         Some(NodeEnum::MinMaxExpr(minmax)) => {
             let function = minmax_expr_convert(minmax)?;
-            Ok(ColumnExpr::Function(function))
+            Ok(ScalarExpr::Function(function))
         }
         Some(NodeEnum::AExpr(aexpr))
             if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprNullif) =>
         {
             let function = aexpr_nullif_convert(aexpr)?;
-            Ok(ColumnExpr::Function(function))
+            Ok(ScalarExpr::Function(function))
         }
         Some(NodeEnum::AExpr(aexpr))
             if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprOp) =>
         {
             let arith = aexpr_arithmetic_convert(aexpr)?;
-            Ok(ColumnExpr::Arithmetic(arith))
+            Ok(ScalarExpr::Arithmetic(arith))
         }
         Some(NodeEnum::CaseExpr(case_expr)) => {
             let case = case_expr_convert(case_expr)?;
-            Ok(ColumnExpr::Case(case))
+            Ok(ScalarExpr::Case(case))
         }
         Some(NodeEnum::TypeCast(tc)) => type_cast_convert(tc),
         other => Err(AstError::UnsupportedFeature {
@@ -659,14 +653,14 @@ fn node_convert_to_column_expr(node: &Node) -> Result<ColumnExpr, AstError> {
     }
 }
 
-fn type_cast_convert(tc: &TypeCast) -> Result<ColumnExpr, AstError> {
+fn type_cast_convert(tc: &TypeCast) -> Result<ScalarExpr, AstError> {
     let arg = tc
         .arg
         .as_ref()
         .ok_or_else(|| AstError::UnsupportedFeature {
             feature: "TypeCast missing argument".to_owned(),
         })?;
-    let inner = node_convert_to_column_expr(arg)?;
+    let inner = node_convert_to_scalar_expr(arg)?;
     let type_name = tc
         .type_name
         .as_ref()
@@ -674,7 +668,7 @@ fn type_cast_convert(tc: &TypeCast) -> Result<ColumnExpr, AstError> {
             feature: "TypeCast missing type name".to_owned(),
         })?;
     let target_type = type_name_render(type_name)?;
-    Ok(ColumnExpr::TypeCast {
+    Ok(ScalarExpr::TypeCast {
         expr: Box::new(inner),
         target_type,
     })
@@ -760,7 +754,7 @@ fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
         func_call
             .args
             .iter()
-            .map(node_convert_to_column_expr)
+            .map(node_convert_to_scalar_expr)
             .collect::<Result<Vec<_>, _>>()?
     };
 
@@ -800,7 +794,7 @@ fn window_def_convert(win_def: &pg_query::protobuf::WindowDef) -> Result<WindowS
     let partition_by = win_def
         .partition_clause
         .iter()
-        .map(node_convert_to_column_expr)
+        .map(node_convert_to_scalar_expr)
         .collect::<Result<Vec<_>, _>>()?;
 
     // Convert ORDER BY clauses
@@ -826,7 +820,7 @@ fn window_order_by_convert(
                 .ok_or_else(|| AstError::UnsupportedFeature {
                     feature: "ORDER BY with no expression".to_owned(),
                 })
-                .and_then(|n| node_convert_to_column_expr(n))?;
+                .and_then(|n| node_convert_to_scalar_expr(n))?;
 
             let direction = match SortByDir::try_from(sort_by.sortby_dir) {
                 Ok(SortByDir::SortbyAsc) => OrderDirection::Asc,
@@ -854,7 +848,7 @@ fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstErr
     let args = coalesce
         .args
         .iter()
-        .map(node_convert_to_column_expr)
+        .map(node_convert_to_scalar_expr)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(FunctionCall {
@@ -882,7 +876,7 @@ fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
     let args = minmax
         .args
         .iter()
-        .map(node_convert_to_column_expr)
+        .map(node_convert_to_scalar_expr)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(FunctionCall {
@@ -900,10 +894,10 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
     let mut args = Vec::with_capacity(2);
 
     if let Some(lexpr) = &aexpr.lexpr {
-        args.push(node_convert_to_column_expr(lexpr)?);
+        args.push(node_convert_to_scalar_expr(lexpr)?);
     }
     if let Some(rexpr) = &aexpr.rexpr {
-        args.push(node_convert_to_column_expr(rexpr)?);
+        args.push(node_convert_to_scalar_expr(rexpr)?);
     }
 
     Ok(FunctionCall {
@@ -927,7 +921,7 @@ fn aexpr_arithmetic_convert(aexpr: &AExpr) -> Result<ArithmeticExpr, AstError> {
         .ok_or_else(|| AstError::UnsupportedFeature {
             feature: "arithmetic expression without left operand".to_owned(),
         })
-        .and_then(|n| node_convert_to_column_expr(n))?;
+        .and_then(|n| node_convert_to_scalar_expr(n))?;
 
     let right = aexpr
         .rexpr
@@ -935,7 +929,7 @@ fn aexpr_arithmetic_convert(aexpr: &AExpr) -> Result<ArithmeticExpr, AstError> {
         .ok_or_else(|| AstError::UnsupportedFeature {
             feature: "arithmetic expression without right operand".to_owned(),
         })
-        .and_then(|n| node_convert_to_column_expr(n))?;
+        .and_then(|n| node_convert_to_scalar_expr(n))?;
 
     Ok(ArithmeticExpr {
         left: Box::new(left),
@@ -972,7 +966,7 @@ fn case_expr_convert(case_expr: &PgCaseExpr) -> Result<CaseExpr, AstError> {
     let arg = case_expr
         .arg
         .as_ref()
-        .map(|n| node_convert_to_column_expr(n))
+        .map(|n| node_convert_to_scalar_expr(n))
         .transpose()?
         .map(Box::new);
 
@@ -987,7 +981,7 @@ fn case_expr_convert(case_expr: &PgCaseExpr) -> Result<CaseExpr, AstError> {
     let default = case_expr
         .defresult
         .as_ref()
-        .map(|n| node_convert_to_column_expr(n))
+        .map(|n| node_convert_to_scalar_expr(n))
         .transpose()?
         .map(Box::new);
 
@@ -1019,7 +1013,7 @@ fn case_when_convert(node: &Node) -> Result<CaseWhen, AstError> {
         .ok_or_else(|| AstError::UnsupportedFeature {
             feature: "CASE WHEN without result".to_owned(),
         })
-        .and_then(|n| node_convert_to_column_expr(n))?;
+        .and_then(|n| node_convert_to_scalar_expr(n))?;
 
     Ok(CaseWhen { condition, result })
 }
@@ -1033,7 +1027,7 @@ fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, A
                 feature: "ORDER BY without expression".to_owned(),
             })?;
 
-            let expr = node_convert_to_column_expr(expr_node)?;
+            let expr = node_convert_to_scalar_expr(expr_node)?;
             let direction =
                 OrderDirection::try_from(SortByDir::try_from(sort_by.sortby_dir).map_err(
                     |_| AstError::UnsupportedFeature {
@@ -1164,7 +1158,7 @@ mod tests {
     fn parse_select(sql: &str) -> SelectNode {
         let query = parse_query(sql);
         match query.body {
-            QueryBody::Select(node) => node,
+            QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),
         }
     }
@@ -1228,13 +1222,15 @@ mod tests {
             assert_eq!(columns.len(), 2);
 
             // First column: id
-            if let ColumnExpr::Column(col_ref) = &columns[0].expr {
+            if let ScalarExpr::Column(col_ref) = &columns[0].expr().expect("non-star SELECT column")
+            {
                 assert_eq!(col_ref.table, None);
                 assert_eq!(col_ref.column, "id");
             }
 
             // Second column: name
-            if let ColumnExpr::Column(col_ref) = &columns[1].expr {
+            if let ScalarExpr::Column(col_ref) = &columns[1].expr().expect("non-star SELECT column")
+            {
                 assert_eq!(col_ref.table, None);
                 assert_eq!(col_ref.column, "name");
             }
@@ -1260,13 +1256,15 @@ mod tests {
             assert_eq!(columns.len(), 2);
 
             // First column: u.id
-            if let ColumnExpr::Column(col_ref) = &columns[0].expr {
+            if let ScalarExpr::Column(col_ref) = &columns[0].expr().expect("non-star SELECT column")
+            {
                 assert_eq!(col_ref.table, Some(EcoString::from("u")));
                 assert_eq!(col_ref.column, "id");
             }
 
             // Second column: u.name
-            if let ColumnExpr::Column(col_ref) = &columns[1].expr {
+            if let ScalarExpr::Column(col_ref) = &columns[1].expr().expect("non-star SELECT column")
+            {
                 assert_eq!(col_ref.table, Some(EcoString::from("u")));
                 assert_eq!(col_ref.column, "name");
             }
@@ -1281,14 +1279,22 @@ mod tests {
             assert_eq!(columns.len(), 2);
 
             // First column: id as user_id
-            assert_eq!(columns[0].alias, Some(EcoString::from("user_id")));
-            if let ColumnExpr::Column(col_ref) = &columns[0].expr {
+            assert_eq!(
+                columns[0].alias().cloned(),
+                Some(EcoString::from("user_id"))
+            );
+            if let ScalarExpr::Column(col_ref) = &columns[0].expr().expect("non-star SELECT column")
+            {
                 assert_eq!(col_ref.column, "id");
             }
 
             // Second column: name as full_name
-            assert_eq!(columns[1].alias, Some(EcoString::from("full_name")));
-            if let ColumnExpr::Column(col_ref) = &columns[1].expr {
+            assert_eq!(
+                columns[1].alias().cloned(),
+                Some(EcoString::from("full_name"))
+            );
+            if let ScalarExpr::Column(col_ref) = &columns[1].expr().expect("non-star SELECT column")
+            {
                 assert_eq!(col_ref.column, "name");
             }
         }
@@ -1309,8 +1315,8 @@ mod tests {
 
         // Columns should have no aliases
         if let SelectColumns::Columns(columns) = &select.columns {
-            assert_eq!(columns[0].alias, None);
-            assert_eq!(columns[1].alias, None);
+            assert_eq!(columns[0].alias().cloned(), None);
+            assert_eq!(columns[1].alias().cloned(), None);
         }
     }
 
@@ -1436,8 +1442,8 @@ mod tests {
 
         assert_eq!(
             columns[0],
-            SelectColumn {
-                expr: ColumnExpr::Column(ColumnNode {
+            SelectColumn::Expr {
+                expr: ScalarExpr::Column(ColumnNode {
                     table: Some(EcoString::from("invoice")),
                     column: EcoString::from("id")
                 }),
@@ -1445,8 +1451,11 @@ mod tests {
             }
         );
 
-        assert!(matches!(columns[1].expr, ColumnExpr::Subquery(_)));
-        assert_eq!(columns[1].alias, Some(EcoString::from("one")));
+        assert!(matches!(
+            columns[1].expr().expect("non-star SELECT column"),
+            ScalarExpr::Subquery(_)
+        ));
+        assert_eq!(columns[1].alias().cloned(), Some(EcoString::from("one")));
     }
 
     #[test]
@@ -1609,8 +1618,8 @@ mod tests {
         let mut buf = String::new();
 
         // Simple column
-        SelectColumn {
-            expr: ColumnExpr::Column(ColumnNode {
+        SelectColumn::Expr {
+            expr: ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
             }),
@@ -1621,8 +1630,8 @@ mod tests {
         buf.clear();
 
         // Qualified column
-        SelectColumn {
-            expr: ColumnExpr::Column(ColumnNode {
+        SelectColumn::Expr {
+            expr: ScalarExpr::Column(ColumnNode {
                 table: Some(EcoString::from("users")),
                 column: EcoString::from("name"),
             }),
@@ -1633,8 +1642,8 @@ mod tests {
         buf.clear();
 
         // alias requires quoting
-        SelectColumn {
-            expr: ColumnExpr::Column(ColumnNode {
+        SelectColumn::Expr {
+            expr: ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
             }),
@@ -1734,11 +1743,13 @@ mod tests {
         // Simple equality: id = 1
         let expr = BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(1))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(1),
+            ))),
         };
 
         expr.deparse(&mut buf);
@@ -1748,11 +1759,13 @@ mod tests {
         // Complex expression: users.name = 'john'
         let expr = BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: Some(EcoString::from("users")),
                 column: EcoString::from("name"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::String("john".to_owned()),
+            ))),
         };
 
         expr.deparse(&mut buf);
@@ -1766,10 +1779,10 @@ mod tests {
         // NOT active (prefix operator)
         let expr = UnaryExpr {
             op: UnaryOp::Not,
-            expr: Box::new(WhereExpr::Column(ColumnNode {
+            expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("active"),
-            })),
+            }))),
         };
 
         expr.deparse(&mut buf);
@@ -1779,10 +1792,10 @@ mod tests {
         // deleted_at IS NULL (postfix operator)
         let expr = UnaryExpr {
             op: UnaryOp::IsNull,
-            expr: Box::new(WhereExpr::Column(ColumnNode {
+            expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("deleted_at"),
-            })),
+            }))),
         };
 
         expr.deparse(&mut buf);
@@ -1792,10 +1805,10 @@ mod tests {
         // name IS NOT NULL (postfix operator)
         let expr = UnaryExpr {
             op: UnaryOp::IsNotNull,
-            expr: Box::new(WhereExpr::Column(ColumnNode {
+            expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("name"),
-            })),
+            }))),
         };
 
         expr.deparse(&mut buf);
@@ -1805,10 +1818,10 @@ mod tests {
         // active IS TRUE (postfix operator)
         let expr = UnaryExpr {
             op: UnaryOp::IsTrue,
-            expr: Box::new(WhereExpr::Column(ColumnNode {
+            expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("active"),
-            })),
+            }))),
         };
 
         expr.deparse(&mut buf);
@@ -1818,10 +1831,10 @@ mod tests {
         // active IS NOT FALSE (postfix operator)
         let expr = UnaryExpr {
             op: UnaryOp::IsNotFalse,
-            expr: Box::new(WhereExpr::Column(ColumnNode {
+            expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("active"),
-            })),
+            }))),
         };
 
         expr.deparse(&mut buf);
@@ -2256,10 +2269,10 @@ mod tests {
     }
 
     #[test]
-    fn test_column_expr_nodes() {
+    fn test_scalar_expr_nodes() {
         let ast = parse_query("SELECT id, name FROM users WHERE active = true");
 
-        // Test that ColumnExpr::nodes() can traverse through to ColumnNode
+        // Test that ScalarExpr::nodes() can traverse through to ColumnNode
         let columns: Vec<&ColumnNode> = ast.nodes().collect();
         assert_eq!(columns.len(), 3); // id, name, active
         assert_eq!(columns[0].column, "id");
@@ -2271,7 +2284,7 @@ mod tests {
     fn test_function_call_nodes() {
         let func = FunctionCall {
             name: EcoString::from("COUNT"),
-            args: vec![ColumnExpr::Column(ColumnNode {
+            args: vec![ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
             })],
@@ -2314,8 +2327,8 @@ mod tests {
     }
 
     #[test]
-    fn test_column_expr_subquery_nodes() {
-        // Scalar subquery in SELECT list: ColumnExpr::Subquery should traverse into inner query
+    fn test_scalar_expr_subquery_nodes() {
+        // Scalar subquery in SELECT list: ScalarExpr::Subquery should traverse into inner query
         let ast = parse_query("SELECT id, (SELECT COUNT(*) FROM orders) FROM users");
 
         // Should find both tables: users (FROM) and orders (inside scalar subquery)
@@ -2327,7 +2340,7 @@ mod tests {
         );
         assert!(
             table_names.contains(&"orders"),
-            "should find inner table 'orders' via ColumnExpr::Subquery traversal"
+            "should find inner table 'orders' via ScalarExpr::Subquery traversal"
         );
         assert_eq!(tables.len(), 2);
     }
@@ -2358,12 +2371,12 @@ mod tests {
         let multi = MultiExpr {
             op: MultiOp::In,
             exprs: vec![
-                WhereExpr::Column(ColumnNode {
+                WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("id"),
-                }),
-                WhereExpr::Value(LiteralValue::Integer(1)),
-                WhereExpr::Value(LiteralValue::Integer(2)),
+                })),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(1))),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(2))),
             ],
         };
 
@@ -2383,12 +2396,16 @@ mod tests {
         let multi = MultiExpr {
             op: MultiOp::In,
             exprs: vec![
-                WhereExpr::Column(ColumnNode {
+                WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("status"),
-                }),
-                WhereExpr::Value(LiteralValue::String("active".to_owned())),
-                WhereExpr::Value(LiteralValue::String("pending".to_owned())),
+                })),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(
+                    "active".to_owned(),
+                ))),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(
+                    "pending".to_owned(),
+                ))),
             ],
         };
 
@@ -2402,13 +2419,13 @@ mod tests {
         let multi = MultiExpr {
             op: MultiOp::NotIn,
             exprs: vec![
-                WhereExpr::Column(ColumnNode {
+                WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("id"),
-                }),
-                WhereExpr::Value(LiteralValue::Integer(1)),
-                WhereExpr::Value(LiteralValue::Integer(2)),
-                WhereExpr::Value(LiteralValue::Integer(3)),
+                })),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(1))),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(2))),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(3))),
             ],
         };
 
@@ -2436,7 +2453,7 @@ mod tests {
         assert_eq!(ast.order_by.len(), 1);
         assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
 
-        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
+        if let ScalarExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.column, "name");
             assert_eq!(col.table, None);
         } else {
@@ -2451,7 +2468,7 @@ mod tests {
         assert_eq!(ast.order_by.len(), 1);
         assert_eq!(ast.order_by[0].direction, OrderDirection::Desc);
 
-        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
+        if let ScalarExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.column, "age");
         } else {
             panic!("Expected column expression");
@@ -2475,7 +2492,7 @@ mod tests {
 
         // First ORDER BY clause
         assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
-        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
+        if let ScalarExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.column, "last_name");
         } else {
             panic!("Expected column expression");
@@ -2483,7 +2500,7 @@ mod tests {
 
         // Second ORDER BY clause
         assert_eq!(ast.order_by[1].direction, OrderDirection::Desc);
-        if let ColumnExpr::Column(col) = &ast.order_by[1].expr {
+        if let ScalarExpr::Column(col) = &ast.order_by[1].expr {
             assert_eq!(col.column, "first_name");
         } else {
             panic!("Expected column expression");
@@ -2496,7 +2513,7 @@ mod tests {
 
         assert_eq!(ast.order_by.len(), 1);
 
-        if let ColumnExpr::Column(col) = &ast.order_by[0].expr {
+        if let ScalarExpr::Column(col) = &ast.order_by[0].expr {
             assert_eq!(col.table, Some(EcoString::from("u")));
             assert_eq!(col.column, "name");
         } else {
@@ -2763,7 +2780,7 @@ mod tests {
         };
 
         assert_eq!(columns.len(), 1);
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "count");
@@ -2779,7 +2796,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "count");
@@ -2795,7 +2812,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "count");
@@ -2810,7 +2827,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "sum");
@@ -2825,14 +2842,14 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "round");
         assert_eq!(func.args.len(), 1);
 
         // First arg should be AVG(value)
-        let ColumnExpr::Function(inner) = &func.args[0] else {
+        let ScalarExpr::Function(inner) = &func.args[0] else {
             panic!("expected nested function");
         };
         assert_eq!(inner.name, "avg");
@@ -2846,7 +2863,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        assert_eq!(columns[0].alias, Some(EcoString::from("total")));
+        assert_eq!(columns[0].alias().cloned(), Some(EcoString::from("total")));
     }
 
     #[test]
@@ -2858,9 +2875,18 @@ mod tests {
         };
 
         assert_eq!(columns.len(), 3);
-        assert!(matches!(columns[0].expr, ColumnExpr::Column(_)));
-        assert!(matches!(columns[1].expr, ColumnExpr::Column(_)));
-        assert!(matches!(columns[2].expr, ColumnExpr::Function(_)));
+        assert!(matches!(
+            columns[0].expr().expect("non-star SELECT column"),
+            ScalarExpr::Column(_)
+        ));
+        assert!(matches!(
+            columns[1].expr().expect("non-star SELECT column"),
+            ScalarExpr::Column(_)
+        ));
+        assert!(matches!(
+            columns[2].expr().expect("non-star SELECT column"),
+            ScalarExpr::Function(_)
+        ));
     }
 
     #[test]
@@ -2873,12 +2899,12 @@ mod tests {
 
         assert_eq!(columns.len(), 2);
         assert!(matches!(
-            columns[0].expr,
-            ColumnExpr::Literal(LiteralValue::Integer(42))
+            columns[0].expr().expect("non-star SELECT column"),
+            ScalarExpr::Literal(LiteralValue::Integer(42))
         ));
         assert!(matches!(
-            &columns[1].expr,
-            ColumnExpr::Literal(LiteralValue::String(s)) if s == "hello"
+            &columns[1].expr().expect("non-star SELECT column"),
+            ScalarExpr::Literal(LiteralValue::String(s)) if s == "hello"
         ));
     }
 
@@ -2902,7 +2928,7 @@ mod tests {
     fn test_function_deparse_count_distinct() {
         let func = FunctionCall {
             name: EcoString::from("count"),
-            args: vec![ColumnExpr::Column(ColumnNode {
+            args: vec![ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("status"),
             })],
@@ -2925,7 +2951,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "coalesce");
@@ -2940,14 +2966,14 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "coalesce");
         assert_eq!(func.args.len(), 2);
 
         // First arg should be MAX(value)
-        let ColumnExpr::Function(inner) = &func.args[0] else {
+        let ScalarExpr::Function(inner) = &func.args[0] else {
             panic!("expected nested function");
         };
         assert_eq!(inner.name, "max");
@@ -2961,7 +2987,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "greatest");
@@ -2976,7 +3002,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "least");
@@ -2991,7 +3017,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "nullif");
@@ -3007,7 +3033,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Case(case) = &columns[0].expr else {
+        let ScalarExpr::Case(case) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected case expression");
         };
         assert!(case.arg.is_none(), "searched CASE should have no arg");
@@ -3025,7 +3051,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Case(case) = &columns[0].expr else {
+        let ScalarExpr::Case(case) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected case expression");
         };
         assert!(case.arg.is_some(), "simple CASE should have arg");
@@ -3041,7 +3067,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Case(case) = &columns[0].expr else {
+        let ScalarExpr::Case(case) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected case expression");
         };
         assert!(case.arg.is_none());
@@ -3083,7 +3109,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "sum");
@@ -3104,7 +3130,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert!(func.over.is_some(), "should have OVER clause");
@@ -3122,7 +3148,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
         assert_eq!(func.name, "row_number");
@@ -3134,7 +3160,7 @@ mod tests {
     fn test_window_function_deparse() {
         let func = FunctionCall {
             name: EcoString::from("sum"),
-            args: vec![ColumnExpr::Column(ColumnNode {
+            args: vec![ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("amount"),
             })],
@@ -3143,12 +3169,12 @@ mod tests {
             agg_order: vec![],
             agg_filter: None,
             over: Some(WindowSpec {
-                partition_by: vec![ColumnExpr::Column(ColumnNode {
+                partition_by: vec![ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("category"),
                 })],
                 order_by: vec![OrderByClause {
-                    expr: ColumnExpr::Column(ColumnNode {
+                    expr: ScalarExpr::Column(ColumnNode {
                         table: None,
                         column: EcoString::from("date"),
                     }),
@@ -3173,7 +3199,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
 
@@ -3192,7 +3218,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
 
@@ -3224,7 +3250,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
 
@@ -3241,7 +3267,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
 
@@ -3260,7 +3286,7 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Function(func) = &columns[0].expr else {
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
             panic!("expected function");
         };
 
@@ -3286,7 +3312,7 @@ mod tests {
 
         let mut buf = String::new();
         for (i, col) in columns.iter().enumerate() {
-            let ColumnExpr::Function(func) = &col.expr else {
+            let ScalarExpr::Function(func) = &col.expr().expect("non-star SELECT column") else {
                 panic!("expected function in column {i}");
             };
             assert!(
@@ -3303,12 +3329,12 @@ mod tests {
 
         // The two columns must deparse differently — collapsing them was the bug.
         let mut a = String::new();
-        let ColumnExpr::Function(f0) = &columns[0].expr else {
+        let ScalarExpr::Function(f0) = &columns[0].expr().expect("non-star SELECT column") else {
             unreachable!()
         };
         f0.deparse(&mut a);
         let mut b = String::new();
-        let ColumnExpr::Function(f1) = &columns[1].expr else {
+        let ScalarExpr::Function(f1) = &columns[1].expr().expect("non-star SELECT column") else {
             unreachable!()
         };
         f1.deparse(&mut b);
@@ -3320,16 +3346,16 @@ mod tests {
         let func = FunctionCall {
             name: EcoString::from("string_agg"),
             args: vec![
-                ColumnExpr::Column(ColumnNode {
+                ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("name"),
                 }),
-                ColumnExpr::Literal(LiteralValue::String(", ".to_owned())),
+                ScalarExpr::Literal(LiteralValue::String(", ".to_owned())),
             ],
             agg_star: false,
             agg_distinct: false,
             agg_order: vec![OrderByClause {
-                expr: ColumnExpr::Column(ColumnNode {
+                expr: ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("name"),
                 }),
@@ -3352,7 +3378,8 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+        let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column")
+        else {
             panic!("expected arithmetic expression");
         };
 
@@ -3368,7 +3395,8 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+        let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column")
+        else {
             panic!("expected arithmetic expression");
         };
 
@@ -3376,7 +3404,7 @@ mod tests {
         // Right side should be -1 (negative literal)
         assert!(matches!(
             arith.right.as_ref(),
-            ColumnExpr::Literal(LiteralValue::Integer(-1))
+            ScalarExpr::Literal(LiteralValue::Integer(-1))
         ));
     }
 
@@ -3389,7 +3417,8 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+        let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column")
+        else {
             panic!("expected arithmetic expression");
         };
 
@@ -3405,7 +3434,8 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+        let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column")
+        else {
             panic!("expected arithmetic expression");
         };
 
@@ -3421,7 +3451,8 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Arithmetic(arith) = &columns[0].expr else {
+        let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column")
+        else {
             panic!("expected arithmetic expression");
         };
 
@@ -3431,12 +3462,12 @@ mod tests {
     #[test]
     fn test_arithmetic_deparse() {
         let arith = ArithmeticExpr {
-            left: Box::new(ColumnExpr::Column(ColumnNode {
+            left: Box::new(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("amount"),
             })),
             op: ArithmeticOp::Multiply,
-            right: Box::new(ColumnExpr::Literal(LiteralValue::Integer(-1))),
+            right: Box::new(ScalarExpr::Literal(LiteralValue::Integer(-1))),
         };
         let mut buf = String::new();
         arith.deparse(&mut buf);
@@ -3453,14 +3484,15 @@ mod tests {
             panic!("expected columns");
         };
 
-        let ColumnExpr::Arithmetic(outer) = &columns[0].expr else {
+        let ScalarExpr::Arithmetic(outer) = &columns[0].expr().expect("non-star SELECT column")
+        else {
             panic!("expected arithmetic expression");
         };
 
         assert_eq!(outer.op, ArithmeticOp::Multiply);
 
         // Left side should be another arithmetic expression (a + b)
-        let ColumnExpr::Arithmetic(inner) = outer.left.as_ref() else {
+        let ScalarExpr::Arithmetic(inner) = outer.left.as_ref() else {
             panic!("expected nested arithmetic expression");
         };
         assert_eq!(inner.op, ArithmeticOp::Add);
@@ -3471,22 +3503,23 @@ mod tests {
     // ========================================================================
 
     /// Parse `sql` and return the first SELECT column's expr.
-    fn parse_first_column(sql: &str) -> ColumnExpr {
+    fn parse_first_column(sql: &str) -> ScalarExpr {
         let select = parse_select(sql);
         let SelectColumns::Columns(columns) = select.columns else {
             panic!("expected columns");
         };
-        columns
-            .into_iter()
-            .next()
-            .expect("at least one column")
-            .expr
+        let SelectColumn::Expr { expr, .. } =
+            columns.into_iter().next().expect("at least one column")
+        else {
+            panic!("expected Expr column");
+        };
+        expr
     }
 
     /// Parse `sql` and unwrap the first column as a `(inner, target_type)` cast.
-    fn parse_first_typecast(sql: &str) -> (ColumnExpr, EcoString) {
+    fn parse_first_typecast(sql: &str) -> (ScalarExpr, EcoString) {
         match parse_first_column(sql) {
-            ColumnExpr::TypeCast { expr, target_type } => (*expr, target_type),
+            ScalarExpr::TypeCast { expr, target_type } => (*expr, target_type),
             other => panic!("expected type cast, got {other:?}"),
         }
     }
@@ -3495,28 +3528,28 @@ mod tests {
     fn test_type_cast_count_star_int() {
         let (expr, target_type) = parse_first_typecast("SELECT COUNT(*)::INT FROM t");
         assert_eq!(target_type.as_str(), "int4");
-        assert!(matches!(expr, ColumnExpr::Function(f) if f.name == "count"));
+        assert!(matches!(expr, ScalarExpr::Function(f) if f.name == "count"));
     }
 
     #[test]
     fn test_type_cast_column_text() {
         let (expr, target_type) = parse_first_typecast("SELECT col::text FROM t");
         assert_eq!(target_type.as_str(), "text");
-        assert!(matches!(expr, ColumnExpr::Column(c) if c.column == "col"));
+        assert!(matches!(expr, ScalarExpr::Column(c) if c.column == "col"));
     }
 
     #[test]
     fn test_type_cast_arithmetic_numeric_typmods() {
         let (expr, target_type) = parse_first_typecast("SELECT (a + b)::numeric(10,2) FROM t");
         assert_eq!(target_type.as_str(), "numeric(10,2)");
-        assert!(matches!(expr, ColumnExpr::Arithmetic(_)));
+        assert!(matches!(expr, ScalarExpr::Arithmetic(_)));
     }
 
     #[test]
     fn test_type_cast_qualified_column() {
         let (expr, target_type) = parse_first_typecast("SELECT t.col::int FROM t");
         assert_eq!(target_type.as_str(), "int4");
-        let ColumnExpr::Column(col) = expr else {
+        let ScalarExpr::Column(col) = expr else {
             panic!("expected column");
         };
         assert_eq!(col.table.as_deref(), Some("t"));
@@ -3527,7 +3560,7 @@ mod tests {
     fn test_type_cast_literal_date_still_parses() {
         let (expr, target_type) = parse_first_typecast("SELECT '2024-01-01'::DATE FROM t");
         assert_eq!(target_type.as_str(), "date");
-        assert!(matches!(expr, ColumnExpr::Literal(LiteralValue::String(_))));
+        assert!(matches!(expr, ScalarExpr::Literal(LiteralValue::String(_))));
     }
 
     #[test]
@@ -3553,8 +3586,11 @@ mod tests {
         let SelectColumns::Columns(columns) = &select.columns else {
             panic!("expected columns");
         };
-        assert_eq!(columns[0].alias.as_deref(), Some("n"));
-        assert!(matches!(&columns[0].expr, ColumnExpr::TypeCast { .. }));
+        assert_eq!(columns[0].alias().cloned().as_deref(), Some("n"));
+        assert!(matches!(
+            &columns[0].expr().expect("non-star SELECT column"),
+            ScalarExpr::TypeCast { .. }
+        ));
     }
 
     // ========================================================================
@@ -3588,7 +3624,7 @@ mod tests {
             panic!("Expected Columns");
         };
         assert_eq!(cols.len(), 1);
-        assert!(matches!(&cols[0].expr, ColumnExpr::Star(None)));
+        assert!(matches!(&cols[0], SelectColumn::Star(None)));
     }
 
     #[test]
@@ -3601,8 +3637,10 @@ mod tests {
             panic!("Expected Columns");
         };
         assert_eq!(cols.len(), 2);
-        assert!(matches!(&cols[0].expr, ColumnExpr::Star(None)));
-        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "col"));
+        assert!(matches!(&cols[0], SelectColumn::Star(None)));
+        assert!(
+            matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "col")
+        );
     }
 
     #[test]
@@ -3615,9 +3653,9 @@ mod tests {
             panic!("Expected Columns");
         };
         assert_eq!(cols.len(), 2);
-        assert!(matches!(&cols[0].expr, ColumnExpr::Star(Some(t)) if t == "t1"));
+        assert!(matches!(&cols[0], SelectColumn::Star(Some(t)) if t == "t1"));
         assert!(
-            matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "col" && c.table.as_deref() == Some("t2"))
+            matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "col" && c.table.as_deref() == Some("t2"))
         );
     }
 

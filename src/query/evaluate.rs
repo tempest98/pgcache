@@ -1,7 +1,9 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
-use crate::query::resolved::{ResolvedBinaryExpr, ResolvedColumnNode, ResolvedWhereExpr};
+use crate::query::resolved::{
+    ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedWhereExpr,
+};
 
 /// Recursively evaluate a resolved WHERE expression against a single row.
 ///
@@ -55,8 +57,14 @@ fn expr_comparison_evaluate(
 ) -> bool {
     // Extract column and value from the comparison expression
     let (column_ref, value) = match (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()) {
-        (ResolvedWhereExpr::Column(col), ResolvedWhereExpr::Value(val)) => (col, val),
-        (ResolvedWhereExpr::Value(val), ResolvedWhereExpr::Column(col)) => (col, val),
+        (
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(val)),
+        ) => (col, val),
+        (
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(val)),
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
+        ) => (col, val),
         _ => return false, // Should not happen if is_cacheable_expr works correctly
     };
 
@@ -85,7 +93,7 @@ fn unary_expr_evaluate(
     row_data: &[Option<String>],
     table_name: &str,
 ) -> bool {
-    let value = if let ResolvedWhereExpr::Column(col) = expr {
+    let value = if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = expr {
         column_value_get(col, row_data, table_name)
     } else {
         None
@@ -240,7 +248,10 @@ pub fn where_value_compare_string(
 /// see `UpdateEvalStrategy`.
 pub fn resolved_where_expr_supported(expr: &ResolvedWhereExpr) -> bool {
     match expr {
-        ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => true,
+        ResolvedWhereExpr::Scalar(scalar) => matches!(
+            scalar,
+            ResolvedScalarExpr::Column(_) | ResolvedScalarExpr::Literal(_)
+        ),
         ResolvedWhereExpr::Binary(binary) => match binary.op {
             BinaryOp::And | BinaryOp::Or => {
                 resolved_where_expr_supported(&binary.lexpr)
@@ -255,10 +266,7 @@ pub fn resolved_where_expr_supported(expr: &ResolvedWhereExpr) -> bool {
             BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => false,
         },
         ResolvedWhereExpr::Unary(unary) => resolved_where_expr_supported(&unary.expr),
-        ResolvedWhereExpr::Multi(_)
-        | ResolvedWhereExpr::Array(_)
-        | ResolvedWhereExpr::Function { .. }
-        | ResolvedWhereExpr::Subquery { .. } => false,
+        ResolvedWhereExpr::Multi(_) | ResolvedWhereExpr::Subquery { .. } => false,
     }
 }
 
@@ -266,8 +274,13 @@ pub fn resolved_where_expr_supported(expr: &ResolvedWhereExpr) -> bool {
 pub fn is_simple_comparison(binary_expr: &ResolvedBinaryExpr) -> bool {
     matches!(
         (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()),
-        (ResolvedWhereExpr::Column(_), ResolvedWhereExpr::Value(_))
-            | (ResolvedWhereExpr::Value(_), ResolvedWhereExpr::Column(_))
+        (
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(_)),
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(_)),
+        ) | (
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(_)),
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(_)),
+        )
     )
 }
 
@@ -278,8 +291,8 @@ mod tests {
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, SubLinkType, UnaryOp};
     use crate::query::resolved::{
-        ResolvedMultiExpr, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectNode,
-        ResolvedUnaryExpr,
+        ResolvedFunctionCall, ResolvedMultiExpr, ResolvedQueryBody, ResolvedQueryExpr,
+        ResolvedSelectNode, ResolvedUnaryExpr,
     };
     use ecow::EcoString;
     use ordered_float::NotNan;
@@ -342,11 +355,11 @@ mod tests {
     }
 
     fn col_expr(table: &TableMetadata, column: &str) -> ResolvedWhereExpr {
-        ResolvedWhereExpr::Column(resolved_column(table, column))
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(resolved_column(table, column)))
     }
 
     fn val_expr(v: LiteralValue) -> ResolvedWhereExpr {
-        ResolvedWhereExpr::Value(v)
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(v))
     }
 
     fn binary(
@@ -798,11 +811,15 @@ mod tests {
             Some("true".to_owned()),
         ];
 
-        let expr = ResolvedWhereExpr::Function {
+        let expr = ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Function(ResolvedFunctionCall {
             name: EcoString::from("upper"),
             args: vec![],
             agg_star: false,
-        };
+            agg_distinct: false,
+            agg_order: vec![],
+            agg_filter: None,
+            over: None,
+        }));
 
         assert!(!where_expr_evaluate(&expr, &row_data, table.name.as_str()));
     }
@@ -1274,7 +1291,7 @@ mod tests {
 
         let expr = binary_expr(
             BinaryOp::Equal,
-            ResolvedWhereExpr::Column(other_col),
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(other_col)),
             val_expr(LiteralValue::Integer(1)),
         );
 
@@ -1377,11 +1394,15 @@ mod tests {
 
     #[test]
     fn unsupported_function() {
-        let expr = ResolvedWhereExpr::Function {
+        let expr = ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Function(ResolvedFunctionCall {
             name: EcoString::from("upper"),
             args: vec![],
             agg_star: false,
-        };
+            agg_distinct: false,
+            agg_order: vec![],
+            agg_filter: None,
+            over: None,
+        }));
         assert!(!resolved_where_expr_supported(&expr));
     }
 
@@ -1431,7 +1452,10 @@ mod tests {
         let mut other_col = resolved_column(&table, "id");
         other_col.table = "other_table".into();
 
-        let expr = unary_expr(UnaryOp::IsNull, ResolvedWhereExpr::Column(other_col));
+        let expr = unary_expr(
+            UnaryOp::IsNull,
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(other_col)),
+        );
 
         let row_data = vec![
             Some("1".to_owned()),

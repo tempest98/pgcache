@@ -5,7 +5,7 @@ use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
 use crate::query::ast::{LiteralValue, TableAlias, ValuesClause};
 use crate::query::resolved::{
-    ResolvedColumnExpr, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns,
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
     ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr,
 };
 
@@ -123,7 +123,7 @@ fn resolved_select_node_column_alias_update(
 ) {
     // Update WHERE clause columns
     if let Some(where_clause) = &mut resolved.where_clause {
-        resolved_where_column_alias_update(where_clause, schema, table, alias);
+        resolved_where_expr_alias_update(where_clause, schema, table, alias);
     }
     // Update SELECT columns
     resolved_select_columns_alias_update(&mut resolved.columns, schema, table, alias);
@@ -140,7 +140,7 @@ fn resolved_query_expr_column_alias_update(
         ResolvedQueryBody::Select(select_node) => {
             // Update WHERE clause columns
             if let Some(where_clause) = &mut select_node.where_clause {
-                resolved_where_column_alias_update(where_clause, schema, table, alias);
+                resolved_where_expr_alias_update(where_clause, schema, table, alias);
             }
             // Update SELECT columns
             resolved_select_columns_alias_update(&mut select_node.columns, schema, table, alias);
@@ -155,42 +155,30 @@ fn resolved_query_expr_column_alias_update(
     }
     // Update ORDER BY columns at query level
     for order_by in &mut query.order_by {
-        resolved_column_expr_alias_update(&mut order_by.expr, schema, table, alias);
+        resolved_scalar_expr_alias_update(&mut order_by.expr, schema, table, alias);
     }
 }
 
-fn resolved_where_column_alias_update(
+fn resolved_where_expr_alias_update(
     expr: &mut ResolvedWhereExpr,
     schema: &str,
     table: &str,
     alias: &str,
 ) {
     match expr {
-        ResolvedWhereExpr::Column(col) => {
-            if col.schema == schema && col.table == table {
-                col.table_alias = Some(EcoString::from(alias));
-            }
+        ResolvedWhereExpr::Scalar(scalar) => {
+            resolved_scalar_expr_alias_update(scalar, schema, table, alias);
         }
         ResolvedWhereExpr::Unary(unary) => {
-            resolved_where_column_alias_update(&mut unary.expr, schema, table, alias);
+            resolved_where_expr_alias_update(&mut unary.expr, schema, table, alias);
         }
         ResolvedWhereExpr::Binary(binary) => {
-            resolved_where_column_alias_update(&mut binary.lexpr, schema, table, alias);
-            resolved_where_column_alias_update(&mut binary.rexpr, schema, table, alias);
+            resolved_where_expr_alias_update(&mut binary.lexpr, schema, table, alias);
+            resolved_where_expr_alias_update(&mut binary.rexpr, schema, table, alias);
         }
         ResolvedWhereExpr::Multi(multi) => {
             for e in &mut multi.exprs {
-                resolved_where_column_alias_update(e, schema, table, alias);
-            }
-        }
-        ResolvedWhereExpr::Array(elems) => {
-            for elem in elems {
-                resolved_where_column_alias_update(elem, schema, table, alias);
-            }
-        }
-        ResolvedWhereExpr::Function { args, .. } => {
-            for arg in args {
-                resolved_where_column_alias_update(arg, schema, table, alias);
+                resolved_where_expr_alias_update(e, schema, table, alias);
             }
         }
         ResolvedWhereExpr::Subquery {
@@ -198,10 +186,9 @@ fn resolved_where_column_alias_update(
         } => {
             resolved_query_expr_column_alias_update(query, schema, table, alias);
             if let Some(test) = test_expr {
-                resolved_where_column_alias_update(test, schema, table, alias);
+                resolved_scalar_expr_alias_update(test, schema, table, alias);
             }
         }
-        ResolvedWhereExpr::Value(_) => {}
     }
 }
 
@@ -214,67 +201,72 @@ fn resolved_select_columns_alias_update(
     match columns {
         ResolvedSelectColumns::Columns(cols) => {
             for col in cols {
-                resolved_column_expr_alias_update(&mut col.expr, schema, table, alias);
+                resolved_scalar_expr_alias_update(&mut col.expr, schema, table, alias);
             }
         }
         ResolvedSelectColumns::None => {}
     }
 }
 
-fn resolved_column_expr_alias_update(
-    expr: &mut ResolvedColumnExpr,
+fn resolved_scalar_expr_alias_update(
+    expr: &mut ResolvedScalarExpr,
     schema: &str,
     table: &str,
     alias: &str,
 ) {
     match expr {
-        ResolvedColumnExpr::Column(col) => {
+        ResolvedScalarExpr::Column(col) => {
             if col.schema == schema && col.table == table {
                 col.table_alias = Some(EcoString::from(alias));
             }
         }
-        ResolvedColumnExpr::Function(func) => {
+        ResolvedScalarExpr::Function(func) => {
             for arg in &mut func.args {
-                resolved_column_expr_alias_update(arg, schema, table, alias);
+                resolved_scalar_expr_alias_update(arg, schema, table, alias);
             }
             for clause in &mut func.agg_order {
-                resolved_column_expr_alias_update(&mut clause.expr, schema, table, alias);
+                resolved_scalar_expr_alias_update(&mut clause.expr, schema, table, alias);
             }
             if let Some(filter) = &mut func.agg_filter {
-                resolved_where_column_alias_update(filter, schema, table, alias);
+                resolved_where_expr_alias_update(filter, schema, table, alias);
             }
             if let Some(window_spec) = &mut func.over {
                 for col in &mut window_spec.partition_by {
-                    resolved_column_expr_alias_update(col, schema, table, alias);
+                    resolved_scalar_expr_alias_update(col, schema, table, alias);
                 }
                 for clause in &mut window_spec.order_by {
-                    resolved_column_expr_alias_update(&mut clause.expr, schema, table, alias);
+                    resolved_scalar_expr_alias_update(&mut clause.expr, schema, table, alias);
                 }
             }
         }
-        ResolvedColumnExpr::Case(case) => {
+        ResolvedScalarExpr::Case(case) => {
             if let Some(arg) = &mut case.arg {
-                resolved_column_expr_alias_update(arg, schema, table, alias);
+                resolved_scalar_expr_alias_update(arg, schema, table, alias);
             }
             for when in &mut case.whens {
-                resolved_where_column_alias_update(&mut when.condition, schema, table, alias);
-                resolved_column_expr_alias_update(&mut when.result, schema, table, alias);
+                resolved_where_expr_alias_update(&mut when.condition, schema, table, alias);
+                resolved_scalar_expr_alias_update(&mut when.result, schema, table, alias);
             }
             if let Some(default) = &mut case.default {
-                resolved_column_expr_alias_update(default, schema, table, alias);
+                resolved_scalar_expr_alias_update(default, schema, table, alias);
             }
         }
-        ResolvedColumnExpr::Arithmetic(arith) => {
-            resolved_column_expr_alias_update(&mut arith.left, schema, table, alias);
-            resolved_column_expr_alias_update(&mut arith.right, schema, table, alias);
+        ResolvedScalarExpr::Arithmetic(arith) => {
+            resolved_scalar_expr_alias_update(&mut arith.left, schema, table, alias);
+            resolved_scalar_expr_alias_update(&mut arith.right, schema, table, alias);
         }
-        ResolvedColumnExpr::Subquery(query, _) => {
+        ResolvedScalarExpr::Subquery(query, _) => {
             resolved_query_expr_column_alias_update(query, schema, table, alias);
         }
-        ResolvedColumnExpr::TypeCast { expr, .. } => {
-            resolved_column_expr_alias_update(expr, schema, table, alias);
+        ResolvedScalarExpr::Array(elems) => {
+            for elem in elems {
+                resolved_scalar_expr_alias_update(elem, schema, table, alias);
+            }
         }
-        ResolvedColumnExpr::Identifier(_) | ResolvedColumnExpr::Literal(_) => {}
+        ResolvedScalarExpr::TypeCast { expr, .. } => {
+            resolved_scalar_expr_alias_update(expr, schema, table, alias);
+        }
+        ResolvedScalarExpr::Identifier(_) | ResolvedScalarExpr::Literal(_) => {}
     }
 }
 
@@ -491,10 +483,12 @@ mod tests {
         let id_meta = column_metadata("id", 1, "int4");
         let where_clause = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(ResolvedWhereExpr::Column(resolved_column(
-                "users", "id", id_meta,
+            lexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
+                resolved_column("users", "id", id_meta),
             ))),
-            rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(42))),
+            rexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(
+                LiteralValue::Integer(42),
+            ))),
         });
 
         let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
@@ -522,7 +516,7 @@ mod tests {
     fn test_select_column_alias_updated() {
         let id_meta = column_metadata("id", 1, "int4");
         let columns = ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
-            expr: ResolvedColumnExpr::Column(resolved_column("users", "id", id_meta)),
+            expr: ResolvedScalarExpr::Column(resolved_column("users", "id", id_meta)),
             alias: None,
         }]);
 

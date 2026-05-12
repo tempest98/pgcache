@@ -720,7 +720,7 @@ mod tests {
         let ast = pg_query::parse(sql).expect("parse SQL");
         let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
         match query_expr.body {
-            QueryBody::Select(node) => node,
+            QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),
         }
     }

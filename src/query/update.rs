@@ -1,7 +1,7 @@
 use crate::cache::{UpdateQuerySource, query::outer_join_optional_tables};
 use crate::query::ast::LiteralValue;
 use crate::query::resolved::{
-    ResolvedColumnExpr, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumn,
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
     ResolvedSelectColumns, ResolvedTableNode,
 };
 use crate::query::transform::resolved_select_node_update_replace;
@@ -22,7 +22,7 @@ pub fn query_table_update_queries(
     let mut result = Vec::new();
 
     let select_true = ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
-        expr: ResolvedColumnExpr::Literal(LiteralValue::Boolean(true)),
+        expr: ResolvedScalarExpr::Literal(LiteralValue::Boolean(true)),
         alias: None,
     }]);
 

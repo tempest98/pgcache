@@ -194,12 +194,9 @@ fn join_condition_is_valid(expr: &WhereExpr) -> bool {
             | BinaryOp::NotLike
             | BinaryOp::NotILike => false,
         },
-        WhereExpr::Value(_)
-        | WhereExpr::Column(_)
+        WhereExpr::Scalar(_)
         | WhereExpr::Unary(_)
         | WhereExpr::Multi(_)
-        | WhereExpr::Array(_)
-        | WhereExpr::Function { .. }
         | WhereExpr::Subquery { .. } => false,
     }
 }
@@ -294,41 +291,23 @@ fn is_cacheable_expr(
                 is_cacheable_expr(&binary_expr.rexpr, ctx, fv)
             }
         },
-        WhereExpr::Value(_) => Ok(()),
-        WhereExpr::Column(_) => Ok(()),
+        WhereExpr::Scalar(scalar) => is_cacheable_scalar_expr(scalar, ctx, fv),
         WhereExpr::Multi(multi_expr) => match multi_expr.op {
             MultiOp::In
             | MultiOp::NotIn
             | MultiOp::Between
             | MultiOp::NotBetween
             | MultiOp::BetweenSymmetric
-            | MultiOp::NotBetweenSymmetric => {
-                for e in &multi_expr.exprs {
-                    is_cacheable_expr(e, ctx, fv)?;
-                }
-                Ok(())
-            }
-            MultiOp::Any { .. } | MultiOp::All { .. } => {
+            | MultiOp::NotBetweenSymmetric
+            | MultiOp::Any { .. }
+            | MultiOp::All { .. } => {
                 for e in &multi_expr.exprs {
                     is_cacheable_expr(e, ctx, fv)?;
                 }
                 Ok(())
             }
         },
-        WhereExpr::Array(elems) => elems.iter().try_for_each(|e| is_cacheable_expr(e, ctx, fv)),
         WhereExpr::Unary(unary_expr) => is_cacheable_expr(&unary_expr.expr, ctx, fv),
-        WhereExpr::Function { name, args, .. } => {
-            let is_immutable = matches!(
-                fv.get(name.to_lowercase().as_str()),
-                Some(FunctionVolatility::Immutable)
-            );
-            if is_immutable || matches!(ctx, ExprContext::SelectList) {
-                args.iter()
-                    .try_for_each(|arg| is_cacheable_expr(arg, ctx, fv))
-            } else {
-                Err(CacheabilityError::NonImmutableFunction)
-            }
-        }
         WhereExpr::Subquery {
             query,
             sublink_type,
@@ -339,7 +318,7 @@ fn is_cacheable_expr(
 
             // Check test_expr (left-hand side for IN/ANY/ALL) is cacheable
             if let Some(test) = test_expr {
-                is_cacheable_expr(test, ctx, fv)?;
+                is_cacheable_scalar_expr(test, ctx, fv)?;
             }
 
             // All supported sublink types are cacheable if inner query is cacheable
@@ -370,13 +349,15 @@ fn is_cacheable_select_list(
     ctx: ExprContext,
     fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
-    use crate::query::ast::SelectColumns;
+    use crate::query::ast::{SelectColumn, SelectColumns};
 
     match &select.columns {
         SelectColumns::None => Ok(()),
         SelectColumns::Columns(cols) => {
             for col in cols {
-                is_cacheable_column_expr(&col.expr, ctx, fv)?;
+                if let SelectColumn::Expr { expr, .. } = col {
+                    is_cacheable_scalar_expr(expr, ctx, fv)?;
+                }
             }
             Ok(())
         }
@@ -384,19 +365,25 @@ fn is_cacheable_select_list(
 }
 
 /// Check if a column expression is cacheable.
-fn is_cacheable_column_expr(
-    expr: &crate::query::ast::ColumnExpr,
+fn is_cacheable_scalar_expr(
+    expr: &crate::query::ast::ScalarExpr,
     ctx: ExprContext,
     fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
-    use crate::query::ast::ColumnExpr;
+    use crate::query::ast::ScalarExpr;
 
     match expr {
-        ColumnExpr::Column(_) | ColumnExpr::Star(_) | ColumnExpr::Literal(_) => Ok(()),
-        ColumnExpr::Function(func) => {
-            // Recursively check function arguments
+        ScalarExpr::Column(_) | ScalarExpr::Literal(_) => Ok(()),
+        ScalarExpr::Function(func) => {
+            let is_immutable = matches!(
+                fv.get(func.name.to_lowercase().as_str()),
+                Some(FunctionVolatility::Immutable)
+            );
+            if !is_immutable && !matches!(ctx, ExprContext::SelectList) {
+                return Err(CacheabilityError::NonImmutableFunction);
+            }
             for arg in &func.args {
-                is_cacheable_column_expr(arg, ctx, fv)?;
+                is_cacheable_scalar_expr(arg, ctx, fv)?;
             }
             // FILTER predicates run per input row, so use WhereClause context
             // to reject volatile functions inside FILTER.
@@ -405,33 +392,30 @@ fn is_cacheable_column_expr(
             }
             Ok(())
         }
-        ColumnExpr::Case(case) => {
-            // Check case argument if present
+        ScalarExpr::Case(case) => {
             if let Some(arg) = &case.arg {
-                is_cacheable_column_expr(arg, ctx, fv)?;
+                is_cacheable_scalar_expr(arg, ctx, fv)?;
             }
-            // Check when conditions and results
             for when in &case.whens {
                 is_cacheable_expr(&when.condition, ctx, fv)?;
-                is_cacheable_column_expr(&when.result, ctx, fv)?;
+                is_cacheable_scalar_expr(&when.result, ctx, fv)?;
             }
-            // Check default
             if let Some(default) = &case.default {
-                is_cacheable_column_expr(default, ctx, fv)?;
+                is_cacheable_scalar_expr(default, ctx, fv)?;
             }
             Ok(())
         }
-        ColumnExpr::Arithmetic(arith) => {
-            is_cacheable_column_expr(&arith.left, ctx, fv)?;
-            is_cacheable_column_expr(&arith.right, ctx, fv)
+        ScalarExpr::Arithmetic(arith) => {
+            is_cacheable_scalar_expr(&arith.left, ctx, fv)?;
+            is_cacheable_scalar_expr(&arith.right, ctx, fv)
         }
-        ColumnExpr::Subquery(query) => {
-            // Scalar subquery in SELECT list - check inner query
-            is_cacheable_subquery_inner(query, fv)
-        }
-        ColumnExpr::TypeCast { expr, .. } => {
+        ScalarExpr::Subquery(query) => is_cacheable_subquery_inner(query, fv),
+        ScalarExpr::Array(elems) => elems
+            .iter()
+            .try_for_each(|e| is_cacheable_scalar_expr(e, ctx, fv)),
+        ScalarExpr::TypeCast { expr, .. } => {
             // Type cast is pure coercion — defer to the wrapped expression.
-            is_cacheable_column_expr(expr, ctx, fv)
+            is_cacheable_scalar_expr(expr, ctx, fv)
         }
     }
 }

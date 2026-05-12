@@ -12,7 +12,7 @@ use std::fmt::Write;
 
 use crate::query::ast::{Deparse, LimitClause, OrderDirection, SetOpType};
 use crate::query::resolved::{
-    ResolvedColumnExpr, ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr,
+    ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
     ResolvedSelectColumns, ResolvedSelectNode,
 };
 
@@ -217,17 +217,18 @@ fn order_by_serve_viable(resolved: &ResolvedQueryExpr) -> bool {
                 return false;
             };
             resolved.order_by.iter().all(|o| match &o.expr {
-                ResolvedColumnExpr::Identifier(name) => leftmost
+                ResolvedScalarExpr::Identifier(name) => leftmost
                     .columns
                     .position_by_output_name(name.as_str())
                     .is_some(),
-                ResolvedColumnExpr::Column(_)
-                | ResolvedColumnExpr::Function(_)
-                | ResolvedColumnExpr::Literal(_)
-                | ResolvedColumnExpr::Case(_)
-                | ResolvedColumnExpr::Arithmetic(_)
-                | ResolvedColumnExpr::Subquery(_, _)
-                | ResolvedColumnExpr::TypeCast { .. } => false,
+                ResolvedScalarExpr::Column(_)
+                | ResolvedScalarExpr::Function(_)
+                | ResolvedScalarExpr::Literal(_)
+                | ResolvedScalarExpr::Case(_)
+                | ResolvedScalarExpr::Arithmetic(_)
+                | ResolvedScalarExpr::Subquery(_, _)
+                | ResolvedScalarExpr::Array(_)
+                | ResolvedScalarExpr::TypeCast { .. } => false,
             })
         }
         ResolvedQueryBody::Values(_) => false,
@@ -280,7 +281,7 @@ pub fn shape_classify(
         }
 
         ResolvedQueryBody::Select(select) => {
-            if columns_any(&select.columns, &column_expr_has_window) {
+            if columns_any(&select.columns, &scalar_expr_has_window) {
                 // Window function → Materialize unconditionally (expensive on
                 // pure compute grounds, even when result cardinality matches
                 // source cardinality).
@@ -315,7 +316,7 @@ pub fn shape_classify(
 /// `pred`. Does not descend into subqueries.
 fn columns_any<P>(columns: &ResolvedSelectColumns, pred: &P) -> bool
 where
-    P: Fn(&ResolvedColumnExpr) -> bool,
+    P: Fn(&ResolvedScalarExpr) -> bool,
 {
     match columns {
         ResolvedSelectColumns::None => false,
@@ -326,27 +327,28 @@ where
 /// True if the expression contains a window function (any `FuncCall` with an
 /// `OVER (...)` clause). Descends through Function args, CASE branches, and
 /// Arithmetic operands, but not into scalar subqueries.
-fn column_expr_has_window(expr: &ResolvedColumnExpr) -> bool {
+fn scalar_expr_has_window(expr: &ResolvedScalarExpr) -> bool {
     match expr {
-        ResolvedColumnExpr::Function(func) => {
-            func.over.is_some() || func.args.iter().any(column_expr_has_window)
+        ResolvedScalarExpr::Function(func) => {
+            func.over.is_some() || func.args.iter().any(scalar_expr_has_window)
         }
-        ResolvedColumnExpr::Case(case) => {
-            case.arg.as_ref().is_some_and(|a| column_expr_has_window(a))
-                || case.whens.iter().any(|w| column_expr_has_window(&w.result))
+        ResolvedScalarExpr::Case(case) => {
+            case.arg.as_ref().is_some_and(|a| scalar_expr_has_window(a))
+                || case.whens.iter().any(|w| scalar_expr_has_window(&w.result))
                 || case
                     .default
                     .as_ref()
-                    .is_some_and(|d| column_expr_has_window(d))
+                    .is_some_and(|d| scalar_expr_has_window(d))
         }
-        ResolvedColumnExpr::Arithmetic(a) => {
-            column_expr_has_window(&a.left) || column_expr_has_window(&a.right)
+        ResolvedScalarExpr::Arithmetic(a) => {
+            scalar_expr_has_window(&a.left) || scalar_expr_has_window(&a.right)
         }
-        ResolvedColumnExpr::TypeCast { expr, .. } => column_expr_has_window(expr),
-        ResolvedColumnExpr::Column(_)
-        | ResolvedColumnExpr::Identifier(_)
-        | ResolvedColumnExpr::Literal(_)
-        | ResolvedColumnExpr::Subquery(_, _) => false,
+        ResolvedScalarExpr::Array(elems) => elems.iter().any(scalar_expr_has_window),
+        ResolvedScalarExpr::TypeCast { expr, .. } => scalar_expr_has_window(expr),
+        ResolvedScalarExpr::Column(_)
+        | ResolvedScalarExpr::Identifier(_)
+        | ResolvedScalarExpr::Literal(_)
+        | ResolvedScalarExpr::Subquery(_, _) => false,
     }
 }
 

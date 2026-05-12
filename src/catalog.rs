@@ -13,9 +13,9 @@ use tokio_postgres::{Client, Error};
 
 use crate::cache::CacheError;
 
-use crate::query::ast::{ColumnExpr, ColumnNode, SelectColumn, SelectColumns, TableAlias};
+use crate::query::ast::{ColumnNode, ScalarExpr, SelectColumn, SelectColumns, TableAlias};
 use crate::query::resolved::{
-    ResolvedColumnExpr, ResolvedColumnNode, ResolvedSelectColumn, ResolvedSelectColumns,
+    ResolvedColumnNode, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
 };
 
 /// Column storage: sorted by position with O(1) name lookups.
@@ -125,8 +125,8 @@ impl TableMetadata {
         let columns = self
             .columns
             .iter()
-            .map(|c| SelectColumn {
-                expr: ColumnExpr::Column(ColumnNode {
+            .map(|c| SelectColumn::Expr {
+                expr: ScalarExpr::Column(ColumnNode {
                     table: if let Some(alias) = alias {
                         Some(alias.name.clone())
                     } else {
@@ -159,7 +159,7 @@ impl TableMetadata {
             .columns
             .iter()
             .map(|c| ResolvedSelectColumn {
-                expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
+                expr: ResolvedScalarExpr::Column(ResolvedColumnNode {
                     schema: self.schema.clone(),
                     table: self.name.clone(),
                     table_alias: table_alias.map(EcoString::from),

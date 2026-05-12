@@ -6,14 +6,15 @@ use tokio_postgres::types::Type;
 use crate::cache::SubqueryKind;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::query::ast::{
-    ColumnExpr, ColumnNode, LimitClause, LiteralValue, OrderByClause, QueryBody, QueryExpr,
-    SelectColumns, SelectNode, TableAlias, TableNode, TableSource, WhereExpr, WindowSpec,
+    ColumnNode, LimitClause, LiteralValue, OrderByClause, QueryBody, QueryExpr, ScalarExpr,
+    SelectColumn, SelectColumns, SelectNode, TableAlias, TableNode, TableSource, WhereExpr,
+    WindowSpec,
 };
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr,
-    ResolvedCaseWhen, ResolvedColumnExpr, ResolvedColumnNode, ResolvedFunctionCall,
-    ResolvedJoinNode, ResolvedLimitClause, ResolvedMultiExpr, ResolvedOrderByClause,
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumn, ResolvedSelectColumns,
+    ResolvedCaseWhen, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
+    ResolvedLimitClause, ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody,
+    ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
     ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource,
     ResolvedTableSubqueryNode, ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowSpec,
 };
@@ -216,14 +217,15 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                 // Use column metadata from the source column if available,
                 // otherwise create a synthetic entry with TEXT type
                 let base_meta = match &col.expr {
-                    ResolvedColumnExpr::Column(c) => c.column_metadata.clone(),
-                    ResolvedColumnExpr::Identifier(_)
-                    | ResolvedColumnExpr::Function(_)
-                    | ResolvedColumnExpr::Literal(_)
-                    | ResolvedColumnExpr::Case(_)
-                    | ResolvedColumnExpr::Arithmetic(_)
-                    | ResolvedColumnExpr::Subquery(..)
-                    | ResolvedColumnExpr::TypeCast { .. } => ColumnMetadata {
+                    ResolvedScalarExpr::Column(c) => c.column_metadata.clone(),
+                    ResolvedScalarExpr::Identifier(_)
+                    | ResolvedScalarExpr::Function(_)
+                    | ResolvedScalarExpr::Literal(_)
+                    | ResolvedScalarExpr::Case(_)
+                    | ResolvedScalarExpr::Arithmetic(_)
+                    | ResolvedScalarExpr::Subquery(..)
+                    | ResolvedScalarExpr::Array(_)
+                    | ResolvedScalarExpr::TypeCast { .. } => ColumnMetadata {
                         name: name.clone(),
                         position: i16::try_from(i + 1).expect("column position fits in i16"),
                         type_oid: 25, // TEXT OID
@@ -381,10 +383,9 @@ fn where_expr_resolve(
     scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ResolvedWhereExpr> {
     match expr {
-        WhereExpr::Value(lit) => Ok(ResolvedWhereExpr::Value(lit.clone())),
-        WhereExpr::Column(col) => {
-            let resolved = column_resolve(col, scope)?;
-            Ok(ResolvedWhereExpr::Column(resolved))
+        WhereExpr::Scalar(scalar) => {
+            let resolved = scalar_expr_resolve(scalar, scope)?;
+            Ok(ResolvedWhereExpr::Scalar(resolved))
         }
         WhereExpr::Unary(unary) => {
             let resolved_expr = where_expr_resolve(&unary.expr, scope)?;
@@ -412,28 +413,6 @@ fn where_expr_resolve(
                 exprs: resolved_exprs,
             }))
         }
-        WhereExpr::Array(elems) => {
-            let mut resolved_elems = Vec::with_capacity(elems.len());
-            for e in elems {
-                resolved_elems.push(where_expr_resolve(e, scope)?);
-            }
-            Ok(ResolvedWhereExpr::Array(resolved_elems))
-        }
-        WhereExpr::Function {
-            name,
-            args,
-            agg_star,
-        } => {
-            let mut resolved_args = Vec::with_capacity(args.len());
-            for arg in args {
-                resolved_args.push(where_expr_resolve(arg, scope)?);
-            }
-            Ok(ResolvedWhereExpr::Function {
-                name: name.as_str().into(),
-                args: resolved_args,
-                agg_star: *agg_star,
-            })
-        }
         WhereExpr::Subquery {
             query,
             sublink_type,
@@ -441,7 +420,7 @@ fn where_expr_resolve(
         } => {
             // Resolve the test expression (left-hand side for IN/ANY/ALL) in the outer scope
             let resolved_test = match test_expr {
-                Some(e) => Some(Box::new(where_expr_resolve(e, scope)?)),
+                Some(e) => Some(Box::new(scalar_expr_resolve(e, scope)?)),
                 None => None,
             };
 
@@ -558,21 +537,20 @@ fn table_source_resolve<'a>(
 }
 
 /// Resolve a column expression in SELECT list
-fn column_expr_resolve(
-    expr: &ColumnExpr,
+fn scalar_expr_resolve(
+    expr: &ScalarExpr,
     scope: &mut ResolutionScope<'_>,
-) -> ResolveResult<ResolvedColumnExpr> {
+) -> ResolveResult<ResolvedScalarExpr> {
     match expr {
-        ColumnExpr::Star(_) => unreachable!("Star expanded in select_columns_resolve"),
-        ColumnExpr::Column(col) => {
+        ScalarExpr::Column(col) => {
             let resolved = column_resolve(col, scope)?;
-            Ok(ResolvedColumnExpr::Column(resolved))
+            Ok(ResolvedScalarExpr::Column(resolved))
         }
-        ColumnExpr::Literal(lit) => Ok(ResolvedColumnExpr::Literal(lit.clone())),
-        ColumnExpr::Function(func) => {
+        ScalarExpr::Literal(lit) => Ok(ResolvedScalarExpr::Literal(lit.clone())),
+        ScalarExpr::Function(func) => {
             let mut resolved_args = Vec::with_capacity(func.args.len());
             for arg in &func.args {
-                resolved_args.push(column_expr_resolve(arg, scope)?);
+                resolved_args.push(scalar_expr_resolve(arg, scope)?);
             }
             // Aggregate ORDER BY (e.g. `string_agg(x, ',' ORDER BY y)`) has no
             // access to SELECT-list aliases — it's evaluated per row within the
@@ -586,7 +564,7 @@ fn column_expr_resolve(
                 Some(w) => Some(window_spec_resolve(w, scope)?),
                 None => None,
             };
-            Ok(ResolvedColumnExpr::Function(ResolvedFunctionCall {
+            Ok(ResolvedScalarExpr::Function(ResolvedFunctionCall {
                 name: func.name.as_str().into(),
                 args: resolved_args,
                 agg_star: func.agg_star,
@@ -596,47 +574,54 @@ fn column_expr_resolve(
                 over: resolved_over,
             }))
         }
-        ColumnExpr::Case(case) => {
+        ScalarExpr::Case(case) => {
             let arg = match &case.arg {
-                Some(a) => Some(Box::new(column_expr_resolve(a, scope)?)),
+                Some(a) => Some(Box::new(scalar_expr_resolve(a, scope)?)),
                 None => None,
             };
             let mut whens = Vec::with_capacity(case.whens.len());
             for w in &case.whens {
                 let condition = where_expr_resolve(&w.condition, scope)?;
-                let result = column_expr_resolve(&w.result, scope)?;
+                let result = scalar_expr_resolve(&w.result, scope)?;
                 whens.push(ResolvedCaseWhen { condition, result });
             }
             let default = match &case.default {
-                Some(d) => Some(Box::new(column_expr_resolve(d, scope)?)),
+                Some(d) => Some(Box::new(scalar_expr_resolve(d, scope)?)),
                 None => None,
             };
-            Ok(ResolvedColumnExpr::Case(ResolvedCaseExpr {
+            Ok(ResolvedScalarExpr::Case(ResolvedCaseExpr {
                 arg,
                 whens,
                 default,
             }))
         }
-        ColumnExpr::Arithmetic(arith) => {
-            let left = column_expr_resolve(&arith.left, scope)?;
-            let right = column_expr_resolve(&arith.right, scope)?;
-            Ok(ResolvedColumnExpr::Arithmetic(ResolvedArithmeticExpr {
+        ScalarExpr::Arithmetic(arith) => {
+            let left = scalar_expr_resolve(&arith.left, scope)?;
+            let right = scalar_expr_resolve(&arith.right, scope)?;
+            Ok(ResolvedScalarExpr::Arithmetic(ResolvedArithmeticExpr {
                 left: Box::new(left),
                 op: arith.op,
                 right: Box::new(right),
             }))
         }
-        ColumnExpr::Subquery(query) => {
+        ScalarExpr::Subquery(query) => {
             // Resolve the scalar subquery, collecting any correlated outer references
             let (resolved_query, outer_refs) = scope.subquery_resolve(query)?;
-            Ok(ResolvedColumnExpr::Subquery(
+            Ok(ResolvedScalarExpr::Subquery(
                 Box::new(resolved_query),
                 outer_refs,
             ))
         }
-        ColumnExpr::TypeCast { expr, target_type } => {
-            let inner = column_expr_resolve(expr, scope)?;
-            Ok(ResolvedColumnExpr::TypeCast {
+        ScalarExpr::Array(elems) => {
+            let mut resolved = Vec::with_capacity(elems.len());
+            for e in elems {
+                resolved.push(scalar_expr_resolve(e, scope)?);
+            }
+            Ok(ResolvedScalarExpr::Array(resolved))
+        }
+        ScalarExpr::TypeCast { expr, target_type } => {
+            let inner = scalar_expr_resolve(expr, scope)?;
+            Ok(ResolvedScalarExpr::TypeCast {
                 expr: Box::new(inner),
                 target_type: target_type.clone(),
             })
@@ -651,11 +636,11 @@ fn window_spec_resolve(
 ) -> ResolveResult<ResolvedWindowSpec> {
     let mut partition_by = Vec::with_capacity(window_spec.partition_by.len());
     for col in &window_spec.partition_by {
-        partition_by.push(column_expr_resolve(col, scope)?);
+        partition_by.push(scalar_expr_resolve(col, scope)?);
     }
     let mut order_by = Vec::with_capacity(window_spec.order_by.len());
     for clause in &window_spec.order_by {
-        let resolved_expr = column_expr_resolve(&clause.expr, scope)?;
+        let resolved_expr = scalar_expr_resolve(&clause.expr, scope)?;
         order_by.push(ResolvedOrderByClause {
             expr: resolved_expr,
             direction: clause.direction.clone(),
@@ -680,34 +665,39 @@ fn select_columns_resolve(
         SelectColumns::Columns(cols) => {
             let mut resolved_cols = Vec::new();
             for col in cols {
-                if let ColumnExpr::Star(qualifier) = &col.expr {
-                    // Expand star to all columns from matching table(s)
-                    for (table_metadata, alias) in &scope.tables {
-                        let matches = match qualifier {
-                            None => true,
-                            Some(q) => alias.is_some_and(|a| a == q) || table_metadata.name == *q,
-                        };
-                        if matches {
-                            for column_metadata in table_metadata.columns.iter() {
-                                resolved_cols.push(ResolvedSelectColumn {
-                                    expr: ResolvedColumnExpr::Column(ResolvedColumnNode {
-                                        schema: table_metadata.schema.clone(),
-                                        table: table_metadata.name.clone(),
-                                        table_alias: alias.map(EcoString::from),
-                                        column: column_metadata.name.clone(),
-                                        column_metadata: column_metadata.clone(),
-                                    }),
-                                    alias: None,
-                                });
+                match col {
+                    SelectColumn::Star(qualifier) => {
+                        // Expand star to all columns from matching table(s)
+                        for (table_metadata, alias) in &scope.tables {
+                            let matches = match qualifier {
+                                None => true,
+                                Some(q) => {
+                                    alias.is_some_and(|a| a == q) || table_metadata.name == *q
+                                }
+                            };
+                            if matches {
+                                for column_metadata in table_metadata.columns.iter() {
+                                    resolved_cols.push(ResolvedSelectColumn {
+                                        expr: ResolvedScalarExpr::Column(ResolvedColumnNode {
+                                            schema: table_metadata.schema.clone(),
+                                            table: table_metadata.name.clone(),
+                                            table_alias: alias.map(EcoString::from),
+                                            column: column_metadata.name.clone(),
+                                            column_metadata: column_metadata.clone(),
+                                        }),
+                                        alias: None,
+                                    });
+                                }
                             }
                         }
                     }
-                } else {
-                    let resolved_expr = column_expr_resolve(&col.expr, scope)?;
-                    resolved_cols.push(ResolvedSelectColumn {
-                        expr: resolved_expr,
-                        alias: col.alias.as_deref().map(EcoString::from),
-                    });
+                    SelectColumn::Expr { expr, alias } => {
+                        let resolved_expr = scalar_expr_resolve(expr, scope)?;
+                        resolved_cols.push(ResolvedSelectColumn {
+                            expr: resolved_expr,
+                            alias: alias.as_deref().map(EcoString::from),
+                        });
+                    }
                 }
             }
             Ok(ResolvedSelectColumns::Columns(resolved_cols))
@@ -717,7 +707,7 @@ fn select_columns_resolve(
 
 /// Resolve ORDER BY clauses. When `select_columns` is provided, an unqualified
 /// identifier that matches a SELECT-list output name resolves to
-/// `ResolvedColumnExpr::Identifier` — matching PostgreSQL's precedence rule
+/// `ResolvedScalarExpr::Identifier` — matching PostgreSQL's precedence rule
 /// that ORDER BY matches output names before falling back to column lookup.
 fn order_by_resolve(
     order_by: &[OrderByClause],
@@ -728,7 +718,7 @@ fn order_by_resolve(
     for clause in order_by {
         let resolved_expr = match order_by_alias_match(&clause.expr, select_columns) {
             Some(ident) => ident,
-            None => column_expr_resolve(&clause.expr, scope)?,
+            None => scalar_expr_resolve(&clause.expr, scope)?,
         };
         resolved.push(ResolvedOrderByClause {
             expr: resolved_expr,
@@ -741,17 +731,17 @@ fn order_by_resolve(
 /// If `clause_expr` is an unqualified column reference whose name matches a
 /// SELECT-list output name, return it as an `Identifier`.
 fn order_by_alias_match(
-    clause_expr: &ColumnExpr,
+    clause_expr: &ScalarExpr,
     select_columns: Option<&ResolvedSelectColumns>,
-) -> Option<ResolvedColumnExpr> {
-    let ColumnExpr::Column(col) = clause_expr else {
+) -> Option<ResolvedScalarExpr> {
+    let ScalarExpr::Column(col) = clause_expr else {
         return None;
     };
     if col.table.is_some() {
         return None;
     }
     select_columns?.position_by_output_name(col.column.as_str())?;
-    Some(ResolvedColumnExpr::Identifier(col.column.clone()))
+    Some(ResolvedScalarExpr::Identifier(col.column.clone()))
 }
 
 /// Convert ORDER BY clauses to use unqualified Identifier expressions.
@@ -760,7 +750,7 @@ fn order_by_as_identifiers(order_by: &[OrderByClause]) -> Vec<ResolvedOrderByCla
     order_by
         .iter()
         .map(|clause| {
-            let expr = column_expr_to_identifier(&clause.expr);
+            let expr = scalar_expr_to_identifier(&clause.expr);
             ResolvedOrderByClause {
                 expr,
                 direction: clause.direction.clone(),
@@ -769,33 +759,37 @@ fn order_by_as_identifiers(order_by: &[OrderByClause]) -> Vec<ResolvedOrderByCla
         .collect()
 }
 
-/// Convert a ColumnExpr to a ResolvedColumnExpr using unqualified Identifier for columns.
+/// Convert a ScalarExpr to a ResolvedScalarExpr using unqualified Identifier for columns.
 /// Used for ORDER BY in set operations where columns reference output names, not table columns.
-fn column_expr_to_identifier(expr: &ColumnExpr) -> ResolvedColumnExpr {
+fn scalar_expr_to_identifier(expr: &ScalarExpr) -> ResolvedScalarExpr {
     match expr {
-        ColumnExpr::Star(_) => unreachable!("Star expanded in select_columns_resolve"),
-        ColumnExpr::Column(col) => ResolvedColumnExpr::Identifier(col.column.as_str().into()),
-        ColumnExpr::Literal(lit) => ResolvedColumnExpr::Literal(lit.clone()),
-        ColumnExpr::Function(func) => ResolvedColumnExpr::Function(ResolvedFunctionCall {
+        ScalarExpr::Column(col) => ResolvedScalarExpr::Identifier(col.column.as_str().into()),
+        ScalarExpr::Literal(lit) => ResolvedScalarExpr::Literal(lit.clone()),
+        ScalarExpr::Function(func) => ResolvedScalarExpr::Function(ResolvedFunctionCall {
             name: func.name.as_str().into(),
-            args: func.args.iter().map(column_expr_to_identifier).collect(),
+            args: func.args.iter().map(scalar_expr_to_identifier).collect(),
             agg_star: func.agg_star,
             agg_distinct: func.agg_distinct,
-            agg_order: vec![], // ORDER BY within aggregate not needed for set operation ORDER BY
-            agg_filter: None,  // FILTER predicate doesn't reference set-op output names
-            over: None,        // Window spec not needed for set operation ORDER BY
+            // Set-op ORDER BY references output column names only;
+            // intra-function decorations don't apply.
+            agg_order: vec![],
+            agg_filter: None,
+            over: None,
         }),
-        ColumnExpr::Case(_) | ColumnExpr::Subquery(_) => {
+        ScalarExpr::Case(_) | ScalarExpr::Subquery(_) => {
             // CASE and subquery expressions in ORDER BY are uncommon; use null as fallback
-            ResolvedColumnExpr::Literal(LiteralValue::Null)
+            ResolvedScalarExpr::Literal(LiteralValue::Null)
         }
-        ColumnExpr::Arithmetic(arith) => ResolvedColumnExpr::Arithmetic(ResolvedArithmeticExpr {
-            left: Box::new(column_expr_to_identifier(&arith.left)),
+        ScalarExpr::Arithmetic(arith) => ResolvedScalarExpr::Arithmetic(ResolvedArithmeticExpr {
+            left: Box::new(scalar_expr_to_identifier(&arith.left)),
             op: arith.op,
-            right: Box::new(column_expr_to_identifier(&arith.right)),
+            right: Box::new(scalar_expr_to_identifier(&arith.right)),
         }),
-        ColumnExpr::TypeCast { expr, target_type } => ResolvedColumnExpr::TypeCast {
-            expr: Box::new(column_expr_to_identifier(expr)),
+        ScalarExpr::Array(elems) => {
+            ResolvedScalarExpr::Array(elems.iter().map(scalar_expr_to_identifier).collect())
+        }
+        ScalarExpr::TypeCast { expr, target_type } => ResolvedScalarExpr::TypeCast {
+            expr: Box::new(scalar_expr_to_identifier(expr)),
             target_type: target_type.clone(),
         },
     }
@@ -1044,7 +1038,7 @@ mod tests {
         let ast = pg_query::parse(sql).expect("parse SQL");
         let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
         match query_expr.body {
-            QueryBody::Select(node) => node,
+            QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),
         }
     }
@@ -1237,7 +1231,7 @@ mod tests {
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
-            if let ResolvedWhereExpr::Column(col) = &*binary.lexpr {
+            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
                 assert_eq!(col.schema, "public");
                 assert_eq!(col.table, "users");
                 assert_eq!(col.column, "id");
@@ -1259,7 +1253,7 @@ mod tests {
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
-            if let ResolvedWhereExpr::Column(col) = &*binary.lexpr {
+            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
                 assert_eq!(col.schema, "public");
                 assert_eq!(col.table, "users");
                 assert_eq!(col.column, "name");
@@ -1281,7 +1275,7 @@ mod tests {
 
         // Check WHERE clause resolved correctly
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
-            if let ResolvedWhereExpr::Column(col) = &*binary.lexpr {
+            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
                 assert_eq!(col.schema, "public");
                 assert_eq!(col.table, "users");
                 assert_eq!(col.column, "id");
@@ -1321,12 +1315,12 @@ mod tests {
             panic!("Expected Columns");
         };
         assert_eq!(cols.len(), 2);
-        let ResolvedColumnExpr::Column(col) = &cols[0].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[0].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "id");
         assert_eq!(col.table, "users");
-        let ResolvedColumnExpr::Column(col) = &cols[1].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[1].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "name");
@@ -1344,14 +1338,14 @@ mod tests {
         if let ResolvedSelectColumns::Columns(cols) = &resolved.columns {
             assert_eq!(cols.len(), 2);
 
-            if let ResolvedColumnExpr::Column(col) = &cols[0].expr {
+            if let ResolvedScalarExpr::Column(col) = &cols[0].expr {
                 assert_eq!(col.column, "id");
                 assert_eq!(col.table, "users");
             } else {
                 panic!("Expected column expression");
             }
 
-            if let ResolvedColumnExpr::Column(col) = &cols[1].expr {
+            if let ResolvedScalarExpr::Column(col) = &cols[1].expr {
                 assert_eq!(col.column, "name");
                 assert_eq!(col.table, "users");
             } else {
@@ -1375,17 +1369,17 @@ mod tests {
         };
         assert_eq!(cols.len(), 3); // id, name (from *), name (explicit)
 
-        let ResolvedColumnExpr::Column(col) = &cols[0].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[0].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "id");
 
-        let ResolvedColumnExpr::Column(col) = &cols[1].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[1].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "name");
 
-        let ResolvedColumnExpr::Column(col) = &cols[2].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[2].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "name");
@@ -1408,19 +1402,19 @@ mod tests {
         // u.* expands to users.id, users.name, then o.name
         assert_eq!(cols.len(), 3);
 
-        let ResolvedColumnExpr::Column(col) = &cols[0].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[0].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "id");
         assert_eq!(col.table, "users");
 
-        let ResolvedColumnExpr::Column(col) = &cols[1].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[1].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "name");
         assert_eq!(col.table, "users");
 
-        let ResolvedColumnExpr::Column(col) = &cols[2].expr else {
+        let ResolvedScalarExpr::Column(col) = &cols[2].expr else {
             panic!("Expected column expression");
         };
         assert_eq!(col.column, "name");
@@ -1459,11 +1453,15 @@ mod tests {
 
             // Check join condition
             if let Some(ResolvedWhereExpr::Binary(cond)) = &join.condition {
-                if let ResolvedWhereExpr::Column(left_col) = &*cond.lexpr {
+                if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(left_col)) =
+                    &*cond.lexpr
+                {
                     assert_eq!(left_col.table, "users");
                     assert_eq!(left_col.column, "id");
                 }
-                if let ResolvedWhereExpr::Column(right_col) = &*cond.rexpr {
+                if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(right_col)) =
+                    &*cond.rexpr
+                {
                     assert_eq!(right_col.table, "orders");
                     assert_eq!(right_col.column, "id");
                 }
@@ -1506,12 +1504,16 @@ mod tests {
 
             // Check join condition uses aliases
             if let Some(ResolvedWhereExpr::Binary(cond)) = &join.condition {
-                if let ResolvedWhereExpr::Column(left_col) = &*cond.lexpr {
+                if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(left_col)) =
+                    &*cond.lexpr
+                {
                     // Should resolve to 'users' table even though alias 'u' was used
                     assert_eq!(left_col.table, "users");
                     assert_eq!(left_col.column, "id");
                 }
-                if let ResolvedWhereExpr::Column(right_col) = &*cond.rexpr {
+                if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(right_col)) =
+                    &*cond.rexpr
+                {
                     // Should resolve to 'orders' table even though alias 'o' was used
                     assert_eq!(right_col.table, "orders");
                     assert_eq!(right_col.column, "id");
@@ -1539,7 +1541,9 @@ mod tests {
             // Left side: id = 1
             if let ResolvedWhereExpr::Binary(left_binary) = &*and_expr.lexpr {
                 assert_eq!(left_binary.op, BinaryOp::Equal);
-                if let ResolvedWhereExpr::Column(col) = &*left_binary.lexpr {
+                if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) =
+                    &*left_binary.lexpr
+                {
                     assert_eq!(col.column, "id");
                 }
             } else {
@@ -1549,7 +1553,9 @@ mod tests {
             // Right side: name = 'john'
             if let ResolvedWhereExpr::Binary(right_binary) = &*and_expr.rexpr {
                 assert_eq!(right_binary.op, BinaryOp::Equal);
-                if let ResolvedWhereExpr::Column(col) = &*right_binary.lexpr {
+                if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) =
+                    &*right_binary.lexpr
+                {
                     assert_eq!(col.column, "name");
                 }
             } else {
@@ -1576,7 +1582,7 @@ mod tests {
         assert_eq!(resolved.order_by.len(), 1);
         assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
 
-        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+        if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
             assert_eq!(col.schema, "public");
             assert_eq!(col.table, "users");
             assert_eq!(col.column, "name");
@@ -1599,7 +1605,7 @@ mod tests {
         assert_eq!(resolved.order_by.len(), 2);
 
         assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
-        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+        if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
             assert_eq!(col.column, "name");
             assert_eq!(col.table, "users");
         } else {
@@ -1607,7 +1613,7 @@ mod tests {
         }
 
         assert_eq!(resolved.order_by[1].direction, OrderDirection::Desc);
-        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[1].expr {
+        if let ResolvedScalarExpr::Column(col) = &resolved.order_by[1].expr {
             assert_eq!(col.column, "id");
             assert_eq!(col.table, "users");
         } else {
@@ -1626,7 +1632,7 @@ mod tests {
         assert_eq!(resolved.order_by.len(), 1);
         assert_eq!(resolved.order_by[0].direction, OrderDirection::Desc);
 
-        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+        if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
             // Should resolve to actual table name, not alias
             assert_eq!(col.table, "users");
             assert_eq!(col.column, "name");
@@ -1647,7 +1653,7 @@ mod tests {
         assert_eq!(resolved.order_by.len(), 1);
         assert_eq!(resolved.order_by[0].direction, OrderDirection::Desc);
         match &resolved.order_by[0].expr {
-            ResolvedColumnExpr::Identifier(name) => assert_eq!(name, "display_name"),
+            ResolvedScalarExpr::Identifier(name) => assert_eq!(name, "display_name"),
             other => panic!("expected Identifier for alias, got {other:?}"),
         }
     }
@@ -1664,7 +1670,7 @@ mod tests {
 
         assert_eq!(resolved.order_by.len(), 1);
         match &resolved.order_by[0].expr {
-            ResolvedColumnExpr::Identifier(name) => assert_eq!(name, "total"),
+            ResolvedScalarExpr::Identifier(name) => assert_eq!(name, "total"),
             other => panic!("expected Identifier for alias, got {other:?}"),
         }
     }
@@ -1681,7 +1687,7 @@ mod tests {
 
         assert_eq!(resolved.order_by.len(), 1);
         match &resolved.order_by[0].expr {
-            ResolvedColumnExpr::Column(col) => {
+            ResolvedScalarExpr::Column(col) => {
                 assert_eq!(col.table, "users");
                 assert_eq!(col.column, "name");
             }
@@ -1703,7 +1709,7 @@ mod tests {
         assert_eq!(resolved.order_by.len(), 2);
 
         // First: u.name ASC
-        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+        if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
             assert_eq!(col.table, "users");
             assert_eq!(col.column, "name");
         } else {
@@ -1711,7 +1717,7 @@ mod tests {
         }
 
         // Second: o.id DESC
-        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[1].expr {
+        if let ResolvedScalarExpr::Column(col) = &resolved.order_by[1].expr {
             assert_eq!(col.table, "orders");
             assert_eq!(col.column, "id");
         } else {
@@ -1729,7 +1735,7 @@ mod tests {
         let resolved = resolve_query("SELECT id FROM users ORDER BY name", &tables);
 
         assert_eq!(resolved.order_by.len(), 1);
-        if let ResolvedColumnExpr::Column(col) = &resolved.order_by[0].expr {
+        if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
             assert_eq!(col.table, "users");
             assert_eq!(col.column, "name");
         } else {
@@ -2236,7 +2242,7 @@ mod tests {
 
         assert!(resolved.having.is_some());
         if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.having {
-            if let ResolvedWhereExpr::Column(col) = &*binary.lexpr {
+            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
                 assert_eq!(col.column, "name");
             } else {
                 panic!("Expected column in HAVING clause");
@@ -2346,7 +2352,7 @@ mod tests {
         };
 
         let ResolvedSelectColumn {
-            expr: ResolvedColumnExpr::Function(func),
+            expr: ResolvedScalarExpr::Function(func),
             ..
         } = &columns[0]
         else {
@@ -2972,7 +2978,7 @@ mod tests {
         let outer_refs = cols
             .iter()
             .find_map(|col| match &col.expr {
-                ResolvedColumnExpr::Subquery(_, outer_refs) => Some(outer_refs),
+                ResolvedScalarExpr::Subquery(_, outer_refs) => Some(outer_refs),
                 _ => None,
             })
             .expect("subquery column");
@@ -3090,7 +3096,7 @@ mod tests {
         let outer_refs = cols
             .iter()
             .find_map(|col| match &col.expr {
-                ResolvedColumnExpr::Subquery(_, outer_refs) => Some(outer_refs),
+                ResolvedScalarExpr::Subquery(_, outer_refs) => Some(outer_refs),
                 _ => None,
             })
             .expect("subquery column");

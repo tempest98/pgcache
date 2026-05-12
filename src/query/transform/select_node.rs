@@ -46,8 +46,8 @@ mod tests {
     use crate::catalog::ColumnMetadata;
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::resolved::{
-        ResolvedBinaryExpr, ResolvedColumnNode, ResolvedTableNode, ResolvedTableSource,
-        ResolvedWhereExpr,
+        ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedTableNode,
+        ResolvedTableSource, ResolvedWhereExpr,
     };
     use postgres_types::Type;
 
@@ -89,8 +89,12 @@ mod tests {
         let node = ResolvedSelectNode {
             having: Some(ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
-                rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
+                lexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(
+                    LiteralValue::Integer(1),
+                ))),
+                rexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(
+                    LiteralValue::Integer(1),
+                ))),
             })),
             ..Default::default()
         };
@@ -107,8 +111,12 @@ mod tests {
     fn test_resolved_select_node_replace_preserves_where() {
         let where_clause = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
-            rexpr: Box::new(ResolvedWhereExpr::Value(LiteralValue::Integer(1))),
+            lexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(
+                LiteralValue::Integer(1),
+            ))),
+            rexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(
+                LiteralValue::Integer(1),
+            ))),
         });
 
         let node = ResolvedSelectNode {

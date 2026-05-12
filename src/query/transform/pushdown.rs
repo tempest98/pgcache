@@ -4,8 +4,8 @@ use ecow::EcoString;
 
 use crate::query::ast::BinaryOp;
 use crate::query::resolved::{
-    ResolvedBinaryExpr, ResolvedColumnExpr, ResolvedColumnNode, ResolvedMultiExpr,
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedBinaryExpr, ResolvedColumnNode, ResolvedMultiExpr, ResolvedQueryBody,
+    ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns, ResolvedSelectNode,
     ResolvedSetOpNode, ResolvedTableSource, ResolvedUnaryExpr, ResolvedWhereExpr,
 };
 
@@ -95,13 +95,10 @@ pub(crate) fn where_expr_conjuncts_split(expr: ResolvedWhereExpr) -> Vec<Resolve
             result.extend(where_expr_conjuncts_split(*binary.rexpr));
             result
         }
-        other @ (ResolvedWhereExpr::Value(_)
-        | ResolvedWhereExpr::Column(_)
+        other @ (ResolvedWhereExpr::Scalar(_)
         | ResolvedWhereExpr::Unary(_)
         | ResolvedWhereExpr::Binary(_)
         | ResolvedWhereExpr::Multi(_)
-        | ResolvedWhereExpr::Array(_)
-        | ResolvedWhereExpr::Function { .. }
         | ResolvedWhereExpr::Subquery { .. }) => vec![other],
     }
 }
@@ -139,14 +136,39 @@ fn predicate_targets_subquery(expr: &ResolvedWhereExpr, alias: &str) -> bool {
 fn predicate_has_subquery(expr: &ResolvedWhereExpr) -> bool {
     match expr {
         ResolvedWhereExpr::Subquery { .. } => true,
-        ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => false,
-        ResolvedWhereExpr::Array(elems) => elems.iter().any(predicate_has_subquery),
-        ResolvedWhereExpr::Function { args, .. } => args.iter().any(predicate_has_subquery),
+        ResolvedWhereExpr::Scalar(scalar) => scalar_expr_has_subquery(scalar),
         ResolvedWhereExpr::Unary(u) => predicate_has_subquery(&u.expr),
         ResolvedWhereExpr::Binary(b) => {
             predicate_has_subquery(&b.lexpr) || predicate_has_subquery(&b.rexpr)
         }
         ResolvedWhereExpr::Multi(m) => m.exprs.iter().any(predicate_has_subquery),
+    }
+}
+
+fn scalar_expr_has_subquery(expr: &ResolvedScalarExpr) -> bool {
+    match expr {
+        ResolvedScalarExpr::Subquery(_, _) => true,
+        ResolvedScalarExpr::Function(func) => func.args.iter().any(scalar_expr_has_subquery),
+        ResolvedScalarExpr::Arithmetic(arith) => {
+            scalar_expr_has_subquery(&arith.left) || scalar_expr_has_subquery(&arith.right)
+        }
+        ResolvedScalarExpr::Case(case) => {
+            case.arg
+                .as_ref()
+                .is_some_and(|a| scalar_expr_has_subquery(a))
+                || case.whens.iter().any(|w| {
+                    predicate_has_subquery(&w.condition) || scalar_expr_has_subquery(&w.result)
+                })
+                || case
+                    .default
+                    .as_ref()
+                    .is_some_and(|d| scalar_expr_has_subquery(d))
+        }
+        ResolvedScalarExpr::Array(elems) => elems.iter().any(scalar_expr_has_subquery),
+        ResolvedScalarExpr::TypeCast { expr, .. } => scalar_expr_has_subquery(expr),
+        ResolvedScalarExpr::Column(_)
+        | ResolvedScalarExpr::Identifier(_)
+        | ResolvedScalarExpr::Literal(_) => false,
     }
 }
 
@@ -171,14 +193,15 @@ fn subquery_output_column_names(query: &ResolvedQueryExpr) -> Vec<EcoString> {
                     Some(alias.clone())
                 } else {
                     match &col.expr {
-                        ResolvedColumnExpr::Column(c) => Some(c.column.clone()),
-                        ResolvedColumnExpr::Identifier(ident) => Some(ident.clone()),
-                        ResolvedColumnExpr::Function(_)
-                        | ResolvedColumnExpr::Literal(_)
-                        | ResolvedColumnExpr::Case(_)
-                        | ResolvedColumnExpr::Arithmetic(_)
-                        | ResolvedColumnExpr::Subquery(..)
-                        | ResolvedColumnExpr::TypeCast { .. } => None,
+                        ResolvedScalarExpr::Column(c) => Some(c.column.clone()),
+                        ResolvedScalarExpr::Identifier(ident) => Some(ident.clone()),
+                        ResolvedScalarExpr::Function(_)
+                        | ResolvedScalarExpr::Literal(_)
+                        | ResolvedScalarExpr::Case(_)
+                        | ResolvedScalarExpr::Arithmetic(_)
+                        | ResolvedScalarExpr::Subquery(..)
+                        | ResolvedScalarExpr::Array(_)
+                        | ResolvedScalarExpr::TypeCast { .. } => None,
                     }
                 }
             })
@@ -198,7 +221,7 @@ fn branch_pushdown_is_safe(select: &ResolvedSelectNode) -> bool {
     // Check for window functions in SELECT columns
     if let ResolvedSelectColumns::Columns(cols) = &select.columns {
         for col in cols {
-            if let ResolvedColumnExpr::Function(func) = &col.expr
+            if let ResolvedScalarExpr::Function(func) = &col.expr
                 && func.over.is_some()
             {
                 return false;
@@ -267,14 +290,15 @@ fn predicate_push_into_select(
             let &pos = name_to_position.get(col_name)?;
             let col = branch_columns.get(pos)?;
             match &col.expr {
-                ResolvedColumnExpr::Column(node) => Some((col_name, node)),
-                ResolvedColumnExpr::Identifier(_)
-                | ResolvedColumnExpr::Function(_)
-                | ResolvedColumnExpr::Literal(_)
-                | ResolvedColumnExpr::Case(_)
-                | ResolvedColumnExpr::Arithmetic(_)
-                | ResolvedColumnExpr::Subquery(..)
-                | ResolvedColumnExpr::TypeCast { .. } => None,
+                ResolvedScalarExpr::Column(node) => Some((col_name, node)),
+                ResolvedScalarExpr::Identifier(_)
+                | ResolvedScalarExpr::Function(_)
+                | ResolvedScalarExpr::Literal(_)
+                | ResolvedScalarExpr::Case(_)
+                | ResolvedScalarExpr::Arithmetic(_)
+                | ResolvedScalarExpr::Subquery(..)
+                | ResolvedScalarExpr::Array(_)
+                | ResolvedScalarExpr::TypeCast { .. } => None,
             }
         })
         .collect::<Option<_>>()?;
@@ -323,11 +347,9 @@ fn where_expr_columns_remap(
     name_to_column: &HashMap<&str, &ResolvedColumnNode>,
 ) -> Option<ResolvedWhereExpr> {
     match expr {
-        ResolvedWhereExpr::Column(col) => {
-            let replacement = name_to_column.get(col.column.as_str())?;
-            Some(ResolvedWhereExpr::Column((*replacement).clone()))
-        }
-        ResolvedWhereExpr::Value(v) => Some(ResolvedWhereExpr::Value(v.clone())),
+        ResolvedWhereExpr::Scalar(scalar) => Some(ResolvedWhereExpr::Scalar(
+            scalar_expr_columns_remap(scalar, name_to_column)?,
+        )),
         ResolvedWhereExpr::Unary(u) => {
             let remapped = where_expr_columns_remap(&u.expr, name_to_column)?;
             Some(ResolvedWhereExpr::Unary(ResolvedUnaryExpr {
@@ -355,30 +377,34 @@ fn where_expr_columns_remap(
                 exprs: remapped?,
             }))
         }
-        ResolvedWhereExpr::Array(elems) => {
-            let remapped: Option<Vec<_>> = elems
-                .iter()
-                .map(|e| where_expr_columns_remap(e, name_to_column))
-                .collect();
-            Some(ResolvedWhereExpr::Array(remapped?))
-        }
-        ResolvedWhereExpr::Function {
-            name,
-            args,
-            agg_star,
-        } => {
-            let remapped: Option<Vec<_>> = args
-                .iter()
-                .map(|a| where_expr_columns_remap(a, name_to_column))
-                .collect();
-            Some(ResolvedWhereExpr::Function {
-                name: name.clone(),
-                args: remapped?,
-                agg_star: *agg_star,
-            })
-        }
         // Should not reach here — predicate_has_subquery filters these out
         ResolvedWhereExpr::Subquery { .. } => None,
+    }
+}
+
+fn scalar_expr_columns_remap(
+    expr: &ResolvedScalarExpr,
+    name_to_column: &HashMap<&str, &ResolvedColumnNode>,
+) -> Option<ResolvedScalarExpr> {
+    match expr {
+        ResolvedScalarExpr::Column(col) => {
+            let replacement = name_to_column.get(col.column.as_str())?;
+            Some(ResolvedScalarExpr::Column((*replacement).clone()))
+        }
+        ResolvedScalarExpr::Literal(v) => Some(ResolvedScalarExpr::Literal(v.clone())),
+        ResolvedScalarExpr::Array(elems) => {
+            let remapped: Option<Vec<_>> = elems
+                .iter()
+                .map(|e| scalar_expr_columns_remap(e, name_to_column))
+                .collect();
+            Some(ResolvedScalarExpr::Array(remapped?))
+        }
+        ResolvedScalarExpr::Identifier(_)
+        | ResolvedScalarExpr::Function(_)
+        | ResolvedScalarExpr::Case(_)
+        | ResolvedScalarExpr::Arithmetic(_)
+        | ResolvedScalarExpr::Subquery(_, _)
+        | ResolvedScalarExpr::TypeCast { .. } => None,
     }
 }
 
@@ -466,8 +492,8 @@ mod tests {
                 matches!(
                     (b.lexpr.as_ref(), b.rexpr.as_ref()),
                     (
-                        ResolvedWhereExpr::Column(col),
-                        ResolvedWhereExpr::Value(LiteralValue::String(v))
+                        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
+                        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(LiteralValue::String(v)))
                     ) if col.table == table && col.column == column && v == value
                 )
             }
@@ -577,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_column_expr_no_pushdown() {
+    fn test_non_scalar_expr_no_pushdown() {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
 
@@ -725,9 +751,10 @@ mod tests {
 
     #[test]
     fn test_conjuncts_split_join_roundtrip() {
-        let a = ResolvedWhereExpr::Value(LiteralValue::Boolean(true));
-        let b = ResolvedWhereExpr::Value(LiteralValue::Boolean(false));
-        let c = ResolvedWhereExpr::Value(LiteralValue::Null);
+        let a = ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(LiteralValue::Boolean(true)));
+        let b =
+            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(LiteralValue::Boolean(false)));
+        let c = ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(LiteralValue::Null));
 
         let combined = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
             op: BinaryOp::And,

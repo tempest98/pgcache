@@ -4,7 +4,9 @@
 use rootcause::Report;
 
 use crate::cache::QueryParameters;
-use crate::query::ast::{LiteralValue, QueryBody, QueryExpr, SelectNode, TableSource, WhereExpr};
+use crate::query::ast::{
+    LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectNode, TableSource, WhereExpr,
+};
 
 use super::super::{AstTransformError, AstTransformResult};
 use super::parameter_to_literal;
@@ -114,21 +116,7 @@ fn where_expr_parameters_replace(
     parameters: &QueryParameters,
 ) -> AstTransformResult<()> {
     match expr {
-        WhereExpr::Value(literal) => {
-            if let LiteralValue::Parameter(placeholder) = literal {
-                let index = parameter_index_parse(placeholder)?;
-
-                let param = parameters.get(index).ok_or_else(|| {
-                    Report::from(AstTransformError::ParameterOutOfBounds {
-                        index,
-                        count: parameters.len(),
-                    })
-                })?;
-
-                *literal = parameter_to_literal(&param)?;
-            }
-        }
-        WhereExpr::Column(_) => {}
+        WhereExpr::Scalar(scalar) => scalar_expr_parameters_replace(scalar, parameters)?,
         WhereExpr::Unary(unary) => {
             where_expr_parameters_replace(&mut unary.expr, parameters)?;
         }
@@ -141,23 +129,72 @@ fn where_expr_parameters_replace(
                 where_expr_parameters_replace(expr, parameters)?;
             }
         }
-        WhereExpr::Array(elems) => {
-            for elem in elems {
-                where_expr_parameters_replace(elem, parameters)?;
-            }
-        }
-        WhereExpr::Function { args, .. } => {
-            for arg in args {
-                where_expr_parameters_replace(arg, parameters)?;
-            }
-        }
         WhereExpr::Subquery {
             query, test_expr, ..
         } => {
             query_expr_parameters_replace_mut(query, parameters)?;
             if let Some(test) = test_expr {
-                where_expr_parameters_replace(test, parameters)?;
+                scalar_expr_parameters_replace(test, parameters)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn scalar_expr_parameters_replace(
+    expr: &mut ScalarExpr,
+    parameters: &QueryParameters,
+) -> AstTransformResult<()> {
+    match expr {
+        ScalarExpr::Literal(literal) => {
+            literal_value_parameters_replace(literal, parameters)?;
+        }
+        ScalarExpr::Column(_) => {}
+        ScalarExpr::Function(func) => {
+            for arg in &mut func.args {
+                scalar_expr_parameters_replace(arg, parameters)?;
+            }
+            for clause in &mut func.agg_order {
+                scalar_expr_parameters_replace(&mut clause.expr, parameters)?;
+            }
+            if let Some(filter) = &mut func.agg_filter {
+                where_expr_parameters_replace(filter, parameters)?;
+            }
+            if let Some(over) = &mut func.over {
+                for col in &mut over.partition_by {
+                    scalar_expr_parameters_replace(col, parameters)?;
+                }
+                for clause in &mut over.order_by {
+                    scalar_expr_parameters_replace(&mut clause.expr, parameters)?;
+                }
+            }
+        }
+        ScalarExpr::Case(case) => {
+            if let Some(arg) = &mut case.arg {
+                scalar_expr_parameters_replace(arg, parameters)?;
+            }
+            for when in &mut case.whens {
+                where_expr_parameters_replace(&mut when.condition, parameters)?;
+                scalar_expr_parameters_replace(&mut when.result, parameters)?;
+            }
+            if let Some(default) = &mut case.default {
+                scalar_expr_parameters_replace(default, parameters)?;
+            }
+        }
+        ScalarExpr::Arithmetic(arith) => {
+            scalar_expr_parameters_replace(&mut arith.left, parameters)?;
+            scalar_expr_parameters_replace(&mut arith.right, parameters)?;
+        }
+        ScalarExpr::Subquery(query) => {
+            query_expr_parameters_replace_mut(query, parameters)?;
+        }
+        ScalarExpr::Array(elems) => {
+            for elem in elems {
+                scalar_expr_parameters_replace(elem, parameters)?;
+            }
+        }
+        ScalarExpr::TypeCast { expr, .. } => {
+            scalar_expr_parameters_replace(expr, parameters)?;
         }
     }
     Ok(())
@@ -224,7 +261,7 @@ mod tests {
         let ast = pg_query::parse(sql).expect("parse SQL");
         let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
         match query_expr.body {
-            QueryBody::Select(node) => node,
+            QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),
         }
     }

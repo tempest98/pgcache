@@ -7,12 +7,13 @@ use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::node::Node as NodeEnum;
 use pg_query::protobuf::{
     AConst, AExpr, AExprKind, BoolExpr, BoolExprType, BoolTestType, BooleanTest, ColumnRef,
-    FuncCall, NullTest, NullTestType, ParamRef, SelectStmt, SubLink,
+    NullTest, NullTestType, ParamRef, SelectStmt, SubLink,
 };
 
+use super::convert::node_convert_to_scalar_expr;
 use super::{
-    BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, SubLinkType, UnaryExpr,
-    UnaryOp, WhereExpr, select_stmt_to_query_expr,
+    BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, ScalarExpr, SubLinkType,
+    UnaryExpr, UnaryOp, WhereExpr, select_stmt_to_query_expr,
 };
 
 error_set! {
@@ -55,24 +56,34 @@ pub fn select_stmt_parse_where(
 /// Convert a pg_query Node to our WhereExpr - main entry point for recursion
 pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WhereParseError> {
     match node.node.as_ref() {
+        // Predicate-shaped nodes
         Some(NodeEnum::AExpr(expr)) => a_expr_convert(expr),
         Some(NodeEnum::BoolExpr(expr)) => bool_expr_convert(expr),
-        Some(NodeEnum::ColumnRef(col_ref)) => {
-            let column = column_ref_extract(col_ref)?;
-            Ok(WhereExpr::Column(column))
-        }
-        Some(NodeEnum::AConst(const_val)) => {
-            let value = const_value_extract(const_val)?;
-            Ok(WhereExpr::Value(value))
-        }
-        Some(NodeEnum::ParamRef(param_ref)) => {
-            let value = param_ref_extract(param_ref);
-            Ok(WhereExpr::Value(value))
-        }
         Some(NodeEnum::SubLink(sub_link)) => sublink_convert(sub_link),
         Some(NodeEnum::NullTest(null_test)) => null_test_convert(null_test),
         Some(NodeEnum::BooleanTest(bool_test)) => boolean_test_convert(bool_test),
-        Some(NodeEnum::FuncCall(func_call)) => func_call_to_where_expr(func_call),
+
+        // Scalar-leaf nodes — wrap into WhereExpr::Scalar
+        Some(NodeEnum::ColumnRef(col_ref)) => {
+            let column = column_ref_extract(col_ref)?;
+            Ok(WhereExpr::Scalar(ScalarExpr::Column(column)))
+        }
+        Some(NodeEnum::AConst(const_val)) => {
+            let value = const_value_extract(const_val)?;
+            Ok(WhereExpr::Scalar(ScalarExpr::Literal(value)))
+        }
+        Some(NodeEnum::ParamRef(param_ref)) => {
+            let value = param_ref_extract(param_ref);
+            Ok(WhereExpr::Scalar(ScalarExpr::Literal(value)))
+        }
+        Some(NodeEnum::FuncCall(_)) => {
+            // Delegate to convert.rs's scalar converter so aggregate metadata
+            // (DISTINCT, ORDER BY, FILTER, OVER) is preserved.
+            let scalar = node_convert_to_scalar_expr(node).map_err(|e| WhereParseError::Other {
+                error: e.to_string(),
+            })?;
+            Ok(WhereExpr::Scalar(scalar))
+        }
         unsupported => {
             trace!(?unsupported, "unsupported WHERE clause node type");
             Err(WhereParseError::UnsupportedPattern)
@@ -96,11 +107,16 @@ fn sublink_convert(sub_link: &SubLink) -> Result<WhereExpr, WhereParseError> {
         }
     };
 
-    // Parse the test expression (left-hand side for IN/ANY/ALL)
+    // Parse the test expression (left-hand side for IN/ANY/ALL).
+    // Always a scalar (the value being tested against the subquery output).
     let test_expr = sub_link
         .testexpr
         .as_ref()
-        .map(|e| node_convert_to_expr(e))
+        .map(|e| {
+            node_convert_to_scalar_expr(e).map_err(|err| WhereParseError::Other {
+                error: err.to_string(),
+            })
+        })
         .transpose()?
         .map(Box::new);
 
@@ -167,37 +183,6 @@ fn boolean_test_convert(bool_test: &BooleanTest) -> Result<WhereExpr, WhereParse
         op,
         expr: Box::new(node_convert_to_expr(arg)?),
     }))
-}
-
-/// Convert pg_query FuncCall to WhereExpr::Function
-fn func_call_to_where_expr(func_call: &FuncCall) -> Result<WhereExpr, WhereParseError> {
-    // Extract function name — last component of qualified name (e.g., "pg_catalog.now" -> "now")
-    let name = func_call
-        .funcname
-        .iter()
-        .filter_map(|n| match &n.node {
-            Some(NodeEnum::String(s)) => Some(EcoString::from(s.sval.as_str())),
-            _ => None,
-        })
-        .next_back()
-        .ok_or(WhereParseError::UnsupportedPattern)?;
-
-    // Handle COUNT(*) — agg_star means no explicit args
-    let args = if func_call.agg_star {
-        vec![]
-    } else {
-        func_call
-            .args
-            .iter()
-            .map(node_convert_to_expr)
-            .collect::<Result<Vec<_>, _>>()?
-    };
-
-    Ok(WhereExpr::Function {
-        name,
-        args,
-        agg_star: func_call.agg_star,
-    })
 }
 
 /// Extract column reference from pg_query ColumnRef
@@ -449,19 +434,24 @@ fn between_bounds_extract(
     Ok((node_convert_to_expr(low)?, node_convert_to_expr(high)?))
 }
 
-/// Convert the right-hand side of ANY/ALL to a WhereExpr.
+/// Convert the right-hand side of ANY/ALL.
 ///
-/// The rexpr can be an array constructor (ARRAY[1,2,3]) → `WhereExpr::Array`,
-/// or a single expression (parameter $1, column ref) → passed through as-is.
+/// The rexpr can be an array constructor (ARRAY[1,2,3]) wrapped as a
+/// `ScalarExpr::Array`, or a single expression (parameter $1, column ref)
+/// passed through as-is.
 fn any_all_rexpr_convert(node: &pg_query::Node) -> Result<WhereExpr, WhereParseError> {
     match &node.node {
         Some(NodeEnum::AArrayExpr(array_expr)) => {
             let elems = array_expr
                 .elements
                 .iter()
-                .map(node_convert_to_expr)
+                .map(|n| {
+                    node_convert_to_scalar_expr(n).map_err(|err| WhereParseError::Other {
+                        error: err.to_string(),
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(WhereExpr::Array(elems))
+            Ok(WhereExpr::Scalar(ScalarExpr::Array(elems)))
         }
         _ => node_convert_to_expr(node),
     }
@@ -608,7 +598,7 @@ mod tests {
 
     use super::*;
     use crate::query::ast::{
-        AstError, ColumnExpr, SelectColumns, query_expr_convert, query_expr_fingerprint,
+        AstError, ScalarExpr, SelectColumns, query_expr_convert, query_expr_fingerprint,
     };
 
     /// Parse SQL and extract the WHERE clause via the AST layer.
@@ -643,8 +633,12 @@ mod tests {
             panic!("expected explicit columns");
         };
         assert_eq!(cols.len(), 2);
-        assert!(matches!(&cols[0].expr, ColumnExpr::Column(c) if c.column == "id"));
-        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "str"));
+        assert!(
+            matches!(&cols[0].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "id")
+        );
+        assert!(
+            matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "str")
+        );
 
         let q = query_expr_convert(
             &pg_query::parse("select count(id), str from test where str = 'hihi'").unwrap(),
@@ -655,8 +649,12 @@ mod tests {
             panic!("expected explicit columns");
         };
         assert_eq!(cols.len(), 2);
-        assert!(matches!(&cols[0].expr, ColumnExpr::Function(f) if f.name == "count"));
-        assert!(matches!(&cols[1].expr, ColumnExpr::Column(c) if c.column == "str"));
+        assert!(
+            matches!(&cols[0].expr().expect("non-star SELECT column"), ScalarExpr::Function(f) if f.name == "count")
+        );
+        assert!(
+            matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "str")
+        );
     }
 
     #[test]
@@ -668,11 +666,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("str"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::String("hello".to_owned()),
+            ))),
         }));
 
         assert_eq!(where_clause, expected);
@@ -687,11 +687,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(123),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -705,11 +707,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("active"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Boolean(true),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -723,11 +727,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("cnt"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(0))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(0),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -743,19 +749,23 @@ mod tests {
             op: BinaryOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("str"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::String("hello".to_owned()),
+                ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("id"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::Integer(123),
+                ))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -772,19 +782,23 @@ mod tests {
             op: BinaryOp::Or,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("str"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::String("hello".to_owned()),
+                ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("str"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("world".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::String("world".to_owned()),
+                ))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -801,11 +815,13 @@ mod tests {
             op: UnaryOp::Not,
             expr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("str"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::String("hello".to_owned()),
+                ))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -820,11 +836,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: Some(EcoString::from("test")),
                 column: EcoString::from("str"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::String("hello".to_owned()))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::String("hello".to_owned()),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -838,11 +856,11 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("data"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Null)),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Null))),
         }));
 
         assert_eq!(where_clause, expected);
@@ -867,11 +885,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::NotEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(123),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -885,11 +905,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::NotEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(123),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -903,11 +925,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::LessThan,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(123),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -921,11 +945,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::LessThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(123),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -939,11 +965,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::GreaterThanOrEqual,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(123))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Integer(123),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -961,12 +989,14 @@ mod tests {
 
         assert_eq!(binary.op, BinaryOp::Like);
 
-        let WhereExpr::Column(col) = binary.lexpr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = binary.lexpr.as_ref() else {
             panic!("expected Column on left");
         };
         assert_eq!(col.column, "name");
 
-        let WhereExpr::Value(LiteralValue::String(pattern)) = binary.rexpr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(pattern))) =
+            binary.rexpr.as_ref()
+        else {
             panic!("expected string pattern on right");
         };
         assert_eq!(pattern, "test%");
@@ -988,28 +1018,34 @@ mod tests {
                 op: BinaryOp::And,
                 lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                     op: BinaryOp::Equal,
-                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                         table: None,
                         column: EcoString::from("name"),
-                    })),
-                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
+                    }))),
+                    rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                        LiteralValue::String("john".to_owned()),
+                    ))),
                 })),
                 rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                     op: BinaryOp::GreaterThan,
-                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                         table: None,
                         column: EcoString::from("age"),
-                    })),
-                    rexpr: Box::new(WhereExpr::Value(LiteralValue::Integer(25))),
+                    }))),
+                    rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                        LiteralValue::Integer(25),
+                    ))),
                 })),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("active"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::Boolean(true),
+                ))),
             })),
         }));
 
@@ -1032,28 +1068,34 @@ mod tests {
                 op: BinaryOp::Or,
                 lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                     op: BinaryOp::Equal,
-                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                         table: None,
                         column: EcoString::from("name"),
-                    })),
-                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("john".to_owned()))),
+                    }))),
+                    rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                        LiteralValue::String("john".to_owned()),
+                    ))),
                 })),
                 rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                     op: BinaryOp::Equal,
-                    lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                    lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                         table: None,
                         column: EcoString::from("name"),
-                    })),
-                    rexpr: Box::new(WhereExpr::Value(LiteralValue::String("jane".to_owned()))),
+                    }))),
+                    rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                        LiteralValue::String("jane".to_owned()),
+                    ))),
                 })),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("name"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::String("bob".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::String("bob".to_owned()),
+                ))),
             })),
         }));
 
@@ -1069,11 +1111,13 @@ mod tests {
 
         let expected = Some(WhereExpr::Binary(BinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Column(ColumnNode {
+            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("id"),
-            })),
-            rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
+            }))),
+            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                LiteralValue::Parameter("$1".to_owned()),
+            ))),
         }));
         assert_eq!(where_clause, expected);
     }
@@ -1089,19 +1133,23 @@ mod tests {
             op: BinaryOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("name"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::Parameter("$1".to_owned()),
+                ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::GreaterThan,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("age"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$2".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::Parameter("$2".to_owned()),
+                ))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -1118,19 +1166,23 @@ mod tests {
             op: BinaryOp::And,
             lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("name"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Parameter("$1".to_owned()))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::Parameter("$1".to_owned()),
+                ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
                 op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Column(ColumnNode {
+                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
                     table: None,
                     column: EcoString::from("active"),
-                })),
-                rexpr: Box::new(WhereExpr::Value(LiteralValue::Boolean(true))),
+                }))),
+                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
+                    LiteralValue::Boolean(true),
+                ))),
             })),
         }));
         assert_eq!(where_clause, expected);
@@ -1152,13 +1204,14 @@ mod tests {
         assert_eq!(multi.exprs.len(), 4); // column + 3 values
 
         // First element should be the column
-        let WhereExpr::Column(col) = &multi.exprs[0] else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "status");
 
         // Remaining elements should be string values
-        let WhereExpr::Value(LiteralValue::String(v1)) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(v1))) = &multi.exprs[1]
+        else {
             panic!("expected string value");
         };
         assert_eq!(v1, "active");
@@ -1193,7 +1246,8 @@ mod tests {
         assert_eq!(multi.op, MultiOp::In);
 
         // Check that values are integers
-        let WhereExpr::Value(LiteralValue::Integer(v1)) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(v1))) = &multi.exprs[1]
+        else {
             panic!("expected integer value");
         };
         assert_eq!(*v1, 1);
@@ -1235,7 +1289,7 @@ mod tests {
 
         assert_eq!(unary.op, UnaryOp::IsNull);
 
-        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "deleted_at");
@@ -1254,7 +1308,7 @@ mod tests {
 
         assert_eq!(unary.op, UnaryOp::IsNotNull);
 
-        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "name");
@@ -1273,7 +1327,7 @@ mod tests {
 
         assert_eq!(unary.op, UnaryOp::IsTrue);
 
-        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "active");
@@ -1292,7 +1346,7 @@ mod tests {
 
         assert_eq!(unary.op, UnaryOp::IsFalse);
 
-        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "active");
@@ -1311,7 +1365,7 @@ mod tests {
 
         assert_eq!(unary.op, UnaryOp::IsNotTrue);
 
-        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "active");
@@ -1330,7 +1384,7 @@ mod tests {
 
         assert_eq!(unary.op, UnaryOp::IsNotFalse);
 
-        let WhereExpr::Column(col) = unary.expr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "active");
@@ -1420,17 +1474,19 @@ mod tests {
         assert_eq!(multi.op, MultiOp::Between);
         assert_eq!(multi.exprs.len(), 3);
 
-        let WhereExpr::Column(col) = &multi.exprs[0] else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "id");
 
-        let WhereExpr::Value(LiteralValue::Integer(low)) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(low))) = &multi.exprs[1]
+        else {
             panic!("expected integer low bound");
         };
         assert_eq!(*low, 1);
 
-        let WhereExpr::Value(LiteralValue::Integer(high)) = &multi.exprs[2] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(high))) = &multi.exprs[2]
+        else {
             panic!("expected integer high bound");
         };
         assert_eq!(*high, 10);
@@ -1465,12 +1521,14 @@ mod tests {
         assert_eq!(multi.op, MultiOp::Between);
         assert_eq!(multi.exprs.len(), 3);
 
-        let WhereExpr::Value(LiteralValue::Parameter(p1)) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p1))) = &multi.exprs[1]
+        else {
             panic!("expected parameter low bound");
         };
         assert_eq!(p1, "$1");
 
-        let WhereExpr::Value(LiteralValue::Parameter(p2)) = &multi.exprs[2] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p2))) = &multi.exprs[2]
+        else {
             panic!("expected parameter high bound");
         };
         assert_eq!(p2, "$2");
@@ -1509,12 +1567,14 @@ mod tests {
 
         assert_eq!(multi.op, MultiOp::Between);
 
-        let WhereExpr::Value(LiteralValue::String(low)) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(low))) = &multi.exprs[1]
+        else {
             panic!("expected string low bound");
         };
         assert_eq!(low, "alice");
 
-        let WhereExpr::Value(LiteralValue::String(high)) = &multi.exprs[2] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(high))) = &multi.exprs[2]
+        else {
             panic!("expected string high bound");
         };
         assert_eq!(high, "charlie");
@@ -1534,17 +1594,19 @@ mod tests {
         assert_eq!(multi.op, MultiOp::BetweenSymmetric);
         assert_eq!(multi.exprs.len(), 3);
 
-        let WhereExpr::Column(col) = &multi.exprs[0] else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "id");
 
-        let WhereExpr::Value(LiteralValue::Integer(low)) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(low))) = &multi.exprs[1]
+        else {
             panic!("expected integer low bound");
         };
         assert_eq!(*low, 10);
 
-        let WhereExpr::Value(LiteralValue::Integer(high)) = &multi.exprs[2] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(high))) = &multi.exprs[2]
+        else {
             panic!("expected integer high bound");
         };
         assert_eq!(*high, 1);
@@ -1585,17 +1647,17 @@ mod tests {
         // [col, ARRAY[1, 2, 3]]
         assert_eq!(multi.exprs.len(), 2);
 
-        let WhereExpr::Column(col) = &multi.exprs[0] else {
+        let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
             panic!("expected Column");
         };
         assert_eq!(col.column, "id");
 
-        let WhereExpr::Array(elems) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Array(elems)) = &multi.exprs[1] else {
             panic!("expected Array");
         };
         assert_eq!(elems.len(), 3);
 
-        let WhereExpr::Value(LiteralValue::Integer(v1)) = &elems[0] else {
+        let ScalarExpr::Literal(LiteralValue::Integer(v1)) = &elems[0] else {
             panic!("expected integer");
         };
         assert_eq!(*v1, 1);
@@ -1621,7 +1683,8 @@ mod tests {
         // [col, $1] — parameter passed through as single value
         assert_eq!(multi.exprs.len(), 2);
 
-        let WhereExpr::Value(LiteralValue::Parameter(p)) = &multi.exprs[1] else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p))) = &multi.exprs[1]
+        else {
             panic!("expected parameter");
         };
         assert_eq!(p, "$1");
@@ -1749,7 +1812,9 @@ mod tests {
 
         assert_eq!(binary.op, BinaryOp::Like);
 
-        let WhereExpr::Value(LiteralValue::Parameter(p)) = binary.rexpr.as_ref() else {
+        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p))) =
+            binary.rexpr.as_ref()
+        else {
             panic!("expected parameter on right");
         };
         assert_eq!(p, "$1");

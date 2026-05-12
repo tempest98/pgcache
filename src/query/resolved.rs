@@ -180,33 +180,26 @@ impl ResolvedMultiExpr {
     }
 }
 
-/// Resolved WHERE expression with fully qualified references
+/// Resolved WHERE expression with fully qualified references.
+/// Scalar leaves are wrapped in `Scalar(ResolvedScalarExpr)`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedWhereExpr {
-    /// Literal value
-    Value(LiteralValue),
-    /// Fully qualified column reference
-    Column(ResolvedColumnNode),
+    /// Scalar leaf — literal, column, function call, arithmetic, array,
+    /// scalar subquery, etc.
+    Scalar(ResolvedScalarExpr),
     /// Unary expression
     Unary(ResolvedUnaryExpr),
     /// Binary expression
     Binary(ResolvedBinaryExpr),
     /// Multi-operand expression
     Multi(ResolvedMultiExpr),
-    /// Array literal: ARRAY[val1, val2, ...]
-    Array(Vec<ResolvedWhereExpr>),
-    /// Function call (for future support)
-    Function {
-        name: EcoString,
-        args: Vec<ResolvedWhereExpr>,
-        agg_star: bool,
-    },
-    /// Subquery in WHERE clause (EXISTS, IN, ANY, ALL, scalar)
+    /// Predicate sublink (EXISTS, IN, ANY, ALL).
+    /// Scalar subqueries appear via `Scalar(ResolvedScalarExpr::Subquery(...))`.
     Subquery {
         query: Box<ResolvedQueryExpr>,
         sublink_type: SubLinkType,
         /// Left-hand expression for IN/ANY/ALL (e.g., `id` in `id IN (SELECT ...)`)
-        test_expr: Option<Box<ResolvedWhereExpr>>,
+        test_expr: Option<Box<ResolvedScalarExpr>>,
         /// Columns from the outer query scope referenced inside this subquery.
         /// Empty for non-correlated subqueries.
         outer_refs: Vec<ResolvedColumnNode>,
@@ -217,15 +210,10 @@ impl ResolvedWhereExpr {
     pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let children: Box<dyn Iterator<Item = &'_ N>> = match self {
-            ResolvedWhereExpr::Value(lit) => Box::new(lit.nodes()),
-            ResolvedWhereExpr::Column(col) => Box::new(col.nodes()),
+            ResolvedWhereExpr::Scalar(scalar) => Box::new(scalar.nodes()),
             ResolvedWhereExpr::Unary(unary) => Box::new(unary.nodes()),
             ResolvedWhereExpr::Binary(binary) => Box::new(binary.nodes()),
             ResolvedWhereExpr::Multi(multi) => Box::new(multi.nodes()),
-            ResolvedWhereExpr::Array(elems) => Box::new(elems.iter().flat_map(|elem| elem.nodes())),
-            ResolvedWhereExpr::Function { args, .. } => {
-                Box::new(args.iter().flat_map(|arg| arg.nodes()))
-            }
             ResolvedWhereExpr::Subquery {
                 query, test_expr, ..
             } => {
@@ -241,6 +229,7 @@ impl ResolvedWhereExpr {
     /// Returns 0 if there are no subqueries.
     pub fn subquery_depth(&self) -> usize {
         match self {
+            ResolvedWhereExpr::Scalar(scalar) => scalar.subquery_depth(),
             ResolvedWhereExpr::Binary(b) => b.lexpr.subquery_depth().max(b.rexpr.subquery_depth()),
             ResolvedWhereExpr::Unary(u) => u.expr.subquery_depth(),
             ResolvedWhereExpr::Multi(m) => m
@@ -249,12 +238,6 @@ impl ResolvedWhereExpr {
                 .map(|e| e.subquery_depth())
                 .max()
                 .unwrap_or(0),
-            ResolvedWhereExpr::Array(elems) => {
-                elems.iter().map(|e| e.subquery_depth()).max().unwrap_or(0)
-            }
-            ResolvedWhereExpr::Function { args, .. } => {
-                args.iter().map(|a| a.subquery_depth()).max().unwrap_or(0)
-            }
             ResolvedWhereExpr::Subquery {
                 query, test_expr, ..
             } => {
@@ -262,7 +245,6 @@ impl ResolvedWhereExpr {
                 let test = test_expr.as_ref().map_or(0, |t| t.subquery_depth());
                 inner.max(test)
             }
-            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
         }
     }
 
@@ -287,10 +269,18 @@ impl ResolvedWhereExpr {
             },
             ResolvedWhereExpr::Multi(_) => 1, // Multi ops (IN, BETWEEN, etc.) are single predicates
             ResolvedWhereExpr::Unary(u) => u.expr.predicate_count(),
-            ResolvedWhereExpr::Array(_) => 0, // Array literals are not predicates
-            ResolvedWhereExpr::Function { .. } => 1, // Treat function calls as single predicate
-            ResolvedWhereExpr::Subquery { .. } => 1, // Treat subqueries as single predicate
-            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => 0,
+            ResolvedWhereExpr::Scalar(scalar) => match scalar {
+                // A bare function/subquery used as predicate counts as one.
+                ResolvedScalarExpr::Function(_) | ResolvedScalarExpr::Subquery(_, _) => 1,
+                ResolvedScalarExpr::Column(_)
+                | ResolvedScalarExpr::Identifier(_)
+                | ResolvedScalarExpr::Literal(_)
+                | ResolvedScalarExpr::Case(_)
+                | ResolvedScalarExpr::Arithmetic(_)
+                | ResolvedScalarExpr::Array(_)
+                | ResolvedScalarExpr::TypeCast { .. } => 0,
+            },
+            ResolvedWhereExpr::Subquery { .. } => 1,
         }
     }
 
@@ -303,6 +293,9 @@ impl ResolvedWhereExpr {
         negated: bool,
     ) {
         match self {
+            ResolvedWhereExpr::Scalar(scalar) => {
+                scalar.subquery_nodes_collect_with_source(branches);
+            }
             ResolvedWhereExpr::Binary(binary) => {
                 binary
                     .lexpr
@@ -324,16 +317,6 @@ impl ResolvedWhereExpr {
             ResolvedWhereExpr::Multi(multi) => {
                 for expr in &multi.exprs {
                     expr.subquery_nodes_collect_with_source(branches, negated);
-                }
-            }
-            ResolvedWhereExpr::Array(elems) => {
-                for elem in elems {
-                    elem.subquery_nodes_collect_with_source(branches, negated);
-                }
-            }
-            ResolvedWhereExpr::Function { args, .. } => {
-                for arg in args {
-                    arg.subquery_nodes_collect_with_source(branches, negated);
                 }
             }
             ResolvedWhereExpr::Subquery {
@@ -362,16 +345,16 @@ impl ResolvedWhereExpr {
                 let source = UpdateQuerySource::Subquery(kind);
                 query.select_nodes_collect_with_source(branches, source, negated);
                 if let Some(test) = test_expr {
-                    test.subquery_nodes_collect_with_source(branches, negated);
+                    test.subquery_nodes_collect_with_source(branches);
                 }
             }
-            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => {}
         }
     }
 
     /// Recursively collect SELECT branches from subqueries in this WHERE expression.
     fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
+            ResolvedWhereExpr::Scalar(scalar) => scalar.subquery_nodes_collect(branches),
             ResolvedWhereExpr::Binary(binary) => {
                 binary.lexpr.subquery_nodes_collect(branches);
                 binary.rexpr.subquery_nodes_collect(branches);
@@ -384,16 +367,6 @@ impl ResolvedWhereExpr {
                     expr.subquery_nodes_collect(branches);
                 }
             }
-            ResolvedWhereExpr::Array(elems) => {
-                for elem in elems {
-                    elem.subquery_nodes_collect(branches);
-                }
-            }
-            ResolvedWhereExpr::Function { args, .. } => {
-                for arg in args {
-                    arg.subquery_nodes_collect(branches);
-                }
-            }
             ResolvedWhereExpr::Subquery {
                 query, test_expr, ..
             } => {
@@ -402,7 +375,6 @@ impl ResolvedWhereExpr {
                     test.subquery_nodes_collect(branches);
                 }
             }
-            ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => {}
         }
     }
 }
@@ -410,8 +382,7 @@ impl ResolvedWhereExpr {
 impl Deparse for ResolvedWhereExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
-            ResolvedWhereExpr::Value(lit) => lit.deparse(buf),
-            ResolvedWhereExpr::Column(col) => col.deparse(buf),
+            ResolvedWhereExpr::Scalar(scalar) => scalar.deparse(buf),
             ResolvedWhereExpr::Unary(unary) => {
                 match unary.op {
                     UnaryOp::IsNull
@@ -523,37 +494,6 @@ impl Deparse for ResolvedWhereExpr {
                 buf.push(')');
                 buf
             }
-            ResolvedWhereExpr::Array(elems) => {
-                buf.push_str("ARRAY[");
-                let mut sep = "";
-                for elem in elems {
-                    buf.push_str(sep);
-                    elem.deparse(buf);
-                    sep = ", ";
-                }
-                buf.push(']');
-                buf
-            }
-            ResolvedWhereExpr::Function {
-                name,
-                args,
-                agg_star,
-            } => {
-                buf.push_str(name);
-                buf.push('(');
-                if *agg_star {
-                    buf.push('*');
-                } else {
-                    let mut sep = "";
-                    for arg in args {
-                        buf.push_str(sep);
-                        arg.deparse(buf);
-                        sep = ", ";
-                    }
-                }
-                buf.push(')');
-                buf
-            }
             ResolvedWhereExpr::Subquery {
                 query,
                 sublink_type,
@@ -607,9 +547,9 @@ impl Deparse for ResolvedWhereExpr {
 /// Resolved arithmetic expression: `left op right`
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedArithmeticExpr {
-    pub left: Box<ResolvedColumnExpr>,
+    pub left: Box<ResolvedScalarExpr>,
     pub op: ArithmeticOp,
-    pub right: Box<ResolvedColumnExpr>,
+    pub right: Box<ResolvedScalarExpr>,
 }
 
 impl ResolvedArithmeticExpr {
@@ -634,26 +574,26 @@ impl Deparse for ResolvedArithmeticExpr {
     }
 }
 
-/// Resolved column expression in SELECT list
+/// Resolved scalar expression — mirror of AST `ScalarExpr`. Appears in
+/// SELECT columns, function args, arithmetic operands, ARRAY elements,
+/// CASE arms, TypeCast inner, scalar subqueries, and WHERE leaves.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ResolvedColumnExpr {
-    /// Fully qualified column reference
+pub enum ResolvedScalarExpr {
     Column(ResolvedColumnNode),
-    /// Unqualified column name (used in set operation ORDER BY)
+    /// Unqualified column name used in set-op ORDER BY, which references
+    /// SELECT-list output names rather than source columns.
     Identifier(EcoString),
-    /// Function call (including aggregates and window functions)
     Function(ResolvedFunctionCall),
-    /// Literal value
     Literal(LiteralValue),
-    /// CASE expression
     Case(ResolvedCaseExpr),
-    /// Arithmetic expression: `left op right`
     Arithmetic(ResolvedArithmeticExpr),
-    /// Scalar subquery in SELECT list
+    /// Second tuple element is the set of outer-scope columns referenced
+    /// inside this subquery; empty for non-correlated subqueries.
     Subquery(Box<ResolvedQueryExpr>, Vec<ResolvedColumnNode>),
-    /// target_type pre-rendered by `query::ast::convert::type_name_render`.
+    Array(Vec<ResolvedScalarExpr>),
+    /// `target_type` pre-rendered by `query::ast::convert::type_name_render`.
     TypeCast {
-        expr: Box<ResolvedColumnExpr>,
+        expr: Box<ResolvedScalarExpr>,
         target_type: EcoString,
     },
 }
@@ -662,7 +602,7 @@ pub enum ResolvedColumnExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFunctionCall {
     pub name: EcoString,
-    pub args: Vec<ResolvedColumnExpr>,
+    pub args: Vec<ResolvedScalarExpr>,
     pub agg_star: bool,
     pub agg_distinct: bool,
     pub agg_order: Vec<ResolvedOrderByClause>,
@@ -729,7 +669,7 @@ impl Deparse for ResolvedFunctionCall {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedWindowSpec {
     /// PARTITION BY columns
-    pub partition_by: Vec<ResolvedColumnExpr>,
+    pub partition_by: Vec<ResolvedScalarExpr>,
     /// ORDER BY clauses
     pub order_by: Vec<ResolvedOrderByClause>,
 }
@@ -776,11 +716,11 @@ impl Deparse for ResolvedWindowSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedCaseExpr {
     /// For simple CASE, the expression being tested
-    pub arg: Option<Box<ResolvedColumnExpr>>,
+    pub arg: Option<Box<ResolvedScalarExpr>>,
     /// List of WHEN clauses
     pub whens: Vec<ResolvedCaseWhen>,
     /// ELSE result
-    pub default: Option<Box<ResolvedColumnExpr>>,
+    pub default: Option<Box<ResolvedScalarExpr>>,
 }
 
 /// Resolved CASE WHEN clause
@@ -789,21 +729,22 @@ pub struct ResolvedCaseWhen {
     /// The condition (for searched CASE) or value (for simple CASE)
     pub condition: ResolvedWhereExpr,
     /// The result if condition is true/matches
-    pub result: ResolvedColumnExpr,
+    pub result: ResolvedScalarExpr,
 }
 
-impl ResolvedColumnExpr {
+impl ResolvedScalarExpr {
     pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let children: Box<dyn Iterator<Item = &'_ N>> = match self {
-            ResolvedColumnExpr::Column(col) => Box::new(col.nodes()),
-            ResolvedColumnExpr::Identifier(_) => Box::new(std::iter::empty()),
-            ResolvedColumnExpr::Literal(lit) => Box::new(lit.nodes()),
-            ResolvedColumnExpr::Function(func) => Box::new(func.nodes()),
-            ResolvedColumnExpr::Case(case) => Box::new(case.nodes()),
-            ResolvedColumnExpr::Arithmetic(arith) => Box::new(arith.nodes()),
-            ResolvedColumnExpr::Subquery(query, _) => Box::new(query.nodes()),
-            ResolvedColumnExpr::TypeCast { expr, .. } => Box::new(expr.nodes()),
+            ResolvedScalarExpr::Column(col) => Box::new(col.nodes()),
+            ResolvedScalarExpr::Identifier(_) => Box::new(std::iter::empty()),
+            ResolvedScalarExpr::Literal(lit) => Box::new(lit.nodes()),
+            ResolvedScalarExpr::Function(func) => Box::new(func.nodes()),
+            ResolvedScalarExpr::Case(case) => Box::new(case.nodes()),
+            ResolvedScalarExpr::Arithmetic(arith) => Box::new(arith.nodes()),
+            ResolvedScalarExpr::Subquery(query, _) => Box::new(query.nodes()),
+            ResolvedScalarExpr::Array(elems) => Box::new(elems.iter().flat_map(|e| e.nodes())),
+            ResolvedScalarExpr::TypeCast { expr, .. } => Box::new(expr.nodes()),
         };
         current.chain(children)
     }
@@ -814,11 +755,11 @@ impl ResolvedColumnExpr {
     /// subquery doesn't make the outer expression aggregating).
     pub fn has_aggregate(&self, agg_fns: &HashSet<String>) -> bool {
         match self {
-            ResolvedColumnExpr::Function(func) => {
+            ResolvedScalarExpr::Function(func) => {
                 agg_fns.contains(func.name.as_str())
                     || func.args.iter().any(|a| a.has_aggregate(agg_fns))
             }
-            ResolvedColumnExpr::Case(case) => {
+            ResolvedScalarExpr::Case(case) => {
                 case.arg.as_ref().is_some_and(|a| a.has_aggregate(agg_fns))
                     || case.whens.iter().any(|w| w.result.has_aggregate(agg_fns))
                     || case
@@ -826,30 +767,31 @@ impl ResolvedColumnExpr {
                         .as_ref()
                         .is_some_and(|d| d.has_aggregate(agg_fns))
             }
-            ResolvedColumnExpr::Arithmetic(arith) => {
+            ResolvedScalarExpr::Arithmetic(arith) => {
                 arith.left.has_aggregate(agg_fns) || arith.right.has_aggregate(agg_fns)
             }
-            ResolvedColumnExpr::TypeCast { expr, .. } => expr.has_aggregate(agg_fns),
-            ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Literal(_)
-            | ResolvedColumnExpr::Subquery(_, _) => false,
+            ResolvedScalarExpr::Array(elems) => elems.iter().any(|e| e.has_aggregate(agg_fns)),
+            ResolvedScalarExpr::TypeCast { expr, .. } => expr.has_aggregate(agg_fns),
+            ResolvedScalarExpr::Column(_)
+            | ResolvedScalarExpr::Identifier(_)
+            | ResolvedScalarExpr::Literal(_)
+            | ResolvedScalarExpr::Subquery(_, _) => false,
         }
     }
 
     /// Compute the maximum subquery nesting depth in this column expression.
     fn subquery_depth(&self) -> usize {
         match self {
-            ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Literal(_) => 0,
-            ResolvedColumnExpr::Function(func) => func
+            ResolvedScalarExpr::Column(_)
+            | ResolvedScalarExpr::Identifier(_)
+            | ResolvedScalarExpr::Literal(_) => 0,
+            ResolvedScalarExpr::Function(func) => func
                 .args
                 .iter()
                 .map(|a| a.subquery_depth())
                 .max()
                 .unwrap_or(0),
-            ResolvedColumnExpr::Case(case) => {
+            ResolvedScalarExpr::Case(case) => {
                 let arg_depth = case.arg.as_ref().map_or(0, |a| a.subquery_depth());
                 let when_depth = case
                     .whens
@@ -860,12 +802,15 @@ impl ResolvedColumnExpr {
                 let default_depth = case.default.as_ref().map_or(0, |d| d.subquery_depth());
                 arg_depth.max(when_depth).max(default_depth)
             }
-            ResolvedColumnExpr::Arithmetic(arith) => arith
+            ResolvedScalarExpr::Arithmetic(arith) => arith
                 .left
                 .subquery_depth()
                 .max(arith.right.subquery_depth()),
-            ResolvedColumnExpr::Subquery(query, _) => 1 + query.subquery_depth(),
-            ResolvedColumnExpr::TypeCast { expr, .. } => expr.subquery_depth(),
+            ResolvedScalarExpr::Subquery(query, _) => 1 + query.subquery_depth(),
+            ResolvedScalarExpr::Array(elems) => {
+                elems.iter().map(|e| e.subquery_depth()).max().unwrap_or(0)
+            }
+            ResolvedScalarExpr::TypeCast { expr, .. } => expr.subquery_depth(),
         }
     }
 
@@ -876,10 +821,10 @@ impl ResolvedColumnExpr {
         branches: &mut Vec<(&'a ResolvedSelectNode, UpdateQuerySource)>,
     ) {
         match self {
-            ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Literal(_) => {}
-            ResolvedColumnExpr::Function(func) => {
+            ResolvedScalarExpr::Column(_)
+            | ResolvedScalarExpr::Identifier(_)
+            | ResolvedScalarExpr::Literal(_) => {}
+            ResolvedScalarExpr::Function(func) => {
                 for arg in &func.args {
                     arg.subquery_nodes_collect_with_source(branches);
                 }
@@ -899,7 +844,7 @@ impl ResolvedColumnExpr {
                     }
                 }
             }
-            ResolvedColumnExpr::Case(case) => {
+            ResolvedScalarExpr::Case(case) => {
                 if let Some(arg) = &case.arg {
                     arg.subquery_nodes_collect_with_source(branches);
                 }
@@ -913,15 +858,20 @@ impl ResolvedColumnExpr {
                     default.subquery_nodes_collect_with_source(branches);
                 }
             }
-            ResolvedColumnExpr::Arithmetic(arith) => {
+            ResolvedScalarExpr::Arithmetic(arith) => {
                 arith.left.subquery_nodes_collect_with_source(branches);
                 arith.right.subquery_nodes_collect_with_source(branches);
             }
-            ResolvedColumnExpr::Subquery(query, _) => {
+            ResolvedScalarExpr::Subquery(query, _) => {
                 let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);
                 query.select_nodes_collect_with_source(branches, source, false);
             }
-            ResolvedColumnExpr::TypeCast { expr, .. } => {
+            ResolvedScalarExpr::Array(elems) => {
+                for elem in elems {
+                    elem.subquery_nodes_collect_with_source(branches);
+                }
+            }
+            ResolvedScalarExpr::TypeCast { expr, .. } => {
                 expr.subquery_nodes_collect_with_source(branches);
             }
         }
@@ -930,10 +880,10 @@ impl ResolvedColumnExpr {
     /// Recursively collect SELECT branches from subqueries in this column expression.
     fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
         match self {
-            ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Literal(_) => {}
-            ResolvedColumnExpr::Function(func) => {
+            ResolvedScalarExpr::Column(_)
+            | ResolvedScalarExpr::Identifier(_)
+            | ResolvedScalarExpr::Literal(_) => {}
+            ResolvedScalarExpr::Function(func) => {
                 for arg in &func.args {
                     arg.subquery_nodes_collect(branches);
                 }
@@ -952,7 +902,7 @@ impl ResolvedColumnExpr {
                     }
                 }
             }
-            ResolvedColumnExpr::Case(case) => {
+            ResolvedScalarExpr::Case(case) => {
                 if let Some(arg) = &case.arg {
                     arg.subquery_nodes_collect(branches);
                 }
@@ -964,14 +914,19 @@ impl ResolvedColumnExpr {
                     default.subquery_nodes_collect(branches);
                 }
             }
-            ResolvedColumnExpr::Arithmetic(arith) => {
+            ResolvedScalarExpr::Arithmetic(arith) => {
                 arith.left.subquery_nodes_collect(branches);
                 arith.right.subquery_nodes_collect(branches);
             }
-            ResolvedColumnExpr::Subquery(query, _) => {
+            ResolvedScalarExpr::Subquery(query, _) => {
                 query.select_nodes_collect(branches);
             }
-            ResolvedColumnExpr::TypeCast { expr, .. } => {
+            ResolvedScalarExpr::Array(elems) => {
+                for elem in elems {
+                    elem.subquery_nodes_collect(branches);
+                }
+            }
+            ResolvedScalarExpr::TypeCast { expr, .. } => {
                 expr.subquery_nodes_collect(branches);
             }
         }
@@ -999,22 +954,33 @@ impl ResolvedCaseWhen {
     }
 }
 
-impl Deparse for ResolvedColumnExpr {
+impl Deparse for ResolvedScalarExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
-            ResolvedColumnExpr::Column(col) => col.deparse(buf),
-            ResolvedColumnExpr::Identifier(name) => name.deparse(buf),
-            ResolvedColumnExpr::Literal(lit) => lit.deparse(buf),
-            ResolvedColumnExpr::Function(func) => func.deparse(buf),
-            ResolvedColumnExpr::Case(case) => case.deparse(buf),
-            ResolvedColumnExpr::Arithmetic(arith) => arith.deparse(buf),
-            ResolvedColumnExpr::Subquery(query, _) => {
+            ResolvedScalarExpr::Column(col) => col.deparse(buf),
+            ResolvedScalarExpr::Identifier(name) => name.deparse(buf),
+            ResolvedScalarExpr::Literal(lit) => lit.deparse(buf),
+            ResolvedScalarExpr::Function(func) => func.deparse(buf),
+            ResolvedScalarExpr::Case(case) => case.deparse(buf),
+            ResolvedScalarExpr::Arithmetic(arith) => arith.deparse(buf),
+            ResolvedScalarExpr::Subquery(query, _) => {
                 buf.push('(');
                 query.deparse(buf);
                 buf.push(')');
                 buf
             }
-            ResolvedColumnExpr::TypeCast { expr, target_type } => {
+            ResolvedScalarExpr::Array(elems) => {
+                buf.push_str("ARRAY[");
+                let mut sep = "";
+                for elem in elems {
+                    buf.push_str(sep);
+                    elem.deparse(buf);
+                    sep = ", ";
+                }
+                buf.push(']');
+                buf
+            }
+            ResolvedScalarExpr::TypeCast { expr, target_type } => {
                 buf.push('(');
                 expr.deparse(buf);
                 buf.push_str(")::");
@@ -1050,7 +1016,7 @@ impl Deparse for ResolvedCaseExpr {
 /// Resolved SELECT column with optional alias
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSelectColumn {
-    pub expr: ResolvedColumnExpr,
+    pub expr: ResolvedScalarExpr,
     pub alias: Option<EcoString>,
 }
 
@@ -1071,14 +1037,15 @@ impl ResolvedSelectColumn {
             return Some(alias);
         }
         match &self.expr {
-            ResolvedColumnExpr::Column(c) => Some(&c.column),
-            ResolvedColumnExpr::Identifier(name) => Some(name),
-            ResolvedColumnExpr::Function(_)
-            | ResolvedColumnExpr::Literal(_)
-            | ResolvedColumnExpr::Case(_)
-            | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(_, _)
-            | ResolvedColumnExpr::TypeCast { .. } => None,
+            ResolvedScalarExpr::Column(c) => Some(&c.column),
+            ResolvedScalarExpr::Identifier(name) => Some(name),
+            ResolvedScalarExpr::Function(_)
+            | ResolvedScalarExpr::Literal(_)
+            | ResolvedScalarExpr::Case(_)
+            | ResolvedScalarExpr::Arithmetic(_)
+            | ResolvedScalarExpr::Subquery(_, _)
+            | ResolvedScalarExpr::Array(_)
+            | ResolvedScalarExpr::TypeCast { .. } => None,
         }
     }
 }
@@ -1156,18 +1123,19 @@ impl ResolvedSelectColumns {
     /// named by the original SELECT-list scope, so source-qualified refs
     /// (`public.orders.status`, `count(orders.id)`) aren't valid against the
     /// MV; positional ORDER BY sidesteps the naming entirely.
-    pub fn columns_position_of(&self, expr: &ResolvedColumnExpr) -> Option<usize> {
+    pub fn columns_position_of(&self, expr: &ResolvedScalarExpr) -> Option<usize> {
         // ORDER BY against a SELECT-list alias resolves to `Identifier(name)`;
         // match by output name so positional rewrite still works for MV serving.
         match expr {
-            ResolvedColumnExpr::Identifier(name) => self.position_by_output_name(name.as_str()),
-            ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Function(_)
-            | ResolvedColumnExpr::Literal(_)
-            | ResolvedColumnExpr::Case(_)
-            | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(..)
-            | ResolvedColumnExpr::TypeCast { .. } => {
+            ResolvedScalarExpr::Identifier(name) => self.position_by_output_name(name.as_str()),
+            ResolvedScalarExpr::Column(_)
+            | ResolvedScalarExpr::Function(_)
+            | ResolvedScalarExpr::Literal(_)
+            | ResolvedScalarExpr::Case(_)
+            | ResolvedScalarExpr::Arithmetic(_)
+            | ResolvedScalarExpr::Subquery(..)
+            | ResolvedScalarExpr::Array(_)
+            | ResolvedScalarExpr::TypeCast { .. } => {
                 let Self::Columns(cols) = self else {
                     return None;
                 };
@@ -1392,7 +1360,7 @@ impl Deparse for ResolvedJoinNode {
 /// Resolved ORDER BY clause
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedOrderByClause {
-    pub expr: ResolvedColumnExpr,
+    pub expr: ResolvedScalarExpr,
     pub direction: OrderDirection,
 }
 

@@ -5,8 +5,18 @@ use ecow::EcoString;
 
 use crate::query::ast::{BinaryOp, LiteralValue, MultiOp};
 use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
+    ResolvedColumnNode, ResolvedScalarExpr, ResolvedSelectNode, ResolvedTableSource,
+    ResolvedWhereExpr,
 };
+
+/// Unwrap a `WhereExpr::Scalar` to its inner `ResolvedScalarExpr` for pattern matching.
+fn binary_scalar_leaf(expr: &ResolvedWhereExpr) -> Option<&ResolvedScalarExpr> {
+    if let ResolvedWhereExpr::Scalar(scalar) = expr {
+        Some(scalar)
+    } else {
+        None
+    }
+}
 
 /// A column constraint extracted from WHERE/JOIN conditions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -610,9 +620,12 @@ fn analyze_constraint_expr(
     match expr {
         // Comparison operators: column op value, value op column, column = column
         ResolvedWhereExpr::Binary(binary) if binary.op.is_comparison() => {
-            match (&*binary.lexpr, &*binary.rexpr) {
+            match (
+                binary_scalar_leaf(&binary.lexpr),
+                binary_scalar_leaf(&binary.rexpr),
+            ) {
                 // column op literal
-                (ResolvedWhereExpr::Column(col), ResolvedWhereExpr::Value(val)) => {
+                (Some(ResolvedScalarExpr::Column(col)), Some(ResolvedScalarExpr::Literal(val))) => {
                     constraints.insert(ColumnConstraint::Comparison {
                         column: col.clone(),
                         op: binary.op,
@@ -620,7 +633,7 @@ fn analyze_constraint_expr(
                     });
                 }
                 // literal op column → column op_flip literal
-                (ResolvedWhereExpr::Value(val), ResolvedWhereExpr::Column(col)) => {
+                (Some(ResolvedScalarExpr::Literal(val)), Some(ResolvedScalarExpr::Column(col))) => {
                     if let Some(flipped) = binary.op.op_flip() {
                         constraints.insert(ColumnConstraint::Comparison {
                             column: col.clone(),
@@ -632,9 +645,10 @@ fn analyze_constraint_expr(
                     }
                 }
                 // column = column (equivalence) — equality only
-                (ResolvedWhereExpr::Column(left), ResolvedWhereExpr::Column(right))
-                    if binary.op == BinaryOp::Equal =>
-                {
+                (
+                    Some(ResolvedScalarExpr::Column(left)),
+                    Some(ResolvedScalarExpr::Column(right)),
+                ) if binary.op == BinaryOp::Equal => {
                     equivalences.insert(ColumnEquivalence {
                         left: left.clone(),
                         right: right.clone(),
@@ -682,13 +696,10 @@ fn analyze_constraint_expr(
         // Everything else: OR, NOT BETWEEN, ANY/ALL, subqueries, function
         // calls, etc. — cannot extract constraints. Mark the analysis
         // incomplete so subsumption falls back to "not subsumed".
-        ResolvedWhereExpr::Value(_)
-        | ResolvedWhereExpr::Column(_)
+        ResolvedWhereExpr::Scalar(_)
         | ResolvedWhereExpr::Unary(_)
         | ResolvedWhereExpr::Binary(_)
         | ResolvedWhereExpr::Multi(_)
-        | ResolvedWhereExpr::Array(_)
-        | ResolvedWhereExpr::Function { .. }
         | ResolvedWhereExpr::Subquery { .. } => {
             *complete = false;
         }
@@ -705,9 +716,9 @@ fn between_constraints_extract(
 ) {
     // exprs layout: [subject, low, high]
     let [
-        ResolvedWhereExpr::Column(col),
-        ResolvedWhereExpr::Value(low),
-        ResolvedWhereExpr::Value(high),
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(low)),
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(high)),
     ] = exprs
     else {
         return;
@@ -741,7 +752,7 @@ fn in_constraints_extract(
     exprs: &[ResolvedWhereExpr],
     constraints: &mut HashSet<ColumnConstraint>,
 ) {
-    let Some(ResolvedWhereExpr::Column(col)) = exprs.first() else {
+    let Some(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col))) = exprs.first() else {
         return;
     };
     let values = exprs.get(1..).unwrap_or_default();
@@ -749,7 +760,7 @@ fn in_constraints_extract(
     // All values must be literals, no Parameters or Nulls
     let mut literal_values: Vec<LiteralValue> = Vec::with_capacity(values.len());
     for expr in values {
-        let ResolvedWhereExpr::Value(v) = expr else {
+        let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(v)) = expr else {
             return;
         };
         if literal_value_is_incomparable(v) {
@@ -770,7 +781,7 @@ fn in_constraints_extract(
 
 /// Extract an `InSet` constraint from `column = ANY(<array>)`.
 /// `exprs` layout: `[subject, rhs]` where `rhs` is one of:
-///   - `Value(LiteralValue::Array(elements, _))` — produced by binary
+///   - `Literal(LiteralValue::Array(elements, _))` — produced by binary
 ///     array parameter substitution (PGC-103)
 ///   - `Array(elements)` — produced by `pg_query`'s `AArrayExpr` for
 ///     literal `ARRAY[v1, v2, …]` syntax in the original SQL
@@ -783,18 +794,22 @@ fn any_eq_array_constraints_extract(
     constraints: &mut HashSet<ColumnConstraint>,
     complete: &mut bool,
 ) {
-    let [ResolvedWhereExpr::Column(col), rhs] = exprs else {
+    let [
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
+        ResolvedWhereExpr::Scalar(rhs),
+    ] = exprs
+    else {
         *complete = false;
         return;
     };
 
     // Collect element values from either AST shape.
     let mut literal_values: Vec<LiteralValue> = match rhs {
-        ResolvedWhereExpr::Value(LiteralValue::Array(values, _)) => values.clone(),
-        ResolvedWhereExpr::Array(elems) => {
+        ResolvedScalarExpr::Literal(LiteralValue::Array(values, _)) => values.clone(),
+        ResolvedScalarExpr::Array(elems) => {
             let mut out = Vec::with_capacity(elems.len());
             for elem in elems {
-                let ResolvedWhereExpr::Value(v) = elem else {
+                let ResolvedScalarExpr::Literal(v) = elem else {
                     *complete = false;
                     return;
                 };
@@ -802,13 +817,14 @@ fn any_eq_array_constraints_extract(
             }
             out
         }
-        ResolvedWhereExpr::Value(_)
-        | ResolvedWhereExpr::Column(_)
-        | ResolvedWhereExpr::Unary(_)
-        | ResolvedWhereExpr::Binary(_)
-        | ResolvedWhereExpr::Multi(_)
-        | ResolvedWhereExpr::Function { .. }
-        | ResolvedWhereExpr::Subquery { .. } => {
+        ResolvedScalarExpr::Literal(_)
+        | ResolvedScalarExpr::Column(_)
+        | ResolvedScalarExpr::Identifier(_)
+        | ResolvedScalarExpr::Function(_)
+        | ResolvedScalarExpr::Case(_)
+        | ResolvedScalarExpr::Arithmetic(_)
+        | ResolvedScalarExpr::Subquery(_, _)
+        | ResolvedScalarExpr::TypeCast { .. } => {
             *complete = false;
             return;
         }
@@ -836,13 +852,13 @@ fn not_in_constraints_extract(
     exprs: &[ResolvedWhereExpr],
     constraints: &mut HashSet<ColumnConstraint>,
 ) {
-    let Some(ResolvedWhereExpr::Column(col)) = exprs.first() else {
+    let Some(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col))) = exprs.first() else {
         return;
     };
     let values = exprs.get(1..).unwrap_or_default();
 
     for expr in values {
-        let ResolvedWhereExpr::Value(v) = expr else {
+        let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(v)) = expr else {
             return;
         };
         if literal_value_is_incomparable(v) {

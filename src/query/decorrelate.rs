@@ -9,12 +9,17 @@ use crate::cache::SubqueryKind;
 use crate::catalog::ColumnMetadata;
 use crate::query::ast::{BinaryOp, JoinType, SubLinkType, TableAlias, UnaryOp};
 use crate::query::resolved::{
-    ResolvedBinaryExpr, ResolvedColumnExpr, ResolvedColumnNode, ResolvedJoinNode,
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumn, ResolvedSelectColumns,
-    ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableSource, ResolvedTableSubqueryNode,
-    ResolvedUnaryExpr, ResolvedWhereExpr,
+    ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedQueryBody, ResolvedQueryExpr,
+    ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedSetOpNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedUnaryExpr,
+    ResolvedWhereExpr,
 };
 use crate::query::transform::{where_expr_conjuncts_join, where_expr_conjuncts_split};
+
+/// Wrap a resolved column node as a boxed `WhereExpr::Scalar(Column(...))` leaf.
+fn boxed_scalar_column(col: ResolvedColumnNode) -> Box<ResolvedWhereExpr> {
+    Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)))
+}
 
 error_set! {
     DecorrelateError := {
@@ -151,7 +156,10 @@ fn where_clause_correlation_partition(
             ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::Equal => {
                 // Check if this is a Column = Column with one side being an outer ref
                 match (binary.lexpr.as_ref(), binary.rexpr.as_ref()) {
-                    (ResolvedWhereExpr::Column(left), ResolvedWhereExpr::Column(right)) => {
+                    (
+                        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(left)),
+                        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(right)),
+                    ) => {
                         let left_is_outer = column_matches_outer_ref(left, &outer_keys);
                         let right_is_outer = column_matches_outer_ref(right, &outer_keys);
 
@@ -180,13 +188,10 @@ fn where_clause_correlation_partition(
                     }
                 }
             }
-            ResolvedWhereExpr::Value(_)
-            | ResolvedWhereExpr::Column(_)
+            ResolvedWhereExpr::Scalar(_)
             | ResolvedWhereExpr::Unary(_)
             | ResolvedWhereExpr::Binary(_)
             | ResolvedWhereExpr::Multi(_)
-            | ResolvedWhereExpr::Array(_)
-            | ResolvedWhereExpr::Function { .. }
             | ResolvedWhereExpr::Subquery { .. } => {
                 // Non-equality predicate — check if it references outer refs
                 if conjunct_references_outer_ref(&conjunct, &outer_keys) {
@@ -212,8 +217,7 @@ fn conjunct_references_outer_ref(
     outer_keys: &HashSet<(&str, &str, &str)>,
 ) -> bool {
     match expr {
-        ResolvedWhereExpr::Column(col) => column_matches_outer_ref(col, outer_keys),
-        ResolvedWhereExpr::Value(_) => false,
+        ResolvedWhereExpr::Scalar(scalar) => scalar_references_outer_ref(scalar, outer_keys),
         ResolvedWhereExpr::Unary(u) => conjunct_references_outer_ref(&u.expr, outer_keys),
         ResolvedWhereExpr::Binary(b) => {
             conjunct_references_outer_ref(&b.lexpr, outer_keys)
@@ -223,13 +227,44 @@ fn conjunct_references_outer_ref(
             .exprs
             .iter()
             .any(|e| conjunct_references_outer_ref(e, outer_keys)),
-        ResolvedWhereExpr::Array(elems) => elems
-            .iter()
-            .any(|e| conjunct_references_outer_ref(e, outer_keys)),
-        ResolvedWhereExpr::Function { args, .. } => args
-            .iter()
-            .any(|a| conjunct_references_outer_ref(a, outer_keys)),
         ResolvedWhereExpr::Subquery { .. } => false,
+    }
+}
+
+fn scalar_references_outer_ref(
+    expr: &ResolvedScalarExpr,
+    outer_keys: &HashSet<(&str, &str, &str)>,
+) -> bool {
+    match expr {
+        ResolvedScalarExpr::Column(col) => column_matches_outer_ref(col, outer_keys),
+        ResolvedScalarExpr::Function(func) => func
+            .args
+            .iter()
+            .any(|a| scalar_references_outer_ref(a, outer_keys)),
+        ResolvedScalarExpr::Arithmetic(arith) => {
+            scalar_references_outer_ref(&arith.left, outer_keys)
+                || scalar_references_outer_ref(&arith.right, outer_keys)
+        }
+        ResolvedScalarExpr::Case(case) => {
+            case.arg
+                .as_ref()
+                .is_some_and(|a| scalar_references_outer_ref(a, outer_keys))
+                || case.whens.iter().any(|w| {
+                    conjunct_references_outer_ref(&w.condition, outer_keys)
+                        || scalar_references_outer_ref(&w.result, outer_keys)
+                })
+                || case
+                    .default
+                    .as_ref()
+                    .is_some_and(|d| scalar_references_outer_ref(d, outer_keys))
+        }
+        ResolvedScalarExpr::Array(elems) => elems
+            .iter()
+            .any(|e| scalar_references_outer_ref(e, outer_keys)),
+        ResolvedScalarExpr::TypeCast { expr, .. } => scalar_references_outer_ref(expr, outer_keys),
+        ResolvedScalarExpr::Literal(_)
+        | ResolvedScalarExpr::Identifier(_)
+        | ResolvedScalarExpr::Subquery(_, _) => false,
     }
 }
 
@@ -237,19 +272,15 @@ fn conjunct_references_outer_ref(
 fn correlation_predicates_to_condition(predicates: &CorrelationPredicates) -> ResolvedWhereExpr {
     let first = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
         op: BinaryOp::Equal,
-        lexpr: Box::new(ResolvedWhereExpr::Column(
-            predicates.first.inner_column.clone(),
-        )),
-        rexpr: Box::new(ResolvedWhereExpr::Column(
-            predicates.first.outer_column.clone(),
-        )),
+        lexpr: boxed_scalar_column(predicates.first.inner_column.clone()),
+        rexpr: boxed_scalar_column(predicates.first.outer_column.clone()),
     });
 
     predicates.rest.iter().fold(first, |acc, p| {
         let condition = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(ResolvedWhereExpr::Column(p.inner_column.clone())),
-            rexpr: Box::new(ResolvedWhereExpr::Column(p.outer_column.clone())),
+            lexpr: boxed_scalar_column(p.inner_column.clone()),
+            rexpr: boxed_scalar_column(p.outer_column.clone()),
         });
         ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
             op: BinaryOp::And,
@@ -348,9 +379,7 @@ fn subquery_not_exists_decorrelate(
     let first_predicate = &predicates.first;
     let is_null_check = ResolvedWhereExpr::Unary(ResolvedUnaryExpr {
         op: UnaryOp::IsNull,
-        expr: Box::new(ResolvedWhereExpr::Column(
-            first_predicate.inner_column.clone(),
-        )),
+        expr: boxed_scalar_column(first_predicate.inner_column.clone()),
     });
 
     // Merge IS NULL with existing outer WHERE
@@ -406,31 +435,32 @@ fn merge_where_clauses(
     }
 }
 
-/// Check whether a ResolvedColumnExpr contains any correlated subquery (non-empty outer_refs).
-fn column_expr_has_correlation(expr: &ResolvedColumnExpr) -> bool {
+/// Check whether a ResolvedScalarExpr contains any correlated subquery (non-empty outer_refs).
+fn scalar_expr_has_correlation(expr: &ResolvedScalarExpr) -> bool {
     match expr {
-        ResolvedColumnExpr::Subquery(_, outer_refs) => !outer_refs.is_empty(),
-        ResolvedColumnExpr::Function(func) => func.args.iter().any(column_expr_has_correlation),
-        ResolvedColumnExpr::Case(case) => {
+        ResolvedScalarExpr::Subquery(_, outer_refs) => !outer_refs.is_empty(),
+        ResolvedScalarExpr::Function(func) => func.args.iter().any(scalar_expr_has_correlation),
+        ResolvedScalarExpr::Case(case) => {
             case.arg
                 .as_ref()
-                .is_some_and(|a| column_expr_has_correlation(a))
+                .is_some_and(|a| scalar_expr_has_correlation(a))
                 || case.whens.iter().any(|w| {
                     where_expr_has_correlation(&w.condition)
-                        || column_expr_has_correlation(&w.result)
+                        || scalar_expr_has_correlation(&w.result)
                 })
                 || case
                     .default
                     .as_ref()
-                    .is_some_and(|d| column_expr_has_correlation(d))
+                    .is_some_and(|d| scalar_expr_has_correlation(d))
         }
-        ResolvedColumnExpr::Arithmetic(arith) => {
-            column_expr_has_correlation(&arith.left) || column_expr_has_correlation(&arith.right)
+        ResolvedScalarExpr::Arithmetic(arith) => {
+            scalar_expr_has_correlation(&arith.left) || scalar_expr_has_correlation(&arith.right)
         }
-        ResolvedColumnExpr::TypeCast { expr, .. } => column_expr_has_correlation(expr),
-        ResolvedColumnExpr::Column(_)
-        | ResolvedColumnExpr::Identifier(_)
-        | ResolvedColumnExpr::Literal(_) => false,
+        ResolvedScalarExpr::Array(elems) => elems.iter().any(scalar_expr_has_correlation),
+        ResolvedScalarExpr::TypeCast { expr, .. } => scalar_expr_has_correlation(expr),
+        ResolvedScalarExpr::Column(_)
+        | ResolvedScalarExpr::Identifier(_)
+        | ResolvedScalarExpr::Literal(_) => false,
     }
 }
 
@@ -438,14 +468,12 @@ fn column_expr_has_correlation(expr: &ResolvedColumnExpr) -> bool {
 fn where_expr_has_correlation(expr: &ResolvedWhereExpr) -> bool {
     match expr {
         ResolvedWhereExpr::Subquery { outer_refs, .. } => !outer_refs.is_empty(),
+        ResolvedWhereExpr::Scalar(scalar) => scalar_expr_has_correlation(scalar),
         ResolvedWhereExpr::Unary(u) => where_expr_has_correlation(&u.expr),
         ResolvedWhereExpr::Binary(b) => {
             where_expr_has_correlation(&b.lexpr) || where_expr_has_correlation(&b.rexpr)
         }
         ResolvedWhereExpr::Multi(m) => m.exprs.iter().any(where_expr_has_correlation),
-        ResolvedWhereExpr::Array(elems) => elems.iter().any(where_expr_has_correlation),
-        ResolvedWhereExpr::Function { args, .. } => args.iter().any(where_expr_has_correlation),
-        ResolvedWhereExpr::Value(_) | ResolvedWhereExpr::Column(_) => false,
     }
 }
 
@@ -523,14 +551,15 @@ fn in_any_inner_output_column(
 
     match columns.as_slice() {
         [col] => match &col.expr {
-            ResolvedColumnExpr::Column(col_node) => Ok(col_node.clone()),
-            ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Function(_)
-            | ResolvedColumnExpr::Literal(_)
-            | ResolvedColumnExpr::Case(_)
-            | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(..)
-            | ResolvedColumnExpr::TypeCast { .. } => Err(DecorrelateError::NonDecorrelatable {
+            ResolvedScalarExpr::Column(col_node) => Ok(col_node.clone()),
+            ResolvedScalarExpr::Identifier(_)
+            | ResolvedScalarExpr::Function(_)
+            | ResolvedScalarExpr::Literal(_)
+            | ResolvedScalarExpr::Case(_)
+            | ResolvedScalarExpr::Arithmetic(_)
+            | ResolvedScalarExpr::Subquery(..)
+            | ResolvedScalarExpr::Array(_)
+            | ResolvedScalarExpr::TypeCast { .. } => Err(DecorrelateError::NonDecorrelatable {
                 reason: "IN subquery output is not a simple column reference".to_owned(),
             }
             .into()),
@@ -553,7 +582,7 @@ fn subquery_in_any_decorrelate(
     inner_query: &ResolvedQueryExpr,
     predicates: &CorrelationPredicates,
     residual: Option<ResolvedWhereExpr>,
-    test_expr: &ResolvedWhereExpr,
+    test_expr: &ResolvedScalarExpr,
     inner_output_column: &ResolvedColumnNode,
 ) -> Option<ResolvedSelectNode> {
     let inner_select = inner_query_select(inner_query)?;
@@ -561,8 +590,8 @@ fn subquery_in_any_decorrelate(
     // Build IN predicate: test_expr = inner_output_column
     let in_predicate = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
         op: BinaryOp::Equal,
-        lexpr: Box::new(test_expr.clone()),
-        rexpr: Box::new(ResolvedWhereExpr::Column(inner_output_column.clone())),
+        lexpr: Box::new(ResolvedWhereExpr::Scalar(test_expr.clone())),
+        rexpr: boxed_scalar_column(inner_output_column.clone()),
     });
 
     // Build correlation condition from WHERE predicates and combine with IN predicate
@@ -607,7 +636,7 @@ fn subquery_not_in_all_decorrelate(
     inner_query: &ResolvedQueryExpr,
     predicates: &CorrelationPredicates,
     residual: Option<ResolvedWhereExpr>,
-    test_expr: &ResolvedWhereExpr,
+    test_expr: &ResolvedScalarExpr,
     inner_output_column: &ResolvedColumnNode,
 ) -> Option<ResolvedSelectNode> {
     let inner_select = inner_query_select(inner_query)?;
@@ -615,8 +644,8 @@ fn subquery_not_in_all_decorrelate(
     // Build IN predicate: test_expr = inner_output_column
     let in_predicate = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
         op: BinaryOp::Equal,
-        lexpr: Box::new(test_expr.clone()),
-        rexpr: Box::new(ResolvedWhereExpr::Column(inner_output_column.clone())),
+        lexpr: Box::new(ResolvedWhereExpr::Scalar(test_expr.clone())),
+        rexpr: boxed_scalar_column(inner_output_column.clone()),
     });
 
     // Build correlation condition from WHERE predicates and combine with IN predicate
@@ -651,7 +680,7 @@ fn subquery_not_in_all_decorrelate(
     // IS NULL check on inner output column (anti-join filter)
     let is_null_check = ResolvedWhereExpr::Unary(ResolvedUnaryExpr {
         op: UnaryOp::IsNull,
-        expr: Box::new(ResolvedWhereExpr::Column(inner_output_column.clone())),
+        expr: boxed_scalar_column(inner_output_column.clone()),
     });
 
     // Merge IS NULL with existing outer WHERE
@@ -807,7 +836,7 @@ fn subquery_scalar_decorrelate(
     let mut derived_columns: Vec<ResolvedSelectColumn> = predicates
         .iter()
         .map(|p| ResolvedSelectColumn {
-            expr: ResolvedColumnExpr::Column(p.inner_column.clone()),
+            expr: ResolvedScalarExpr::Column(p.inner_column.clone()),
             alias: None,
         })
         .collect();
@@ -858,8 +887,8 @@ fn subquery_scalar_decorrelate(
         );
         ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
             op: BinaryOp::Equal,
-            lexpr: Box::new(ResolvedWhereExpr::Column(derived_col)),
-            rexpr: Box::new(ResolvedWhereExpr::Column(p.outer_column.clone())),
+            lexpr: boxed_scalar_column(derived_col),
+            rexpr: boxed_scalar_column(p.outer_column.clone()),
         })
     };
 
@@ -926,7 +955,12 @@ fn conjunct_scalar_decorrelate(
             match left_join_derived(&select.from, result.derived_table, result.join_condition) {
                 Some(new_from) => {
                     select.from = new_from;
-                    Ok((ResolvedWhereExpr::Column(result.scalar_column_ref), true))
+                    Ok((
+                        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
+                            result.scalar_column_ref,
+                        )),
+                        true,
+                    ))
                 }
                 None => Ok((expr.clone(), false)),
             }
@@ -964,11 +998,8 @@ fn conjunct_scalar_decorrelate(
                 Ok((expr.clone(), false))
             }
         }
-        ResolvedWhereExpr::Value(_)
-        | ResolvedWhereExpr::Column(_)
+        ResolvedWhereExpr::Scalar(_)
         | ResolvedWhereExpr::Multi(_)
-        | ResolvedWhereExpr::Array(_)
-        | ResolvedWhereExpr::Function { .. }
         | ResolvedWhereExpr::Subquery { .. } => Ok((expr.clone(), false)),
     }
 }
@@ -990,13 +1021,13 @@ fn select_columns_decorrelate(
 
     for col in cols {
         match &col.expr {
-            ResolvedColumnExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
+            ResolvedScalarExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
                 let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
                 match left_join_derived(&select.from, result.derived_table, result.join_condition) {
                     Some(new_from) => {
                         select.from = new_from;
                         new_cols.push(ResolvedSelectColumn {
-                            expr: ResolvedColumnExpr::Column(result.scalar_column_ref),
+                            expr: ResolvedScalarExpr::Column(result.scalar_column_ref),
                             alias: col.alias.clone(),
                         });
                         transformed = true;
@@ -1006,17 +1037,18 @@ fn select_columns_decorrelate(
                     }
                 }
             }
-            other @ (ResolvedColumnExpr::Column(_)
-            | ResolvedColumnExpr::Identifier(_)
-            | ResolvedColumnExpr::Function(_)
-            | ResolvedColumnExpr::Literal(_)
-            | ResolvedColumnExpr::Case(_)
-            | ResolvedColumnExpr::Arithmetic(_)
-            | ResolvedColumnExpr::Subquery(..)
-            | ResolvedColumnExpr::TypeCast { .. }) => {
+            other @ (ResolvedScalarExpr::Column(_)
+            | ResolvedScalarExpr::Identifier(_)
+            | ResolvedScalarExpr::Function(_)
+            | ResolvedScalarExpr::Literal(_)
+            | ResolvedScalarExpr::Case(_)
+            | ResolvedScalarExpr::Arithmetic(_)
+            | ResolvedScalarExpr::Subquery(..)
+            | ResolvedScalarExpr::Array(_)
+            | ResolvedScalarExpr::TypeCast { .. }) => {
                 // Reject nested correlation in non-Subquery exprs (e.g., CASE with
                 // correlated subquery) — we don't walk into arbitrary column exprs.
-                if column_expr_has_correlation(other) {
+                if scalar_expr_has_correlation(other) {
                     return Err(DecorrelateError::NonDecorrelatable {
                         reason: "correlated subquery nested in SELECT expression".to_owned(),
                     }
@@ -1109,7 +1141,7 @@ fn conjunct_in_any_try_decorrelate(
     current_select: &ResolvedSelectNode,
     query: &ResolvedQueryExpr,
     outer_refs: &[ResolvedColumnNode],
-    test_expr: &ResolvedWhereExpr,
+    test_expr: &ResolvedScalarExpr,
 ) -> DecorrelateResult<Option<ResolvedSelectNode>> {
     let Some(inner_select) = inner_query_select(query) else {
         return Ok(None);
@@ -1152,7 +1184,7 @@ fn conjunct_not_in_all_try_decorrelate(
     current_select: &ResolvedSelectNode,
     query: &ResolvedQueryExpr,
     outer_refs: &[ResolvedColumnNode],
-    test_expr: &ResolvedWhereExpr,
+    test_expr: &ResolvedScalarExpr,
 ) -> DecorrelateResult<Option<ResolvedSelectNode>> {
     let Some(inner_select) = inner_query_select(query) else {
         return Ok(None);
@@ -1424,13 +1456,10 @@ fn select_node_decorrelate(
 
             // Catch-all: non-correlated or non-subquery predicates, and scalar
             // correlated subqueries embedded in expressions (e.g., col > (SELECT ...))
-            ResolvedWhereExpr::Value(_)
-            | ResolvedWhereExpr::Column(_)
+            ResolvedWhereExpr::Scalar(_)
             | ResolvedWhereExpr::Unary(_)
             | ResolvedWhereExpr::Binary(_)
             | ResolvedWhereExpr::Multi(_)
-            | ResolvedWhereExpr::Array(_)
-            | ResolvedWhereExpr::Function { .. }
             | ResolvedWhereExpr::Subquery { .. } => {
                 if where_expr_has_correlation(&conjunct) {
                     let (new_conjunct, was_transformed) =
