@@ -14,8 +14,8 @@ use super::convert::{
     aexpr_arithmetic_convert, arithmetic_op_extract, node_convert_to_scalar_expr,
 };
 use super::{
-    BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, ScalarExpr, SubLinkType,
-    UnaryExpr, UnaryOp, WhereExpr, select_stmt_to_query_expr,
+    AstError, BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, ScalarExpr,
+    SubLinkType, UnaryExpr, UnaryOp, WhereExpr, select_stmt_to_query_expr,
 };
 
 error_set! {
@@ -36,8 +36,12 @@ error_set! {
         MissingExpression,
         #[display("{error}")]
         Other { error: String },
-        #[display("Subquery parse error: {error}")]
-        SubqueryError { error: String },
+        /// Wraps a structural AST conversion failure surfaced while parsing
+        /// a WHERE-side scalar (function call, scalar subquery, arithmetic
+        /// operand, etc.). Boxed to keep the enum size bounded — `AstError`
+        /// already contains `WhereParseError(WhereParseError)`.
+        #[display("{0}")]
+        Conversion(Box<AstError>),
     }
 }
 
@@ -81,9 +85,7 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
         Some(NodeEnum::FuncCall(_)) => {
             // Delegate to convert.rs's scalar converter so aggregate metadata
             // (DISTINCT, ORDER BY, FILTER, OVER) is preserved.
-            let scalar = node_convert_to_scalar_expr(node).map_err(|e| WhereParseError::Other {
-                error: e.to_string(),
-            })?;
+            let scalar = node_convert_to_scalar_expr(node)?;
             Ok(WhereExpr::Scalar(scalar))
         }
         unsupported => {
@@ -97,11 +99,7 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
 fn sublink_convert(sub_link: &SubLink) -> Result<WhereExpr, WhereParseError> {
     // Parse the subquery SELECT statement
     let query = match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
-        Some(NodeEnum::SelectStmt(select_stmt)) => {
-            select_stmt_to_query_expr(select_stmt).map_err(|e| WhereParseError::SubqueryError {
-                error: e.to_string(),
-            })?
-        }
+        Some(NodeEnum::SelectStmt(select_stmt)) => select_stmt_to_query_expr(select_stmt)?,
         _ => {
             return Err(WhereParseError::Other {
                 error: "SubLink missing or invalid subselect".to_owned(),
@@ -113,21 +111,13 @@ fn sublink_convert(sub_link: &SubLink) -> Result<WhereExpr, WhereParseError> {
     // Always a scalar (the value being tested against the subquery output).
     let test_expr = sub_link
         .testexpr
-        .as_ref()
-        .map(|e| {
-            node_convert_to_scalar_expr(e).map_err(|err| WhereParseError::Other {
-                error: err.to_string(),
-            })
-        })
+        .as_deref()
+        .map(node_convert_to_scalar_expr)
         .transpose()?
         .map(Box::new);
 
     // Convert the SubLink type
-    let sublink_type = SubLinkType::try_from(sub_link.sub_link_type()).map_err(|e| {
-        WhereParseError::SubqueryError {
-            error: e.to_string(),
-        }
-    })?;
+    let sublink_type = SubLinkType::try_from(sub_link.sub_link_type())?;
 
     Ok(WhereExpr::Subquery {
         query: Box::new(query),
@@ -254,9 +244,7 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
             // comparison (=, <, >=, !=). Arithmetic yields a scalar; comparison
             // yields a predicate. Dispatch on the operator name.
             if arithmetic_op_extract(&expr.name).is_ok() {
-                let arith = aexpr_arithmetic_convert(expr).map_err(|e| WhereParseError::Other {
-                    error: e.to_string(),
-                })?;
+                let arith = aexpr_arithmetic_convert(expr)?;
                 return Ok(WhereExpr::Scalar(ScalarExpr::Arithmetic(arith)));
             }
 
@@ -456,11 +444,7 @@ fn any_all_rexpr_convert(node: &pg_query::Node) -> Result<WhereExpr, WhereParseE
             let elems = array_expr
                 .elements
                 .iter()
-                .map(|n| {
-                    node_convert_to_scalar_expr(n).map_err(|err| WhereParseError::Other {
-                        error: err.to_string(),
-                    })
-                })
+                .map(node_convert_to_scalar_expr)
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(WhereExpr::Scalar(ScalarExpr::Array(elems)))
         }
