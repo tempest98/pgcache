@@ -10,7 +10,9 @@ use pg_query::protobuf::{
     NullTest, NullTestType, ParamRef, SelectStmt, SubLink,
 };
 
-use super::convert::node_convert_to_scalar_expr;
+use super::convert::{
+    aexpr_arithmetic_convert, arithmetic_op_extract, node_convert_to_scalar_expr,
+};
 use super::{
     BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, ScalarExpr, SubLinkType,
     UnaryExpr, UnaryOp, WhereExpr, select_stmt_to_query_expr,
@@ -239,7 +241,7 @@ pub fn const_value_extract(const_val: &AConst) -> Result<LiteralValue, WherePars
 }
 
 /// Extract parameter reference from pg_query ParamRef
-fn param_ref_extract(param_ref: &ParamRef) -> LiteralValue {
+pub(super) fn param_ref_extract(param_ref: &ParamRef) -> LiteralValue {
     LiteralValue::Parameter(format!("${}", param_ref.number))
 }
 
@@ -248,7 +250,16 @@ fn param_ref_extract(param_ref: &ParamRef) -> LiteralValue {
 fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
     match expr.kind() {
         AExprKind::AexprOp => {
-            // Handle binary operations like =, <, >, etc.
+            // pg_query uses AExprOp for both arithmetic (+, -, *, /, %) and
+            // comparison (=, <, >=, !=). Arithmetic yields a scalar; comparison
+            // yields a predicate. Dispatch on the operator name.
+            if arithmetic_op_extract(&expr.name).is_ok() {
+                let arith = aexpr_arithmetic_convert(expr).map_err(|e| WhereParseError::Other {
+                    error: e.to_string(),
+                })?;
+                return Ok(WhereExpr::Scalar(ScalarExpr::Arithmetic(arith)));
+            }
+
             let op = operator_extract(&expr.name)?;
 
             let lexpr = expr
@@ -503,14 +514,14 @@ fn operator_extract(name_nodes: &[pg_query::Node]) -> Result<BinaryOp, WherePars
             ">=" => Ok(BinaryOp::GreaterThanOrEqual),
 
             op => {
-                dbg!(op);
+                trace!(operator = %op, "unsupported comparison operator");
                 Err(WhereParseError::UnsupportedOperator {
                     operator: op.to_owned(),
                 })
             }
         },
         unsupported => {
-            dbg!(unsupported);
+            trace!(?unsupported, "invalid operator name format");
             Err(WhereParseError::Other {
                 error: "Invalid operator name format".to_owned(),
             })
@@ -598,7 +609,8 @@ mod tests {
 
     use super::*;
     use crate::query::ast::{
-        AstError, ScalarExpr, SelectColumns, query_expr_convert, query_expr_fingerprint,
+        ArithmeticOp, AstError, Deparse, ScalarExpr, SelectColumns, query_expr_convert,
+        query_expr_fingerprint,
     };
 
     /// Parse SQL and extract the WHERE clause via the AST layer.
@@ -633,12 +645,8 @@ mod tests {
             panic!("expected explicit columns");
         };
         assert_eq!(cols.len(), 2);
-        assert!(
-            matches!(&cols[0].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "id")
-        );
-        assert!(
-            matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "str")
-        );
+        assert!(matches!(&cols[0].expr().unwrap(), ScalarExpr::Column(c) if c.column == "id"));
+        assert!(matches!(&cols[1].expr().unwrap(), ScalarExpr::Column(c) if c.column == "str"));
 
         let q = query_expr_convert(
             &pg_query::parse("select count(id), str from test where str = 'hihi'").unwrap(),
@@ -649,12 +657,8 @@ mod tests {
             panic!("expected explicit columns");
         };
         assert_eq!(cols.len(), 2);
-        assert!(
-            matches!(&cols[0].expr().expect("non-star SELECT column"), ScalarExpr::Function(f) if f.name == "count")
-        );
-        assert!(
-            matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "str")
-        );
+        assert!(matches!(&cols[0].expr().unwrap(), ScalarExpr::Function(f) if f.name == "count"));
+        assert!(matches!(&cols[1].expr().unwrap(), ScalarExpr::Column(c) if c.column == "str"));
     }
 
     #[test]
@@ -1838,5 +1842,117 @@ mod tests {
             panic!("expected BinaryExpr on right side");
         };
         assert_eq!(right.op, BinaryOp::Like);
+    }
+
+    // ------------------------------------------------------------------
+    // Arithmetic in WHERE (PGC-118 layer 1)
+    //
+    // Layer 2 (constant_fold) runs at the end of `query_expr_convert`, so
+    // pure-literal arithmetic is folded away before these assertions see
+    // the tree. Each test uses at least one non-literal operand (column or
+    // parameter) to keep the arithmetic node observable.
+    // ------------------------------------------------------------------
+
+    /// Pull the RHS of `WHERE col = <rhs>` so each arithmetic test can
+    /// assert on the scalar shape directly.
+    fn where_clause_rhs(sql: &str) -> ScalarExpr {
+        let WhereExpr::Binary(binary) = where_clause_parse(sql).unwrap().unwrap() else {
+            panic!("expected binary WHERE");
+        };
+        let WhereExpr::Scalar(scalar) = *binary.rexpr else {
+            panic!("expected scalar RHS");
+        };
+        scalar
+    }
+
+    #[test]
+    fn where_clause_arithmetic_with_column_left() {
+        let ScalarExpr::Arithmetic(arith) = where_clause_rhs("SELECT * FROM t WHERE x = a + 1")
+        else {
+            panic!("expected arithmetic RHS");
+        };
+        assert_eq!(arith.op, ArithmeticOp::Add);
+        assert!(matches!(*arith.left, ScalarExpr::Column(ref c) if c.column == "a"));
+        assert!(matches!(
+            *arith.right,
+            ScalarExpr::Literal(LiteralValue::Integer(1))
+        ));
+    }
+
+    #[test]
+    fn where_clause_arithmetic_modulo_with_parameter() {
+        let ScalarExpr::Arithmetic(arith) = where_clause_rhs("SELECT * FROM t WHERE x = $1 % 10")
+        else {
+            panic!("expected arithmetic RHS");
+        };
+        assert_eq!(arith.op, ArithmeticOp::Modulo);
+        assert!(matches!(
+            *arith.left,
+            ScalarExpr::Literal(LiteralValue::Parameter(_))
+        ));
+        assert!(matches!(
+            *arith.right,
+            ScalarExpr::Literal(LiteralValue::Integer(10))
+        ));
+    }
+
+    #[test]
+    fn where_clause_arithmetic_all_ops() {
+        for (sql, expected_op) in [
+            ("SELECT * FROM t WHERE x = a + 2", ArithmeticOp::Add),
+            ("SELECT * FROM t WHERE x = a - 2", ArithmeticOp::Subtract),
+            ("SELECT * FROM t WHERE x = a * 2", ArithmeticOp::Multiply),
+            ("SELECT * FROM t WHERE x = a / 2", ArithmeticOp::Divide),
+            ("SELECT * FROM t WHERE x = a % 3", ArithmeticOp::Modulo),
+        ] {
+            let ScalarExpr::Arithmetic(arith) = where_clause_rhs(sql) else {
+                panic!("expected arithmetic RHS for {sql}");
+            };
+            assert_eq!(arith.op, expected_op, "{sql}");
+        }
+    }
+
+    #[test]
+    fn where_clause_arithmetic_nested_with_parameter() {
+        // PGC-118 bench query shape, with a parameter to keep arithmetic observable.
+        let ScalarExpr::Arithmetic(outer) =
+            where_clause_rhs("SELECT * FROM t WHERE user_id = $1 % 10000 + 1")
+        else {
+            panic!("expected outer arithmetic");
+        };
+        assert_eq!(outer.op, ArithmeticOp::Add);
+        let ScalarExpr::Arithmetic(inner) = &*outer.left else {
+            panic!("expected inner arithmetic on left");
+        };
+        assert_eq!(inner.op, ArithmeticOp::Modulo);
+        assert!(matches!(
+            *outer.right,
+            ScalarExpr::Literal(LiteralValue::Integer(1))
+        ));
+    }
+
+    #[test]
+    fn where_clause_arithmetic_two_columns() {
+        let ScalarExpr::Arithmetic(arith) = where_clause_rhs("SELECT * FROM t WHERE x = a + b")
+        else {
+            panic!("expected arithmetic RHS");
+        };
+        assert_eq!(arith.op, ArithmeticOp::Add);
+        assert!(matches!(*arith.left, ScalarExpr::Column(ref c) if c.column == "a"));
+        assert!(matches!(*arith.right, ScalarExpr::Column(ref c) if c.column == "b"));
+    }
+
+    #[test]
+    fn where_clause_arithmetic_deparse() {
+        // Round-trip a non-foldable arithmetic query to confirm Scalar wrapping deparses cleanly.
+        let q = query_expr_convert(
+            &pg_query::parse("SELECT * FROM t WHERE x = a % 10000 + 1").unwrap(),
+        )
+        .unwrap();
+        let mut buf = String::new();
+        q.deparse(&mut buf);
+        // ArithmeticExpr::deparse parenthesizes each level, so nested
+        // `a % 10000 + 1` round-trips as `((a % 10000) + 1)`.
+        assert_eq!(buf, "SELECT * FROM t WHERE x = ((a % 10000) + 1)");
     }
 }

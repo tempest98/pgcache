@@ -33,6 +33,10 @@ pub fn query_expr_parameters_replace(
         }
     }
 
+    // Bind-time substitution can newly expose pure-literal arithmetic that the
+    // convert-time fold couldn't reach (e.g. `$1 % 10 + 1` once $1 is bound).
+    super::super::query_expr_constant_fold(&mut new_query);
+
     Ok(new_query)
 }
 

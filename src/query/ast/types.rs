@@ -1335,6 +1335,8 @@ pub enum ArithmeticOp {
     Multiply,
     #[strum(to_string = "/")]
     Divide,
+    #[strum(to_string = "%")]
+    Modulo,
 }
 
 /// Arithmetic expression: `left op right` (e.g., `amount * -1`)

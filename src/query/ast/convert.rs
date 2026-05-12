@@ -6,12 +6,13 @@ use pg_query::protobuf::{
     AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, CteMaterialize, FuncCall, JoinExpr,
     MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir, TypeCast, TypeName,
 };
-use pg_query::protobuf::{
-    Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum,
-};
+use pg_query::protobuf::{Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum};
+
+use crate::query::transform::query_expr_constant_fold;
 
 use super::expr_parse::{
-    column_ref_extract, const_value_extract, node_convert_to_expr, select_stmt_parse_where,
+    column_ref_extract, const_value_extract, node_convert_to_expr, param_ref_extract,
+    select_stmt_parse_where,
 };
 use super::*;
 
@@ -23,13 +24,19 @@ pub fn query_expr_convert(ast: &ParseResult) -> Result<QueryExpr, AstError> {
 
     let stmt_node = raw_stmt.stmt.as_ref().ok_or(AstError::MissingStatement)?;
 
-    match stmt_node.node.as_ref() {
+    let mut query = match stmt_node.node.as_ref() {
         Some(NodeEnum::SelectStmt(select_stmt)) => select_stmt_to_query_expr(select_stmt),
         Some(other) => Err(AstError::UnsupportedStatement {
             statement_type: format!("{other:?}"),
         }),
         None => Err(AstError::MissingStatement),
-    }
+    }?;
+
+    // Fold pure-literal arithmetic so different inline-literal queries that
+    // reduce to the same value share a fingerprint (PGC-118).
+    query_expr_constant_fold(&mut query);
+
+    Ok(query)
 }
 
 /// Context for CTE-aware parsing. Tracks CTE definitions from an outer
@@ -582,6 +589,10 @@ pub(super) fn node_convert_to_scalar_expr(node: &Node) -> Result<ScalarExpr, Ast
             let value = const_value_extract(const_val)?;
             Ok(ScalarExpr::Literal(value))
         }
+        Some(NodeEnum::ParamRef(param_ref)) => {
+            let value = param_ref_extract(param_ref);
+            Ok(ScalarExpr::Literal(value))
+        }
         Some(NodeEnum::SubLink(sub_link)) => {
             match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
                 Some(NodeEnum::SelectStmt(select_stmt)) => {
@@ -886,7 +897,7 @@ fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
     })
 }
 
-fn aexpr_arithmetic_convert(aexpr: &AExpr) -> Result<ArithmeticExpr, AstError> {
+pub(super) fn aexpr_arithmetic_convert(aexpr: &AExpr) -> Result<ArithmeticExpr, AstError> {
     // Extract operator from name field
     let op = arithmetic_op_extract(&aexpr.name)?;
 
@@ -913,7 +924,9 @@ fn aexpr_arithmetic_convert(aexpr: &AExpr) -> Result<ArithmeticExpr, AstError> {
     })
 }
 
-fn arithmetic_op_extract(name_nodes: &[pg_query::Node]) -> Result<ArithmeticOp, AstError> {
+pub(super) fn arithmetic_op_extract(
+    name_nodes: &[pg_query::Node],
+) -> Result<ArithmeticOp, AstError> {
     let [name_node] = name_nodes else {
         return Err(AstError::UnsupportedFeature {
             feature: "multi-part operator names in arithmetic".to_owned(),
@@ -926,6 +939,7 @@ fn arithmetic_op_extract(name_nodes: &[pg_query::Node]) -> Result<ArithmeticOp, 
             "-" => Ok(ArithmeticOp::Subtract),
             "*" => Ok(ArithmeticOp::Multiply),
             "/" => Ok(ArithmeticOp::Divide),
+            "%" => Ok(ArithmeticOp::Modulo),
             op => Err(AstError::UnsupportedFeature {
                 feature: format!("arithmetic operator: {op}"),
             }),

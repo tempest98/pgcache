@@ -1,3 +1,4 @@
+mod constant_fold;
 mod parameters;
 mod pushdown;
 mod select_node;
@@ -25,6 +26,7 @@ error_set! {
 /// Result type with location-tracking error reports for AST transform operations.
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
+pub use constant_fold::query_expr_constant_fold;
 pub use parameters::{query_expr_parameters_replace, select_node_parameters_replace};
 pub use pushdown::predicate_pushdown_apply;
 pub(crate) use pushdown::{where_expr_conjuncts_join, where_expr_conjuncts_split};
