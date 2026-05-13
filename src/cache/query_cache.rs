@@ -177,7 +177,7 @@ impl QueryCache {
 
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub async fn query_dispatch(&mut self, msg: QueryRequest) -> CacheResult<()> {
+    pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
         if !Self::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
             metrics::counter!(names::QUERIES_ALLOWLIST_SKIPPED).increment(1);
@@ -197,6 +197,11 @@ impl QueryCache {
             .map(|entry| entry.clone());
         metrics::histogram!(names::CACHE_LOOKUP_LATENCY_SECONDS)
             .record(lookup_start.elapsed().as_secs_f64());
+        // Stamp lookup_complete uniformly across all paths so `lookup_seconds`
+        // means "proxy dispatch → cache state lookup done." Path-specific
+        // post-lookup work is captured by dedicated histograms
+        // (forward_decision / coalesce_intake / coalesce_wait).
+        msg.timing.lookup_complete_at = Some(Instant::now());
 
         match &cache_entry {
             // Cache hit: Ready with sufficient rows — serve from cache
@@ -252,6 +257,7 @@ impl QueryCache {
                 trace!("cache loading, coalesce {fingerprint}");
                 self.metrics_miss_record(fingerprint);
                 let key = Self::coalesce_key_from_request(&msg);
+                msg.timing.waiter_enqueued_at = Some(Instant::now());
                 self.waiting
                     .borrow_mut()
                     .entry(fingerprint)
@@ -415,8 +421,10 @@ impl QueryCache {
         mv_source: bool,
         coalesced: Vec<CoalescedClient>,
     ) -> CacheResult<()> {
-        let mut timing = msg.timing;
-        timing.lookup_complete_at = Some(Instant::now());
+        // `lookup_complete_at` is stamped earlier in `query_dispatch` (and
+        // copied through coalesce drains), so it's already set on
+        // `msg.timing` at this point.
+        let timing = msg.timing;
 
         let (
             has_sync,
@@ -509,6 +517,13 @@ impl QueryCache {
 
         let mut served = 0u64;
         for (_key, mut waiters) in groups {
+            // Stamp drain_started_at on every waiter (including the one that
+            // becomes primary) so `coalesce_wait_seconds` fires per-waiter,
+            // not just per-group.
+            let drain_started = Instant::now();
+            for w in &mut waiters {
+                w.timing.drain_started_at = Some(drain_started);
+            }
             let primary = waiters.remove(0);
 
             // Check whether the cached rows cover this group's LIMIT
@@ -578,7 +593,9 @@ impl QueryCache {
         };
 
         for (_key, waiters) in groups {
-            for msg in waiters {
+            let drain_started = Instant::now();
+            for mut msg in waiters {
+                msg.timing.drain_started_at = Some(drain_started);
                 let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing);
             }
         }

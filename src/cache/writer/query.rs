@@ -340,6 +340,11 @@ impl CacheWriter {
         let generation = self.cache.generation_counter;
         self.cache.generations.insert(generation);
 
+        // Increment per-relation refcounts. `changed` is true if any oid
+        // transitioned 0→1 (new active relation) — caller uses this to
+        // decide whether the publication needs syncing inline.
+        let changed = self.active_relations_acquire(&relation_oids);
+
         let cached_query = CachedQuery {
             fingerprint,
             generation,
@@ -355,7 +360,6 @@ impl CacheWriter {
         };
 
         self.cache.cached_queries.insert_overwrite(cached_query);
-        let changed = self.active_relations_rebuild();
         (generation, changed)
     }
 
@@ -765,10 +769,8 @@ impl CacheWriter {
         cached.invalidated = false;
         cached.cached_bytes = 0;
         cached.registration_started_at = Some(started_at);
+        // Refcount unchanged — readmit reuses the existing relation_oids set.
         self.cache.cached_queries.insert_overwrite(cached);
-        if self.active_relations_rebuild() {
-            self.publication_update().await?;
-        }
 
         // Update state view to Loading
         self.state_view_update(
@@ -863,7 +865,7 @@ impl CacheWriter {
                 self.cache.generations.remove(&query.generation);
                 self.cache
                     .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
-                self.relations_dirty = true;
+                self.active_relations_release(&query.relation_oids);
                 debug!("cleaned up failed query {fingerprint}");
             }
             None => {

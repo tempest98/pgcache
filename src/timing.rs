@@ -90,6 +90,14 @@ pub struct QueryDurations {
     /// (dispatched_at → forwarded_at). Captures cache-thread decision time
     /// plus the channel hop back to the proxy.
     pub forward_decision_ns: Option<u64>,
+    /// Coalesce path: cache thread book-keeping into the waiting list
+    /// (lookup_complete_at → waiter_enqueued_at).
+    pub coalesce_intake_ns: Option<u64>,
+    /// Coalesce path: the actual wait — from joining the waiting list until
+    /// the drain task picked up the group (waiter_enqueued_at →
+    /// drain_started_at). Dominated by the population pipeline + writer's
+    /// Ready notify + coordinator drain pickup.
+    pub coalesce_wait_ns: Option<u64>,
     /// Total time from reception to completion
     pub total_ns: Option<u64>,
 }
@@ -112,8 +120,19 @@ pub struct QueryTiming {
     /// When the query was dispatched to the cache channel
     pub dispatched_at: Option<Instant>,
 
-    /// When cache lookup completed (found Ready, Loading, or Miss)
+    /// When cache state lookup completed (DashMap.get + state check). Stamped
+    /// uniformly across all paths immediately after the lookup, before the
+    /// match dispatches on the resulting state. `lookup_seconds` measures
+    /// proxy dispatch → this point; consistently μs-scale across paths.
     pub lookup_complete_at: Option<Instant>,
+
+    /// Coalesce path only: when the waiter was pushed onto the waiting map
+    /// (in the Loading match arm of query_dispatch).
+    pub waiter_enqueued_at: Option<Instant>,
+
+    /// Coalesce path only: when `waiting_drain_ready` (or
+    /// `waiting_drain_failed`) began processing this waiter's group.
+    pub drain_started_at: Option<Instant>,
 
     /// When the worker thread received the message from the channel (cache hit path)
     pub worker_received_at: Option<Instant>,
@@ -149,6 +168,8 @@ impl QueryTiming {
             parsed_at: None,
             dispatched_at: None,
             lookup_complete_at: None,
+            waiter_enqueued_at: None,
+            drain_started_at: None,
             worker_received_at: None,
             conn_acquired_at: None,
             worker_start_at: None,
@@ -190,6 +211,12 @@ impl QueryTiming {
             forward_decision_ns: self
                 .forwarded_at
                 .and_then(|f| self.dispatched_at.map(|d| instant_diff_ns(f, d))),
+            coalesce_intake_ns: self
+                .waiter_enqueued_at
+                .and_then(|w| self.lookup_complete_at.map(|l| instant_diff_ns(w, l))),
+            coalesce_wait_ns: self
+                .drain_started_at
+                .and_then(|d| self.waiter_enqueued_at.map(|w| instant_diff_ns(d, w))),
             total_ns: self
                 .response_written_at
                 .or(self.origin_response_at)
@@ -209,43 +236,46 @@ pub fn timing_record(timing: &QueryTiming) {
     let durations = timing.durations();
 
     // Record to Prometheus histograms (converting ns to seconds)
-    if let Some(ns) = durations.parse_ns {
-        metrics::histogram!(names::QUERY_STAGE_PARSE_SECONDS).record(ns as f64 / 1_000_000_000.0);
+    macro_rules! record_ns {
+        ($field:expr, $name:expr) => {
+            if let Some(ns) = $field {
+                metrics::histogram!($name).record(ns as f64 / 1_000_000_000.0);
+            }
+        };
     }
-    if let Some(ns) = durations.dispatch_ns {
-        metrics::histogram!(names::QUERY_STAGE_DISPATCH_SECONDS)
-            .record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.lookup_ns {
-        metrics::histogram!(names::QUERY_STAGE_LOOKUP_SECONDS).record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.queue_wait_ns {
-        metrics::histogram!(names::QUERY_STAGE_QUEUE_WAIT_SECONDS)
-            .record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.conn_wait_ns {
-        metrics::histogram!(names::QUERY_STAGE_CONN_WAIT_SECONDS)
-            .record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.spawn_wait_ns {
-        metrics::histogram!(names::QUERY_STAGE_SPAWN_WAIT_SECONDS)
-            .record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.worker_execution_ns {
-        metrics::histogram!(names::QUERY_STAGE_WORKER_EXEC_SECONDS)
-            .record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.response_write_ns {
-        metrics::histogram!(names::QUERY_STAGE_RESPONSE_WRITE_SECONDS)
-            .record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.forward_decision_ns {
-        metrics::histogram!(names::QUERY_STAGE_FORWARD_DECISION_SECONDS)
-            .record(ns as f64 / 1_000_000_000.0);
-    }
-    if let Some(ns) = durations.total_ns {
-        metrics::histogram!(names::QUERY_STAGE_TOTAL_SECONDS).record(ns as f64 / 1_000_000_000.0);
-    }
+    record_ns!(durations.parse_ns, names::QUERY_STAGE_PARSE_SECONDS);
+    record_ns!(durations.dispatch_ns, names::QUERY_STAGE_DISPATCH_SECONDS);
+    record_ns!(durations.lookup_ns, names::QUERY_STAGE_LOOKUP_SECONDS);
+    record_ns!(
+        durations.queue_wait_ns,
+        names::QUERY_STAGE_QUEUE_WAIT_SECONDS
+    );
+    record_ns!(durations.conn_wait_ns, names::QUERY_STAGE_CONN_WAIT_SECONDS);
+    record_ns!(
+        durations.spawn_wait_ns,
+        names::QUERY_STAGE_SPAWN_WAIT_SECONDS
+    );
+    record_ns!(
+        durations.worker_execution_ns,
+        names::QUERY_STAGE_WORKER_EXEC_SECONDS
+    );
+    record_ns!(
+        durations.response_write_ns,
+        names::QUERY_STAGE_RESPONSE_WRITE_SECONDS
+    );
+    record_ns!(
+        durations.forward_decision_ns,
+        names::QUERY_STAGE_FORWARD_DECISION_SECONDS
+    );
+    record_ns!(
+        durations.coalesce_intake_ns,
+        names::QUERY_STAGE_COALESCE_INTAKE_SECONDS
+    );
+    record_ns!(
+        durations.coalesce_wait_ns,
+        names::QUERY_STAGE_COALESCE_WAIT_SECONDS
+    );
+    record_ns!(durations.total_ns, names::QUERY_STAGE_TOTAL_SECONDS);
 
     // Trace-level logging for detailed per-query debugging
     if tracing::enabled!(tracing::Level::TRACE) {

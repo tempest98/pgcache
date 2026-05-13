@@ -69,6 +69,11 @@ pub struct CacheWriter {
     pub(super) cache_pool: Vec<Rc<Client>>,
     /// Shared set of relation OIDs with active cached queries (read by CDC processor).
     active_relations: ActiveRelations,
+    /// Per-relation_oid refcount of cached queries that reference each
+    /// relation. Pairs with `active_relations` — the snapshot is only
+    /// updated on 0↔1 transitions instead of rebuilt by walking
+    /// `cached_queries` on every register/evict.
+    relation_refcounts: std::collections::HashMap<u32, usize>,
     /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
     pub(super) aggregate_functions: HashSet<String>,
     /// Publication name for dynamic table management.
@@ -190,6 +195,7 @@ impl CacheWriter {
             populate_next: 0,
             cache_pool,
             active_relations,
+            relation_refcounts: std::collections::HashMap::new(),
             aggregate_functions,
             publication_name: settings.cdc.publication_name.clone(),
             publication_oids: HashSet::new(),
@@ -394,21 +400,64 @@ impl CacheWriter {
         }
     }
 
-    /// Rebuild the shared active relations set from current cached queries.
-    /// Returns `true` if the set changed.
-    pub(super) fn active_relations_rebuild(&self) -> bool {
-        let oids: HashSet<u32> = self
-            .cache
-            .cached_queries
-            .iter()
-            .flat_map(|q| q.relation_oids.iter().copied())
-            .collect();
-
-        let current = self.active_relations.load();
-        if **current == oids {
+    /// Increment refcounts for each relation_oid the new cached_query
+    /// touches. On 0→1 transitions, clone-mutate-swap the
+    /// `active_relations` snapshot and set `relations_dirty` so the next
+    /// `publication_dirty_drain` syncs the origin publication.
+    ///
+    /// O(|oids| + |active_set|) per call vs. the previous O(|cached_queries|)
+    /// rebuild — typically a handful of integer ops since most registers
+    /// add no new tables. Returns `true` if the active set changed; callers
+    /// may sync the publication inline for cases where the new relation
+    /// must be in the publication before subsequent work (e.g., population
+    /// fetches from origin).
+    pub(super) fn active_relations_acquire(&mut self, oids: &[u32]) -> bool {
+        let mut newly_active: Vec<u32> = Vec::new();
+        for &oid in oids {
+            let count = self.relation_refcounts.entry(oid).or_insert(0);
+            if *count == 0 {
+                newly_active.push(oid);
+            }
+            *count += 1;
+        }
+        if newly_active.is_empty() {
             return false;
         }
-        self.active_relations.store(Arc::new(oids));
+        let mut new_set = (**self.active_relations.load()).clone();
+        for oid in newly_active {
+            new_set.insert(oid);
+        }
+        self.active_relations.store(Arc::new(new_set));
+        self.relations_dirty = true;
+        true
+    }
+
+    /// Decrement refcounts. On 1→0 transitions, drop the oid from the
+    /// `active_relations` snapshot and set `relations_dirty`. Removal paths
+    /// don't need to sync the publication inline — stale subscriptions
+    /// to dropped relations are filtered out by the writer ignoring CDC
+    /// events for relations not in `active_relations`. Returns `true` if
+    /// the active set changed.
+    pub(super) fn active_relations_release(&mut self, oids: &[u32]) -> bool {
+        let mut newly_inactive: Vec<u32> = Vec::new();
+        for &oid in oids {
+            if let Some(count) = self.relation_refcounts.get_mut(&oid) {
+                *count -= 1;
+                if *count == 0 {
+                    self.relation_refcounts.remove(&oid);
+                    newly_inactive.push(oid);
+                }
+            }
+        }
+        if newly_inactive.is_empty() {
+            return false;
+        }
+        let mut new_set = (**self.active_relations.load()).clone();
+        for oid in newly_inactive {
+            new_set.remove(&oid);
+        }
+        self.active_relations.store(Arc::new(new_set));
+        self.relations_dirty = true;
         true
     }
 
@@ -421,6 +470,9 @@ impl CacheWriter {
         let new_oids: HashSet<u32> = (**self.active_relations.load()).clone();
 
         if new_oids == self.publication_oids {
+            // Already in sync. Clear the dirty flag so a deferred drain
+            // doesn't redo this comparison.
+            self.relations_dirty = false;
             return Ok(());
         }
 
@@ -456,6 +508,9 @@ impl CacheWriter {
         if !removed.is_empty() {
             self.cache_tables_drop(&removed).await;
         }
+        // Publication now matches active_relations; any pending drain is
+        // satisfied by this call.
+        self.relations_dirty = false;
         Ok(())
     }
 
@@ -472,16 +527,16 @@ impl CacheWriter {
             .join(", ")
     }
 
-    /// Drain the dirty flag: rebuild active relations and sync the publication
-    /// (which also drops orphaned cache tables).
+    /// Drain the dirty flag: sync the origin publication (which also drops
+    /// orphaned cache tables). `active_relations` is kept up to date
+    /// incrementally via `active_relations_acquire` / `_release`, so the only
+    /// remaining work here is the publication sync itself.
     async fn publication_dirty_drain(&mut self) -> CacheResult<()> {
         if !self.relations_dirty {
             return Ok(());
         }
         self.relations_dirty = false;
-        if self.active_relations_rebuild() {
-            self.publication_update().await?;
-        }
+        self.publication_update().await?;
         Ok(())
     }
 
@@ -760,11 +815,8 @@ impl CacheWriter {
             if let Some(query) = self.cache.cached_queries.remove1(fp) {
                 self.cache
                     .update_queries_remove_fingerprint(*fp, &query.relation_oids);
+                self.active_relations_release(&query.relation_oids);
             }
-        }
-
-        if !stale_fingerprints.is_empty() {
-            self.relations_dirty = true;
         }
 
         // Remove stale Pending and Invalidated entries from state_view

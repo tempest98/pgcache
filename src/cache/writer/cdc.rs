@@ -315,7 +315,10 @@ impl CacheWriter {
             m.eviction_count += 1;
             m.cached_since_ns = None;
         }
-        self.relations_dirty = true;
+        // Removal paths defer publication sync to the end-of-command drain
+        // (publication_dirty_drain) — stale subscriptions to the dropped
+        // oid are filtered out by the writer ignoring its CDC events.
+        self.active_relations_release(&query.relation_oids);
 
         let prev_generation_threshold = self.cache.generation_purge_threshold();
 
