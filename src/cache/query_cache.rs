@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use ecow::EcoString;
@@ -26,6 +27,10 @@ use super::{
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     types::{CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, SharedResolved},
 };
+
+/// Minimum credit stamped on a Pending entry. Provides a survival floor during
+/// cold start (when `last_hits_per_gc` is zero) and for low-traffic workloads.
+const MIN_PENDING_CREDIT: u32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueryType {
@@ -273,7 +278,7 @@ impl QueryCache {
 
             // Pending — hold request, check subsumption, increment hit count, admit if threshold reached
             Some(CachedQueryView {
-                state: CachedQueryState::Pending(hit_count),
+                state: CachedQueryState::Pending { hit_count, .. },
                 ..
             }) => {
                 let new_count = hit_count + 1;
@@ -284,7 +289,13 @@ impl QueryCache {
                     self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
                         .await
                 } else {
-                    self.cached_query_state_set(&fingerprint, CachedQueryState::Pending(new_count));
+                    self.cached_query_state_set(
+                        &fingerprint,
+                        CachedQueryState::Pending {
+                            hit_count: new_count,
+                            credit: self.pending_initial_credit(),
+                        },
+                    );
                     self.subsumption_await(msg, fingerprint, AdmitAction::CheckOnly)
                         .await
                 }
@@ -311,11 +322,26 @@ impl QueryCache {
 
     /// Record a cache hit in per-query metrics.
     fn metrics_hit_record(&self, fingerprint: u64) {
+        self.state_view
+            .hits_since_gc
+            .fetch_add(1, Ordering::Relaxed);
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.hit_count += 1;
             m.last_hit_at_ns =
                 NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
         }
+    }
+
+    /// Credit stamped on a Pending entry at insert and on each re-hit. Sized to
+    /// the previous GC tick's hit count (floored at `MIN_PENDING_CREDIT`) so
+    /// candidates survive ~1 GC interval of activity unless re-hit. The writer
+    /// decays `credit` by the current tick's hit delta on every GC pass and
+    /// purges entries that drain to zero.
+    fn pending_initial_credit(&self) -> u32 {
+        self.state_view
+            .last_hits_per_gc
+            .load(Ordering::Relaxed)
+            .max(MIN_PENDING_CREDIT)
     }
 
     /// Record a cache miss in per-query metrics.
@@ -726,7 +752,10 @@ impl QueryCache {
         let initial_state = if immediate_admit {
             CachedQueryState::Loading
         } else {
-            CachedQueryState::Pending(1)
+            CachedQueryState::Pending {
+                hit_count: 1,
+                credit: self.pending_initial_credit(),
+            }
         };
 
         self.state_view.cached_queries.insert(

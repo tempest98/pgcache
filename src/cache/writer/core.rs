@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use ecow::EcoString;
@@ -608,7 +609,7 @@ impl CacheWriter {
             for entry in self.state_view.cached_queries.iter() {
                 match entry.value().state {
                     CachedQueryState::Loading => loading_count += 1,
-                    CachedQueryState::Pending(_) => pending_count += 1,
+                    CachedQueryState::Pending { .. } => pending_count += 1,
                     CachedQueryState::Invalidated => invalidated_count += 1,
                     CachedQueryState::Ready => {}
                 }
@@ -800,19 +801,27 @@ impl CacheWriter {
 
     /// GC dead entries across writer state and the shared state view.
     ///
-    /// Three passes:
+    /// Four passes:
+    /// - Snapshot the hit counter into `last_hits_per_gc`; the delta seeds
+    ///   coordinator-side Pending-credit sizing and decays existing credits.
     /// - Invalidated, non-pinned entries in `cache.cached_queries` whose
     ///   generation is below the purge threshold (CLOCK-policy carryover
     ///   after CDC invalidation that wasn't readmitted).
-    /// - Pending/Invalidated entries in `state_view.cached_queries` below
-    ///   the threshold (state-view counterparts of the above + pre-admission
-    ///   markers that were never promoted).
+    /// - Entries in `state_view.cached_queries`: Pending entries decay their
+    ///   credit by the tick delta and are retained iff credit remains;
+    ///   Invalidated entries are retained iff generation is above the purge
+    ///   threshold.
     /// - Orphaned per-query entries in `state_view.metrics` whose
     ///   fingerprint no longer exists in either map.
     ///
     /// Runs on the 1s gauges tick, not per-command — see callsite.
     fn stale_entries_cleanup(&mut self) {
         let cleanup_threshold = self.cache.generation_purge_threshold();
+
+        let hit_delta = self.state_view.hits_since_gc.swap(0, Ordering::Relaxed);
+        self.state_view
+            .last_hits_per_gc
+            .store(hit_delta, Ordering::Relaxed);
 
         // Remove invalidated entries from cached_queries that are below threshold
         let stale_fingerprints: Vec<u64> = self
@@ -831,12 +840,15 @@ impl CacheWriter {
             }
         }
 
-        // Remove stale Pending and Invalidated entries from state_view
         self.state_view.cached_queries.retain(|_fp, entry| {
-            !matches!(
-                entry.state,
-                CachedQueryState::Pending(_) | CachedQueryState::Invalidated
-            ) || entry.generation >= cleanup_threshold
+            match &mut entry.state {
+                CachedQueryState::Pending { credit, .. } => {
+                    *credit = credit.saturating_sub(hit_delta);
+                    *credit > 0
+                }
+                CachedQueryState::Invalidated => entry.generation >= cleanup_threshold,
+                CachedQueryState::Loading | CachedQueryState::Ready => true,
+            }
         });
 
         // Remove metrics for fingerprints no longer in either map

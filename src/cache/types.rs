@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -28,9 +29,10 @@ pub type SharedResolved = Arc<ResolvedQueryExpr>;
 /// State of a cached query
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachedQueryState {
-    /// Seen but not yet admitted to cache (clock policy only).
-    /// The u32 tracks how many times this query has been seen.
-    Pending(u32),
+    /// Seen but not yet admitted to cache. `hit_count` promotes at
+    /// `admission_threshold`; `credit` is the decay budget — see
+    /// `QueryCache::pending_initial_credit`.
+    Pending { hit_count: u32, credit: u32 },
     /// Admitted, population in progress
     Loading,
     /// Cached and serving hits
@@ -334,6 +336,13 @@ pub struct CacheStateView {
     pub cached_queries: DashMap<u64, CachedQueryView>,
     pub metrics: DashMap<u64, QueryMetrics>,
     pub started_at: Instant,
+    /// Cache hits observed during the current GC interval. Incremented by the
+    /// coordinator on each Ready-state serve; snapshot-and-zeroed by the writer
+    /// on the 1s GC tick. Drives the Pending-credit decay scheme.
+    pub hits_since_gc: AtomicU32,
+    /// Previous GC tick's hit count, used by the coordinator to size the
+    /// initial credit stamped on new Pending entries (or on Pending re-hits).
+    pub last_hits_per_gc: AtomicU32,
 }
 
 impl std::fmt::Debug for CacheStateView {
@@ -352,6 +361,8 @@ impl CacheStateView {
             cached_queries: DashMap::new(),
             metrics: DashMap::new(),
             started_at: Instant::now(),
+            hits_since_gc: AtomicU32::new(0),
+            last_hits_per_gc: AtomicU32::new(0),
         }
     }
 }
