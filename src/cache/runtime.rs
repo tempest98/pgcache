@@ -20,7 +20,7 @@ use crate::{
         CacheError, CacheResult, MapIntoReport, ReportExt, StatusRequest,
         cdc::CdcProcessor,
         messages::{CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
-        query_cache::{QueryCache, QueryRequest, WorkerRequest},
+        query_cache::{QueryCache, QueryRequest, WorkerRequest, reply_forward},
         types::{ActiveRelations, CacheStateView, WorkerMetrics},
         worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         writer::writer_run,
@@ -59,13 +59,12 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
         }
         Err((e, data)) => {
             debug!("forwarding to origin due to parameter conversion error: {e}");
-            // Pipeline includes Execute+Sync; simple queries use raw data.
-            let forward_buf = if let Some(pipeline) = proxy_msg.pipeline {
-                pipeline.buffered_bytes
-            } else {
-                data
-            };
-            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(forward_buf));
+            let _ = reply_forward(
+                proxy_msg.reply_tx,
+                proxy_msg.pipeline,
+                data,
+                proxy_msg.timing,
+            );
         }
     }
 }
@@ -432,12 +431,13 @@ pub fn cache_run(
                                             });
                                         } else {
                                             // CDC is down; forward to origin to avoid serving stale data
-                                            let forward_buf = if let Some(pipeline) = proxy_msg.pipeline {
-                                                pipeline.buffered_bytes
-                                            } else {
-                                                proxy_msg.message.into_data()
-                                            };
-                                            let _ = proxy_msg.reply_tx.send(CacheReply::Forward(forward_buf));
+                                            let data = proxy_msg.message.into_data();
+                                            let _ = reply_forward(
+                                                proxy_msg.reply_tx,
+                                                proxy_msg.pipeline,
+                                                data,
+                                                proxy_msg.timing,
+                                            );
                                         }
                                     }
                                     None => {

@@ -213,9 +213,16 @@ impl QueryTelemetry {
         self.client_received_at = Some(Instant::now());
     }
 
-    /// Record that the query was forwarded to origin.
-    fn origin_forward(&mut self) {
-        self.origin_sent_at = Some(Instant::now());
+    /// Record that the query was forwarded to origin. Pass the QueryTiming
+    /// returned by the cache thread to also stamp `forwarded_at` and retain
+    /// it for per-stage histogram emission on completion.
+    fn origin_forward(&mut self, timing: Option<QueryTiming>) {
+        let now = Instant::now();
+        self.origin_sent_at = Some(now);
+        if let Some(mut t) = timing {
+            t.forwarded_at = Some(now);
+            self.cache_timing = Some(t);
+        }
     }
 
     /// Create cache timing for a cacheable query.
@@ -227,9 +234,12 @@ impl QueryTelemetry {
         self.cache_timing = Some(timing);
     }
 
-    /// Record origin query completion. Takes both timestamps and records
-    /// ORIGIN_EXECUTION_SECONDS and ORIGIN_QUERY_LATENCY_SECONDS.
+    /// Record origin query completion. Records ORIGIN_EXECUTION_SECONDS and
+    /// ORIGIN_QUERY_LATENCY_SECONDS, and — when forward-path timing was
+    /// threaded back from the cache thread — records the per-stage breakdown
+    /// via `timing_record`.
     fn origin_complete(&mut self) {
+        let now = Instant::now();
         if let Some(start) = self.origin_sent_at.take() {
             metrics::histogram!(names::ORIGIN_EXECUTION_SECONDS)
                 .record(start.elapsed().as_secs_f64());
@@ -237,6 +247,15 @@ impl QueryTelemetry {
         if let Some(start) = self.client_received_at.take() {
             metrics::histogram!(names::ORIGIN_QUERY_LATENCY_SECONDS)
                 .record(start.elapsed().as_secs_f64());
+        }
+        if let Some(mut timing) = self.cache_timing.take() {
+            // Forward path: `response_written_at` is intentionally left None.
+            // The actual client write happens later in the event loop; stamping
+            // here would record a near-zero diff that would pollute the
+            // `response_write_seconds` histogram with cache-hit values.
+            // `total_ns` falls back to `origin_response_at` (see timing.rs).
+            timing.origin_response_at = Some(now);
+            timing_record(&timing);
         }
     }
 
@@ -542,7 +561,7 @@ impl ConnectionState {
                                     metrics::counter!(names::QUERIES_INVALID).increment(1);
                                 }
                             }
-                            self.telemetry.origin_forward();
+                            self.telemetry.origin_forward(None);
                             self.origin_write_buf.push_back(msg.data);
                             ProxyMode::Read
                         }
@@ -555,14 +574,14 @@ impl ConnectionState {
                             metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
                             metrics::counter!(names::QUERIES_INVALID).increment(1);
                             error!("handle_query {}", e);
-                            self.telemetry.origin_forward();
+                            self.telemetry.origin_forward(None);
                             self.origin_write_buf.push_back(msg.data);
                             ProxyMode::Read
                         }
                     };
                 } else {
                     metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
-                    self.telemetry.origin_forward();
+                    self.telemetry.origin_forward(None);
                     self.origin_write_buf.push_back(msg.data);
                 }
             }
@@ -901,7 +920,7 @@ impl ConnectionState {
         }
 
         let bytes = self.extended.buffer_forward(buffer, trailing_bytes);
-        self.telemetry.origin_forward();
+        self.telemetry.origin_forward(None);
         self.origin_write_buf.push_back(bytes);
     }
 
@@ -912,7 +931,7 @@ impl ConnectionState {
             "net: cache→proxy reply={}",
             match &reply {
                 CacheReply::Complete(_) => "Complete",
-                CacheReply::Forward(_) => "Forward",
+                CacheReply::Forward(_, _) => "Forward",
                 CacheReply::Error(_) => "Error",
             }
         );
@@ -975,14 +994,14 @@ impl ConnectionState {
             CacheReply::Error(buf) => {
                 metrics::counter!(names::QUERIES_CACHE_ERROR).increment(1);
                 debug!("forwarding to origin");
-                self.telemetry.origin_forward();
+                self.telemetry.origin_forward(None);
                 self.origin_write_buf.push_back(buf);
                 self.proxy_mode = ProxyMode::Read;
             }
-            CacheReply::Forward(buf) => {
+            CacheReply::Forward(buf, timing) => {
                 metrics::counter!(names::QUERIES_CACHE_MISS).increment(1);
                 debug!("forwarding to origin");
-                self.telemetry.origin_forward();
+                self.telemetry.origin_forward(Some(timing));
                 self.origin_write_buf.push_back(buf);
                 self.proxy_mode = ProxyMode::Read;
             }

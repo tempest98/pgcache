@@ -2,3 +2,4 @@
 /target
 codescene-cli.log
 profile.json.gz
+config.toml

@@ -86,6 +86,10 @@ pub struct QueryDurations {
     pub worker_execution_ns: Option<u64>,
     /// Time spent writing response to client
     pub response_write_ns: Option<u64>,
+    /// Forward path: time from cache dispatch to bytes-on-wire-to-origin
+    /// (dispatched_at → forwarded_at). Captures cache-thread decision time
+    /// plus the channel hop back to the proxy.
+    pub forward_decision_ns: Option<u64>,
     /// Total time from reception to completion
     pub total_ns: Option<u64>,
 }
@@ -178,9 +182,14 @@ impl QueryTiming {
             worker_execution_ns: self
                 .query_done_at
                 .and_then(|e| self.worker_start_at.map(|s| instant_diff_ns(e, s))),
-            response_write_ns: self
-                .response_written_at
-                .and_then(|r| self.query_done_at.map(|e| instant_diff_ns(r, e))),
+            response_write_ns: self.response_written_at.and_then(|r| {
+                self.query_done_at
+                    .or(self.origin_response_at)
+                    .map(|e| instant_diff_ns(r, e))
+            }),
+            forward_decision_ns: self
+                .forwarded_at
+                .and_then(|f| self.dispatched_at.map(|d| instant_diff_ns(f, d))),
             total_ns: self
                 .response_written_at
                 .or(self.origin_response_at)
@@ -228,6 +237,10 @@ pub fn timing_record(timing: &QueryTiming) {
     }
     if let Some(ns) = durations.response_write_ns {
         metrics::histogram!(names::QUERY_STAGE_RESPONSE_WRITE_SECONDS)
+            .record(ns as f64 / 1_000_000_000.0);
+    }
+    if let Some(ns) = durations.forward_decision_ns {
+        metrics::histogram!(names::QUERY_STAGE_FORWARD_DECISION_SECONDS)
             .record(ns as f64 / 1_000_000_000.0);
     }
     if let Some(ns) = durations.total_ns {

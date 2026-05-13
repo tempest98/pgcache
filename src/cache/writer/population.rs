@@ -34,7 +34,15 @@ pub async fn population_worker(
 ) {
     debug!("population worker {id} started");
 
+    let mut idle_start = Instant::now();
     while let Some(work) = rx.recv().await {
+        // Time spent waiting on rx — recorded as a histogram so the `_sum`
+        // gives cumulative idle time per worker (utilization signal) and the
+        // quantiles surface variance. Pairs with task_seconds and wall clock
+        // to compute per-worker utilization.
+        metrics::histogram!(names::CACHE_POPULATION_WORKER_IDLE_SECONDS, "worker" => id.to_string())
+            .record(idle_start.elapsed().as_secs_f64());
+
         // Channel depth gauge; queue length never approaches 2^53.
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => id.to_string())
@@ -56,6 +64,8 @@ pub async fn population_worker(
         .await;
         metrics::histogram!(names::CACHE_POPULATION_TASK_SECONDS)
             .record(task_start.elapsed().as_secs_f64());
+
+        idle_start = Instant::now();
 
         match result {
             Ok((cached_bytes, row_count)) => {
@@ -106,10 +116,13 @@ async fn population_task(
     db_origin: Rc<Client>,
     db_cache: &Client,
 ) -> CacheResult<(usize, u64)> {
-    // Set generation for tracking triggers
+    // Set generation for tracking triggers. Simple Query (one round-trip)
+    // rather than `execute` (Extended Query, Parse+Bind+Execute+Sync) — SET
+    // doesn't benefit from prepare, and the single-round-trip path more
+    // honestly reflects the trivial work being done.
     let set_generation_sql = format!("SET mem.query_generation = {generation}");
     db_cache
-        .execute(&set_generation_sql, &[])
+        .simple_query(&set_generation_sql)
         .await
         .map_into_report::<CacheError>()?;
 
@@ -152,9 +165,9 @@ async fn population_task(
 
     let task_elapsed = task_start.elapsed();
 
-    // Reset generation
+    // Reset generation — same Simple Query rationale as the forward SET.
     db_cache
-        .execute("SET mem.query_generation = 0", &[])
+        .simple_query("SET mem.query_generation = 0")
         .await
         .map_into_report::<CacheError>()?;
 

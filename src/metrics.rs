@@ -184,6 +184,10 @@ pub mod names {
     pub const CACHE_POPULATION_TASK_SECONDS: &str = "pgcache.cache.population.task_seconds";
     pub const CACHE_POPULATION_STREAM_SECONDS: &str = "pgcache.cache.population.stream_seconds";
     pub const CACHE_POPULATION_WAIT_SECONDS: &str = "pgcache.cache.population.wait_seconds";
+    /// Per-worker time waiting on rx.recv() between tasks. With \`task_seconds\`
+    /// and wall clock, gives a clear utilization signal at a given pool size.
+    pub const CACHE_POPULATION_WORKER_IDLE_SECONDS: &str =
+        "pgcache.cache.population.worker_idle_seconds";
     /// Scaling signals for correlating per-Register cost against state size.
     pub const CACHE_WRITER_UPDATE_QUERIES_TOTAL: &str = "pgcache.cache.writer.update_queries_total";
     pub const CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION: &str =
@@ -199,6 +203,11 @@ pub mod names {
     pub const QUERY_STAGE_WORKER_EXEC_SECONDS: &str = "pgcache.query.stage.worker_exec_seconds";
     pub const QUERY_STAGE_RESPONSE_WRITE_SECONDS: &str =
         "pgcache.query.stage.response_write_seconds";
+    /// Forward-path only: dispatched_at → forwarded_at. Cache-thread decision
+    /// time plus the channel hop back to the proxy. Surfaces hidden cost on
+    /// the cache-miss path that `lookup_seconds` doesn't capture.
+    pub const QUERY_STAGE_FORWARD_DECISION_SECONDS: &str =
+        "pgcache.query.stage.forward_decision_seconds";
     pub const QUERY_STAGE_TOTAL_SECONDS: &str = "pgcache.query.stage.total_seconds";
 }
 

@@ -181,7 +181,7 @@ impl QueryCache {
         let cfg = self.dynamic.load();
         if !Self::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
             metrics::counter!(names::QUERIES_ALLOWLIST_SKIPPED).increment(1);
-            return reply_forward(msg.reply_tx, msg.pipeline, msg.data);
+            return reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing);
         }
 
         let fingerprint = query_expr_fingerprint(&msg.cacheable_query.query);
@@ -234,7 +234,7 @@ impl QueryCache {
                 self.metrics_miss_record(fingerprint);
                 // Set Loading immediately to prevent duplicate LimitBump commands from racing
                 self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data)?;
+                reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing)?;
                 self.query_tx
                     .send(QueryCommand::LimitBump {
                         fingerprint,
@@ -514,9 +514,14 @@ impl QueryCache {
             // Check whether the cached rows cover this group's LIMIT
             let primary_needed = limit_rows_needed(&primary.cacheable_query.query.limit);
             if !limit_is_sufficient(max_limit, primary_needed) {
-                let _ = reply_forward(primary.reply_tx, primary.pipeline, primary.data);
+                let _ = reply_forward(
+                    primary.reply_tx,
+                    primary.pipeline,
+                    primary.data,
+                    primary.timing,
+                );
                 for msg in waiters {
-                    let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data);
+                    let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing);
                 }
                 continue;
             }
@@ -574,7 +579,7 @@ impl QueryCache {
 
         for (_key, waiters) in groups {
             for msg in waiters {
-                let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data);
+                let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing);
             }
         }
 
@@ -686,7 +691,7 @@ impl QueryCache {
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data)
+                reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing)
             }
         }
     }
@@ -741,16 +746,17 @@ impl QueryCache {
 }
 
 /// Forward a query to origin by sending the reply through the oneshot channel.
-fn reply_forward(
+pub(super) fn reply_forward(
     reply_tx: oneshot::Sender<CacheReply>,
     pipeline: Option<PipelineContext>,
     data: BytesMut,
+    timing: QueryTiming,
 ) -> CacheResult<()> {
     let buf = match pipeline {
         Some(pipeline) => pipeline.buffered_bytes,
         None => data,
     };
     reply_tx
-        .send(CacheReply::Forward(buf))
+        .send(CacheReply::Forward(buf, timing))
         .map_err(|_| CacheError::Reply.into())
 }

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ecow::EcoString;
 use tokio::runtime::Builder;
@@ -300,9 +300,11 @@ impl CacheWriter {
                 }
             }
         }
+        // Publication dirty drain runs per-command because it's correctness
+        // work (it surfaces relation changes to the CDC publication). Gauge
+        // emission is on a periodic tick in `writer_run` — iterating the
+        // state_view DashMap per command dominated writer time at scale.
         self.publication_dirty_drain().await?;
-        self.state_gauges_update();
-        self.writer_scale_gauges_update();
         metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
             .record(handle_start.elapsed().as_secs_f64());
         Ok(())
@@ -376,7 +378,6 @@ impl CacheWriter {
             }
         }
         self.publication_dirty_drain().await?;
-        self.state_gauges_update();
         metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
             .record(handle_start.elapsed().as_secs_f64());
         Ok(())
@@ -999,11 +1000,24 @@ pub fn writer_run(
                     CacheWriter::new(settings, state_view, active_relations, query_tx, notify_tx)
                         .await?;
 
+                // Gauges (queries_loading/pending/invalidated, cache_size_bytes,
+                // generation, tables_tracked, update_queries_total/max) used to
+                // be emitted from every query/CDC command. state_gauges_update
+                // iterates the entire state_view DashMap, which dominated
+                // writer per-command time at scale. Emit on a 1s tick instead —
+                // well below typical Prometheus scrape intervals.
+                let mut gauges_interval = tokio::time::interval(Duration::from_secs(1));
+                gauges_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => {
                             debug!("writer shutdown signal received");
                             break;
+                        }
+                        _ = gauges_interval.tick() => {
+                            writer.state_gauges_update();
+                            writer.writer_scale_gauges_update();
                         }
                         // Handle query commands from coordinator
                         msg = query_rx.recv() => {

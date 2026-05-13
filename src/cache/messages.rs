@@ -187,8 +187,11 @@ pub enum CacheReply {
     /// Query completed successfully. Worker wrote the full response to the client.
     Complete(Option<QueryTiming>),
     /// Query should be forwarded to origin (cache miss or not cacheable).
-    /// Contains buffered bytes for origin (or just execute_data if no pipeline).
-    Forward(BytesMut),
+    /// Contains buffered bytes for origin (or just execute_data if no pipeline),
+    /// plus the per-query timing struct so the proxy can continue stamping
+    /// forward-path stages and record full per-stage histograms when the
+    /// forward completes.
+    Forward(BytesMut, QueryTiming),
     /// Query execution failed. Contains buffered bytes for origin fallback.
     Error(BytesMut),
 }
