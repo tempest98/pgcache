@@ -735,7 +735,9 @@ impl CacheWriter {
             pinned_skips = 0;
         }
 
-        self.stale_entries_cleanup();
+        // stale_entries_cleanup runs on the 1s gauges tick instead of here —
+        // it is GC of dead Pending/Invalidated entries, not eviction-critical,
+        // and its O(cached_queries) scan would dominate Ready handling.
         Ok(())
     }
 
@@ -796,9 +798,19 @@ impl CacheWriter {
         Ok(())
     }
 
-    /// Clean up stale Pending and Invalidated entries from state_view.
-    /// Pending entries that haven't been promoted and Invalidated entries whose
-    /// generation is below the cleanup threshold are removed.
+    /// GC dead entries across writer state and the shared state view.
+    ///
+    /// Three passes:
+    /// - Invalidated, non-pinned entries in `cache.cached_queries` whose
+    ///   generation is below the purge threshold (CLOCK-policy carryover
+    ///   after CDC invalidation that wasn't readmitted).
+    /// - Pending/Invalidated entries in `state_view.cached_queries` below
+    ///   the threshold (state-view counterparts of the above + pre-admission
+    ///   markers that were never promoted).
+    /// - Orphaned per-query entries in `state_view.metrics` whose
+    ///   fingerprint no longer exists in either map.
+    ///
+    /// Runs on the 1s gauges tick, not per-command — see callsite.
     fn stale_entries_cleanup(&mut self) {
         let cleanup_threshold = self.cache.generation_purge_threshold();
 
@@ -1068,6 +1080,7 @@ pub fn writer_run(
                             break;
                         }
                         _ = gauges_interval.tick() => {
+                            writer.stale_entries_cleanup();
                             writer.state_gauges_update();
                             writer.writer_scale_gauges_update();
                         }
