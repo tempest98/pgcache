@@ -1,5 +1,5 @@
 telemetry = false
-num_workers = 1
+num_workers = 8
 #cache_size = 500000
 #log_level = "trace"
 #log_level = "debug"

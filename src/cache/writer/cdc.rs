@@ -728,7 +728,7 @@ impl CacheWriter {
         };
 
         let mut fp_list = Vec::new();
-        for update_query in &update_queries.queries {
+        for update_query in update_queries.iter_complexity_ordered() {
             // Guard clause: handle uncached rows (INSERT or UPDATE where row not in cache)
             if row_changes.is_none() {
                 if self.row_uncached_invalidation_check(
@@ -802,7 +802,7 @@ impl CacheWriter {
 
         // Phase 1: Rust evaluation for LocalEval queries. Complexity-sorted
         // iteration gives us the same try-simplest-first property.
-        for update_query in &update_queries.queries {
+        for update_query in update_queries.iter_complexity_ordered() {
             if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
                 continue;
             }
@@ -831,8 +831,7 @@ impl CacheWriter {
 
         // Phase 2: fall back to PG-side WHERE EXISTS for PgEval queries.
         let pg_eval_queries: Vec<&UpdateQuery> = update_queries
-            .queries
-            .iter()
+            .iter_complexity_ordered()
             .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
             .collect();
 

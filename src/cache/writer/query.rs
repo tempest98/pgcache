@@ -180,20 +180,63 @@ impl CacheWriter {
         }
     }
 
-    /// Register an update query for a relation, maintaining complexity sort order.
-    fn update_query_register(&mut self, relation_oid: u32, update_query: UpdateQuery) {
-        self.cache
+    /// Register an update query for a relation. Maintains complexity-sorted
+    /// fingerprint order for CDC iteration and indexes the constraints for
+    /// sub-linear subsumption candidate lookup.
+    fn update_query_register(
+        &mut self,
+        relation_oid: u32,
+        table_name: &str,
+        update_query: UpdateQuery,
+    ) {
+        let fingerprint = update_query.fingerprint;
+        let complexity = update_query.complexity;
+        let has_limit = update_query.has_limit;
+        // Index the per-table constraints for subsumption lookup. Skip
+        // entries that are ineligible parents:
+        // - has_limit: limited queries are excluded by `subsumption_check`.
+        // - !where_analysis_complete: the WHERE clause couldn't be fully
+        //   analyzed, so we can't reason about coverage (PGC-106). The
+        //   detailed check would reject these anyway; skipping the index
+        //   entry saves a per-lookup candidate visit.
+        // Queries with empty per-table constraints (full-table scans) are
+        // indexed with `&[]` — they're the broadest subsumers and live in
+        // the empty `ColumnSet` class.
+        let index_eligible = !has_limit && update_query.constraints.where_analysis_complete;
+        let table_constraints = index_eligible.then(|| {
+            update_query
+                .constraints
+                .table_constraints
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default()
+        });
+
+        let mut queries = self
+            .cache
             .update_queries
             .entry(relation_oid)
-            .and_modify(|mut queries| {
-                queries.queries.push(update_query.clone());
-                // Keep queries sorted by complexity (ascending) so simpler queries are tried first
-                queries.queries.sort_by_key(|q| q.complexity);
+            .or_insert_with(|| UpdateQueries::new(relation_oid));
+
+        queries.queries.insert(fingerprint, update_query);
+        // Insert fingerprint into complexity_order at the correct position
+        // (ascending by complexity, then by fingerprint for stability).
+        let pos = queries
+            .complexity_order
+            .binary_search_by(|fp| {
+                let c = queries
+                    .queries
+                    .get(fp)
+                    .map(|q| q.complexity)
+                    .unwrap_or(usize::MAX);
+                c.cmp(&complexity).then_with(|| fp.cmp(&fingerprint))
             })
-            .or_insert_with(|| UpdateQueries {
-                relation_oid,
-                queries: vec![update_query],
-            });
+            .unwrap_or_else(|p| p);
+        queries.complexity_order.insert(pos, fingerprint);
+
+        if let Some(tcs) = table_constraints {
+            queries.subsumption.insert(fingerprint, &tcs);
+        }
     }
 
     /// Dispatch population work to next worker using round-robin scheduling.
@@ -273,7 +316,7 @@ impl CacheWriter {
                 eval_strategy,
             };
 
-            self.update_query_register(relation_oid, update_query);
+            self.update_query_register(relation_oid, table_node.name.as_str(), update_query);
             relation_oids.push(relation_oid);
         }
         Ok(relation_oids)
@@ -403,7 +446,22 @@ impl CacheWriter {
             };
             let table_name = &table_meta.name;
 
-            let table_covered = update_queries.queries.iter().any(|uq| {
+            // Sub-linear candidate lookup via the per-relation subsumption index.
+            // Returns parents whose constraint-column set is a subset of new's;
+            // we still need to apply parent_ready / single-table / fine-grained
+            // constraint checks per candidate, but the candidate set is
+            // typically far smaller than `queries.len()`.
+            let empty: Vec<crate::query::constraints::TableConstraint> = Vec::new();
+            let new_table_constraints = new_constraints
+                .table_constraints
+                .get(table_name.as_str())
+                .unwrap_or(&empty);
+            let candidate_fps = update_queries.subsumption.candidates(new_table_constraints);
+
+            let table_covered = candidate_fps.into_iter().any(|fp| {
+                let Some(uq) = update_queries.queries.get(&fp) else {
+                    return false;
+                };
                 if uq.has_limit {
                     return false;
                 }
@@ -812,7 +870,9 @@ impl CacheWriter {
                 // No cached_query but `update_queries_register` may have run
                 // before the failure — sweep orphan entries by fingerprint.
                 for mut entry in self.cache.update_queries.iter_mut() {
-                    entry.queries.retain(|q| q.fingerprint != fingerprint);
+                    entry.queries.remove(&fingerprint);
+                    entry.complexity_order.retain(|fp| *fp != fingerprint);
+                    entry.subsumption.remove(fingerprint);
                 }
             }
         }
@@ -861,14 +921,29 @@ impl CacheWriter {
             self.cache.cached_queries.insert_overwrite(cached);
         }
 
-        // Update has_limit on update queries
+        // Update has_limit on update queries. Limited queries are ineligible
+        // parents for subsumption, so the index entry is dropped when the bit
+        // goes false → true and (re-)added when it goes true → false.
         let has_limit = new_max_limit.is_some();
         for oid in &relation_oids {
+            let table_name = self.cache.tables.get1(oid).map(|t| t.name.clone());
             if let Some(mut queries) = self.cache.update_queries.get_mut(oid) {
-                for uq in &mut queries.queries {
-                    if uq.fingerprint == fingerprint {
-                        uq.has_limit = has_limit;
-                    }
+                if let Some(uq) = queries.queries.get_mut(&fingerprint) {
+                    uq.has_limit = has_limit;
+                }
+                if has_limit {
+                    queries.subsumption.remove(fingerprint);
+                } else if let Some(name) = table_name
+                    && let Some(uq) = queries.queries.get(&fingerprint)
+                    && uq.constraints.where_analysis_complete
+                {
+                    let tcs = uq
+                        .constraints
+                        .table_constraints
+                        .get(name.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    queries.subsumption.insert(fingerprint, &tcs);
                 }
             }
         }
