@@ -27,7 +27,7 @@ use super::super::{
     mv::{ShapeGate, shape_classify},
     query::CacheableQuery,
     types::{
-        CachedQuery, CachedQueryState, QueryMetrics, SharedResolved, UpdateEvalStrategy,
+        CachedQuery, QueryMetrics, SharedResolved, UpdateEvalStrategy,
         UpdateQueries, UpdateQuery, UpdateQuerySource,
     },
 };
@@ -558,13 +558,11 @@ impl CacheWriter {
             return Ok(None);
         }
 
-        // Mark Ready in state view
-        self.state_view_update(
+        self.state_ready_transition(
             fingerprint,
-            CachedQueryState::Ready,
             generation,
-            &resolution.resolved,
-            &resolution.deparsed_sql,
+            Arc::clone(&resolution.resolved),
+            resolution.deparsed_sql.clone(),
             resolution.max_limit,
         );
 
@@ -627,9 +625,9 @@ impl CacheWriter {
         metrics::histogram!(names::CACHE_WRITER_REGISTER_RESOLVE_SECONDS)
             .record(resolve_start.elapsed().as_secs_f64());
 
-        // Classify shape for MV eligibility. Sticky — readmit and limit-bump
-        // paths preserve the result via state_view_update. Classification
-        // was done in `query_resolve`; reuse it here.
+        // Classify shape for MV eligibility. Sticky — readmit/limit-bump
+        // preserve the result through state_view_write. Classification was
+        // done in `query_resolve`; reuse here.
         self.mv_state_set(fingerprint, resolution.shape_gate);
 
         // Phase 2: Subsumption check
@@ -772,10 +770,8 @@ impl CacheWriter {
         // Refcount unchanged — readmit reuses the existing relation_oids set.
         self.cache.cached_queries.insert_overwrite(cached);
 
-        // Update state view to Loading
-        self.state_view_update(
+        self.state_loading_transition(
             fingerprint,
-            CachedQueryState::Loading,
             new_generation,
             &resolved,
             &deparsed_sql,
@@ -825,23 +821,13 @@ impl CacheWriter {
                 m.last_population_duration_us = population_duration_us.and_then(NonZeroU64::new);
             }
 
-            // Update shared state view
-            self.state_view_update(
-                fingerprint,
-                CachedQueryState::Ready,
-                generation,
-                &resolved,
-                &deparsed_sql,
-                max_limit,
-            );
-            // Notify coordinator to drain coalesced waiters
-            let _ = self.notify_tx.send(WriterNotify::Ready {
+            self.state_ready_transition(
                 fingerprint,
                 generation,
                 resolved,
                 deparsed_sql,
                 max_limit,
-            });
+            );
 
             trace!(
                 "cached query ready, cached_bytes={cached_bytes} rows={row_count} {fingerprint}"
@@ -950,10 +936,8 @@ impl CacheWriter {
             }
         }
 
-        // Set state to Loading while re-populating
-        self.state_view_update(
+        self.state_loading_transition(
             fingerprint,
-            CachedQueryState::Loading,
             new_generation,
             &resolved,
             &deparsed_sql,

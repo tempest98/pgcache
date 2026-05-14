@@ -555,7 +555,10 @@ impl CacheWriter {
         }
     }
 
-    pub(super) fn state_view_update(
+    /// Preserves shape_gate and mv_state. Private — callers must go through
+    /// the public `state_*_transition` wrappers so paired side effects (notify
+    /// on Ready) aren't skipped.
+    fn state_view_write(
         &self,
         fingerprint: u64,
         state: CachedQueryState,
@@ -564,10 +567,6 @@ impl CacheWriter {
         deparsed_sql: &EcoString,
         max_limit: Option<u64>,
     ) {
-        // Preserve shape_gate and mv_state across state transitions — the writer
-        // mutates those via dedicated helpers (registration classifier, mv_dirty_mark,
-        // rebuild, etc). For a first insert (no existing entry), default to Skip/Skipped
-        // until classification runs.
         self.state_view
             .cached_queries
             .entry(fingerprint)
@@ -589,6 +588,53 @@ impl CacheWriter {
                 shape_gate: ShapeGate::Skip,
                 mv_state: MvState::Skipped,
             });
+    }
+
+    /// Caller must follow up with population work (or another Ready/Failed
+    /// transition); otherwise coalesced waiters stay stuck.
+    pub(super) fn state_loading_transition(
+        &self,
+        fingerprint: u64,
+        generation: u64,
+        resolved: &SharedResolved,
+        deparsed_sql: &EcoString,
+        max_limit: Option<u64>,
+    ) {
+        self.state_view_write(
+            fingerprint,
+            CachedQueryState::Loading,
+            generation,
+            resolved,
+            deparsed_sql,
+            max_limit,
+        );
+    }
+
+    /// Mark Ready and notify the cache loop. Skipping the notify leaves
+    /// coalesced waiters hung forever — always go through this wrapper.
+    pub(super) fn state_ready_transition(
+        &self,
+        fingerprint: u64,
+        generation: u64,
+        resolved: SharedResolved,
+        deparsed_sql: EcoString,
+        max_limit: Option<u64>,
+    ) {
+        self.state_view_write(
+            fingerprint,
+            CachedQueryState::Ready,
+            generation,
+            &resolved,
+            &deparsed_sql,
+            max_limit,
+        );
+        let _ = self.notify_tx.send(WriterNotify::Ready {
+            fingerprint,
+            generation,
+            resolved,
+            deparsed_sql,
+            max_limit,
+        });
     }
 
     /// Update cache state gauges with current values.
