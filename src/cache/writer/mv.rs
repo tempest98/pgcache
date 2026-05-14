@@ -137,7 +137,7 @@ impl CacheWriter {
             );
             let _ = self
                 .db_cache
-                .execute(&format!("DROP TABLE IF EXISTS {mv_table}"), &[])
+                .batch_execute(&format!("DROP TABLE IF EXISTS {mv_table}"))
                 .await;
             self.mv_state_transition(fingerprint, MvState::Pending { has_table: false });
             return Ok(());
@@ -284,7 +284,7 @@ impl CacheWriter {
             let mv_table = mv_table_name(fingerprint);
             if let Err(e) = self
                 .db_cache
-                .execute(&format!("TRUNCATE {mv_table}"), &[])
+                .batch_execute(&format!("TRUNCATE {mv_table}"))
                 .await
                 .map_into_report::<CacheError>()
                 .attach_loc("truncating dirty MV in eviction sweep")
@@ -311,7 +311,7 @@ impl CacheWriter {
         }
         let mv_table = mv_table_name(fingerprint);
         self.db_cache
-            .execute(&format!("DROP TABLE IF EXISTS {mv_table}"), &[])
+            .batch_execute(&format!("DROP TABLE IF EXISTS {mv_table}"))
             .await
             .map_into_report::<CacheError>()
             .attach_loc("dropping MV table on eviction")?;
@@ -354,7 +354,7 @@ impl CacheWriter {
         // Set query generation on cache DB for consistent snapshot filtering.
         let set_gen = format!("SET mem.query_generation = {}", ctx.generation);
         self.db_cache
-            .execute(&set_gen, &[])
+            .batch_execute(&set_gen)
             .await
             .map_into_report::<CacheError>()
             .attach_loc("setting query generation for MV size gate")?;
@@ -366,7 +366,7 @@ impl CacheWriter {
         // Always reset generation, even on failure.
         let _ = self
             .db_cache
-            .execute("SET mem.query_generation = 0", &[])
+            .batch_execute("SET mem.query_generation = 0")
             .await;
 
         let row = result

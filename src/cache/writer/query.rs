@@ -527,7 +527,7 @@ impl CacheWriter {
         let set_gen_sql = format!("SET mem.query_generation = {generation}");
         if let Err(e) = self
             .db_cache
-            .execute(&set_gen_sql, &[])
+            .batch_execute(&set_gen_sql)
             .await
             .map_into_report::<CacheError>()
         {
@@ -540,14 +540,14 @@ impl CacheWriter {
 
         let cache_exec_result = self
             .db_cache
-            .query(resolution.deparsed_sql.as_str(), &[])
+            .batch_execute(resolution.deparsed_sql.as_str())
             .await
             .map_into_report::<CacheError>();
 
         // Always reset generation, even on failure
         let _ = self
             .db_cache
-            .execute("SET mem.query_generation = 0", &[])
+            .batch_execute("SET mem.query_generation = 0")
             .await;
 
         if let Err(e) = cache_exec_result {

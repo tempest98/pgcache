@@ -500,7 +500,7 @@ impl CacheWriter {
 
         debug!("publication update: {sql}");
         self.db_origin
-            .execute(&sql, &[])
+            .batch_execute(&sql)
             .await
             .map_into_report::<CacheError>()
             .attach_loc("updating publication table list")?;
@@ -761,7 +761,7 @@ impl CacheWriter {
         // 2. Set query generation on cache DB connection for row tracking
         let set_gen_sql = format!("SET mem.query_generation = {new_generation}");
         self.db_cache
-            .execute(&set_gen_sql, &[])
+            .batch_execute(&set_gen_sql)
             .await
             .map_into_report::<CacheError>()?;
 
@@ -769,15 +769,14 @@ impl CacheWriter {
         //    The CustomScan tracker side-effect updates dshash from old_gen to new_gen.
         let mut sql = String::with_capacity(512);
         crate::query::ast::Deparse::deparse(&*resolved, &mut sql);
-        let _ = self
-            .db_cache
-            .query(&sql, &[])
+        self.db_cache
+            .batch_execute(&sql)
             .await
             .map_into_report::<CacheError>()?;
 
         // 4. Reset query generation
         self.db_cache
-            .execute("SET mem.query_generation = 0", &[])
+            .batch_execute("SET mem.query_generation = 0")
             .await
             .map_into_report::<CacheError>()?;
 

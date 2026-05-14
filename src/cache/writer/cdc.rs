@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::Instant;
 
+use ecow::EcoString;
 use futures_util::stream::FuturesUnordered;
 use postgres_protocol::escape;
-use tokio_postgres::Row;
+use tokio_postgres::SimpleQueryMessage;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, instrument, trace};
 
@@ -31,6 +33,21 @@ use crate::result::error_chain_format;
 /// Default capacity for dynamically built SQL strings.
 const SQL_BUFFER_CAPACITY: usize = 1024;
 
+/// Rows-affected count from a single-statement `simple_query` result. Returns
+/// the first `CommandComplete` count; 0 if none is present (e.g. statement
+/// affected nothing or returned only rows).
+fn simple_query_rows_affected(msgs: &[SimpleQueryMessage]) -> u64 {
+    msgs.iter()
+        .find_map(|m| {
+            if let SimpleQueryMessage::CommandComplete(n) = m {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
 /// Distinguishes INSERT from DELETE so that subquery invalidation logic
 /// can flip Inclusion/Exclusion semantics correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +71,7 @@ impl CacheWriter {
         let fp_list = self
             .update_queries_check_invalidate(
                 relation_oid,
-                &None,
+                None,
                 &row_data,
                 None,
                 CdcOperation::Upsert,
@@ -110,7 +127,7 @@ impl CacheWriter {
 
         let fp_list = self.update_queries_check_invalidate(
             relation_oid,
-            &row_changes.first(),
+            row_changes.as_ref(),
             &new_row_data,
             Some(&key_data),
             CdcOperation::Upsert,
@@ -154,7 +171,7 @@ impl CacheWriter {
 
             let delete_sql = self.cache_delete_sql(table_metadata, &new_row_data)?;
             self.db_cache
-                .execute(delete_sql.as_str(), &[])
+                .batch_execute(delete_sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?;
         }
@@ -171,7 +188,7 @@ impl CacheWriter {
 
             let delete_sql = self.cache_delete_sql(table_metadata, &key_data)?;
             self.db_cache
-                .execute(delete_sql.as_str(), &[])
+                .batch_execute(delete_sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?;
         }
@@ -206,11 +223,13 @@ impl CacheWriter {
         };
 
         let delete_sql = self.cache_delete_sql(table_metadata, &row_data)?;
-        let rows_deleted = self
-            .db_cache
-            .execute(delete_sql.as_str(), &[])
-            .await
-            .map_into_report::<CacheError>()?;
+        let rows_deleted = simple_query_rows_affected(
+            &self
+                .db_cache
+                .simple_query(delete_sql.as_str())
+                .await
+                .map_into_report::<CacheError>()?,
+        );
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables
@@ -219,7 +238,7 @@ impl CacheWriter {
             let fp_list = self
                 .update_queries_check_invalidate(
                     relation_oid,
-                    &None,
+                    None,
                     &row_data,
                     None,
                     CdcOperation::Delete,
@@ -273,7 +292,7 @@ impl CacheWriter {
         }
 
         self.db_cache
-            .execute(sql.as_str(), &[])
+            .batch_execute(sql.as_str())
             .await
             .map_into_report::<CacheError>()?;
 
@@ -443,12 +462,17 @@ impl CacheWriter {
         Ok(())
     }
 
+    /// SELECT one row from the cache, projecting a boolean per non-PK column
+    /// that's true iff the cached value differs from the incoming `row_data`
+    /// value. Used by CDC UPDATE handling to decide whether a column change
+    /// actually shifts query membership. Returns `None` when the row isn't in
+    /// the cache (no PK match).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn query_row_changes(
         &self,
         relation_oid: u32,
         row_data: &[Option<String>],
-    ) -> CacheResult<Vec<Row>> {
+    ) -> CacheResult<Option<HashMap<EcoString, bool>>> {
         let table_metadata =
             self.cache
                 .tables
@@ -509,10 +533,26 @@ impl CacheWriter {
             return Err(CacheError::NoPrimaryKey.into());
         }
 
-        self.db_cache
-            .query(&sql, &[])
+        let msgs = self
+            .db_cache
+            .simple_query(&sql)
             .await
-            .map_into_report::<CacheError>()
+            .map_into_report::<CacheError>()?;
+
+        for msg in msgs {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let mut changes = HashMap::with_capacity(row.len());
+                for (idx, col) in row.columns().iter().enumerate() {
+                    // PG boolean text format: "t" = true, "f" = false. NULL
+                    // shouldn't occur (IS DISTINCT FROM always returns t/f),
+                    // but treat any non-"t" as false defensively.
+                    let changed = row.get(idx) == Some("t");
+                    changes.insert(EcoString::from(col.name()), changed);
+                }
+                return Ok(Some(changes));
+            }
+        }
+        Ok(None)
     }
 
     /// Check if all WHERE constraints for a table match the given row values.
@@ -670,7 +710,7 @@ impl CacheWriter {
         update_query: &UpdateQuery,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
-        row_changes: &Row,
+        row_changes: &HashMap<EcoString, bool>,
     ) -> bool {
         // Subquery and non-terminal outer join tables: always invalidate on
         // UPDATE — column changes could shift set membership or cascade to
@@ -686,7 +726,13 @@ impl CacheWriter {
             .constraints
             .table_join_columns(&table_metadata.name)
         {
-            let column_changed = row_changes.get::<&str, bool>(column);
+            // Missing column would mean query constraints reference a column
+            // that wasn't projected — a builder invariant violation, not a
+            // runtime condition. Silent `false` would risk missed
+            // invalidations and stale reads, so panic instead.
+            let column_changed = *row_changes
+                .get(column)
+                .expect("column present in row_changes");
 
             if !column_changed {
                 continue;
@@ -707,7 +753,7 @@ impl CacheWriter {
     pub(super) fn update_queries_check_invalidate(
         &self,
         relation_oid: u32,
-        row_changes: &Option<&Row>,
+        row_changes: Option<&HashMap<EcoString, bool>>,
         row_data: &[Option<String>],
         key_data: Option<&[Option<String>]>,
         operation: CdcOperation,
@@ -826,7 +872,7 @@ impl CacheWriter {
 
             let sql = self.cache_upsert_unconditional_sql(table_metadata, row_data);
             let conn = self.cache_pool.first().ok_or(CacheError::Other)?;
-            conn.execute(sql.as_str(), &[])
+            conn.batch_execute(sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?;
             return Ok(true);
@@ -865,7 +911,10 @@ impl CacheWriter {
                     .ok_or(CacheError::Other)?;
 
                 futures.push(async move {
-                    let result = conn.execute(sql.as_str(), &[]).await;
+                    let result = conn
+                        .simple_query(sql.as_str())
+                        .await
+                        .map(|msgs| simple_query_rows_affected(&msgs));
                     (fingerprint, result)
                 });
             }
