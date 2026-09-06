@@ -170,9 +170,8 @@ pub(super) fn numeric_parse_wire(bytes: &[u8]) -> AstTransformResult<(i16, u16, 
         .into());
     }
     let mut digits: Vec<i16> = Vec::with_capacity(ndigits);
-    for chunk in rest.chunks_exact(2) {
-        let pair: [u8; 2] = chunk.try_into().expect("2-byte digit pair");
-        let d = i16::from_be_bytes(pair);
+    for pair in rest.as_chunks::<2>().0 {
+        let d = i16::from_be_bytes(*pair);
         if !(0..=9999).contains(&d) {
             return Err(AstTransformError::InvalidParameterValue {
                 message: format!("invalid numeric digit out of [0,9999]: {d}"),

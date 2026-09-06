@@ -102,14 +102,14 @@ fn point_table() -> TableMetadata {
 }
 
 #[test]
-fn empty_index_has_no_candidates() {
+fn test_empty_index_has_no_candidates() {
     let idx = ConstraintIndex::<Fingerprint>::new();
     let candidates = idx.candidates(&[eq("id", int(42))]);
     assert!(candidates.is_empty());
 }
 
 #[test]
-fn equality_pure_exact_match() {
+fn test_equality_pure_exact_match() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(42))]);
     idx.insert(fp(2), &[eq("id", int(99))]);
@@ -119,7 +119,7 @@ fn equality_pure_exact_match() {
 }
 
 #[test]
-fn equality_pure_different_value_misses() {
+fn test_equality_pure_different_value_misses() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(42))]);
 
@@ -128,7 +128,7 @@ fn equality_pure_different_value_misses() {
 }
 
 #[test]
-fn parent_broader_via_subset_filter() {
+fn test_parent_broader_via_subset_filter() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Parent constrains only category=5 — class {category}
     idx.insert(fp(1), &[eq("category", int(5))]);
@@ -144,7 +144,7 @@ fn parent_broader_via_subset_filter() {
 }
 
 #[test]
-fn parent_with_unconstrained_column_finds_via_empty_class() {
+fn test_parent_with_unconstrained_column_finds_via_empty_class() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Parent: full table scan, no constraints — class {}
     idx.insert(fp(1), &[]);
@@ -156,7 +156,7 @@ fn parent_with_unconstrained_column_finds_via_empty_class() {
 }
 
 #[test]
-fn complex_constraint_lands_in_complex_bucket() {
+fn test_complex_constraint_lands_in_complex_bucket() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(100))]);
     idx.insert(
@@ -175,7 +175,7 @@ fn complex_constraint_lands_in_complex_bucket() {
 }
 
 #[test]
-fn mixed_equality_and_complex_both_returned() {
+fn test_mixed_equality_and_complex_both_returned() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(42))]); // class {id}.equality[(42,)]
     idx.insert(fp(2), &[gt("id", int(0))]); // class {id}.complex
@@ -185,7 +185,7 @@ fn mixed_equality_and_complex_both_returned() {
 }
 
 #[test]
-fn remove_drops_entry() {
+fn test_remove_drops_entry() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(42))]);
     idx.remove(fp(1));
@@ -195,7 +195,7 @@ fn remove_drops_entry() {
 }
 
 #[test]
-fn remove_keeps_unrelated_entries() {
+fn test_remove_keeps_unrelated_entries() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(42))]);
     idx.insert(fp(2), &[eq("id", int(42))]);
@@ -205,7 +205,7 @@ fn remove_keeps_unrelated_entries() {
 }
 
 #[test]
-fn column_order_does_not_affect_class_membership() {
+fn test_column_order_does_not_affect_class_membership() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Insert as [a, b]
     idx.insert(fp(1), &[eq("a", int(1)), eq("b", int(2))]);
@@ -215,7 +215,7 @@ fn column_order_does_not_affect_class_membership() {
 }
 
 #[test]
-fn contradictory_equality_lands_in_complex() {
+fn test_contradictory_equality_lands_in_complex() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // WHERE a=1 AND a=2 — same column, conflicting values. Classifier
     // falls back to complex.
@@ -227,7 +227,7 @@ fn contradictory_equality_lands_in_complex() {
 }
 
 #[test]
-fn empty_new_query_finds_only_unconstrained_parents() {
+fn test_empty_new_query_finds_only_unconstrained_parents() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[]); // unconstrained — class {}
     idx.insert(fp(2), &[eq("id", int(42))]); // class {id}, not a subset of {}
@@ -237,7 +237,7 @@ fn empty_new_query_finds_only_unconstrained_parents() {
 }
 
 #[test]
-fn powerset_bounded_by_column_count() {
+fn test_powerset_bounded_by_column_count() {
     // 4 columns → 16 subsets. Just confirm we don't explode for a
     // realistic max.
     let cols = ColumnSet::new(vec![col("a"), col("b"), col("c"), col("d")]);
@@ -249,7 +249,7 @@ fn powerset_bounded_by_column_count() {
 // equality bucket regardless of whether new is equality-pure.
 
 #[test]
-fn unconstrained_parent_subsumes_complex_new_range() {
+fn test_unconstrained_parent_subsumes_complex_new_range() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[]); // unconstrained — class {}
 
@@ -262,7 +262,7 @@ fn unconstrained_parent_subsumes_complex_new_range() {
 }
 
 #[test]
-fn unconstrained_parent_subsumes_complex_new_inset() {
+fn test_unconstrained_parent_subsumes_complex_new_inset() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[]);
 
@@ -274,7 +274,7 @@ fn unconstrained_parent_subsumes_complex_new_inset() {
 }
 
 #[test]
-fn unconstrained_parent_subsumes_mixed_new() {
+fn test_unconstrained_parent_subsumes_mixed_new() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[]);
 
@@ -288,7 +288,7 @@ fn unconstrained_parent_subsumes_mixed_new() {
 }
 
 #[test]
-fn unconstrained_new_finds_unconstrained_parent() {
+fn test_unconstrained_new_finds_unconstrained_parent() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[]);
     idx.insert(fp(2), &[eq("id", int(42))]);
@@ -301,7 +301,7 @@ fn unconstrained_new_finds_unconstrained_parent() {
 // previous indexing (not double-count).
 
 #[test]
-fn reinsert_same_fingerprint_replaces() {
+fn test_reinsert_same_fingerprint_replaces() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(5))]);
     // Same fingerprint, different value — lookup of old value misses.
@@ -312,7 +312,7 @@ fn reinsert_same_fingerprint_replaces() {
 }
 
 #[test]
-fn reinsert_changing_shape_replaces() {
+fn test_reinsert_changing_shape_replaces() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Start as Equality-pure on {id}.
     idx.insert(fp(1), &[eq("id", int(5))]);
@@ -331,7 +331,7 @@ fn reinsert_changing_shape_replaces() {
 }
 
 #[test]
-fn remove_unconstrained_drops_empty_class() {
+fn test_remove_unconstrained_drops_empty_class() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[]);
     idx.remove(fp(1));
@@ -352,7 +352,7 @@ fn remove_unconstrained_drops_empty_class() {
 // matching subset class, so the only true miss is when the parent is in
 // an equality bucket of a non-empty class AND new is overall complex.
 #[test]
-fn known_limitation_equality_parent_missed_by_complex_new() {
+fn test_known_limitation_equality_parent_missed_by_complex_new() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Parent: WHERE a = 5 — lives in class {a}.equality[(5,)]
     idx.insert(fp(1), &[eq("a", int(5))]);
@@ -416,14 +416,14 @@ fn test_walkthrough_two_parents_four_queries() {
 // (their values live in the cast-output domain, not the column domain).
 
 #[test]
-fn cast_comparison_classifies_as_complex() {
+fn test_cast_comparison_classifies_as_complex() {
     let constraint = cast_eq("name", CastTarget::Int4, int(42));
     let class = classify(&[constraint]);
     assert!(matches!(class, Classification::Complex { .. }));
 }
 
 #[test]
-fn cast_comparison_alongside_equality_classifies_as_complex() {
+fn test_cast_comparison_alongside_equality_classifies_as_complex() {
     // Mixed: a bare equality + a cast comparison. Cast presence forces Complex.
     let constraints = vec![eq("id", int(1)), cast_eq("name", CastTarget::Int4, int(42))];
     let class = classify(&constraints);
@@ -438,7 +438,7 @@ fn cast_comparison_alongside_equality_classifies_as_complex() {
 // once the V1 index lands, since V0 cannot satisfy it.
 
 #[test]
-fn range_parent_subsumes_equality_in_range() {
+fn test_range_parent_subsumes_equality_in_range() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(100))]);
 
@@ -448,7 +448,7 @@ fn range_parent_subsumes_equality_in_range() {
 }
 
 #[test]
-fn range_parent_subsumes_narrower_range() {
+fn test_range_parent_subsumes_narrower_range() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0))]);
 
@@ -458,7 +458,7 @@ fn range_parent_subsumes_narrower_range() {
 }
 
 #[test]
-fn inset_parent_subsumes_member_equality() {
+fn test_inset_parent_subsumes_member_equality() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(
         fp(1),
@@ -477,7 +477,7 @@ fn inset_parent_subsumes_member_equality() {
 }
 
 #[test]
-fn multi_column_complex_class_subsumer_returned() {
+fn test_multi_column_complex_class_subsumer_returned() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Parent: id > 10 AND region = 5 — class {id, region}, Complex.
     idx.insert(fp(1), &[gt("id", int(10)), eq("region", int(5))]);
@@ -488,7 +488,7 @@ fn multi_column_complex_class_subsumer_returned() {
 }
 
 #[test]
-fn range_parent_in_subset_class_returned() {
+fn test_range_parent_in_subset_class_returned() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Parent constrains only category — class {category}, Complex.
     idx.insert(fp(1), &[gt("category", int(5))]);
@@ -508,7 +508,7 @@ fn range_parent_in_subset_class_returned() {
 // scan could not satisfy them, so they land with the V1 index.
 
 #[test]
-fn range_parent_excludes_out_of_range_equality() {
+fn test_range_parent_excludes_out_of_range_equality() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(100))]);
 
@@ -518,7 +518,7 @@ fn range_parent_excludes_out_of_range_equality() {
 }
 
 #[test]
-fn range_parent_excludes_broader_range() {
+fn test_range_parent_excludes_broader_range() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(50))]);
 
@@ -528,7 +528,7 @@ fn range_parent_excludes_broader_range() {
 }
 
 #[test]
-fn upper_range_parent_bounds_both_ways() {
+fn test_upper_range_parent_bounds_both_ways() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[lt("id", int(100))]);
 
@@ -537,7 +537,7 @@ fn upper_range_parent_bounds_both_ways() {
 }
 
 #[test]
-fn inset_parent_excludes_non_member() {
+fn test_inset_parent_excludes_non_member() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[any_of("status", vec![text("a"), text("b")])]);
 
@@ -546,7 +546,7 @@ fn inset_parent_excludes_non_member() {
 }
 
 #[test]
-fn inset_parent_subsumes_subset_inset_only() {
+fn test_inset_parent_subsumes_subset_inset_only() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(
         fp(1),
@@ -566,7 +566,7 @@ fn inset_parent_subsumes_subset_inset_only() {
 }
 
 #[test]
-fn multi_column_excludes_when_one_column_misses() {
+fn test_multi_column_excludes_when_one_column_misses() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Parent: id > 10 AND region = 5.
     idx.insert(fp(1), &[gt("id", int(10)), eq("region", int(5))]);
@@ -577,7 +577,7 @@ fn multi_column_excludes_when_one_column_misses() {
 }
 
 #[test]
-fn two_sided_range_avoids_opaque_fallback() {
+fn test_two_sided_range_avoids_opaque_fallback() {
     // PGC-189: two-sided range parents go into `range_both`, not the
     // linear fallback. `complex_fallback_total` stays at zero.
     let mut idx = ConstraintIndex::<Fingerprint>::new();
@@ -589,7 +589,7 @@ fn two_sided_range_avoids_opaque_fallback() {
 }
 
 #[test]
-fn single_sided_range_avoids_fallback() {
+fn test_single_sided_range_avoids_fallback() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0))]);
 
@@ -598,7 +598,7 @@ fn single_sided_range_avoids_fallback() {
 }
 
 #[test]
-fn remove_clears_range_parent() {
+fn test_remove_clears_range_parent() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(100))]);
     idx.remove(fp(1));
@@ -609,7 +609,7 @@ fn remove_clears_range_parent() {
 }
 
 #[test]
-fn remove_one_range_parent_keeps_sibling() {
+fn test_remove_one_range_parent_keeps_sibling() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(10))]);
     idx.insert(fp(2), &[gt("id", int(20))]);
@@ -622,7 +622,7 @@ fn remove_one_range_parent_keeps_sibling() {
 }
 
 #[test]
-fn two_sided_column_does_not_mask_sibling() {
+fn test_two_sided_column_does_not_mask_sibling() {
     // Parent: two-sided range on `id` (range_both), clean equality on
     // `region`. Region's precise filter must still apply across columns.
     let mut idx = ConstraintIndex::<Fingerprint>::new();
@@ -641,7 +641,7 @@ fn two_sided_column_does_not_mask_sibling() {
 // tests for the `range_both` code paths.
 
 #[test]
-fn two_sided_parent_subsumes_interior_equality() {
+fn test_two_sided_parent_subsumes_interior_equality() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
@@ -650,7 +650,7 @@ fn two_sided_parent_subsumes_interior_equality() {
 }
 
 #[test]
-fn two_sided_parent_excludes_outside_equality() {
+fn test_two_sided_parent_excludes_outside_equality() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
@@ -660,7 +660,7 @@ fn two_sided_parent_excludes_outside_equality() {
 }
 
 #[test]
-fn two_sided_parent_subsumes_narrower_two_sided_query() {
+fn test_two_sided_parent_subsumes_narrower_two_sided_query() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
@@ -670,7 +670,7 @@ fn two_sided_parent_subsumes_narrower_two_sided_query() {
 }
 
 #[test]
-fn two_sided_parent_excludes_broader_two_sided_query() {
+fn test_two_sided_parent_excludes_broader_two_sided_query() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(10)), lt("id", int(90))]);
 
@@ -680,7 +680,7 @@ fn two_sided_parent_excludes_broader_two_sided_query() {
 }
 
 #[test]
-fn two_sided_parent_excludes_partial_overlap() {
+fn test_two_sided_parent_excludes_partial_overlap() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
@@ -694,7 +694,7 @@ fn two_sided_parent_excludes_partial_overlap() {
 }
 
 #[test]
-fn two_sided_parent_does_not_cover_single_sided_query() {
+fn test_two_sided_parent_does_not_cover_single_sided_query() {
     // A finite-bound parent cannot cover a half-infinite query interval.
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
@@ -706,7 +706,7 @@ fn two_sided_parent_does_not_cover_single_sided_query() {
 }
 
 #[test]
-fn two_sided_remove_clears_parent() {
+fn test_two_sided_remove_clears_parent() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
     idx.remove(fp(1));
@@ -717,7 +717,7 @@ fn two_sided_remove_clears_parent() {
 }
 
 #[test]
-fn two_sided_remove_one_keeps_sibling() {
+fn test_two_sided_remove_one_keeps_sibling() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(50))]);
     idx.insert(fp(2), &[gt("id", int(0)), lt("id", int(100))]);
@@ -731,7 +731,7 @@ fn two_sided_remove_one_keeps_sibling() {
 }
 
 #[test]
-fn two_sided_mixed_with_single_sided_class() {
+fn test_two_sided_mixed_with_single_sided_class() {
     // Two-sided and single-sided parents coexisting on the same column.
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]); // (0, 100)
@@ -752,7 +752,7 @@ fn two_sided_mixed_with_single_sided_class() {
 // the index returns cross-variant numeric candidates (no under-return).
 
 #[test]
-fn numeric_unification_equality_cross_variant() {
+fn test_numeric_unification_equality_cross_variant() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(200))]);
     assert!(
@@ -770,7 +770,7 @@ fn numeric_unification_equality_cross_variant() {
 }
 
 #[test]
-fn numeric_unification_range_cross_variant() {
+fn test_numeric_unification_range_cross_variant() {
     // Integer lower-bound range, Float point probe.
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[gt("price", int(10))]);
@@ -793,7 +793,7 @@ fn numeric_unification_range_cross_variant() {
 // Point probe: the row is an `Equal`-on-every-column degenerate query.
 
 #[test]
-fn point_probe_basic() {
+fn test_point_probe_basic() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(200))]);
     idx.insert(fp(2), &[eq("id", int(999))]);
@@ -812,7 +812,7 @@ fn point_probe_basic() {
 }
 
 #[test]
-fn point_probe_unknown_is_conservative() {
+fn test_point_probe_unknown_is_conservative() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(200))]); // equality-pure bucket
     idx.insert(fp(2), &[gt("id", int(100))]); // complex bucket
@@ -831,7 +831,7 @@ fn point_probe_unknown_is_conservative() {
 }
 
 #[test]
-fn point_probe_partial_unknown_filters_known_columns() {
+fn test_point_probe_partial_unknown_filters_known_columns() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Two-column equality-pure entries on {id, region}.
     idx.insert(fp(1), &[eq("id", int(1)), eq("region", int(5))]);
@@ -868,7 +868,7 @@ fn has_num_form(forms: &ColumnForms, x: f64) -> bool {
 }
 
 #[test]
-fn row_value_forms_coercion() {
+fn test_row_value_forms_coercion() {
     let t = point_table();
     let row = [bs("200"), bs("alice"), bs("t")];
 
@@ -921,7 +921,7 @@ fn row_value_forms_coercion() {
 }
 
 #[test]
-fn row_value_forms_drives_point_probe() {
+fn test_row_value_forms_drives_point_probe() {
     let t = point_table();
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", int(200))]);
@@ -939,7 +939,7 @@ fn row_value_forms_drives_point_probe() {
 // while still finding ordinary `Num`-keyed entries through the Float form.
 
 #[test]
-fn point_probe_numeric_column_string_literal_equality() {
+fn test_point_probe_numeric_column_string_literal_equality() {
     let t = point_table();
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     idx.insert(fp(1), &[eq("id", text("200"))]); // id::text = '200' → String
@@ -963,7 +963,7 @@ fn point_probe_numeric_column_string_literal_equality() {
 }
 
 #[test]
-fn point_probe_numeric_column_string_literal_range() {
+fn test_point_probe_numeric_column_string_literal_range() {
     // A String-keyed range walks the lexicographic `Str` region; a '42'
     // row must satisfy `> '10'` lexicographically and not be under-returned.
     let t = point_table();

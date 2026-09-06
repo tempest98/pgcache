@@ -279,7 +279,7 @@ pub fn proxy_run(
                             .await
                             .map_err(|e| {
                                 Report::from(ConnectionError::IoError(std::io::Error::other(
-                                    format!("bind error [{}] {e}", &settings.listen.socket),
+                                    format!("bind error [{}] {e}", settings.listen.socket),
                                 )))
                             })?;
                     // Listener is bound — only now is the proxy ready to accept
