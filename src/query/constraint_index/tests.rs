@@ -371,6 +371,46 @@ fn known_limitation_equality_parent_missed_by_complex_new() {
     );
 }
 
+/// Mirrors `docs/walkthroughs/subsumption-index.md`: two parents on `orders`,
+/// four new queries. Keep the prose and this test in step.
+#[test]
+fn test_walkthrough_two_parents_four_queries() {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    // Parent A: WHERE tenant_id = 7 — class {tenant_id}, equality bucket.
+    idx.insert(fp(1), &[eq("tenant_id", int(7))]);
+    // Parent B: WHERE tenant_id = 7 AND created_at > 100 — class
+    // {created_at, tenant_id}, complex bucket.
+    idx.insert(
+        fp(2),
+        &[eq("tenant_id", int(7)), gt("created_at", int(100))],
+    );
+
+    // Query 1: equality-pure. The {tenant_id} subset finds A; B's class is
+    // not a subset of {status, tenant_id}.
+    let q1 = idx.candidates(&[eq("tenant_id", int(7)), eq("status", text("open"))]);
+    assert_eq!(q1, fps([1]));
+
+    // Query 2: complex. B is found via the {created_at, tenant_id} class. A
+    // is missed because the equality probe is skipped for a complex new
+    // query (PGC-412; expect {1, 2} once fixed).
+    let q2 = idx.candidates(&[eq("tenant_id", int(7)), gt("created_at", int(150))]);
+    assert_eq!(q2, fps([2]));
+
+    // Query 3: B's lower bound 100 is above 50, so the created_at column
+    // returns nothing and the per-column intersection is empty.
+    let q3 = idx.candidates(&[eq("tenant_id", int(7)), gt("created_at", int(50))]);
+    assert!(q3.is_empty());
+
+    // Query 4: only B registered. The new query's classes {} and {tenant_id}
+    // don't exist, so B (narrower) is never a candidate.
+    let mut only_b = ConstraintIndex::<Fingerprint>::new();
+    only_b.insert(
+        fp(2),
+        &[eq("tenant_id", int(7)), gt("created_at", int(100))],
+    );
+    assert!(only_b.candidates(&[eq("tenant_id", int(7))]).is_empty());
+}
+
 // PGC-182: CastComparison constraints route through Complex classification
 // so the equality-pure fast-bucket doesn't try to index them by raw value
 // (their values live in the cast-output domain, not the column domain).

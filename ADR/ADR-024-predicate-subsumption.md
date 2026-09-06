@@ -81,3 +81,4 @@ If the cache DB execution fails (e.g. table dropped by concurrent eviction), sub
 - Message types: `SubsumptionResult`, `AdmitAction` in `src/cache/messages.rs`
 - Metrics: `pgcache.cache.subsumptions` counter, `pgcache.cache.subsumption_latency_seconds` histogram in `src/metrics.rs`
 - Per-query metric: `subsumption_count` on `QueryMetrics` in `src/cache/types.rs`
+- Worked example: [docs/walkthroughs/subsumption-index.md](../docs/walkthroughs/subsumption-index.md)
