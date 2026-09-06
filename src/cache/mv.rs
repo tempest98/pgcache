@@ -577,7 +577,7 @@ fn scalar_expr_has_window(expr: &ResolvedScalarExpr) -> bool {
 mod tests {
 
     use iddqd::BiHashMap;
-    use tokio_postgres::types::Type;
+    use postgres_types::Type;
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};

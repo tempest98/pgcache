@@ -381,8 +381,8 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
+    use bytes::Bytes;
     use postgres_types::Type as PgType;
-    use tokio_util::bytes::Bytes;
 
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::query::ast::{

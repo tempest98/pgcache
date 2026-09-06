@@ -6,15 +6,21 @@ use std::io;
 use std::ops::Deref;
 use std::str::Utf8Error;
 
+use bytes::{Bytes, BytesMut};
 use error_set::error_set;
 use rootcause::Report;
-use tokio_util::bytes::{Bytes, BytesMut};
 
+#[cfg(feature = "proxy")]
 pub(crate) mod backend;
+#[cfg(feature = "proxy")]
 pub(crate) mod encode;
+#[cfg(feature = "proxy")]
 pub(crate) mod extended;
+#[cfg(feature = "proxy")]
 pub(crate) mod frontend;
+#[cfg(feature = "proxy")]
 pub(crate) mod frontend_encode;
+#[cfg(feature = "proxy")]
 pub(crate) mod session;
 
 error_set! {

@@ -237,7 +237,7 @@ mod tests {
     use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolve::query_expr_resolve;
     use iddqd::BiHashMap;
-    use tokio_postgres::types::Type;
+    use postgres_types::Type;
 
     fn users_table() -> TableMetadata {
         let columns = ColumnStore::new([

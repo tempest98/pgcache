@@ -4,7 +4,7 @@
 
 use ecow::EcoString;
 use iddqd::BiHashMap;
-use tokio_postgres::types::Type;
+use postgres_types::Type;
 
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::oid::Oid;

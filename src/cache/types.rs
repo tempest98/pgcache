@@ -28,20 +28,7 @@ use super::update_query::UpdateQueries;
 /// on every cache hit (the dispatch→serve path).
 pub type SharedResolved = Arc<ResolvedQueryExpr>;
 
-/// State of a cached query
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CachedQueryState {
-    /// Seen but not yet admitted to cache. `hit_count` promotes at
-    /// `admission_threshold`; `credit` is the decay budget — see
-    /// `CacheDispatch::pending_initial_credit`.
-    Pending { hit_count: u32, credit: u32 },
-    /// Admitted, population in progress
-    Loading,
-    /// Cached and serving hits
-    Ready,
-    /// CDC-invalidated, awaiting re-hit for fast readmission (clock policy only)
-    Invalidated,
-}
+pub use super::serve_decision::CachedQueryState;
 
 /// A cached query with its metadata and state
 #[derive(Debug)]

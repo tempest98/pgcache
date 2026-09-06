@@ -59,15 +59,22 @@ const DEFAULT_MEMO_CACHE_SIZE: usize = 64 * 1024 * 1024;
 /// Fraction of the detected memory budget used as the memo default (PROTOTYPE,
 /// PGC-277). The memo competes for the same throttle ceiling as registration by
 /// its actual footprint, so this is a soft ceiling on the hot-result cache.
+#[cfg(feature = "proxy")]
 const MEMO_RAM_FRACTION_DIVISOR: u64 = 4;
 
 /// RAM-relative default memo budget: 1/[`MEMO_RAM_FRACTION_DIVISOR`] of the
 /// detected memory budget, floored at [`DEFAULT_MEMO_CACHE_SIZE`]. Falls back to
 /// the floor when RAM is undetectable (non-Linux/non-macOS).
+#[cfg(feature = "proxy")]
 fn memo_default() -> usize {
     crate::memory::total_budget_bytes()
         .and_then(|b| usize::try_from(b / MEMO_RAM_FRACTION_DIVISOR).ok())
         .map_or(DEFAULT_MEMO_CACHE_SIZE, |v| v.max(DEFAULT_MEMO_CACHE_SIZE))
+}
+
+#[cfg(not(feature = "proxy"))]
+fn memo_default() -> usize {
+    DEFAULT_MEMO_CACHE_SIZE
 }
 
 impl DynamicConfig {

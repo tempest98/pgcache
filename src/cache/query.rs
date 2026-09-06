@@ -3,9 +3,9 @@ use crate::oid::Oid;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
+use bytes::Bytes;
 use ecow::EcoString;
 
-use crate::cache::messages::QueryParameters;
 use crate::query::transform::{AstTransformResult, query_expr_parameters_replace};
 use crate::{
     catalog::FunctionVolatility,
@@ -641,7 +641,7 @@ mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use iddqd::BiHashMap;
-    use tokio_postgres::types::Type;
+    use postgres_types::Type;
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
@@ -1564,4 +1564,55 @@ mod tests {
             );
         }
     }
+}
+
+/// Parameters passed into an extended query
+#[derive(Debug)]
+pub struct QueryParameters {
+    pub values: Vec<Option<Bytes>>,
+    pub formats: Vec<i16>,
+    pub oids: Vec<u32>,
+}
+
+impl QueryParameters {
+    pub fn get(&self, index: usize) -> Option<QueryParameter> {
+        let value = self.values.get(index)?;
+
+        // Per the extended query protocol, format codes and OIDs may have fewer
+        // entries than there are parameters:
+        //   0 entries  → apply the default (text format / unspecified OID) to all
+        //   1 entry    → apply that single value to all parameters
+        //   N entries  → one entry per parameter
+        let format = match self.formats.as_slice() {
+            [] => 0,
+            [single] => *single,
+            codes => *codes.get(index)?,
+        };
+        let oid = match self.oids.as_slice() {
+            [] => 0,
+            [single] => *single,
+            oids => *oids.get(index)?,
+        };
+
+        Some(QueryParameter {
+            value: value.clone(),
+            format,
+            oid,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryParameter {
+    pub value: Option<Bytes>,
+    pub format: i16,
+    pub oid: u32,
 }

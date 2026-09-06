@@ -7,6 +7,7 @@ use ecow::EcoString;
 use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 
+use crate::cache::serve_decision::AdmitAction;
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
@@ -213,15 +214,6 @@ pub struct PopulationMerge {
     /// excluding queue wait). Feeds the per-query estimate that sets the
     /// re-population coalesce-forward deadline (PGC-335).
     pub fetch_stage_ms: f64,
-}
-
-/// Controls what the writer does when a query is not subsumed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdmitAction {
-    /// Register and populate when not subsumed (first miss, threshold reached, invalidated).
-    Admit,
-    /// Do nothing when not subsumed (pending below threshold).
-    CheckOnly,
 }
 
 /// Result of an off-thread MV build task. The task runs SQL only; all

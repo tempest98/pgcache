@@ -9,7 +9,7 @@ use crate::query::constraints::TableConstraint;
 use crate::query::{Fingerprint, FingerprintSet};
 use ecow::EcoString;
 use ordered_float::NotNan;
-use tokio_postgres::types::Type;
+use postgres_types::Type;
 
 fn col(s: &str) -> EcoString {
     EcoString::from(s)

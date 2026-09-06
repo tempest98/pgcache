@@ -385,7 +385,7 @@ mod tests {
     };
     use ecow::EcoString;
     use ordered_float::NotNan;
-    use tokio_postgres::types::Type;
+    use postgres_types::Type;
 
     // ------------------------------------------------------------------
     // Fixtures

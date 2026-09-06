@@ -3,11 +3,15 @@ use std::fmt;
 use postgres_types::PgLsn;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "proxy")]
 pub(crate) mod cache_connection;
+#[cfg(feature = "proxy")]
 pub(crate) mod cdc;
+#[cfg(feature = "proxy")]
 pub(crate) mod connect;
 pub(crate) mod protocol;
 
+#[cfg(feature = "proxy")]
 pub use connect::{config_build, config_connect, connect};
 
 /// A PostgreSQL WAL log sequence number — a monotonic byte position in the WAL

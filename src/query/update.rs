@@ -70,7 +70,7 @@ mod tests {
     use std::collections::HashMap;
 
     use iddqd::BiHashMap;
-    use tokio_postgres::types::Type;
+    use postgres_types::Type;
 
     use crate::cache::SubqueryKind;
     use crate::cache::query::CacheableQuery;

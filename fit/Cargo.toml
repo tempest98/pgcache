@@ -8,7 +8,7 @@ name = "pgcache-fit"
 path = "src/main.rs"
 
 [dependencies]
-pgcache = { path = ".." }
+pgcache = { path = "..", default-features = false }
 pg_query = "6.1.1"
 postgres-types = { git = "https://github.com/PgCache/rust-postgres", branch = "compat" }
 clap = { version = "4.6.1", features = ["derive"] }

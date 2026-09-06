@@ -110,7 +110,7 @@ fn float_op(a: f64, op: ArithmeticOp, b: f64) -> Option<LiteralValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::messages::QueryParameters;
+    use crate::cache::QueryParameters;
     use crate::query::ast::{WhereExpr, query_expr_fingerprint, query_expr_parse};
     use crate::query::transform::query_expr_parameters_replace;
     use bytes::Bytes;

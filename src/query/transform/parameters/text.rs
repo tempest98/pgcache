@@ -53,8 +53,8 @@ pub(super) fn text_parameter_to_literal(
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
+    use bytes::Bytes;
     use postgres_types::Type as PgType;
-    use tokio_util::bytes::Bytes;
 
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};

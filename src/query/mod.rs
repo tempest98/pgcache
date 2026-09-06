@@ -1,5 +1,7 @@
 pub mod ast;
 pub mod cast;
+// Point lookups (row → candidate queries) are CDC-only; dead in the analysis-only build.
+#[cfg_attr(not(feature = "proxy"), allow(dead_code))]
 pub mod constraint_index;
 pub mod constraints;
 pub mod decorrelate;

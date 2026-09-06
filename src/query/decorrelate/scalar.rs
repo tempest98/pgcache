@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use ecow::EcoString;
+use postgres_types::Type;
 use rootcause::Report;
-use tokio_postgres::types::Type;
 
 use crate::cache::SubqueryKind;
 use crate::catalog::ColumnMetadata;

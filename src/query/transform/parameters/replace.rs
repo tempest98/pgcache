@@ -100,8 +100,8 @@ fn parameter_index_parse(placeholder: &str) -> AstTransformResult<usize> {
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
+    use bytes::Bytes;
     use postgres_types::Type as PgType;
-    use tokio_util::bytes::Bytes;
 
     use crate::cache::QueryParameters;
     use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};

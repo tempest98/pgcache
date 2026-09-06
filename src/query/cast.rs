@@ -18,7 +18,7 @@
 //!   coercion locally before comparing.
 
 use ecow::EcoString;
-use tokio_postgres::types::Type;
+use postgres_types::Type;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::resolved::{

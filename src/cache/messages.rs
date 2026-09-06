@@ -11,15 +11,16 @@ use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
 use crate::timing::QueryTiming;
 
+use super::query::QueryParameters;
 use super::types::SharedResolved;
+
+pub use super::serve_decision::AdmitAction;
 
 mod cdc_command;
 mod query_command;
 
 pub use cdc_command::{CdcCommand, CdcValue, cdc_values_convert};
-pub use query_command::{
-    AdmitAction, MvBuildOutcome, PopulationMerge, QueryCommand, SubsumptionResult,
-};
+pub use query_command::{MvBuildOutcome, PopulationMerge, QueryCommand, SubsumptionResult};
 
 /// Notifications from writer to dispatch for coalescing queue drain.
 pub enum WriterNotify {
@@ -86,57 +87,6 @@ pub struct PipelineContext {
     /// response. True for a Sync-terminated dispatch's trailing execute; false
     /// for non-trailing executes and Flush dispatches (one Sync ⇒ one RFQ).
     pub emit_rfq: bool,
-}
-
-/// Parameters passed into an extended query
-#[derive(Debug)]
-pub struct QueryParameters {
-    pub values: Vec<Option<Bytes>>,
-    pub formats: Vec<i16>,
-    pub oids: Vec<u32>,
-}
-
-impl QueryParameters {
-    pub fn get(&self, index: usize) -> Option<QueryParameter> {
-        let value = self.values.get(index)?;
-
-        // Per the extended query protocol, format codes and OIDs may have fewer
-        // entries than there are parameters:
-        //   0 entries  → apply the default (text format / unspecified OID) to all
-        //   1 entry    → apply that single value to all parameters
-        //   N entries  → one entry per parameter
-        let format = match self.formats.as_slice() {
-            [] => 0,
-            [single] => *single,
-            codes => *codes.get(index)?,
-        };
-        let oid = match self.oids.as_slice() {
-            [] => 0,
-            [single] => *single,
-            oids => *oids.get(index)?,
-        };
-
-        Some(QueryParameter {
-            value: value.clone(),
-            format,
-            oid,
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-}
-
-#[derive(Debug)]
-pub struct QueryParameter {
-    pub value: Option<Bytes>,
-    pub format: i16,
-    pub oid: u32,
 }
 
 /// Message types for communication between proxy and cache

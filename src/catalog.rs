@@ -4,11 +4,14 @@
 //! These structures are used by both the cache subsystem (for tracking tables)
 //! and the query resolution subsystem (for name resolution and type information).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "proxy")]
+use std::collections::HashSet;
 
 use ecow::EcoString;
 use iddqd::{BiHashItem, bi_upcast};
-use tokio_postgres::types::{Kind, Type};
+use postgres_types::{Kind, Type};
+#[cfg(feature = "proxy")]
 use tokio_postgres::{Client, Error};
 
 use crate::cache::CacheError;
@@ -351,6 +354,7 @@ pub const AGGREGATE_FUNCTIONS_SQL: &str =
 ///
 /// The map is keyed by lowercase function name to match PostgreSQL's
 /// case-insensitive identifier handling.
+#[cfg(feature = "proxy")]
 pub async fn function_volatility_map_load(
     client: &Client,
 ) -> Result<HashMap<EcoString, FunctionVolatility>, Error> {
@@ -377,6 +381,7 @@ pub async fn function_volatility_map_load(
 /// of lowercase function names. Used during decorrelation to determine whether
 /// a scalar subquery's output expression contains an aggregate (which controls
 /// whether a GROUP BY is needed in the derived table).
+#[cfg(feature = "proxy")]
 pub async fn aggregate_functions_load(client: &Client) -> Result<HashSet<EcoString>, Error> {
     let rows = client.query(AGGREGATE_FUNCTIONS_SQL, &[]).await?;
 

@@ -297,7 +297,7 @@ mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use iddqd::BiHashMap;
-    use tokio_postgres::types::{Kind, Type};
+    use postgres_types::{Kind, Type};
 
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::oid::Oid;

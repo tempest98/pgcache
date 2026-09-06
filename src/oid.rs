@@ -2,9 +2,9 @@
 
 use std::fmt;
 
+use bytes::BytesMut;
+use postgres_types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
 use serde::{Deserialize, Serialize};
-use tokio_postgres::types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
-use tokio_util::bytes::BytesMut;
 
 /// A PostgreSQL relation OID (`pg_class.oid`). A newtype over `u32` for type
 /// safety — oids share `u32`'s layout with column positions, counts, and other

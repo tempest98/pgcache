@@ -1,7 +1,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 use iddqd::BiHashMap;
-use tokio_postgres::types::Type;
+use postgres_types::Type;
 
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::oid::Oid;

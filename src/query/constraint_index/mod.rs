@@ -34,6 +34,7 @@ mod value_key;
 use index::{Membership, SubsumptionClass};
 use value_key::ValueKey;
 
+#[cfg(any(feature = "proxy", test))]
 pub(crate) use row_forms::row_value_forms;
 
 /// `HashMap` keyed by an id type with the passthrough identity hasher.

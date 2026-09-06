@@ -10,9 +10,33 @@
 
 use crate::settings::CachePolicy;
 
-pub use super::messages::AdmitAction;
 use super::query::limit_is_sufficient;
-use super::types::{CachedQueryState, CachedQueryView};
+#[cfg(feature = "proxy")]
+use super::types::CachedQueryView;
+
+/// State of a cached query
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedQueryState {
+    /// Seen but not yet admitted to cache. `hit_count` promotes at
+    /// `admission_threshold`; `credit` is the decay budget — see
+    /// `CacheDispatch::pending_initial_credit`.
+    Pending { hit_count: u32, credit: u32 },
+    /// Admitted, population in progress
+    Loading,
+    /// Cached and serving hits
+    Ready,
+    /// CDC-invalidated, awaiting re-hit for fast readmission (clock policy only)
+    Invalidated,
+}
+
+/// Controls what the writer does when a query is not subsumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitAction {
+    /// Register and populate when not subsumed (first miss, threshold reached, invalidated).
+    Admit,
+    /// Do nothing when not subsumed (pending below threshold).
+    CheckOnly,
+}
 
 /// The decision-relevant slice of a cache entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +64,7 @@ impl EntrySnapshot {
     }
 }
 
+#[cfg(feature = "proxy")]
 impl From<&CachedQueryView> for EntrySnapshot {
     fn from(view: &CachedQueryView) -> Self {
         EntrySnapshot {
