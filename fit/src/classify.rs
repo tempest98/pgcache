@@ -12,7 +12,8 @@ use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::TableMetadata;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::{
-    QueryExpr, RawStatement, query_expr_fingerprint, statement_convert_raw,
+    AstError, QueryExpr, RawStatement, WhereParseError, query_expr_fingerprint,
+    statement_convert_raw,
 };
 use pgcache_lib::query::constraints::{
     QueryConstraints, TableConstraint, analyze_query_constraints,
@@ -67,7 +68,7 @@ pub fn statement_parse(sql: &str, trace_parameters: &[Option<EcoString>]) -> Par
             cte_write,
         })) => match converted {
             Err(ast_error) => ParseOutcome::SelectUnconvertible {
-                error: ast_error.to_string(),
+                error: ast_error_detail(&ast_error),
                 cte_write,
             },
             Ok(expr) => {
@@ -113,30 +114,78 @@ impl PassthroughReason {
     pub fn label(self) -> &'static str {
         match self {
             PassthroughReason::ParseError => "parse error",
-            PassthroughReason::ConversionUnsupported => "unsupported construct (conversion)",
-            PassthroughReason::ParameterSubstitution => "parameter substitution failed",
+            PassthroughReason::ConversionUnsupported => "unsupported SQL feature",
+            PassthroughReason::ParameterSubstitution => "logged parameters couldn't be applied",
             PassthroughReason::UnsupportedQueryType => "unsupported query type",
             PassthroughReason::UnsupportedFrom => "unsupported FROM clause",
             PassthroughReason::UnsupportedSubquery => "unsupported subquery",
             PassthroughReason::NonImmutableFunction => "non-immutable function",
             PassthroughReason::HasLimit => "LIMIT not cacheable here",
             PassthroughReason::SystemCatalogReference => "system catalog reference",
-            PassthroughReason::ResolutionFailed => "resolution failed",
-            PassthroughReason::DecorrelationFailed => "non-decorrelatable subquery",
+            PassthroughReason::ResolutionFailed => "column or table couldn't be resolved",
+            PassthroughReason::DecorrelationFailed => "subquery can't be rewritten as a join",
         }
     }
 }
 
-fn cacheability_reason(error: &CacheabilityError) -> PassthroughReason {
+/// The report's rule: the reason label names the category, the detail names
+/// only the item. The lib's `Display` strings carry their own category prefix
+/// (right for proxy logs, which have no grouping), so take the payloads here.
+fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<String>) {
     match error {
-        CacheabilityError::UnsupportedQueryType { .. } => PassthroughReason::UnsupportedQueryType,
-        CacheabilityError::UnsupportedFrom { .. } => PassthroughReason::UnsupportedFrom,
-        CacheabilityError::UnsupportedSubquery { .. } => PassthroughReason::UnsupportedSubquery,
-        CacheabilityError::NonImmutableFunction { .. } => PassthroughReason::NonImmutableFunction,
-        CacheabilityError::HasLimit => PassthroughReason::HasLimit,
-        CacheabilityError::SystemCatalogReference { .. } => {
-            PassthroughReason::SystemCatalogReference
+        CacheabilityError::UnsupportedQueryType { kind } => (
+            PassthroughReason::UnsupportedQueryType,
+            Some((*kind).to_owned()),
+        ),
+        CacheabilityError::UnsupportedFrom { construct } => (
+            PassthroughReason::UnsupportedFrom,
+            Some((*construct).to_owned()),
+        ),
+        CacheabilityError::UnsupportedSubquery { kind } => (
+            PassthroughReason::UnsupportedSubquery,
+            Some((*kind).to_owned()),
+        ),
+        CacheabilityError::NonImmutableFunction { function } => (
+            PassthroughReason::NonImmutableFunction,
+            Some(function.to_string()),
+        ),
+        CacheabilityError::HasLimit => (PassthroughReason::HasLimit, None),
+        CacheabilityError::SystemCatalogReference { relation } => (
+            PassthroughReason::SystemCatalogReference,
+            Some(relation.to_string()),
+        ),
+    }
+}
+
+/// Item-only text for a converter failure (see [`cacheability_reason`]).
+fn ast_error_detail(error: &AstError) -> String {
+    match error {
+        AstError::UnsupportedStatement { statement_type } => {
+            format!("statement type {statement_type}")
         }
+        AstError::UnsupportedSelectFeature { feature }
+        | AstError::UnsupportedFeature { feature } => feature.clone(),
+        AstError::InvalidTableRef => "table reference".to_owned(),
+        AstError::UnsupportedJoinType => "join type".to_owned(),
+        AstError::UnsupportedSubLinkType { sublink_type } => {
+            format!("subquery type {sublink_type}")
+        }
+        AstError::WhereParseError(error) => where_error_detail(error),
+        AstError::MultipleStatements | AstError::MissingStatement => error.to_string(),
+    }
+}
+
+fn where_error_detail(error: &WhereParseError) -> String {
+    match error {
+        WhereParseError::UnsupportedPattern => "WHERE clause pattern".to_owned(),
+        WhereParseError::UnsupportedAExpr { expr } => format!("WHERE expression {expr}"),
+        WhereParseError::UnsupportedOperator { operator } => format!("operator {operator}"),
+        WhereParseError::InvalidColumnRef => "column reference".to_owned(),
+        WhereParseError::InvalidConstValue { value } => format!("constant {value}"),
+        WhereParseError::ComplexExpression { expr } => format!("expression {expr}"),
+        WhereParseError::MissingExpression => "missing expression".to_owned(),
+        WhereParseError::Other { error } => error.clone(),
+        WhereParseError::Conversion(inner) => ast_error_detail(inner),
     }
 }
 
@@ -223,9 +272,10 @@ pub fn statement_classify(
     let cacheable = match CacheableQuery::try_new((**expr).clone(), &builtins.volatility) {
         Ok(cacheable) => cacheable,
         Err(error) => {
+            let (reason, detail) = cacheability_reason(&error);
             return Verdict::Passthrough {
-                reason: cacheability_reason(&error),
-                detail: Some(error.to_string()),
+                reason,
+                detail,
                 cte_write: None,
             };
         }

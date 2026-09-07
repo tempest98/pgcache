@@ -242,8 +242,10 @@ mod stable {
         assert!(all.contains("Passthrough statements:"));
         assert!(all.contains("system catalog reference: 7 statements"));
         assert_eq!(all.matches("SELECT * FROM pg_class WHERE oid").count(), 7);
-        // Conversion failures carry the converter's detail line.
-        assert!(all.contains("  SELECT * FROM t TABLESAMPLE SYSTEM (10)\n    Unsupported"));
+        // Conversion failures carry the converter's item as a detail line,
+        // without repeating the reason label's category.
+        assert!(all.contains("  SELECT * FROM t TABLESAMPLE SYSTEM (10)\n    FROM clause type"));
+        assert!(!all.contains("\n    Unsupported"));
     }
 
     #[test]

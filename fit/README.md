@@ -111,7 +111,7 @@ Cacheable:   3 statements (50.0%)   calls  71.9%  time  31.5%
 
 - **Cacheable** — pgcache would cache this SELECT.
 - **Passthrough** — a SELECT pgcache would forward to the origin, grouped by
-  reason (unsupported construct, non-immutable function, system-catalog
+  reason (unsupported SQL feature, non-immutable function, system-catalog
   reference, and so on).
 - **Writes** — INSERT/UPDATE/DELETE, with a per-table breakdown. In the proxy
   these drive cache invalidation; here they're only counted.
@@ -130,11 +130,11 @@ Passthrough statements:
 non-immutable function: 1 statement (16.7%)   calls   3.0%  time  61.6%
   [50 calls, 900.0 ms] SELECT * FROM events WHERE created_at > now()
 
-unsupported construct (conversion): 2 statements (33.3%)
+unsupported SQL feature: 2 statements (33.3%)
   SELECT a, b FROM t GROUP BY GROUPING SETS ((a), (b))
-    Unsupported feature: GROUP BY expression
+    GROUP BY expression
   SELECT * FROM t TABLESAMPLE SYSTEM (10)
-    Unsupported SELECT feature: FROM clause type
+    FROM clause type
 ```
 
 Within a group, statements are ordered by time when the input has it, else by
