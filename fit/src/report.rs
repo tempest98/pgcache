@@ -211,7 +211,9 @@ pub fn check_report_build(
                 shapes.insert(analysis.shape_key);
                 ("cacheable", None, None)
             }
-            Verdict::Passthrough { reason, cte_write } => {
+            Verdict::Passthrough {
+                reason, cte_write, ..
+            } => {
                 passthrough_by_reason
                     .entry(*reason)
                     .or_default()
@@ -240,11 +242,12 @@ pub fn check_report_build(
         let index = *verdict_index
             .entry((item.trace.sql.as_str(), verdict_label, reason_label))
             .or_insert_with(|| {
-                let detail = match &item.parsed.outcome {
-                    ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error) => {
+                let detail = match (&item.parsed.outcome, &*item.verdict) {
+                    (ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error), _) => {
                         Some(error.clone())
                     }
-                    ParseOutcome::SelectUnconvertible { error, .. } => Some(error.clone()),
+                    (ParseOutcome::SelectUnconvertible { error, .. }, _) => Some(error.clone()),
+                    (_, Verdict::Passthrough { detail, .. }) => detail.clone(),
                     _ => None,
                 };
                 verdicts.push(StatementVerdict {

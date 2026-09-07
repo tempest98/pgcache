@@ -102,7 +102,6 @@ pub enum PassthroughReason {
     UnsupportedQueryType,
     UnsupportedFrom,
     UnsupportedSubquery,
-    UnsupportedWhereClause,
     NonImmutableFunction,
     HasLimit,
     SystemCatalogReference,
@@ -119,7 +118,6 @@ impl PassthroughReason {
             PassthroughReason::UnsupportedQueryType => "unsupported query type",
             PassthroughReason::UnsupportedFrom => "unsupported FROM clause",
             PassthroughReason::UnsupportedSubquery => "unsupported subquery",
-            PassthroughReason::UnsupportedWhereClause => "unsupported WHERE clause",
             PassthroughReason::NonImmutableFunction => "non-immutable function",
             PassthroughReason::HasLimit => "LIMIT not cacheable here",
             PassthroughReason::SystemCatalogReference => "system catalog reference",
@@ -131,13 +129,14 @@ impl PassthroughReason {
 
 fn cacheability_reason(error: &CacheabilityError) -> PassthroughReason {
     match error {
-        CacheabilityError::UnsupportedQueryType => PassthroughReason::UnsupportedQueryType,
-        CacheabilityError::UnsupportedFrom => PassthroughReason::UnsupportedFrom,
-        CacheabilityError::UnsupportedSubquery => PassthroughReason::UnsupportedSubquery,
-        CacheabilityError::UnsupportedWhereClause => PassthroughReason::UnsupportedWhereClause,
-        CacheabilityError::NonImmutableFunction => PassthroughReason::NonImmutableFunction,
+        CacheabilityError::UnsupportedQueryType { .. } => PassthroughReason::UnsupportedQueryType,
+        CacheabilityError::UnsupportedFrom { .. } => PassthroughReason::UnsupportedFrom,
+        CacheabilityError::UnsupportedSubquery { .. } => PassthroughReason::UnsupportedSubquery,
+        CacheabilityError::NonImmutableFunction { .. } => PassthroughReason::NonImmutableFunction,
         CacheabilityError::HasLimit => PassthroughReason::HasLimit,
-        CacheabilityError::SystemCatalogReference => PassthroughReason::SystemCatalogReference,
+        CacheabilityError::SystemCatalogReference { .. } => {
+            PassthroughReason::SystemCatalogReference
+        }
     }
 }
 
@@ -177,6 +176,9 @@ pub enum Verdict {
     Cacheable(Box<CacheableAnalysis>),
     Passthrough {
         reason: PassthroughReason,
+        /// The offending item (function, construct, relation) when the lib's
+        /// cacheability check named one.
+        detail: Option<String>,
         /// Write classification of a data-modifying CTE inside a failed
         /// SELECT — the statement still writes.
         cte_write: Option<WriteClass>,
@@ -194,18 +196,21 @@ pub fn statement_classify(
         ParseOutcome::ParseError(_) => {
             return Verdict::Passthrough {
                 reason: PassthroughReason::ParseError,
+                detail: None,
                 cte_write: None,
             };
         }
         ParseOutcome::ParameterError(_) => {
             return Verdict::Passthrough {
                 reason: PassthroughReason::ParameterSubstitution,
+                detail: None,
                 cte_write: None,
             };
         }
         ParseOutcome::SelectUnconvertible { cte_write, .. } => {
             return Verdict::Passthrough {
                 reason: PassthroughReason::ConversionUnsupported,
+                detail: None,
                 cte_write: cte_write.clone(),
             };
         }
@@ -220,6 +225,7 @@ pub fn statement_classify(
         Err(error) => {
             return Verdict::Passthrough {
                 reason: cacheability_reason(&error),
+                detail: Some(error.to_string()),
                 cte_write: None,
             };
         }
@@ -236,6 +242,7 @@ pub fn statement_classify(
     else {
         return Verdict::Passthrough {
             reason: PassthroughReason::ResolutionFailed,
+            detail: None,
             cte_write: None,
         };
     };
@@ -259,6 +266,7 @@ pub fn statement_classify(
         Err(_) => {
             return Verdict::Passthrough {
                 reason: PassthroughReason::DecorrelationFailed,
+                detail: None,
                 cte_write: None,
             };
         }

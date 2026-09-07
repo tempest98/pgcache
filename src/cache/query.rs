@@ -23,17 +23,31 @@ use crate::{
 };
 use error_set::error_set;
 
+// Each variant names the item that triggered it: pgcache-fit's per-statement
+// detail and the proxy's passthrough log both print it (never the SQL body).
 error_set! {
     CacheabilityError := {
-        UnsupportedQueryType,
-        UnsupportedFrom,
-        #[display("Unsupported subquery type")]
-        UnsupportedSubquery,
-        UnsupportedWhereClause,
-        NonImmutableFunction,
+        #[display("Unsupported query type: {kind}")]
+        UnsupportedQueryType {
+            kind: &'static str,
+        },
+        #[display("Unsupported FROM clause: {construct}")]
+        UnsupportedFrom {
+            construct: &'static str,
+        },
+        #[display("Unsupported subquery: {kind}")]
+        UnsupportedSubquery {
+            kind: &'static str,
+        },
+        #[display("Non-immutable function: {function}")]
+        NonImmutableFunction {
+            function: EcoString,
+        },
         HasLimit,
-        #[display("Query references a system catalog (pg_*)")]
-        SystemCatalogReference,
+        #[display("System catalog reference: {relation}")]
+        SystemCatalogReference {
+            relation: EcoString,
+        },
     }
 }
 
@@ -101,22 +115,23 @@ impl CacheableQuery {
 /// relation names, so a match in either the schema or the table name marks a
 /// catalog reference. Covers nested subqueries and CTEs via full-tree traversal.
 fn references_system_catalog(query: &QueryExpr) -> Result<(), CacheabilityError> {
-    // Break on the first catalog table; `.is_break()` ⇒ a reference was found.
-    if query
-        .try_for_each_node::<TableNode, ()>(&mut |table| {
-            let is_catalog =
-                table.schema.as_deref().is_some_and(pg_prefixed) || pg_prefixed(&table.name);
-            if is_catalog {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .is_break()
-    {
-        return Err(CacheabilityError::SystemCatalogReference);
+    // Break on the first catalog table, carrying its name for the error.
+    let found = query.try_for_each_node::<TableNode, EcoString>(&mut |table| {
+        let is_catalog =
+            table.schema.as_deref().is_some_and(pg_prefixed) || pg_prefixed(&table.name);
+        if is_catalog {
+            ControlFlow::Break(match &table.schema {
+                Some(schema) => EcoString::from(format!("{schema}.{}", table.name)),
+                None => table.name.clone(),
+            })
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    match found {
+        ControlFlow::Break(relation) => Err(CacheabilityError::SystemCatalogReference { relation }),
+        ControlFlow::Continue(()) => Ok(()),
     }
-    Ok(())
 }
 
 /// Whether `s` begins with PostgreSQL's reserved `pg_` prefix, ASCII
@@ -137,7 +152,7 @@ fn is_cacheable_body(
         QueryBody::Select(node) => is_cacheable_select(node, fv),
         QueryBody::Values(_) => {
             // VALUES clauses are not cacheable as standalone queries
-            Err(CacheabilityError::UnsupportedQueryType)
+            Err(CacheabilityError::UnsupportedQueryType { kind: "VALUES" })
         }
         QueryBody::SetOp(set_op) => is_cacheable_set_op(set_op, fv),
     }
@@ -188,7 +203,12 @@ fn is_supported_from(
         [TableSource::Table(_)] => Ok(()),
         [TableSource::Subquery(sub)] => is_cacheable_table_subquery(sub, ctx, fv),
         [TableSource::CteRef(cte_ref)] => is_cacheable_cte_ref(cte_ref, ctx, fv),
-        _ => Err(CacheabilityError::UnsupportedFrom),
+        [] => Err(CacheabilityError::UnsupportedFrom {
+            construct: "no FROM clause",
+        }),
+        _ => Err(CacheabilityError::UnsupportedFrom {
+            construct: "comma join",
+        }),
     }
 }
 
@@ -200,12 +220,14 @@ fn is_cacheable_table_subquery(
 ) -> Result<(), CacheabilityError> {
     // LATERAL subqueries are not supported (they reference outer scope)
     if subquery.lateral {
-        return Err(CacheabilityError::UnsupportedSubquery);
+        return Err(CacheabilityError::UnsupportedSubquery { kind: "LATERAL" });
     }
 
     // Subquery must have an alias
     if subquery.alias.is_none() {
-        return Err(CacheabilityError::UnsupportedSubquery);
+        return Err(CacheabilityError::UnsupportedSubquery {
+            kind: "derived table without alias",
+        });
     }
 
     // Inner query must be cacheable
@@ -221,7 +243,9 @@ fn is_supported_join(
 ) -> Result<(), CacheabilityError> {
     // FULL OUTER JOINs are not cacheable — both sides are optional
     if join.join_type == JoinType::Full {
-        return Err(CacheabilityError::UnsupportedFrom);
+        return Err(CacheabilityError::UnsupportedFrom {
+            construct: "FULL JOIN",
+        });
     }
 
     // ON must be equality / AND of equalities. USING/NATURAL resolve to
@@ -232,7 +256,9 @@ fn is_supported_join(
     };
 
     if !condition_valid {
-        return Err(CacheabilityError::UnsupportedFrom);
+        return Err(CacheabilityError::UnsupportedFrom {
+            construct: "non-equi join condition",
+        });
     }
 
     // Recursively validate nested joins/tables/subqueries
@@ -440,12 +466,13 @@ fn is_cacheable_scalar_expr(
     match expr {
         ScalarExpr::Column(_) | ScalarExpr::Literal(_) => Ok(()),
         ScalarExpr::Function(func) => {
+            let function = func.name.to_lowercase();
             let is_immutable = matches!(
-                fv.get(func.name.to_lowercase().as_str()),
+                fv.get(function.as_str()),
                 Some(FunctionVolatility::Immutable)
             );
             if !is_immutable && !matches!(ctx, ExprContext::SelectList) {
-                return Err(CacheabilityError::NonImmutableFunction);
+                return Err(CacheabilityError::NonImmutableFunction { function });
             }
             for arg in &func.args {
                 is_cacheable_scalar_expr(arg, ctx, fv)?;
@@ -718,6 +745,35 @@ mod tests {
     }
 
     #[test]
+    fn test_cacheability_error_names_offending_item() {
+        let display = |sql: &str| check_cacheable(sql).expect_err("not cacheable").to_string();
+        assert_eq!(
+            display("SELECT now()"),
+            "Unsupported FROM clause: no FROM clause"
+        );
+        assert_eq!(
+            display("SELECT id FROM a, b"),
+            "Unsupported FROM clause: comma join"
+        );
+        assert_eq!(
+            display("SELECT a.id FROM a FULL JOIN b ON a.id = b.a_id"),
+            "Unsupported FROM clause: FULL JOIN"
+        );
+        assert_eq!(
+            display("SELECT id FROM a WHERE score > RANDOM()"),
+            "Non-immutable function: random"
+        );
+        assert_eq!(
+            display("SELECT relname FROM pg_catalog.pg_class"),
+            "System catalog reference: pg_catalog.pg_class"
+        );
+        assert_eq!(
+            display("SELECT * FROM (SELECT 1)"),
+            "Unsupported subquery: derived table without alias"
+        );
+    }
+
+    #[test]
     fn test_two_table_join_cacheable() {
         let sql = "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.id = 1";
         let result = check_cacheable(sql);
@@ -785,7 +841,7 @@ mod tests {
         let sql = "SELECT * FROM a FULL JOIN b ON a.id = b.id WHERE a.id = 1";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            matches!(result, Err(CacheabilityError::UnsupportedFrom { .. })),
             "FULL JOIN should not be cacheable"
         );
     }
@@ -816,7 +872,7 @@ mod tests {
         let sql = "SELECT * FROM a JOIN b ON a.id > b.id WHERE a.id = 1";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            matches!(result, Err(CacheabilityError::UnsupportedFrom { .. })),
             "Non-equality join condition should not be cacheable"
         );
     }
@@ -826,7 +882,7 @@ mod tests {
         let sql = "SELECT * FROM a JOIN b ON a.id > b.id JOIN c ON b.id = c.id WHERE a.id = 1";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::UnsupportedFrom)),
+            matches!(result, Err(CacheabilityError::UnsupportedFrom { .. })),
             "Nested join with non-equality condition should not be cacheable"
         );
     }
@@ -1169,7 +1225,7 @@ mod tests {
         let sql = "SELECT * FROM orders WHERE now() > created_at";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::NonImmutableFunction)),
+            matches!(result, Err(CacheabilityError::NonImmutableFunction { .. })),
             "Stable function in WHERE should not be cacheable: {result:?}"
         );
     }
@@ -1179,7 +1235,7 @@ mod tests {
         let sql = "SELECT * FROM orders WHERE random() > 0.5";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::NonImmutableFunction)),
+            matches!(result, Err(CacheabilityError::NonImmutableFunction { .. })),
             "Volatile function in WHERE should not be cacheable: {result:?}"
         );
     }
@@ -1189,7 +1245,7 @@ mod tests {
         let sql = "SELECT * FROM users WHERE unknown_func(col) = 1";
         let result = check_cacheable(sql);
         assert!(
-            matches!(result, Err(CacheabilityError::NonImmutableFunction)),
+            matches!(result, Err(CacheabilityError::NonImmutableFunction { .. })),
             "Unknown function in WHERE should not be cacheable: {result:?}"
         );
     }
@@ -1508,7 +1564,10 @@ mod tests {
         for sql in cases {
             let result = check_cacheable(sql);
             assert!(
-                matches!(result, Err(CacheabilityError::SystemCatalogReference)),
+                matches!(
+                    result,
+                    Err(CacheabilityError::SystemCatalogReference { .. })
+                ),
                 "should reject system catalog reference: {sql} (got {result:?})"
             );
         }
