@@ -56,6 +56,20 @@ cargo build --release -p pgcache-fit
 # binary at ../target/release/pgcache-fit
 ```
 
+## Browser build
+
+`fit/wasm/` wraps the same library in a WebAssembly bundle for the site's
+in-browser analyzer (one JSON request in, one JSON response out; the calling
+convention is in `fit/wasm/smoke.mjs`). It needs the emscripten toolchain and a
+libclang built with the WebAssembly target; `fit/wasm/build.sh` resolves the
+machine-specific paths, builds, copies the bundle into `site/static/fit/`, and
+runs the node smoke test:
+
+```sh
+rustup target add wasm32-unknown-emscripten
+fit/wasm/build.sh          # release; `debug` for an unoptimized build
+```
+
 ## Usage
 
 ```sh

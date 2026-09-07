@@ -6,8 +6,10 @@ use bytes::Bytes;
 use clap::ValueEnum;
 use ecow::EcoString;
 use pgcache_lib::cache::QueryParameters;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TraceFormat {
     /// Semicolon-separated SQL statements
     Sql,

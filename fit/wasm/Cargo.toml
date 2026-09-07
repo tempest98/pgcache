@@ -1,0 +1,16 @@
+[package]
+name = "pgcache-fit-wasm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "pgcache_fit_wasm"
+path = "src/main.rs"
+
+[dependencies]
+pgcache-fit = { path = ".." }
+pgcache = { path = "../..", default-features = false }
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"

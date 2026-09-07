@@ -2199,6 +2199,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgcache-fit-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pgcache",
+ "pgcache-fit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pgtemp"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
