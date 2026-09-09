@@ -11,7 +11,7 @@ use ordered_float::NotNan;
 use pg_query::pg_nodes as pg;
 
 use super::super::raw::{
-    NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value,
+    NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value,
 };
 use super::super::*;
 use super::{
@@ -342,7 +342,7 @@ pub(super) unsafe fn a_expr_convert(expr: *const pg::A_Expr) -> Result<WhereExpr
                 }))
             }
             other => Err(WhereParseError::UnsupportedAExpr {
-                expr: format!("A_Expr_Kind {other}"),
+                expr: format!("{} in WHERE", aexpr_kind_name(other)),
             }),
         }
     }

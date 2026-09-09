@@ -17,7 +17,10 @@ use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::query_expr_constant_fold;
 use crate::query::write::{TransactionBoundary, WriteClass};
 
-use super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value};
+use super::raw::{
+    NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_nodes, node_tag, node_tag_name,
+    string_node_value, sublink_type_name,
+};
 use super::*;
 
 mod where_clause;
@@ -44,7 +47,7 @@ pub unsafe fn query_expr_convert_raw(tree_root: *const c_void) -> Result<QueryEx
         match node_tag(stmt) {
             pg::NodeTag_T_SelectStmt => select_root_convert(cast::<pg::SelectStmt>(stmt)),
             other => Err(AstError::UnsupportedStatement {
-                statement_type: format!("{other:?}"),
+                statement_type: node_tag_name(other).into_owned(),
             }),
         }
     }
@@ -163,7 +166,7 @@ unsafe fn with_clause_extract(
         for cte_node in list_nodes((*with_clause).ctes) {
             if node_tag(cte_node) != pg::NodeTag_T_CommonTableExpr {
                 return Err(AstError::UnsupportedFeature {
-                    feature: format!("WITH clause entry: {:?}", node_tag(cte_node)),
+                    feature: format!("{} in WITH clause", node_tag_name(node_tag(cte_node))),
                 });
             }
             let cte = cast::<pg::CommonTableExpr>(cte_node);
@@ -332,14 +335,14 @@ unsafe fn value_list_convert(
         for row_node in list_nodes(value_lists) {
             if node_tag(row_node) != pg::NodeTag_T_List {
                 return Err(AstError::UnsupportedFeature {
-                    feature: format!("Values row: {:?}", node_tag(row_node)),
+                    feature: format!("{} as VALUES row", node_tag_name(node_tag(row_node))),
                 });
             }
             let mut row = Vec::new();
             for item in list_nodes(row_node as *const pg::List) {
                 if node_tag(item) != pg::NodeTag_T_A_Const {
                     return Err(AstError::UnsupportedFeature {
-                        feature: format!("Value expression: {:?}", node_tag(item)),
+                        feature: format!("{} in VALUES", node_tag_name(node_tag(item))),
                     });
                 }
                 row.push(const_value_extract(cast::<pg::A_Const>(item))?);
@@ -361,7 +364,7 @@ unsafe fn select_columns_convert(target_list: *const pg::List) -> Result<SelectC
         for target in list_nodes(target_list) {
             if node_tag(target) != pg::NodeTag_T_ResTarget {
                 return Err(AstError::UnsupportedSelectFeature {
-                    feature: format!("Target: {:?}", node_tag(target)),
+                    feature: format!("{} in select list", node_tag_name(node_tag(target))),
                 });
             }
             let res_target = cast::<pg::ResTarget>(target);
@@ -436,7 +439,7 @@ unsafe fn table_source_convert(
             }
             pg::NodeTag_T_JoinExpr => join_expr_convert(cast::<pg::JoinExpr>(node), ctx),
             other => Err(AstError::UnsupportedSelectFeature {
-                feature: format!("{context} type: {other:?}"),
+                feature: format!("{} in {context}", node_tag_name(other)),
             }),
         }
     }
@@ -543,10 +546,11 @@ unsafe fn table_subquery_node_convert(
         let subquery = (*range_subselect).subquery as NodePtr;
         if subquery.is_null() || node_tag(subquery) != pg::NodeTag_T_SelectStmt {
             return Err(AstError::UnsupportedSelectFeature {
-                feature: format!(
-                    "subquery: {:?}",
-                    (!subquery.is_null()).then(|| node_tag(subquery))
-                ),
+                feature: if subquery.is_null() {
+                    "empty subquery in FROM".to_owned()
+                } else {
+                    format!("{} as subquery in FROM", node_tag_name(node_tag(subquery)))
+                },
             });
         }
 
@@ -619,7 +623,7 @@ pub(super) unsafe fn scalar_expr_convert(node: NodePtr) -> Result<ScalarExpr, As
                         Ok(ScalarExpr::Arithmetic(aexpr_arithmetic_convert(aexpr)?))
                     }
                     other => Err(AstError::UnsupportedFeature {
-                        feature: format!("Column expression A_Expr kind: {other}"),
+                        feature: format!("{} in a column expression", aexpr_kind_name(other)),
                     }),
                 }
             }
@@ -628,7 +632,7 @@ pub(super) unsafe fn scalar_expr_convert(node: NodePtr) -> Result<ScalarExpr, As
             )?)),
             pg::NodeTag_T_TypeCast => type_cast_convert(cast::<pg::TypeCast>(node)),
             other => Err(AstError::UnsupportedFeature {
-                feature: format!("Column expression node: {other:?}"),
+                feature: format!("{} in a column expression", node_tag_name(other)),
             }),
         }
     }
@@ -666,7 +670,7 @@ unsafe fn type_name_render(tn: *const pg::TypeName) -> Result<EcoString, AstErro
                 Some(s) => parts.push(s),
                 None => {
                     return Err(AstError::UnsupportedFeature {
-                        feature: format!("TypeName component: {:?}", node_tag(n)),
+                        feature: format!("{} in a type name", node_tag_name(node_tag(n))),
                     });
                 }
             }
@@ -689,7 +693,7 @@ unsafe fn type_name_render(tn: *const pg::TypeName) -> Result<EcoString, AstErro
             for tm in list_nodes((*tn).typmods) {
                 if node_tag(tm) != pg::NodeTag_T_A_Const {
                     return Err(AstError::UnsupportedFeature {
-                        feature: format!("TypeName typmod: {:?}", node_tag(tm)),
+                        feature: format!("{} as a type modifier", node_tag_name(node_tag(tm))),
                     });
                 }
                 let lit = const_value_extract(cast::<pg::A_Const>(tm)).map_err(|_| {
@@ -902,7 +906,7 @@ unsafe fn case_when_convert(node: NodePtr) -> Result<CaseWhen, AstError> {
     unsafe {
         if node_tag(node) != pg::NodeTag_T_CaseWhen {
             return Err(AstError::UnsupportedFeature {
-                feature: format!("Expected CaseWhen, got: {:?}", node_tag(node)),
+                feature: format!("{} as a CASE arm", node_tag_name(node_tag(node))),
             });
         }
         let case_when = cast::<pg::CaseWhen>(node);
@@ -941,7 +945,7 @@ unsafe fn group_by_clause_convert(
         for node in list_nodes(group_clause) {
             if node_tag(node) != pg::NodeTag_T_ColumnRef {
                 return Err(AstError::UnsupportedFeature {
-                    feature: format!("GROUP BY expression: {:?}", node_tag(node)),
+                    feature: format!("{} in GROUP BY", node_tag_name(node_tag(node))),
                 });
             }
             group_by.push(column_ref_extract(cast::<pg::ColumnRef>(node)).map_err(AstError::from)?);
@@ -983,7 +987,7 @@ unsafe fn limit_node_extract(node: NodePtr) -> Result<Option<LiteralValue>, AstE
                 format!("${}", (*cast::<pg::ParamRef>(node)).number).into(),
             ))),
             other => Err(AstError::UnsupportedFeature {
-                feature: format!("LIMIT/OFFSET expression: {other:?}"),
+                feature: format!("{} in LIMIT/OFFSET", node_tag_name(other)),
             }),
         }
     }
@@ -1029,7 +1033,7 @@ pub(super) fn sublink_type_map(t: pg::SubLinkType) -> Result<SubLinkType, AstErr
         pg::SubLinkType_ALL_SUBLINK => Ok(SubLinkType::All),
         pg::SubLinkType_EXPR_SUBLINK => Ok(SubLinkType::Expr),
         other => Err(AstError::UnsupportedSubLinkType {
-            sublink_type: format!("{other}"),
+            sublink_type: sublink_type_name(other).into_owned(),
         }),
     }
 }

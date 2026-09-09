@@ -3808,3 +3808,39 @@ fn test_having_aggregate_roundtrip_stable() {
         "HAVING aggregate-metadata deparse must round-trip stably"
     );
 }
+
+/// Converter errors name the construct that was met, not pg_query's numeric
+/// node tag (PGC-409). One case per fall-through arm the workloads have hit.
+#[test]
+fn test_conversion_errors_name_the_construct() {
+    let cases = [
+        (
+            "SELECT * FROM t TABLESAMPLE SYSTEM (10)",
+            "TABLESAMPLE in FROM",
+        ),
+        (
+            "SELECT a FROM t GROUP BY ROLLUP (a)",
+            "GROUPING SETS / ROLLUP / CUBE in GROUP BY",
+        ),
+        (
+            "SELECT arr[1] FROM t",
+            "subscript or field access (x[1], (x).f) in a column expression",
+        ),
+        (
+            "SELECT a AND b FROM t",
+            "AND/OR/NOT expression in a column expression",
+        ),
+        (
+            "SELECT a FROM t WHERE a IS DISTINCT FROM b",
+            "IS DISTINCT FROM",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let err = query_expr_parse(sql).expect_err(sql).to_string();
+        assert!(err.contains(expected), "{sql}: {err}");
+        assert!(
+            !err.chars().last().is_some_and(|c| c.is_ascii_digit()),
+            "{sql}: message ends in a raw number: {err}"
+        );
+    }
+}

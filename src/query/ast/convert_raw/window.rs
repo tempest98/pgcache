@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 
 use pg_query::pg_nodes as pg;
 
-use super::super::raw::{NodePtr, cast, cstr, list_nodes, node_tag};
+use super::super::raw::{NodePtr, cast, cstr, list_nodes, node_tag, node_tag_name};
 use super::super::*;
 use super::{null_order_map, order_dir_map, scalar_expr_convert};
 
@@ -88,7 +88,7 @@ pub(super) unsafe fn window_clause_extract(
         for node in list_nodes(window_clause) {
             if node_tag(node) != pg::NodeTag_T_WindowDef {
                 return Err(AstError::UnsupportedFeature {
-                    feature: format!("WINDOW clause node type: {:?}", node_tag(node)),
+                    feature: format!("{} in WINDOW clause", node_tag_name(node_tag(node))),
                 });
             }
             let win_def = cast::<pg::WindowDef>(node);
@@ -285,7 +285,7 @@ pub(super) unsafe fn window_order_by_convert(
         for sort_node in list_nodes(order_clause) {
             if node_tag(sort_node) != pg::NodeTag_T_SortBy {
                 return Err(AstError::UnsupportedFeature {
-                    feature: format!("ORDER BY node type: {:?}", node_tag(sort_node)),
+                    feature: format!("{} in ORDER BY", node_tag_name(node_tag(sort_node))),
                 });
             }
             order_by.push(sort_by_to_order_clause(cast::<pg::SortBy>(sort_node))?);
